@@ -44,7 +44,7 @@ const steps = computed(() => {
   return [
     { n: 1, title: "模式", phase: "基础" },
     { n: 2, title: "系统", phase: "基础" },
-    { n: 3, title: "CF", phase: "基础" },
+    { n: 3, title: "MAIL", phase: "基础" },
     { n: 4, title: "CF KV", phase: "基础" },
     { n: 5, title: "代理", phase: "基础" },
     { n: 6, title: paySlotTitle, phase: "支付" },

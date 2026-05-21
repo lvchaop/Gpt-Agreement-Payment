@@ -46,6 +46,8 @@ export const useWizardStore = defineStore("wizard", {
       return required.every((name) => this.preflight[name]?.status === "ok");
     },
     isStepHidden(n: number): boolean {
+      const mailMode = (this.answers.mail as any)?.mode ?? "cloudflare_kv";
+      if (mailMode === "imap_list" && n === 4) return true;
       const mm = (this.answers.mode as any)?.mode ?? "single";
       // free_register / free_backfill_rt 不走支付，6(PayPal/GoPay)/7(Card)/13(Stripe runtime) 都隐藏
       if (mm === "free_register" || mm === "free_backfill_rt") {

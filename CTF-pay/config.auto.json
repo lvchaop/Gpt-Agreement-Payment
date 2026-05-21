@@ -6,23 +6,26 @@
     "auto_launch_browser": false,
     "headless": false,
     "timeout_ms": 1800000,
-    "auto_click_checkbox": true
+    "auto_click_checkbox": true,
+    "external_solver": {
+      "enabled": false
+    }
   },
   "cards": [
     {
-      "number": "4242424242424242",
-      "cvc": "123",
-      "exp_month": "12",
-      "exp_year": "2030",
+      "number": "4549241889703641",
+      "cvc": "616",
+      "exp_month": "05",
+      "exp_year": "2029",
       "address": {
         "country": "US",
-        "line1": "1 Example Street",
-        "city": "San Francisco",
-        "postal_code": "94105",
-        "state": "CA"
+        "line1": "2905 Southeast Clinton Street",
+        "city": "Portland",
+        "postal_code": "97202",
+        "state": "Oregon"
       },
-      "name": "JOHN DOE",
-      "email": "tester@example.com"
+      "name": "cpggw",
+      "email": "yoyv5283@outlook.com"
     }
   ],
   "captcha": {
@@ -81,6 +84,6 @@
   },
   "proxy": {
     "host": "127.0.0.1",
-    "port": 18080
+    "port": 7897
   }
 }

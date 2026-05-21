@@ -4,6 +4,7 @@ flows.gz
 flows_*/
 *.har
 *_har
+.venv
 
 # PayPal Camoufox 持久化 profile（含 session cookies）
 CTF-pay/paypal_cf_persist/

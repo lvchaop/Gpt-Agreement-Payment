@@ -101,6 +101,18 @@ def _project_pay(answers: dict) -> dict:
             # webshare 模式下 pipeline._ensure_gost_alive 会拉起本地 gost 中继；
             # card.py 直接连这个地址出网（避开 example 模板透传的 USER:PASS 占位）
             out["proxy"] = f"socks5://127.0.0.1:{gost_port}"
+        elif mode == "trojan-pool":
+            out["trojan_pool"] = {
+                "enabled": True,
+                "pool_file": proxy.get("trojan_pool_file") or "output/trojan_pool.txt",
+                "http_start_port": int(proxy.get("trojan_http_start_port") or 18081),
+                "bridge_bin": proxy.get("trojan_bridge_bin") or "sing-box",
+                "region_all": proxy.get("proxy_region_all") or "",
+                "region_register": proxy.get("proxy_region_register") or "",
+                "region_checkout": proxy.get("proxy_region_checkout") or "",
+                "region_payment": proxy.get("proxy_region_payment") or "",
+            }
+            out["proxy"] = ""
         elif mode == "none":
             out["proxy"] = ""
         elif proxy.get("url"):
@@ -112,15 +124,33 @@ def _project_reg(answers: dict) -> dict:
     """Map flat wizard answers onto CTF-reg config schema."""
     out: dict = {}
     pm = _payment_method(answers)
-    # mail.catch_all_domain(s) 来自 Step03 Cloudflare 的 zone_names
-    # IMAP 字段（imap_server/port/email/auth_code）已彻底删除——OTP 走
-    # CF Email Worker → KV，凭证存 SQLite runtime_meta[secrets]。
-    zones = (answers.get("cloudflare") or {}).get("zone_names") or []
-    if zones:
+    mail_mode = ((answers.get("mail") or {}).get("mode") or "cloudflare_kv").strip()
+    if mail_mode == "imap_list":
+        mail = answers.get("mail") or {}
         out["mail"] = {
-            "catch_all_domain": zones[0],
-            "catch_all_domains": list(zones),
+            "mode": "imap_list",
+            "accounts_path": mail.get("accounts_path") or str(s.get_data_dir() / "email_accounts.csv"),
+            "otp_timeout": int(mail.get("otp_timeout") or 180),
+            "mark_seen": bool(mail.get("mark_seen", False)),
         }
+    else:
+        # mail.catch_all_domain(s) 来自 Step03 Cloudflare 的 zone_names
+        # 默认 OTP 走 CF Email Worker → KV，凭证存 SQLite runtime_meta[secrets]。
+        zones = (answers.get("cloudflare") or {}).get("zone_names") or []
+        if zones:
+            out["mail"] = {
+                "mode": "cloudflare_kv",
+                "catch_all_domain": zones[0],
+                "catch_all_domains": list(zones),
+            }
+    if "mail" not in out:
+        zones = (answers.get("cloudflare") or {}).get("zone_names") or []
+        if zones:
+            out["mail"] = {
+                "mode": "cloudflare_kv",
+                "catch_all_domain": zones[0],
+                "catch_all_domains": list(zones),
+            }
     if "card" in answers and pm in ("card", "both"):
         out["card"] = {k: answers["card"].get(k, "") for k in ("number", "cvc", "exp_month", "exp_year")}
     if "billing" in answers:
@@ -135,6 +165,8 @@ def _project_reg(answers: dict) -> dict:
         if mode == "webshare" and proxy.get("api_key"):
             gost_port = int(proxy.get("gost_listen_port", 18898))
             out["proxy"] = f"socks5://127.0.0.1:{gost_port}"
+        elif mode == "trojan-pool":
+            out["proxy"] = ""
         elif mode == "none":
             out["proxy"] = ""
         elif proxy.get("url"):

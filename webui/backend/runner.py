@@ -93,6 +93,31 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
     """根据参数拼出最终命令行。"""
     cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
            "--config", str(s.PAY_CONFIG_PATH)]
+
+    def _append_proxy_args() -> None:
+        cfg = _read_pay_config()
+        trojan = cfg.get("trojan_pool") or {}
+        if not trojan.get("enabled"):
+            return
+        cmd.extend(["--proxy-mode", "trojan-pool"])
+        pool_file = str(trojan.get("pool_file") or "output/trojan_pool.txt")
+        cmd.extend(["--trojan-pool-file", pool_file])
+        cmd.extend(["--trojan-http-start-port", str(int(trojan.get("http_start_port") or 18081))])
+        bridge_bin = str(trojan.get("bridge_bin") or "sing-box")
+        if bridge_bin:
+            cmd.extend(["--trojan-bridge-bin", bridge_bin])
+        region_map = {
+            "--proxy-region-all": trojan.get("region_all"),
+            "--proxy-region-register": trojan.get("region_register"),
+            "--proxy-region-checkout": trojan.get("region_checkout"),
+            "--proxy-region-payment": trojan.get("region_payment"),
+        }
+        for flag, value in region_map.items():
+            value = str(value or "").strip()
+            if value:
+                cmd.extend([flag, value])
+
+    _append_proxy_args()
     # free_only 两个子模式不需要 paypal / gopay 支付段
     if mode in ("free_register", "free_backfill_rt"):
         if mode == "free_register":

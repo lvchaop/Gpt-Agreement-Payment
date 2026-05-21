@@ -132,14 +132,26 @@ class CloudflareKVOtpProvider:
             **kwargs,
         )
 
-    def _req(self, method: str, path: str, *, accept_404: bool = False) -> Optional[dict]:
+    def _req(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept_404: bool = False,
+        data: bytes | None = None,
+        headers: dict | None = None,
+    ) -> Optional[dict]:
         url = CF_BASE + path
+        req_headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+        }
+        if headers:
+            req_headers.update(headers)
         req = urllib.request.Request(
             url,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-            },
+            data=data,
+            headers=req_headers,
             method=method,
         )
         try:
@@ -197,6 +209,47 @@ class CloudflareKVOtpProvider:
             )
         except Exception as e:
             logger.debug(f"KV delete failed (non-fatal): {e}")
+
+    def put_otp(
+        self,
+        email_addr: str,
+        otp: str,
+        *,
+        metadata: dict | None = None,
+        ttl: int = 600,
+    ) -> dict:
+        """Write an OTP payload to KV using the same shape as the Email Worker."""
+        key = email_addr.strip().lower()
+        if not key:
+            raise RuntimeError("CF KV put_otp 缺 email key")
+        otp = str(otp or "").strip()
+        if not otp:
+            raise RuntimeError(f"CF KV put_otp 缺 otp key={key}")
+
+        payload = dict(metadata or {})
+        payload.update({
+            "otp": otp,
+            "ts": int(time.time() * 1000),
+        })
+        encoded = urllib.parse.quote(key, safe="@.+-")
+        query = f"?expiration_ttl={max(60, int(ttl or 600))}"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        resp = self._req(
+            "PUT",
+            f"/accounts/{self.account_id}"
+            f"/storage/kv/namespaces/{self.kv_id}/values/{encoded}{query}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        if isinstance(resp, dict) and resp.get("success") is False:
+            raise RuntimeError(f"CF KV PUT failed key={key}: {resp.get('errors') or resp}")
+        logger.info(
+            "[CF-KV] 写入 OTP key=%s source=%s subject=%r",
+            key,
+            payload.get("source", "?"),
+            str(payload.get("subject", ""))[:80],
+        )
+        return resp or {"success": True}
 
     def wait_for_otp(
         self,

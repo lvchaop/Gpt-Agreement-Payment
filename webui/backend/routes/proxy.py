@@ -10,15 +10,111 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import signal
+import socket
+import time
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from ..auth import CurrentUser
 from .. import settings as s
 
 
 router = APIRouter(prefix="/api/proxy", tags=["proxy"])
+
+
+class TrojanBridgeRequest(BaseModel):
+    pool_file: str = "output/trojan_pool.txt"
+    http_start_port: int = 18081
+    bridge_bin: str = "sing-box"
+    auto_start: bool = True
+
+
+def _bridge_dir() -> Path:
+    return s.ROOT / "output" / "proxy_bridge"
+
+
+def _resolve_project_path(raw: str) -> Path:
+    text = (raw or "").strip()
+    if not text:
+        return s.ROOT / "output" / "trojan_pool.txt"
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = s.ROOT / path
+    return path
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_bridge_pid() -> int:
+    pid_path = _bridge_dir() / "sing-box.pid"
+    try:
+        return int(pid_path.read_text(encoding="utf-8").strip() or "0")
+    except Exception:
+        return 0
+
+
+def _read_bridge_nodes_from_config() -> list[dict]:
+    config_path = _bridge_dir() / "sing-box.trojan-pool.json"
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    nodes = []
+    inbounds = cfg.get("inbounds") or []
+    rules = ((cfg.get("route") or {}).get("rules") or [])
+    inbound_to_outbound = {}
+    for rule in rules:
+        outbound = rule.get("outbound", "")
+        for tag in rule.get("inbound") or []:
+            inbound_to_outbound[tag] = outbound
+    for inbound in inbounds:
+        if inbound.get("type") != "http":
+            continue
+        port = int(inbound.get("listen_port") or 0)
+        tag = inbound.get("tag", "")
+        nodes.append({
+            "tag": tag,
+            "port": port,
+            "url": f"http://127.0.0.1:{port}" if port else "",
+            "outbound": inbound_to_outbound.get(tag, ""),
+            "open": _port_open(port) if port else False,
+        })
+    return nodes
+
+
+def _trojan_status(extra: dict | None = None) -> dict:
+    pid = _read_bridge_pid()
+    nodes = _read_bridge_nodes_from_config()
+    running = _pid_alive(pid) and bool(nodes) and all(n.get("open") for n in nodes)
+    return {
+        "ok": running,
+        "running": running,
+        "pid": pid if _pid_alive(pid) else 0,
+        "nodes": nodes,
+        "config_path": str(_bridge_dir() / "sing-box.trojan-pool.json"),
+        "pid_path": str(_bridge_dir() / "sing-box.pid"),
+        **(extra or {}),
+    }
 
 
 def _read_pay_config() -> dict:
@@ -120,3 +216,84 @@ def rotate_ip(user: str = CurrentUser):
         "asn": new_px.get("asn_name"),
         "valid": new_px.get("valid"),
     }
+
+
+@router.get("/trojan/status")
+def trojan_status(user: str = CurrentUser):
+    return _trojan_status()
+
+
+@router.get("/trojan/nodes")
+def trojan_nodes(pool_file: str = "output/trojan_pool.txt", http_start_port: int = 18081,
+                 user: str = CurrentUser):
+    try:
+        from proxy_bridge import load_trojan_pool
+        nodes = load_trojan_pool(_resolve_project_path(pool_file), http_start_port=http_start_port)
+        return {
+            "ok": True,
+            "nodes": [
+                {
+                    "region": n.region,
+                    "name": n.name,
+                    "port": n.local_http_port,
+                    "url": n.local_http_url,
+                    "index": n.index,
+                }
+                for n in nodes
+            ],
+            "regions": sorted({n.region for n in nodes}),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Trojan 池解析失败: {e}")
+
+
+@router.post("/trojan/start")
+def trojan_start(body: TrojanBridgeRequest, user: str = CurrentUser):
+    try:
+        from proxy_bridge import TrojanBridgeManager
+        manager = TrojanBridgeManager(
+            str(_resolve_project_path(body.pool_file)),
+            http_start_port=body.http_start_port,
+            work_dir=_bridge_dir(),
+            executable=body.bridge_bin or "sing-box",
+            auto_start=body.auto_start,
+        )
+        manager.ensure_started()
+        nodes = [
+            {
+                "region": n.region,
+                "name": n.name,
+                "port": n.local_http_port,
+                "url": n.local_http_url,
+                "index": n.index,
+                "open": _port_open(n.local_http_port),
+            }
+            for n in manager.nodes
+        ]
+        return _trojan_status({
+            "ok": all(n.get("open") for n in nodes),
+            "nodes": nodes,
+            "regions": manager.regions,
+            "pool_file": str(_resolve_project_path(body.pool_file)),
+        })
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Trojan bridge 启动失败: {e}")
+
+
+@router.post("/trojan/stop")
+def trojan_stop(user: str = CurrentUser):
+    pid = _read_bridge_pid()
+    if not _pid_alive(pid):
+        return _trojan_status({"ok": True, "stopped": True, "message": "bridge 未运行"})
+    try:
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.2)
+        if _pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Trojan bridge 停止失败: {e}")
+    return _trojan_status({"ok": True, "stopped": True})

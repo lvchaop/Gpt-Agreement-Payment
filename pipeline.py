@@ -32,6 +32,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from proxy_bridge import (
+    ProxyStagePlan,
+    TrojanBridgeError,
+    TrojanBridgeManager,
+    apply_payment_proxy_plan,
+)
 from webui.backend.db import get_db
 
 ROOT = Path(__file__).resolve().parent
@@ -594,8 +600,12 @@ from mail_provider import MailProvider
 from browser_register import browser_register
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
-mail = MailProvider(cfg.mail.catch_all_domain)
+mail = MailProvider.from_config(cfg.mail, config_path=config_path)
 result = browser_register(cfg, mail)
+try:
+    mail.mark_used(result.get("email", ""))
+except Exception:
+    pass
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
 """
     else:
@@ -609,9 +619,13 @@ from auth_flow import AuthFlow
 from mail_provider import MailProvider
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
-mail = MailProvider(cfg.mail.catch_all_domain)
+mail = MailProvider.from_config(cfg.mail, config_path=config_path)
 flow = AuthFlow(cfg)
 result = flow.run_register(mail)
+try:
+    mail.mark_used(result.email)
+except Exception:
+    pass
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False), flush=True)
 """
 
@@ -740,7 +754,8 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, use_paypal=False, use_gopay=False,
-        gopay_otp_file=None, python="python3", timeout=600):
+        gopay_otp_file=None, python="python3", timeout=600,
+        proxy_stage_plan=None):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -755,26 +770,31 @@ def pay(card_config_path, session_token=None, access_token=None,
     card_config_path = str(Path(card_config_path).resolve())
     cfg_for_env = {}
 
-    # 如果有外部凭证，创建临时配置
+    # 如果有外部凭证或 CLI/池代理覆盖，创建临时配置
     config_to_use = card_config_path
     tmp_config = None
-    if session_token or access_token:
+    stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    if session_token or access_token or stage_plan.has_any():
         with open(card_config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         cfg_for_env = cfg
-        auth = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
-        auth["mode"] = "access_token"
-        if session_token:
-            auth["session_token"] = session_token
-        if access_token:
-            auth["access_token"] = access_token
-        if device_id:
-            auth["device_id"] = device_id
-        auth["prefer_session_refresh"] = True
-        # 禁用 auto_register（凭证已有）
-        auto = auth.get("auto_register", {})
-        auto["enabled"] = False
-        auth["auto_register"] = auto
+        if session_token or access_token:
+            auth = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
+            auth["mode"] = "access_token"
+            if session_token:
+                auth["session_token"] = session_token
+            if access_token:
+                auth["access_token"] = access_token
+            if device_id:
+                auth["device_id"] = device_id
+            auth["prefer_session_refresh"] = True
+            # 禁用 auto_register（凭证已有）
+            auto = auth.get("auto_register", {})
+            auto["enabled"] = False
+            auth["auto_register"] = auto
+        if stage_plan.has_any():
+            apply_payment_proxy_plan(cfg, stage_plan)
+            print(f"[pay] 阶段代理: {_describe_stage_plan(stage_plan)}")
 
         tmp_config = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="pipeline_pay_",
@@ -856,7 +876,8 @@ def pay(card_config_path, session_token=None, access_token=None,
 def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
              use_gopay=False, gopay_otp_file=None,
              timeout_reg=300, timeout_pay=600,
-             pool=None, team_client=None, card_cfg=None, proxy_pool=None):
+             pool=None, team_client=None, card_cfg=None, proxy_pool=None,
+             proxy_stage_allocator=None, proxy_stage_plan=None):
     """全链路: 注册 → 支付 → (可选) gpt-team 导入探测 → 更新域池
     proxy_pool 非空时从 pool 挑代理，同时覆盖 CTF-reg + CTF-pay 两个 config 的 proxy 字段"""
     card_config_path = str(Path(card_config_path).resolve())
@@ -877,33 +898,33 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
     if proxy_pool is None:
         proxy_pool = _build_proxy_pool_from_card_cfg(card_cfg)
 
-    # 挑代理（独立于域）
-    picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
-    if picked_proxy:
-        print(f"[ProxyPool] 本次代理: {picked_proxy}")
+    stage_plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+    # 挑代理（独立于域）。阶段计划优先；没有阶段计划才沿用旧 ProxyPool。
+    picked_proxy = ""
+    if not stage_plan.has_any():
+        picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+        if picked_proxy:
+            print(f"[ProxyPool] 本次代理: {picked_proxy}")
+    stage_plan = _fill_stage_plan_with_proxy(stage_plan, picked_proxy)
+    if stage_plan.has_any():
+        print(f"[ProxyStage] 本次阶段代理: {_describe_stage_plan(stage_plan)}")
 
     # 挑域 + 写临时 CTF-reg config（同时覆盖 proxy）
     # pool.domains 为空时，若有 provisioner 仍要让 pick() 触发自动开通
     picked_domain = pool.pick() if pool and (pool.domains or pool.provisioner) else ""
     temp_cardw = None
     effective_cardw = cardw_config_path
-    if picked_domain or picked_proxy:
-        temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, picked_proxy)
+    register_proxy = stage_plan.register
+    if picked_domain or register_proxy:
+        temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, register_proxy)
         effective_cardw = temp_cardw
         if picked_domain:
             pool.mark_used(picked_domain)
             print(f"[DomainPool] 本次使用域: {picked_domain}")
 
-    # CTF-pay 也覆盖 proxy（支付流程走同一代理）
-    temp_card = None
-    effective_card = card_config_path
-    if picked_proxy:
-        temp_card = _rewrite_card_with_proxy(card_config_path, picked_proxy)
-        effective_card = temp_card
-
     ts = datetime.now(timezone.utc).isoformat()
     record = {"ts": ts, "registration": {}, "payment": {},
-              "domain": picked_domain, "proxy": picked_proxy}
+              "domain": picked_domain, "proxy": stage_plan.to_dict() if stage_plan.has_any() else picked_proxy}
 
     try:
         # Step 1: 注册
@@ -925,7 +946,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
         print(f"{'='*60}")
         try:
             pay_result = pay(
-                effective_card,
+                card_config_path,
                 session_token=reg.get("session_token"),
                 access_token=reg.get("access_token"),
                 device_id=reg.get("device_id", ""),
@@ -933,6 +954,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 use_gopay=use_gopay,
                 gopay_otp_file=gopay_otp_file,
                 timeout=timeout_pay,
+                proxy_stage_plan=stage_plan,
             )
             record["payment"] = {
                 "status": pay_result.get("status", "unknown"),
@@ -976,9 +998,6 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
         if temp_cardw and os.path.exists(temp_cardw):
             try: os.unlink(temp_cardw)
             except Exception: pass
-        if temp_card and os.path.exists(temp_card):
-            try: os.unlink(temp_card)
-            except Exception: pass
 
 
 def _run_one(args_tuple):
@@ -998,26 +1017,40 @@ def _run_one_pay_only(args_tuple):
 
 
 def _register_one(args_tuple):
-    """单个注册任务。args_tuple = (idx, cardw_config_path, pool_or_None)
+    """单个注册任务。args_tuple = (idx, cardw_config_path, pool_or_None, proxy_allocator, proxy_plan)
     pool 非空时为每个 worker 独立 pick 域 + 改写临时 cardw config。"""
-    if len(args_tuple) == 3:
-        idx, cardw_config_path, pool = args_tuple
-    else:
-        idx, cardw_config_path = args_tuple
-        pool = None
+    idx = args_tuple[0]
+    cardw_config_path = args_tuple[1]
+    pool = args_tuple[2] if len(args_tuple) >= 3 else None
+    proxy_stage_allocator = args_tuple[3] if len(args_tuple) >= 4 else None
+    proxy_stage_plan = args_tuple[4] if len(args_tuple) >= 5 else None
+    stage_plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
     picked_domain = ""
     temp_cardw = None
     effective = cardw_config_path
     try:
-        if pool and pool.domains:
+        if pool and (pool.domains or pool.provisioner):
             picked_domain = pool.pick()
             pool.mark_used(picked_domain)
-            temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain)
+        if picked_domain or stage_plan.register:
+            temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, stage_plan.register)
             effective = temp_cardw
         r = register(effective)
-        return {"index": idx, "status": "ok", "picked_domain": picked_domain, **r}
+        return {
+            "index": idx,
+            "status": "ok",
+            "picked_domain": picked_domain,
+            "proxy_stage_plan": stage_plan.to_dict() if stage_plan.has_any() else {},
+            **r,
+        }
     except Exception as e:
-        return {"index": idx, "status": "error", "picked_domain": picked_domain, "error": str(e)[:200]}
+        return {
+            "index": idx,
+            "status": "error",
+            "picked_domain": picked_domain,
+            "proxy_stage_plan": stage_plan.to_dict() if stage_plan.has_any() else {},
+            "error": str(e)[:200],
+        }
     finally:
         if temp_cardw and os.path.exists(temp_cardw):
             try: os.unlink(temp_cardw)
@@ -1035,6 +1068,8 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     is_pay_only = bool(kwargs.pop("pay_only", False))
     use_gopay = bool(kwargs.pop("use_gopay", False))
     gopay_otp_file = kwargs.pop("gopay_otp_file", "")
+    proxy_stage_allocator = kwargs.get("proxy_stage_allocator")
+    proxy_stage_plan = kwargs.get("proxy_stage_plan")
 
     # 构造共享 pool + team_client（所有 worker 复用）
     card_cfg = _read_card_cfg(card_config_path)
@@ -1050,14 +1085,27 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         ok_count = 0
         for i in range(count):
             print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (register-only)\n{'#'*60}")
+            plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+            effective_cardw = cardw_path
+            temp_cardw = None
             try:
-                r = register(cardw_path)
+                if plan.register:
+                    temp_cardw = _rewrite_cardw_with_domain(cardw_path, "", plan.register)
+                    effective_cardw = temp_cardw
+                    print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
+                r = register(effective_cardw)
                 r["batch_index"] = i
+                if plan.has_any():
+                    r["proxy_stage_plan"] = plan.to_dict()
                 if r.get("status") == "ok":
                     ok_count += 1
             except Exception as e:
                 r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
                 print(f"[batch] ✗ 注册异常: {e}")
+            finally:
+                if temp_cardw and os.path.exists(temp_cardw):
+                    try: os.unlink(temp_cardw)
+                    except Exception: pass
             results.append(r)
             print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
             if i < count - 1 and delay > 0:
@@ -1073,10 +1121,12 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         for i in range(count):
             print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
             try:
+                plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
                 r = pay_only(
                     card_config_path,
                     use_paypal=use_paypal, use_gopay=use_gopay,
                     gopay_otp_file=gopay_otp_file,
+                    proxy_stage_plan=plan,
                 )
                 r["batch_index"] = i
                 if r.get("status") == "succeeded":
@@ -1117,7 +1167,10 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         cardw_cfg = cardw_path
 
         print(f"\n[batch] === 阶段 1: 并行注册 ({workers} workers × {count} 账号) ===")
-        reg_tasks = [(i, cardw_cfg, pool) for i in range(count)]
+        reg_tasks = [
+            (i, cardw_cfg, pool, proxy_stage_allocator, proxy_stage_plan)
+            for i in range(count)
+        ]
         accounts = [None] * count
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_register_one, t): t[0] for t in reg_tasks}
@@ -1149,11 +1202,13 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                     access_token=acc.get("access_token"),
                     device_id=acc.get("device_id", ""),
                     use_paypal=True,
+                    proxy_stage_plan=acc.get("proxy_stage_plan") or {},
                 )
                 record = {
                     "registration": {"status": "ok", "email": acc["email"]},
                     "payment": {"status": pay_result.get("status", "unknown"), "email": acc["email"]},
                     "domain": picked_domain,
+                    "proxy": acc.get("proxy_stage_plan") or {},
                 }
                 if pay_result.get("status") == "succeeded" and team_client:
                     try:
@@ -1170,6 +1225,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                     "registration": {"status": "ok", "email": acc["email"]},
                     "payment": {"status": "error", "email": acc["email"], "error": str(e)[:200]},
                     "domain": picked_domain,
+                    "proxy": acc.get("proxy_stage_plan") or {},
                 }
             record["batch_index"] = i
             _append_result(record)
@@ -1312,7 +1368,7 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
              gopay_otp_file=None, timeout_pay=600, prefer_recent=True,
-             target_email: str = ""):
+             target_email: str = "", proxy_stage_plan=None):
     """Retry payment only.
 
     Default behavior is now:
@@ -1359,7 +1415,8 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         "registration": {"status": "reused" if account else "config", "email": email},
         "payment": {},
         "domain": email.split("@", 1)[1] if "@" in email else "",
-        "proxy": "",
+        "proxy": ProxyStagePlan.from_obj(proxy_stage_plan).to_dict()
+        if ProxyStagePlan.from_obj(proxy_stage_plan).has_any() else "",
     }
     try:
         result = pay(
@@ -1371,6 +1428,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             use_gopay=use_gopay,
             gopay_otp_file=gopay_otp_file,
             timeout=timeout_pay,
+            proxy_stage_plan=proxy_stage_plan,
         )
         status = result.get("status", "unknown")
         raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
@@ -1398,7 +1456,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
 # ──────────────────────────────────────────────
 
 
-def rt_only_for_email(card_config_path: str, target_email: str) -> dict:
+def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan=None) -> dict:
     """对单个 email 跑 RT 交换：用 DB 里现有 password/session 走 Codex OAuth
     拿 refresh_token，写回 registered_accounts。不会付款不会改账号 plan。
     """
@@ -1449,13 +1507,17 @@ def rt_only_for_email(card_config_path: str, target_email: str) -> dict:
         print(f"[rt-only] 缺 mail_cfg（{reg_cfg_path}），无法接收 OTP")
         return {"status": "no_mail_cfg", "email": target}
 
+    stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    proxy_url = stage_plan.payment or _build_proxy_url_from_cfg(card_cfg.get("proxy"))
+    if stage_plan.has_any():
+        print(f"[ProxyStage] rt-only 阶段代理: {_describe_stage_plan(stage_plan)}")
     print(f"[rt-only] 启动 Codex OAuth → email={target} password={'有' if account.get('password') else '无(passwordless)'}")
     try:
         rt = _exchange_refresh_token_with_session(
             email=target,
             password=account.get("password", "") or "",
             mail_cfg=mail_cfg,
-            proxy_url=_build_proxy_url_from_cfg(card_cfg.get("proxy")),
+            proxy_url=proxy_url,
             oauth_client_id=_codex_oauth_client_id_from_config(card_cfg),
         )
     except Exception as e:
@@ -1495,7 +1557,8 @@ def rt_only_for_email(card_config_path: str, target_email: str) -> dict:
         return {"status": "write_failed", "email": target, "error": str(e)[:200]}
 
 
-def rt_only_targets(card_config_path: str, target_emails: list[str]) -> dict:
+def rt_only_targets(card_config_path: str, target_emails: list[str],
+                    proxy_stage_allocator=None, proxy_stage_plan=None) -> dict:
     """批量 RT-only：串行跑每个 email，汇总结果。"""
     results = []
     ok = 0
@@ -1505,7 +1568,8 @@ def rt_only_targets(card_config_path: str, target_emails: list[str]) -> dict:
         em = (em or "").strip()
         if not em:
             continue
-        r = rt_only_for_email(card_config_path, em)
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = rt_only_for_email(card_config_path, em, proxy_stage_plan=plan)
         results.append(r)
         st = r.get("status", "")
         if st == "succeeded":
@@ -1519,7 +1583,8 @@ def rt_only_targets(card_config_path: str, target_emails: list[str]) -> dict:
 
 
 def pay_only_targets(card_config_path: str, target_emails: list[str], *,
-                     use_paypal=False, use_gopay=False, gopay_otp_file=None) -> dict:
+                     use_paypal=False, use_gopay=False, gopay_otp_file=None,
+                     proxy_stage_allocator=None, proxy_stage_plan=None) -> dict:
     """批量 pay-only：对指定 email 列表逐个跑支付。"""
     results = []
     ok = 0
@@ -1529,12 +1594,14 @@ def pay_only_targets(card_config_path: str, target_emails: list[str], *,
         if not em:
             continue
         try:
+            plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
             r = pay_only(
                 card_config_path,
                 use_paypal=use_paypal,
                 use_gopay=use_gopay,
                 gopay_otp_file=gopay_otp_file,
                 target_email=em,
+                proxy_stage_plan=plan,
             )
             results.append({"email": em, "result": r})
             if (r or {}).get("status") == "succeeded":
@@ -1932,7 +1999,8 @@ def _cleanup_dead_cf_subdomains(provisioner, gpt_team_db_path: str,
     return stats
 
 
-def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
+def daemon(card_config_path, cardw_config_path=None, use_paypal=False,
+           proxy_stage_allocator=None, proxy_stage_plan=None):
     """
     状态机：常驻维护 gpt-team 系统里 '可用邀请' 账号数 ≥ target_ok_accounts。
     - 可用定义：isOpen & !isBanned & !isDisabled & !noInvitePermission & seat 未满
@@ -2068,7 +2136,14 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
     print(f"[daemon] 启动：pool={usage_pool}  target={target}  poll={poll_s}s  rate={_hour_label}, {_day_label}  seat_limit={seat_limit}")
     print(f"[daemon] 历史累计: attempts={state['total_attempts']} ok={state['total_succeeded']} fail={state['total_failed']}")
 
-    kwargs = {"card_cfg": card_cfg, "pool": pool, "team_client": team_client, "use_paypal": use_paypal}
+    kwargs = {
+        "card_cfg": card_cfg,
+        "pool": pool,
+        "team_client": team_client,
+        "use_paypal": use_paypal,
+        "proxy_stage_allocator": proxy_stage_allocator,
+        "proxy_stage_plan": proxy_stage_plan,
+    }
 
     while not stop["flag"]:
         # 无 Webshare 轮换额度 + 连续 no_perm 触发的冷却闸门
@@ -2753,12 +2828,47 @@ def _build_proxy_pool_from_card_cfg(card_cfg) -> "ProxyPool":
     return ProxyPool(proxies=pp.get("list", []), rotation=pp.get("rotation", "static"))
 
 
+def _allocate_proxy_stage_plan(proxy_stage_allocator=None, proxy_stage_plan=None) -> ProxyStagePlan:
+    if proxy_stage_allocator is not None:
+        plan = proxy_stage_allocator.allocate()
+        return ProxyStagePlan.from_obj(plan)
+    return ProxyStagePlan.from_obj(proxy_stage_plan)
+
+
+def _fill_stage_plan_with_proxy(plan: ProxyStagePlan, proxy_url: str) -> ProxyStagePlan:
+    plan = ProxyStagePlan.from_obj(plan)
+    if not proxy_url:
+        return plan
+    if not plan.register:
+        plan.register = proxy_url
+    if not plan.checkout:
+        plan.checkout = proxy_url
+    if not plan.payment:
+        plan.payment = proxy_url
+    if not plan.source:
+        plan.source = "proxy-pool"
+    return plan
+
+
+def _describe_stage_plan(plan: ProxyStagePlan) -> str:
+    plan = ProxyStagePlan.from_obj(plan)
+    if not plan.has_any():
+        return "<none>"
+    return (
+        f"register={plan.register or '-'}"
+        f" checkout={plan.checkout or '-'}"
+        f" payment={plan.payment or '-'}"
+        f" regions={plan.register_region or '-'}/{plan.checkout_region or '-'}/{plan.payment_region or '-'}"
+    )
+
+
 def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
     """读 CTF-reg config，把 catch_all_domain 覆盖为 domain，可选覆盖 proxy，写到临时文件返回路径"""
     with open(src_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     mail = data.setdefault("mail", {})
-    mail["catch_all_domain"] = domain
+    if domain:
+        mail["catch_all_domain"] = domain
     if proxy_url:
         data["proxy"] = proxy_url
     tmp = tempfile.NamedTemporaryFile(
@@ -2774,7 +2884,21 @@ def _rewrite_card_with_proxy(src_path, proxy_url):
     """读 CTF-pay config，覆盖 proxy 字段，写到临时文件返回路径"""
     with open(src_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    data["proxy"] = proxy_url
+    apply_payment_proxy_plan(data, proxy_url=proxy_url)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="pipeline_pay_px_",
+        dir=str(CARD_DIR), delete=False,
+    )
+    json.dump(data, tmp, ensure_ascii=False, indent=2)
+    tmp.close()
+    return tmp.name
+
+
+def _rewrite_card_with_proxy_plan(src_path, plan):
+    """读 CTF-pay config，按 register/checkout/payment 阶段代理计划改写。"""
+    with open(src_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    apply_payment_proxy_plan(data, plan)
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_pay_px_",
         dir=str(CARD_DIR), delete=False,
@@ -3178,7 +3302,8 @@ def _team_probe_after_payment(pay_record, team_client, pool, domain):
 def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
                 members_count=4, timeout_reg=300, timeout_pay=600,
                 invite_accept_gap_s=3,
-                resume_owner_email: str = ""):
+                resume_owner_email: str = "",
+                proxy_stage_allocator=None, proxy_stage_plan=None):
     """自产自销（state machine 2nd form）：
       Step 1 (1 次)：注册 - 支付 - 推送 team+cpa    →  现成 pipeline()
       Step 2 (N 次)：注册 - 邀请上车 - 推送 cpa     →  register() + invite/accept + relogin + cpa_push
@@ -3204,6 +3329,8 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
         owner_record = pipeline(
             card_config_path, cardw_config_path=cardw_path,
             use_paypal=use_paypal, timeout_reg=timeout_reg, timeout_pay=timeout_pay,
+            proxy_stage_allocator=proxy_stage_allocator,
+            proxy_stage_plan=proxy_stage_plan,
         )
         owner_email = (owner_record.get("payment") or {}).get("email") \
             or (owner_record.get("registration") or {}).get("email") or ""
@@ -3266,9 +3393,15 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
         entry = {"index": i, "email": "", "status": "pending"}
         try:
             # 与 pipeline() 一致：每次挑代理 + 挑域 + rewrite 临时 cardw
-            picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+            stage_plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+            picked_proxy = ""
+            if not stage_plan.has_any():
+                picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+            stage_plan = _fill_stage_plan_with_proxy(stage_plan, picked_proxy)
             if picked_proxy:
                 print(f"[self-dealer] ProxyPool 本次代理: {picked_proxy}")
+            if stage_plan.has_any():
+                print(f"[self-dealer] ProxyStage 本次代理: {_describe_stage_plan(stage_plan)}")
             picked_domain = ""
             if domain_pool and (domain_pool.domains or domain_pool.provisioner):
                 try:
@@ -3281,9 +3414,9 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
 
             effective_cardw = cardw_path
             temp_cardw = None
-            if picked_domain or picked_proxy:
+            if picked_domain or stage_plan.register:
                 try:
-                    temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, picked_proxy)
+                    temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, stage_plan.register)
                     effective_cardw = temp_cardw
                 except Exception as e:
                     print(f"[self-dealer] rewrite cardw 异常: {e}; 沿用原 cardw")
@@ -3304,13 +3437,14 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
             mem_did = reg.get("device_id") or ""
             mem_pwd = reg.get("password") or ""
             entry["email"] = mem_email
+            api_proxy_url = stage_plan.payment or stage_plan.checkout or stage_plan.register or proxy_url
             if not (mem_email and mem_at and mem_pwd):
                 print(f"[self-dealer] ✗ member {i} 注册结果字段缺失")
                 entry["status"] = "register_incomplete"
                 continue
 
             # 邀请
-            inv = _oai_send_team_invite(owner_at, team_id, mem_email, proxy_url=proxy_url)
+            inv = _oai_send_team_invite(owner_at, team_id, mem_email, proxy_url=api_proxy_url)
             print(f"[self-dealer] invite status={inv['status']}  invite_id={inv['invite_id'][:20] if inv['invite_id'] else '-'}")
             if inv["status"] not in (200, 201):
                 entry["status"] = f"invite_failed http={inv['status']} body={inv['body'][:120]}"
@@ -3319,7 +3453,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
             time.sleep(max(0, invite_accept_gap_s))
 
             # 接受
-            acc = _oai_accept_team_invite(mem_at, team_id, mem_did, proxy_url=proxy_url)
+            acc = _oai_accept_team_invite(mem_at, team_id, mem_did, proxy_url=api_proxy_url)
             print(f"[self-dealer] accept status={acc['status']}  body={acc['body'][:100]}")
             if acc["status"] not in (200, 201):
                 entry["status"] = f"accept_failed http={acc['status']} body={acc['body'][:120]}"
@@ -3328,7 +3462,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
             # 重登拿 refresh_token（Camoufox）
             try:
                 rt = card_mod._exchange_refresh_token_with_session(
-                    email=mem_email, password=mem_pwd, mail_cfg=mail_cfg, proxy_url=proxy_url,
+                    email=mem_email, password=mem_pwd, mail_cfg=mail_cfg, proxy_url=api_proxy_url,
                 )
             except Exception as e:
                 print(f"[self-dealer] ✗ {mem_email} 重登异常: {e}")
@@ -3385,7 +3519,8 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
     return {"owner": owner_email, "team_id": team_id, "members": members_report}
 
 
-def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0):
+def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0,
+                       proxy_stage_allocator=None, proxy_stage_plan=None):
     """free_only mode：注册免费 ChatGPT 号 + 单独跑 OAuth 拿 rt + 推 CPA(free)。
 
     跟 daemon/self_dealer 不同：不进入支付步骤。
@@ -3398,7 +3533,8 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
     cardw_path = _load_cardw_path_from_card_cfg(card_cfg, cardw_config_path)
     cpa_cfg = (card_cfg or {}).get("cpa") or {}
     mail_cfg = card_cfg.get("mail") or {}
-    proxy_url = card_cfg.get("proxy", "")
+    base_stage_plan = _allocate_proxy_stage_plan(None, proxy_stage_plan)
+    proxy_url = base_stage_plan.payment or card_cfg.get("proxy", "")
 
     # 启 gost（如果配了 webshare）
     _ensure_gost_alive(card_cfg)
@@ -3430,13 +3566,18 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
         print(f"\n=== [free-register] {iteration}/{count or '∞'} ===")
 
         picked_domain = pool.pick() if pool and (pool.domains or pool.provisioner) else ""
+        stage_plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        loop_proxy_url = stage_plan.payment or proxy_url
         temp_cardw = None
         effective_cardw = cardw_path
-        if picked_domain:
-            temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, "")
+        if picked_domain or stage_plan.register:
+            temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, stage_plan.register)
             effective_cardw = temp_cardw
-            pool.mark_used(picked_domain)
-            print(f"[free-register] 用域: {picked_domain}")
+            if picked_domain:
+                pool.mark_used(picked_domain)
+                print(f"[free-register] 用域: {picked_domain}")
+            if stage_plan.has_any():
+                print(f"[ProxyStage] free-register 阶段代理: {_describe_stage_plan(stage_plan)}")
 
         try:
             try:
@@ -3451,7 +3592,7 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
             password = reg.get("password") or _password_from_email(email)
             sid = reg.get("device_id", "") or hashlib.md5(email.encode()).hexdigest()[:16]
 
-            rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
+            rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, loop_proxy_url)
 
             if rt:
                 print(f"[free] [{iteration}] register {email} → succeeded rt_len={len(rt)}")
@@ -3482,7 +3623,8 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
     print(f"\n[free-register] 完成 succeeded={succeeded} failed={failed}")
 
 
-def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
+def free_backfill_rt_loop(card_config_path, cardw_config_path=None,
+                          proxy_stage_allocator=None, proxy_stage_plan=None):
     """free_only mode：读数据库里的注册账号给老号补 rt + 推 CPA(free)。
 
     跳过：已有 refresh_token / oauth_status==succeeded / oauth_status==dead /
@@ -3493,7 +3635,8 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
     card_cfg = _read_card_cfg(card_config_path)
     cpa_cfg = (card_cfg or {}).get("cpa") or {}
     mail_cfg = card_cfg.get("mail") or {}
-    proxy_url = card_cfg.get("proxy", "")
+    base_stage_plan = _allocate_proxy_stage_plan(None, proxy_stage_plan)
+    proxy_url = base_stage_plan.payment or card_cfg.get("proxy", "")
 
     _ensure_gost_alive(card_cfg)
 
@@ -3550,7 +3693,11 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
 
         print(f"\n=== [free-backfill] [{i}/{len(todo)}] {email} ===")
 
-        rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
+        stage_plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        loop_proxy_url = stage_plan.payment or proxy_url
+        if stage_plan.has_any():
+            print(f"[ProxyStage] free-backfill 阶段代理: {_describe_stage_plan(stage_plan)}")
+        rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, loop_proxy_url)
 
         if rt:
             print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
@@ -3573,6 +3720,52 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
         time.sleep(3)
 
     print(f"\n[free-backfill] 完成 succeeded={succeeded} failed={failed}")
+
+
+def _build_cli_proxy_stage_controls(args):
+    """Return (proxy_stage_allocator, proxy_stage_plan) from CLI args."""
+    mode = str(getattr(args, "proxy_mode", "config") or "config").strip().lower()
+    manual_proxy = str(getattr(args, "proxy", "") or "").strip()
+    fresh_proxy = str(getattr(args, "fresh_checkout_proxy", "") or "").strip()
+
+    if mode == "config" and manual_proxy:
+        mode = "manual"
+
+    if mode == "manual":
+        checkout_proxy = fresh_proxy or manual_proxy
+        plan = ProxyStagePlan(
+            register=manual_proxy,
+            checkout=checkout_proxy,
+            payment=manual_proxy,
+            source="cli-manual",
+        )
+        return None, plan
+
+    if mode == "trojan-pool":
+        pool_file = str(getattr(args, "trojan_pool_file", "") or "").strip()
+        if not pool_file:
+            raise TrojanBridgeError("--proxy-mode trojan-pool 需要 --trojan-pool-file")
+        manager = TrojanBridgeManager(
+            pool_file,
+            http_start_port=int(getattr(args, "trojan_http_start_port", 18081) or 18081),
+            work_dir=OUTPUT_DIR / "proxy_bridge",
+            executable=str(getattr(args, "trojan_bridge_bin", "sing-box") or "sing-box"),
+            auto_start=not bool(getattr(args, "trojan_no_start", False)),
+        )
+        allocator = manager.allocator(
+            all_region=str(getattr(args, "proxy_region_all", "") or ""),
+            register_region=str(getattr(args, "proxy_region_register", "") or ""),
+            checkout_region=str(getattr(args, "proxy_region_checkout", "") or ""),
+            payment_region=str(getattr(args, "proxy_region_payment", "") or ""),
+        )
+        # 提前启动一次，启动失败可以在主流程开始前直接暴露。
+        manager.ensure_started()
+        return allocator, None
+
+    if fresh_proxy:
+        return None, ProxyStagePlan(checkout=fresh_proxy, source="cli-fresh-checkout")
+
+    return None, None
 
 
 def main():
@@ -3626,6 +3819,29 @@ def main():
     parser.add_argument("--rt-only", action="store_true",
                         help="只对 --target-emails 跑 RT 交换：用现有 password/session "
                              "走 Codex OAuth 拿 refresh_token 写回 DB（不付款）")
+    parser.add_argument("--proxy-mode", default="config",
+                        choices=("config", "manual", "trojan-pool"),
+                        help="代理来源：config=沿用配置，manual=使用 --proxy，trojan-pool=从 Trojan 池分配")
+    parser.add_argument("--proxy", default="",
+                        help="manual 模式的全链路代理 URL；会同时覆盖注册、checkout、支付阶段")
+    parser.add_argument("--fresh-checkout-proxy", default="",
+                        help="仅覆盖 ChatGPT payments/checkout 阶段代理；优先级高于 --proxy 的 checkout 默认值")
+    parser.add_argument("--trojan-pool-file", default="",
+                        help="Trojan 池文件。支持：REGION trojan://... 或 JSON nodes")
+    parser.add_argument("--trojan-http-start-port", type=int, default=18081,
+                        help="Trojan bridge 本地 HTTP 起始端口，默认 18081")
+    parser.add_argument("--trojan-bridge-bin", default="sing-box",
+                        help="sing-box 可执行文件路径或命令名")
+    parser.add_argument("--trojan-no-start", action="store_true",
+                        help="不自动启动 sing-box，只生成/使用已有本地端口")
+    parser.add_argument("--proxy-region-all", default="",
+                        help="Trojan 池默认 region，未指定 register/checkout/payment 时使用")
+    parser.add_argument("--proxy-region-register", default="",
+                        help="注册阶段 region，写入 CTF-reg.proxy")
+    parser.add_argument("--proxy-region-checkout", default="",
+                        help="ChatGPT payments/checkout 阶段 region，写入 fresh_checkout.proxy")
+    parser.add_argument("--proxy-region-payment", default="",
+                        help="Stripe/PayPal/solver 支付阶段 region，写入 CTF-pay.proxy/stage_proxies/browser_challenge")
     args = parser.parse_args()
 
     if args.paypal and args.gopay:
@@ -3636,20 +3852,36 @@ def main():
         sys.exit(2)
 
     try:
+        proxy_stage_allocator, proxy_stage_plan = _build_cli_proxy_stage_controls(args)
         if args.free_register:
             free_register_loop(args.config, cardw_config_path=args.cardw_config,
-                                count=args.count)
+                                count=args.count,
+                                proxy_stage_allocator=proxy_stage_allocator,
+                                proxy_stage_plan=proxy_stage_plan)
             return
         if args.free_backfill_rt:
-            free_backfill_rt_loop(args.config, cardw_config_path=args.cardw_config)
+            free_backfill_rt_loop(
+                args.config,
+                cardw_config_path=args.cardw_config,
+                proxy_stage_allocator=proxy_stage_allocator,
+                proxy_stage_plan=proxy_stage_plan,
+            )
             return
         if args.daemon:
-            daemon(args.config, cardw_config_path=args.cardw_config, use_paypal=args.paypal)
+            daemon(
+                args.config,
+                cardw_config_path=args.cardw_config,
+                use_paypal=args.paypal,
+                proxy_stage_allocator=proxy_stage_allocator,
+                proxy_stage_plan=proxy_stage_plan,
+            )
             return
         if args.self_dealer > 0:
             self_dealer(args.config, cardw_config_path=args.cardw_config,
                         use_paypal=args.paypal, members_count=args.self_dealer,
-                        resume_owner_email=args.self_dealer_resume)
+                        resume_owner_email=args.self_dealer_resume,
+                        proxy_stage_allocator=proxy_stage_allocator,
+                        proxy_stage_plan=proxy_stage_plan)
             return
 
         target_emails_list: list[str] = []
@@ -3660,7 +3892,12 @@ def main():
             if not target_emails_list:
                 print("[ERROR] --rt-only 必须配合 --target-emails 使用", file=sys.stderr)
                 sys.exit(2)
-            r = rt_only_targets(args.config, target_emails_list)
+            r = rt_only_targets(
+                args.config,
+                target_emails_list,
+                proxy_stage_allocator=proxy_stage_allocator,
+                proxy_stage_plan=proxy_stage_plan,
+            )
             print(f"\n结果: ok={r['ok']} skip={r['skip']} fail={r['fail']}")
             return
 
@@ -3669,6 +3906,8 @@ def main():
                 args.config, target_emails_list,
                 use_paypal=args.paypal, use_gopay=args.gopay,
                 gopay_otp_file=args.gopay_otp_file,
+                proxy_stage_allocator=proxy_stage_allocator,
+                proxy_stage_plan=proxy_stage_plan,
             )
             print(f"\n结果: ok={r['ok']} fail={r['fail']}")
             return
@@ -3678,7 +3917,9 @@ def main():
             batch(args.config, args.batch, delay=args.delay, workers=args.workers,
                   use_paypal=args.paypal, cardw_config_path=args.cardw_config,
                   register_only=args.register_only, pay_only=args.pay_only,
-                  use_gopay=args.gopay, gopay_otp_file=args.gopay_otp_file)
+                  use_gopay=args.gopay, gopay_otp_file=args.gopay_otp_file,
+                  proxy_stage_allocator=proxy_stage_allocator,
+                  proxy_stage_plan=proxy_stage_plan)
 
         elif "--batch" in sys.argv:
             print(f"[ERROR] --batch 参数必须 ≥ 1（当前 {args.batch}）", file=sys.stderr)
@@ -3691,7 +3932,21 @@ def main():
                     cfg = json.load(f)
                 cardw_cfg = cfg.get("fresh_checkout", {}).get("auth", {}).get(
                     "auto_register", {}).get("config_path", "CTF-reg/config.noproxy.json")
-            result = register(cardw_cfg)
+            plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+            temp_cardw = None
+            effective_cardw = cardw_cfg
+            try:
+                if plan.register:
+                    temp_cardw = _rewrite_cardw_with_domain(cardw_cfg, "", plan.register)
+                    effective_cardw = temp_cardw
+                    print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
+                result = register(effective_cardw)
+                if plan.has_any():
+                    result["proxy_stage_plan"] = plan.to_dict()
+            finally:
+                if temp_cardw and os.path.exists(temp_cardw):
+                    try: os.unlink(temp_cardw)
+                    except Exception: pass
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         elif args.pay_only:
@@ -3700,15 +3955,18 @@ def main():
                 use_paypal=args.paypal,
                 use_gopay=args.gopay,
                 gopay_otp_file=args.gopay_otp_file,
+                proxy_stage_plan=_allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan),
             )
             print(f"\n结果: {result.get('status', '?')}")
 
         else:
             pipeline(args.config, cardw_config_path=args.cardw_config,
                      use_paypal=args.paypal, use_gopay=args.gopay,
-                     gopay_otp_file=args.gopay_otp_file)
+                     gopay_otp_file=args.gopay_otp_file,
+                     proxy_stage_allocator=proxy_stage_allocator,
+                     proxy_stage_plan=proxy_stage_plan)
 
-    except (RegistrationError, PaymentError) as e:
+    except (RegistrationError, PaymentError, TrojanBridgeError) as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

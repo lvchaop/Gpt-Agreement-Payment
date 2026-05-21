@@ -212,7 +212,17 @@ def _check_config_files(checks: list[dict], req: dict) -> tuple[dict, dict, Path
     return pay_cfg, reg_cfg, reg_path
 
 
-def _check_cloudflare_kv(checks: list[dict], req: dict) -> None:
+def _check_cloudflare_kv(checks: list[dict], req: dict, reg_cfg: dict | None = None) -> None:
+    mail = (reg_cfg or {}).get("mail") if isinstance((reg_cfg or {}).get("mail"), dict) else {}
+    if _text(mail.get("mode")) == "imap_list":
+        _check(
+            checks,
+            "email_otp_provider",
+            "ok",
+            "邮箱 OTP 使用 IMAP 邮箱列表",
+            blocking=False,
+        )
+        return
     presence = _effective_cloudflare_secret_presence()
     missing = [name for name, ok in presence.items() if not ok]
     if not missing:
@@ -251,6 +261,30 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
     if not _requires_registration(req):
         return
     mail = reg_cfg.get("mail") if isinstance(reg_cfg.get("mail"), dict) else {}
+    if _text(mail.get("mode")) == "imap_list":
+        accounts_path = Path(_text(mail.get("accounts_path")))
+        if not accounts_path.is_absolute():
+            accounts_path = (s.ROOT / accounts_path).resolve()
+        if accounts_path.exists():
+            _check(
+                checks,
+                "mail_accounts",
+                "ok",
+                "IMAP 邮箱列表已配置",
+                details=str(accounts_path),
+                blocking=False,
+            )
+        else:
+            _check(
+                checks,
+                "mail_accounts",
+                "fail",
+                "IMAP 邮箱列表文件不存在",
+                missing=["mail.accounts_path"],
+                details=str(accounts_path),
+                action="在配置向导邮箱步骤保存账号列表后重新导出配置",
+            )
+        return
     domains = mail.get("catch_all_domains")
     has_domain = False
     if isinstance(domains, list):
@@ -505,7 +539,7 @@ def build_config_health(req: dict | None = None) -> dict:
 
     pay_cfg, reg_cfg, reg_path = _check_config_files(checks, req)
     if pay_cfg:
-        _check_cloudflare_kv(checks, req)
+        _check_cloudflare_kv(checks, req, reg_cfg)
         _check_registration_config(checks, req, reg_cfg)
         _check_payment_config(checks, req, pay_cfg)
         _check_pay_only_inventory(checks, req, pay_cfg)

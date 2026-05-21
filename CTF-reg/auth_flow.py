@@ -1466,9 +1466,7 @@ class AuthFlow:
     # ── Step 6.5: 注册密码 ──
     def register_password(self, email: str) -> bool:
         logger.info("[5.5/10] 注册密码...")
-        # 按需求：密码默认使用注册邮箱，去掉 '@'
-        # 例如: abc123@example.com -> abc123example.com
-        password = self._default_password_from_email(email)
+        password = (self.result.password or "").strip() or self._default_password_from_email(email)
         self.result.password = password
 
         # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
@@ -2108,6 +2106,9 @@ class AuthFlow:
         # 创建邮箱
         email = mail_provider.create_mailbox()
         self.result.email = email
+        persona = getattr(mail_provider, "last_persona", None)
+        if persona is not None and getattr(persona, "password", ""):
+            self.result.password = persona.password
 
         # 登录/注册链路
         csrf_token = self.get_csrf_token()
@@ -2193,7 +2194,7 @@ class AuthFlow:
                 logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
                 login_password = (os.getenv("LOGIN_PASSWORD", "") or "").strip()
                 if not login_password:
-                    login_password = self._default_password_from_email(email)
+                    login_password = (self.result.password or "").strip() or self._default_password_from_email(email)
                 self.result.password = login_password
                 login_resp = self.login_password_verify(login_password)
                 continue_url = self._normalize_continue_url(

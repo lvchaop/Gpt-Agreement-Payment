@@ -39,6 +39,7 @@ import requests
 _REPO_DIR_BOOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_DIR_BOOT not in sys.path:
     sys.path.insert(0, _REPO_DIR_BOOT)
+from proxy_bridge import ProxyStagePlan, apply_payment_proxy_plan
 from webui.backend.db import get_db
 try:
     from curl_cffi.requests import Session as CurlCffiSession
@@ -1657,21 +1658,27 @@ def _warm_chatgpt_checkout_context(
 
 
 def _extract_checkout_identifiers(data: dict) -> tuple[str, str, str]:
-    cs_id = (data.get("checkout_session_id") or data.get("session_id") or "").strip()
-    processor_entity = (data.get("processor_entity") or "").strip()
+    def _text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return str(value).strip()
+
+    cs_id = _text(data.get("checkout_session_id") or data.get("session_id"))
+    processor_entity = _text(data.get("processor_entity"))
     checkout_url = (
-        data.get("checkout_url")
-        or data.get("url")
-        or data.get("openai_checkout_url")
-        or ""
-    ).strip()
+        _text(data.get("checkout_url"))
+        or _text(data.get("url"))
+        or _text(data.get("openai_checkout_url"))
+    )
 
     candidate_texts = [
         checkout_url,
-        data.get("success_url", ""),
-        data.get("cancel_url", ""),
-        data.get("return_url", ""),
-        data.get("client_secret", ""),
+        _text(data.get("success_url")),
+        _text(data.get("cancel_url")),
+        _text(data.get("return_url")),
+        _text(data.get("client_secret")),
     ]
 
     if not cs_id:
@@ -7972,10 +7979,21 @@ def run(
     use_paypal: bool = False,
     use_gopay: bool = False,
     gopay_otp_file: str = "",
+    proxy_url: str = "",
+    fresh_checkout_proxy_url: str = "",
 ):
     _init_log()  # 初始化日志文件
 
     cfg = load_config(config_path)
+    if proxy_url or fresh_checkout_proxy_url:
+        apply_payment_proxy_plan(
+            cfg,
+            ProxyStagePlan(
+                checkout=fresh_checkout_proxy_url or proxy_url,
+                payment=proxy_url,
+                source="card-cli",
+            ),
+        )
     runtime_cfg = cfg.get("runtime", {})
     behavior_cfg = cfg.get("behavior", {})
     pre_solve_passive_captcha = cfg.get("pre_solve_passive_captcha", True)
@@ -8096,9 +8114,9 @@ def run(
 
     # 代理配置
     proxy_cfg = cfg.get("proxy")
-    if proxy_cfg:
-        proxy_url = _build_proxy_url_from_cfg(proxy_cfg)
-        _apply_proxy_to_http_session(http, proxy_url)
+    proxy_url = _build_proxy_url_from_cfg(proxy_cfg)
+    _apply_proxy_to_http_session(http, proxy_url)
+    if proxy_url:
         _log(f"      代理: {_describe_proxy_cfg(proxy_cfg)}")
     else:
         _log("      代理: 无 (直连)")
@@ -8112,6 +8130,7 @@ def run(
 
     effective_checkout_input = checkout_input
     fresh_cfg = cfg.get("fresh_checkout") or {}
+    fresh_info = None
     if _should_generate_fresh_checkout(checkout_input, force_fresh):
         fresh_info = generate_fresh_checkout(http, cfg, locale_profile=locale_profile)
         effective_checkout_input = fresh_info["url"]
@@ -8205,9 +8224,14 @@ def run(
         init_ctx["payment_method_type"] = "gopay"
     else:
         init_ctx["confirm_mode"] = runtime_cfg.get("confirm_mode", "inline_payment_method_data")
-    # 把 processor_entity 透传给 manual_approval 阶段；默认 openai_llc（IDR/Plus 用）
+    # 把 processor_entity 透传给 manual_approval 阶段。fresh checkout 会直接
+    # 返回它；已有长链接则从 Stripe init 的 success_url 里提取。
     if fresh_info and fresh_info.get("processor_entity"):
         init_ctx["processor_entity"] = fresh_info["processor_entity"]
+    else:
+        _, processor_entity, _ = _extract_checkout_identifiers(init_resp)
+        if processor_entity:
+            init_ctx["processor_entity"] = processor_entity
     init_ctx["frontend_execution"] = (
         runtime_cfg.get("frontend_execution")
         or DEFAULT_FRONTEND_EXECUTION
@@ -8474,8 +8498,14 @@ def run(
                             "checkout_session_id": session_id,
                             "processor_entity": processor_entity,
                         }
-                        # 创建独立 HTTP session 走 ChatGPT 代理
-                        chatgpt_http_for_approve, _transport = _create_chatgpt_http_session(cfg)
+                        # 创建独立 HTTP session，使用和 payments/checkout 一致的 ChatGPT 代理
+                        approve_proxy_cfg = (
+                            fresh_cfg["proxy"] if "proxy" in fresh_cfg else _PROXY_OVERRIDE_SENTINEL
+                        )
+                        chatgpt_http_for_approve, _transport = _create_chatgpt_http_session(
+                            cfg,
+                            proxy_cfg_override=approve_proxy_cfg,
+                        )
                         ar = chatgpt_http_for_approve.post(
                             "https://chatgpt.com/backend-api/payments/checkout/approve",
                             json=approve_body, headers=approve_headers, timeout=20,
@@ -8509,10 +8539,11 @@ def run(
                     }
                     got_redirect = False
                     for poll_i in range(15):
-                        gr = http.get(
-                            f"https://api.stripe.com/v1/payment_pages/{session_id}",
-                            params=get_params, timeout=20,
-                        )
+                        with _http_session_stage_proxy(http, stage_proxy_cfg, "manual_approval_redirect"):
+                            gr = http.get(
+                                f"https://api.stripe.com/v1/payment_pages/{session_id}",
+                                params=get_params, timeout=20,
+                            )
                         if gr.status_code != 200:
                             _log(f"      [manual_approval] GET {gr.status_code}")
                             time.sleep(1); continue
@@ -8787,6 +8818,8 @@ def main():
     parser.add_argument("--card", type=int, default=0, help="使用第 N 张卡 (0-based, 默认 0)")
     parser.add_argument("--config", default="config.json", help="配置文件路径 (默认 config.json)")
     parser.add_argument("--token", default="", help="手动传入 hCaptcha token (跳过打码平台)")
+    parser.add_argument("--proxy", default="", help="覆盖支付阶段代理，并默认同步到 fresh checkout")
+    parser.add_argument("--fresh-checkout-proxy", default="", help="仅覆盖 ChatGPT payments/checkout 阶段代理")
     parser.add_argument("--fresh", action="store_true", help="忽略传入 session，先生成 fresh checkout")
     parser.add_argument("--fresh-only", action="store_true", help="只生成并输出 fresh checkout URL")
     parser.add_argument(
@@ -8834,6 +8867,8 @@ def main():
             use_paypal=args.paypal,
             use_gopay=args.gopay,
             gopay_otp_file=args.gopay_otp_file,
+            proxy_url=args.proxy,
+            fresh_checkout_proxy_url=args.fresh_checkout_proxy,
         )
         if args.json_result and result:
             print("CARD_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)

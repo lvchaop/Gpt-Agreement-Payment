@@ -7,7 +7,7 @@
     <TermChoice
       v-model="form.mode"
       :options="modeOptions"
-      :cols="3"
+      :cols="4"
     />
 
     <div v-if="form.mode === 'webshare'" style="margin-top:16px">
@@ -61,6 +61,49 @@
       </div>
     </div>
 
+    <div v-if="form.mode === 'trojan-pool'" style="margin-top:16px">
+      <div class="info-block">
+        <p><strong>Trojan 池模式</strong>会用 sing-box 把 <code>trojan://</code> 节点转成本地 HTTP 代理，并按阶段选择地区。</p>
+        <ul class="info-list">
+          <li><code>register</code> 写入注册配置</li>
+          <li><code>checkout</code> 写入 <code>fresh_checkout.proxy</code></li>
+          <li><code>payment</code> 写入支付、Stripe stages、PayPal、solver</li>
+        </ul>
+      </div>
+
+      <div class="form-stack">
+        <TermField v-model="form.trojan_pool_file" label="Trojan 池文件 · trojan_pool_file" placeholder="output/trojan_pool.txt" />
+        <TermField v-model.number="form.trojan_http_start_port" label="本地 HTTP 起始端口 · trojan_http_start_port" type="number" placeholder="18081" />
+        <TermField v-model="form.trojan_bridge_bin" label="sing-box 路径 · trojan_bridge_bin" placeholder="sing-box" />
+        <TermField v-model="form.proxy_region_all" label="默认地区 · proxy_region_all" placeholder="US" />
+        <TermField v-model="form.proxy_region_register" label="注册地区 · proxy_region_register" placeholder="US" />
+        <TermField v-model="form.proxy_region_checkout" label="checkout 地区 · proxy_region_checkout" placeholder="US" />
+        <TermField v-model="form.proxy_region_payment" label="支付地区 · proxy_region_payment" placeholder="HK" />
+      </div>
+
+      <div class="step-actions">
+        <TermBtn :loading="bridgeLoading" @click="startTrojan">启动 Trojan Bridge</TermBtn>
+        <TermBtn :loading="bridgeLoading" @click="stopTrojan">停止</TermBtn>
+        <TermBtn :loading="bridgeLoading" @click="refreshTrojan">刷新状态</TermBtn>
+        <TermBtn :loading="bridgeLoading" @click="loadTrojanNodes">解析节点</TermBtn>
+      </div>
+
+      <div v-if="bridgeStatus" class="bridge-panel">
+        <div class="bridge-head">
+          <span :class="bridgeStatus.running ? 'ok-dot' : 'fail-dot'"></span>
+          <span>{{ bridgeStatus.running ? 'bridge running' : 'bridge stopped' }}</span>
+          <code v-if="bridgeStatus.pid">pid={{ bridgeStatus.pid }}</code>
+        </div>
+        <div v-if="bridgeStatus.nodes?.length" class="node-grid">
+          <div v-for="node in bridgeStatus.nodes" :key="node.url || node.port" class="node-row">
+            <span>{{ node.region || node.outbound || node.tag || '-' }}</span>
+            <code>{{ node.url }}</code>
+            <span :class="node.open ? 'ok-text' : 'fail-text'">{{ node.open ? 'open' : 'closed' }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div v-if="result" class="result-block" :class="`result--${result.status}`">
       <div class="result-head">
         <span class="result-icon">{{ icon(result.status) }}</span>
@@ -71,9 +114,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { onMounted, ref, watch } from "vue";
 import { useWizardStore } from "../../stores/wizard";
 import type { PreflightResult } from "../../api/client";
+import { api } from "../../api/client";
 import TermField from "../term/TermField.vue";
 import TermBtn from "../term/TermBtn.vue";
 import TermChoice from "../term/TermChoice.vue";
@@ -93,13 +137,23 @@ const form = ref({
   no_rotation_cooldown_s: init.no_rotation_cooldown_s ?? 10800,
   gost_listen_port: init.gost_listen_port ?? 18898,
   sync_team_proxy: init.sync_team_proxy ?? true,
+  trojan_pool_file: init.trojan_pool_file ?? "output/trojan_pool.txt",
+  trojan_http_start_port: init.trojan_http_start_port ?? 18081,
+  trojan_bridge_bin: init.trojan_bridge_bin ?? "sing-box",
+  proxy_region_all: init.proxy_region_all ?? "",
+  proxy_region_register: init.proxy_region_register ?? "US",
+  proxy_region_checkout: init.proxy_region_checkout ?? "US",
+  proxy_region_payment: init.proxy_region_payment ?? "",
 });
 const loading = ref(false);
+const bridgeLoading = ref(false);
 const result = ref<PreflightResult | null>(null);
 const showAdvanced = ref(false);
+const bridgeStatus = ref<any | null>(null);
 
 const modeOptions = [
   { value: "webshare", label: "webshare", desc: "Webshare API 托管 + 12 路自愈" },
+  { value: "trojan-pool", label: "trojan", desc: "Trojan 池 + 按阶段地区" },
   { value: "manual", label: "manual", desc: "手动 socks5/http" },
   { value: "none", label: "none", desc: "不用代理（直连）" },
 ];
@@ -126,7 +180,60 @@ async function testWebshare() {
   } finally { loading.value = false; }
 }
 
+function trojanBody() {
+  return {
+    pool_file: form.value.trojan_pool_file,
+    http_start_port: Number(form.value.trojan_http_start_port || 18081),
+    bridge_bin: form.value.trojan_bridge_bin || "sing-box",
+    auto_start: true,
+  };
+}
+
+async function startTrojan() {
+  store.setAnswer("proxy", form.value);
+  await store.saveToServer();
+  bridgeLoading.value = true;
+  try {
+    const r = await api.post("/proxy/trojan/start", trojanBody());
+    bridgeStatus.value = r.data;
+  } finally { bridgeLoading.value = false; }
+}
+
+async function stopTrojan() {
+  bridgeLoading.value = true;
+  try {
+    const r = await api.post("/proxy/trojan/stop");
+    bridgeStatus.value = r.data;
+  } finally { bridgeLoading.value = false; }
+}
+
+async function refreshTrojan() {
+  bridgeLoading.value = true;
+  try {
+    const r = await api.get("/proxy/trojan/status");
+    bridgeStatus.value = r.data;
+  } finally { bridgeLoading.value = false; }
+}
+
+async function loadTrojanNodes() {
+  bridgeLoading.value = true;
+  try {
+    const r = await api.get("/proxy/trojan/nodes", {
+      params: {
+        pool_file: form.value.trojan_pool_file,
+        http_start_port: form.value.trojan_http_start_port,
+      },
+    });
+    bridgeStatus.value = {
+      ...(bridgeStatus.value || {}),
+      nodes: r.data.nodes,
+      running: Boolean(bridgeStatus.value?.running),
+    };
+  } finally { bridgeLoading.value = false; }
+}
+
 watch(form, () => store.setAnswer("proxy", form.value), { deep: true });
+onMounted(() => { refreshTrojan().catch(() => {}); });
 
 function icon(s: string) {
   return s === "ok" ? "✓" : s === "fail" ? "✗" : s === "warn" ? "▲" : "○";
@@ -165,4 +272,39 @@ code {
 .advanced-toggle:hover { color: var(--accent); }
 .toggle-row { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 8px 0; font-size: 13px; }
 .toggle-row input { accent-color: var(--accent); }
+.bridge-panel {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  padding: 10px 12px;
+}
+.bridge-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fg-primary);
+}
+.ok-dot,
+.fail-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.ok-dot { background: #16a34a; }
+.fail-dot { background: #dc2626; }
+.node-grid { margin-top: 10px; display: grid; gap: 6px; }
+.node-row {
+  display: grid;
+  grid-template-columns: minmax(52px, 0.5fr) minmax(180px, 2fr) minmax(52px, 0.5fr);
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+.node-row code {
+  overflow-wrap: anywhere;
+}
+.ok-text { color: #16a34a; }
+.fail-text { color: #dc2626; }
 </style>

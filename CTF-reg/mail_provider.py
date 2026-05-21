@@ -1,16 +1,15 @@
-"""邮箱服务（CF Email Routing 路径）。
+"""邮箱服务（CF Email Routing / IMAP account-list 路径）。
 
 历史上这个模块走 IMAP 拉 QQ 邮箱接 OTP（5s 轮询 + 转发链路 30–90s 延迟）。
-现在彻底切到 Cloudflare Email Worker → KV 路径：
+默认路径是 Cloudflare Email Worker → KV：
 
     寄件人 → CF MX (catch-all) → otp-relay Worker → KV
                                                        ↓
                                             cf_kv_otp_provider 读
 
 OTP 提取由 Worker 端做（见 scripts/otp_email_worker.js），
-本模块只剩两件事：
-  1. 用 catch-all 域名生成随机收件地址 (`create_mailbox`)
-  2. 委托 `CloudflareKVOtpProvider` 阻塞拿 OTP (`wait_for_otp`)
+也支持 `mail.mode=imap_list`：从 CSV 邮箱池里取 Gmail/Outlook/自定义
+IMAP 账号，用账号密码 / app password 登录邮箱读取验证码。
 
 KV 凭证读取顺序：环境变量 `CF_API_TOKEN/CF_ACCOUNT_ID/CF_OTP_KV_NAMESPACE_ID`
 → SQLite runtime_meta[secrets] 的 cloudflare 段。详见 cf_kv_otp_provider.py。
@@ -18,7 +17,10 @@ KV 凭证读取顺序：环境变量 `CF_API_TOKEN/CF_ACCOUNT_ID/CF_OTP_KV_NAMES
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import random
+import threading
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -115,13 +117,41 @@ class MailProvider:
     会对二者不一致打负分。
     """
 
-    def __init__(self, catch_all_domain: str = ""):
+    def __init__(
+        self,
+        catch_all_domain: str = "",
+        *,
+        mode: str = "cloudflare_kv",
+        accounts_path: str = "",
+        otp_timeout: int = 180,
+        mark_seen: bool = False,
+    ):
+        self.mode = (mode or "cloudflare_kv").strip().lower()
         self.catch_all_domain = catch_all_domain
+        self.accounts_path = accounts_path
+        self.otp_timeout = otp_timeout
+        self.mark_seen = mark_seen
         self._reuse_email: Optional[str] = None  # 兼容 register-only resume
+        self._reserved_account = None
+        self._pool = None
         # 算法化 persona 生成器（音节合成法，详见 persona.py）
         from persona import PersonaGenerator, Persona
         self._persona_gen = PersonaGenerator(catch_all_domain)
         self.last_persona: Optional[Persona] = None
+
+    @classmethod
+    def from_config(cls, mail_cfg, config_path: str = "") -> "MailProvider":
+        mode = (getattr(mail_cfg, "mode", "") or "cloudflare_kv").strip().lower()
+        accounts_path = (getattr(mail_cfg, "accounts_path", "") or "").strip()
+        if accounts_path and not Path(accounts_path).is_absolute() and config_path:
+            accounts_path = str((Path(config_path).resolve().parent / accounts_path).resolve())
+        return cls(
+            getattr(mail_cfg, "catch_all_domain", "") or "",
+            mode=mode,
+            accounts_path=accounts_path,
+            otp_timeout=int(getattr(mail_cfg, "otp_timeout", 180) or 180),
+            mark_seen=bool(getattr(mail_cfg, "mark_seen", False)),
+        )
 
     @staticmethod
     def _random_name() -> str:
@@ -140,6 +170,15 @@ class MailProvider:
             logger.info(f"复用邮箱: {addr}")
             self.last_persona = None  # resume 路径无法回推 first/last
             return addr
+        if self.mode == "imap_list":
+            account = self._email_pool().reserve_next()
+            self._reserved_account = account
+            self.last_persona = account.to_persona()
+            logger.info(
+                f"邮箱池取号: {account.email} | provider={account.provider} "
+                f"(路径: IMAP account list)"
+            )
+            return account.email
         if not self.catch_all_domain:
             raise RuntimeError(
                 "MailProvider.create_mailbox: catch_all_domain 未配置；"
@@ -159,17 +198,101 @@ class MailProvider:
         timeout: int = 120,
         issued_after: Optional[float] = None,
     ) -> str:
-        """阻塞等 OTP。直接走 CF KV，不再有 IMAP fallback。
+        """阻塞等 OTP。所有模式最终统一从 CF KV 读取。
 
-        失败抛 TimeoutError 或 RuntimeError。原 IMAP 路径已删除——
-        QQ 邮箱 / auth_code 这些参数全部废弃。
+        - cloudflare_kv: CF Email Worker 写 KV，本地轮询 KV。
+        - imap_list: 只对当前 reserved 活跃邮箱启动本地 relay，relay 写 KV，
+          本地仍轮询 KV。
         """
         from cf_kv_otp_provider import CloudflareKVOtpProvider
+
+        kv_provider = CloudflareKVOtpProvider.from_env_or_secrets()
+
+        if self.mode == "imap_list":
+            from mailbox_relay import MailboxRelay
+
+            account = self._reserved_account or self._email_pool().find(email_addr)
+            if account is None:
+                raise RuntimeError(f"邮箱池找不到账号: {email_addr}")
+            effective_timeout = int(timeout or self.otp_timeout or 180)
+            logger.info(
+                f"[mail] IMAP relay → CF KV → wait KV -> {email_addr} "
+                f"provider={account.provider} timeout={effective_timeout}s"
+            )
+
+            relay = MailboxRelay(kv_provider, mark_seen=self.mark_seen)
+            relay_state: dict = {"done": False, "error": None}
+
+            def _run_relay() -> None:
+                try:
+                    relay.relay_until_otp(
+                        account,
+                        email_addr,
+                        timeout=effective_timeout,
+                        issued_after=issued_after,
+                    )
+                    relay_state["done"] = True
+                except Exception as e:
+                    relay_state["error"] = e
+
+            thread = threading.Thread(
+                target=_run_relay,
+                name=f"mailbox-relay-{email_addr}",
+                daemon=True,
+            )
+            thread.start()
+
+            deadline = time.time() + effective_timeout
+            last_timeout: Exception | None = None
+            while time.time() < deadline:
+                if relay_state["error"] is not None:
+                    raise RuntimeError(
+                        f"MailboxRelay 写 KV 失败 email={email_addr}: "
+                        f"{relay_state['error']}"
+                    ) from relay_state["error"]
+                remaining = max(1, int(deadline - time.time()))
+                chunk = min(5, remaining)
+                try:
+                    return kv_provider.wait_for_otp(
+                        email_addr,
+                        timeout=chunk,
+                        issued_after=issued_after,
+                    )
+                except TimeoutError as e:
+                    last_timeout = e
+                    continue
+
+            if relay_state["error"] is not None:
+                raise RuntimeError(
+                    f"MailboxRelay 写 KV 失败 email={email_addr}: "
+                    f"{relay_state['error']}"
+                ) from relay_state["error"]
+            suffix = f": {last_timeout}" if last_timeout else ""
+            raise TimeoutError(
+                f"IMAP relay 已启动但统一 KV 等 OTP 超时 "
+                f"{effective_timeout}s email={email_addr}{suffix}"
+            )
 
         logger.info(
             f"[mail] 走 CF KV 取 OTP -> {email_addr} (timeout={timeout}s)"
         )
-        provider = CloudflareKVOtpProvider.from_env_or_secrets()
-        return provider.wait_for_otp(
+        return kv_provider.wait_for_otp(
             email_addr, timeout=timeout, issued_after=issued_after
         )
+
+    def mark_used(self, email_addr: str) -> None:
+        if self.mode == "imap_list":
+            self._email_pool().mark(email_addr, "used")
+
+    def mark_failed(self, email_addr: str, reason: str = "") -> None:
+        if self.mode == "imap_list":
+            self._email_pool().mark(email_addr, "failed", reason[:200])
+
+    def _email_pool(self):
+        if self._pool is None:
+            if not self.accounts_path:
+                raise RuntimeError("mail.mode=imap_list 需要 mail.accounts_path")
+            from email_account_pool import EmailAccountPool
+
+            self._pool = EmailAccountPool(self.accounts_path)
+        return self._pool
