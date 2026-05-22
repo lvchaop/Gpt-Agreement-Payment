@@ -18,12 +18,177 @@ import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from browser_register import _camoufox_headless, _gen_name, _parse_proxy, _raise_if_blocking_challenge
 from phone_provider import PhoneLease, PhoneProvider
 
 logger = logging.getLogger(__name__)
+
+
+_TRACE_REDACT_HEADER_KEYS = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "openai-sentinel-token",
+    "x-openai-sentinel-token",
+    "cf-clearance",
+}
+_TRACE_REDACT_BODY_KEYS = {
+    "access_token",
+    "api_key",
+    "authorization",
+    "code",
+    "cookie",
+    "csrf_token",
+    "id_token",
+    "openai-sentinel-token",
+    "otp",
+    "password",
+    "refresh_token",
+    "session_token",
+    "token",
+}
+_TRACE_ALLOWED_HOSTS = {"auth.openai.com", "chatgpt.com", "platform.openai.com"}
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _phone_trace_path() -> Path:
+    raw = (os.getenv("PHONE_TRACE_PATH", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    root = Path(__file__).resolve().parents[1]
+    return root / "output" / f"phone_trace_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.jsonl"
+
+
+def _phone_trace_url_allowed(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.netloc or "").lower().split("@")[-1].split(":")[0]
+    path = parsed.path or ""
+    if host == "auth.openai.com":
+        return path.startswith("/api/accounts/") or path.startswith("/oauth/")
+    if host == "chatgpt.com":
+        return path == "/api/auth/session" or path.startswith("/api/auth/")
+    if host == "platform.openai.com":
+        return True
+    return host in _TRACE_ALLOWED_HOSTS and "/api/" in path
+
+
+def _redact_trace_scalar(key: str, value: Any) -> Any:
+    key_lc = (key or "").lower()
+    if key_lc in _TRACE_REDACT_BODY_KEYS or any(token in key_lc for token in ("secret", "token", "cookie")):
+        return "<redacted>"
+    if not isinstance(value, str):
+        return value
+    text = value
+    if re.fullmatch(r"\d{4,8}", text) and any(token in key_lc for token in ("code", "otp")):
+        return "<redacted-code>"
+    if "@" in text and re.search(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text):
+        domain = text.split("@", 1)[1]
+        return f"<email>@{domain}"
+    digits = re.sub(r"\D+", "", text)
+    if len(digits) >= 9 and any(token in key_lc for token in ("phone", "username", "identifier")):
+        prefix = f"+{digits[:3]}" if text.strip().startswith("+") else digits[:3]
+        return f"<phone:{prefix}:digits={len(digits)}>"
+    return text
+
+
+def _redact_trace_obj(value: Any, key: str = "") -> Any:
+    if isinstance(value, dict):
+        return {str(k): _redact_trace_obj(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_trace_obj(v, key) for v in value]
+    return _redact_trace_scalar(key, value)
+
+
+def _redact_trace_headers(headers: dict | None) -> dict:
+    out = {}
+    for key, value in (headers or {}).items():
+        key_s = str(key)
+        if key_s.lower() in _TRACE_REDACT_HEADER_KEYS:
+            out[key_s] = "<redacted>"
+        else:
+            out[key_s] = value
+    return out
+
+
+def _parse_trace_body(raw: str | None) -> Any:
+    if raw is None:
+        return ""
+    text = str(raw)
+    if len(text) > 30000:
+        text = text[:30000] + "...<truncated>"
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    try:
+        return _redact_trace_obj(json.loads(stripped))
+    except Exception:
+        return _redact_trace_scalar("", stripped)
+
+
+def _write_phone_trace(path: Path, event: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event["ts"] = time.time()
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as e:
+        logger.debug("[phone-reg] PHONE_TRACE_DUMP 写入失败: %s", e)
+
+
+def _install_phone_trace(page) -> None:
+    if not _env_flag("PHONE_TRACE_DUMP"):
+        return
+    path = _phone_trace_path()
+    logger.info("[phone-reg] PHONE_TRACE_DUMP enabled: %s", path)
+
+    def on_request(req) -> None:
+        try:
+            if not _phone_trace_url_allowed(req.url):
+                return
+            _write_phone_trace(path, {
+                "type": "request",
+                "method": req.method,
+                "url": req.url,
+                "headers": _redact_trace_headers(req.headers),
+                "post_data": _parse_trace_body(req.post_data),
+            })
+        except Exception as e:
+            logger.debug("[phone-reg] PHONE_TRACE_DUMP request 失败: %s", e)
+
+    def on_response(resp) -> None:
+        try:
+            if not _phone_trace_url_allowed(resp.url):
+                return
+            headers = dict(resp.headers or {})
+            content_type = str(headers.get("content-type") or headers.get("Content-Type") or "").lower()
+            body: Any = ""
+            if any(token in content_type for token in ("json", "text", "javascript")):
+                try:
+                    body = _parse_trace_body(resp.text())
+                except Exception:
+                    body = "<unavailable>"
+            _write_phone_trace(path, {
+                "type": "response",
+                "status": resp.status,
+                "url": resp.url,
+                "headers": _redact_trace_headers(headers),
+                "body": body,
+            })
+        except Exception as e:
+            logger.debug("[phone-reg] PHONE_TRACE_DUMP response 失败: %s", e)
+
+    page.on("request", on_request)
+    page.on("response", on_response)
 
 
 class PageState(str, Enum):
@@ -2698,6 +2863,7 @@ def phone_register(cfg, mail_provider) -> dict:
             locale="en-US",
         ) as browser_ctx:
             page = browser_ctx.pages[0] if browser_ctx.pages else browser_ctx.new_page()
+            _install_phone_trace(page)
             logger.info("[phone-reg] 打开 ChatGPT 首页 ...")
             page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
             _raise_if_blocking_challenge(page, stage="opening ChatGPT home", screenshot_path="/tmp/phone_reg_cloudflare_challenge.png")

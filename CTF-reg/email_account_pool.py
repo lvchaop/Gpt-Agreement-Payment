@@ -13,9 +13,15 @@ import random
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Unix/macOS runtime has fcntl.
+    fcntl = None
 
 
 DEFAULT_COLUMNS = [
@@ -257,6 +263,19 @@ class EmailAccountPool:
     def __init__(self, path: str | Path):
         self.path = Path(path)
 
+    @contextmanager
+    def _locked(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f"{self.path.name}.lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def load_rows(self) -> list[dict]:
         if not self.path.exists():
             return []
@@ -297,14 +316,15 @@ class EmailAccountPool:
         return [account_from_row(r) for r in rows]
 
     def reserve_next(self) -> EmailAccount:
-        rows = self.load_rows()
-        for row in rows:
-            if (row.get("status") or "unused").lower() in ("", "unused"):
-                row["status"] = "reserved"
-                row["fail_reason"] = ""
-                row["updated_at"] = str(int(time.time()))
-                self.write_rows(rows)
-                return account_from_row(row)
+        with self._locked():
+            rows = self.load_rows()
+            for row in rows:
+                if (row.get("status") or "unused").lower() in ("", "unused"):
+                    row["status"] = "reserved"
+                    row["fail_reason"] = ""
+                    row["updated_at"] = str(int(time.time()))
+                    self.write_rows(rows)
+                    return account_from_row(row)
         raise RuntimeError(f"邮箱池没有 unused 账号: {self.path}")
 
     def find(self, email: str) -> EmailAccount | None:
@@ -318,14 +338,15 @@ class EmailAccountPool:
         target = (email or "").strip().lower()
         if not target:
             return
-        rows = self.load_rows()
-        changed = False
-        for row in rows:
-            if row.get("email") == target:
-                row["status"] = status
-                row["fail_reason"] = fail_reason
-                row["updated_at"] = str(int(time.time()))
-                changed = True
-                break
-        if changed:
-            self.write_rows(rows)
+        with self._locked():
+            rows = self.load_rows()
+            changed = False
+            for row in rows:
+                if row.get("email") == target:
+                    row["status"] = status
+                    row["fail_reason"] = fail_reason
+                    row["updated_at"] = str(int(time.time()))
+                    changed = True
+                    break
+            if changed:
+                self.write_rows(rows)
