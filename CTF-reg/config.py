@@ -107,7 +107,7 @@ class PhoneConfig:
     allocate_path: str = "/api/phones/allocate"
     otp_path: str = "/api/phones/{lease_id}/otp"
     otp_method: str = "GET"
-    otp_timeout_s: int = 180
+    otp_timeout_s: int = 120
     otp_poll_interval_s: float = 3.0
     release_path: str = "/api/phones/{lease_id}/release"
     fail_path: str = "/api/phones/{lease_id}/fail"

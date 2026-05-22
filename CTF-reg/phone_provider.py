@@ -32,6 +32,7 @@ _HERO_SMS_PROVIDERS = {
     "sms_activate",
     "smsactivate",
 }
+_MAX_OTP_WAIT_S = 120
 
 
 def _normalize_provider(provider: str) -> str:
@@ -234,6 +235,13 @@ class PhoneProvider:
     def _hero_max_price(self) -> str:
         return str(getattr(self.cfg, "maxPrice", "") or getattr(self.cfg, "max_price", "") or "").strip()
 
+    def _otp_timeout_s(self) -> int:
+        raw = int(getattr(self.cfg, "otp_timeout_s", _MAX_OTP_WAIT_S) or _MAX_OTP_WAIT_S)
+        timeout_s = max(1, min(raw, _MAX_OTP_WAIT_S))
+        if raw > _MAX_OTP_WAIT_S:
+            logger.info("phone OTP timeout capped at %ss (configured=%ss)", _MAX_OTP_WAIT_S, raw)
+        return timeout_s
+
     @staticmethod
     def _hero_phone_parts(phone: str, country_phone_code: Any) -> tuple[str, str, str]:
         raw_phone = str(phone or "").strip()
@@ -303,9 +311,9 @@ class PhoneProvider:
         return ""
 
     def _poll_hero_sms_otp(self, lease_id: str) -> str:
-        timeout_s = int(getattr(self.cfg, "otp_timeout_s", 180) or 180)
+        timeout_s = self._otp_timeout_s()
         interval_s = float(getattr(self.cfg, "otp_poll_interval_s", 3.0) or 3.0)
-        deadline = time.time() + max(20, timeout_s)
+        deadline = time.time() + timeout_s
         last_status = ""
         while time.time() < deadline:
             raw = self._request_text("GET", self._hero_query("getStatusV2", id=lease_id))
@@ -378,11 +386,11 @@ class PhoneProvider:
     def poll_otp(self, lease_id: str) -> str:
         if self.provider == "hero_sms":
             return self._poll_hero_sms_otp(lease_id)
-        timeout_s = int(getattr(self.cfg, "otp_timeout_s", 180) or 180)
+        timeout_s = self._otp_timeout_s()
         interval_s = float(getattr(self.cfg, "otp_poll_interval_s", 3.0) or 3.0)
         method = str(getattr(self.cfg, "otp_method", "GET") or "GET").strip().upper()
         path_tmpl = str(getattr(self.cfg, "otp_path", "") or "")
-        deadline = time.time() + max(20, timeout_s)
+        deadline = time.time() + timeout_s
         last_status = ""
         while time.time() < deadline:
             path = path_tmpl.format(lease_id=lease_id)

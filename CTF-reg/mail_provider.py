@@ -288,6 +288,10 @@ class MailProvider:
         if self.mode == "imap_list":
             self._email_pool().mark(email_addr, "failed", reason[:200])
 
+    def mark_unused(self, email_addr: str) -> None:
+        if self.mode == "imap_list":
+            self._email_pool().mark(email_addr, "unused")
+
     def _email_pool(self):
         if self._pool is None:
             if not self.accounts_path:
