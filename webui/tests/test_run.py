@@ -35,6 +35,15 @@ def test_run_preview_batch(client):
     assert "--workers" in body["cmd_str"]
 
 
+def test_run_preview_phone_register_mode(client):
+    _login(client)
+    r = client.post("/api/run/preview", json={"mode": "single", "register_mode": "phone_browser"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "--register-method" in body["cmd_str"]
+    assert "phone_browser" in body["cmd_str"]
+
+
 def test_run_preview_self_dealer(client):
     _login(client)
     r = client.post("/api/run/preview", json={"mode": "self_dealer", "self_dealer": 4})

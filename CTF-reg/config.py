@@ -79,13 +79,53 @@ class CaptchaConfig:
 
 
 @dataclass
+class RegistrationConfig:
+    """注册路径配置。method 为空时由 pipeline / WEBUI_REG_MODE 决定。"""
+    method: str = ""  # browser | protocol | phone_browser
+
+
+@dataclass
+class PhoneConfig:
+    """手机号注册接口配置。
+
+    provider=http 时，注册流程会在手机号输入框出现后调用 allocate_path 获取号码，
+    提交手机号后轮询 otp_path 获取短信验证码。
+    provider=hero_sms 时，base_url 指向 handler_api.php，service/country 会拼进
+    getNumberV2/getStatusV2 请求。api_key 默认建议通过 api_key_env 注入。
+    """
+    enabled: bool = False
+    provider: str = "http"
+    base_url: str = ""
+    api_key: str = ""
+    api_key_env: str = "PHONE_PROVIDER_API_KEY"
+    country: str = "US"
+    service: str = "tg"
+    maxPrice: str = ""
+    max_price: str = ""
+    lease_ttl_s: int = 300
+    request_timeout_s: int = 20
+    allocate_path: str = "/api/phones/allocate"
+    otp_path: str = "/api/phones/{lease_id}/otp"
+    otp_method: str = "GET"
+    otp_timeout_s: int = 180
+    otp_poll_interval_s: float = 3.0
+    release_path: str = "/api/phones/{lease_id}/release"
+    fail_path: str = "/api/phones/{lease_id}/fail"
+    verified_path: str = "/api/phones/{lease_id}/verified"
+    headers: dict = field(default_factory=dict)
+    allocate_payload: dict = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     """总配置"""
+    registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     mail: MailConfig = field(default_factory=MailConfig)
     card: CardInfo = field(default_factory=CardInfo)
     billing: BillingInfo = field(default_factory=BillingInfo)
     team_plan: TeamPlanConfig = field(default_factory=TeamPlanConfig)
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
+    phone: PhoneConfig = field(default_factory=PhoneConfig)
     proxy: Optional[str] = None
     # 已有凭证（可选，跳过注册直接支付时使用）
     session_token: Optional[str] = None
@@ -99,7 +139,7 @@ class Config:
         """从 JSON 文件加载配置"""
         import dataclasses
 
-        def filtered_kwargs(dataclass_type, raw: dict | None) -> dict:
+        def filtered_kwargs(dataclass_type, raw: Optional[dict]) -> dict:
             # WebUI 与 CTF-pay 会逐步增加配置字段；CTF-reg 只消费其中一部分。
             # 加载时过滤未知 key，避免因为“注册阶段不用的支付字段”中断注册流程。
             valid_keys = {f.name for f in dataclasses.fields(dataclass_type)}
@@ -108,6 +148,8 @@ class Config:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         cfg = cls()
+        if "registration" in data:
+            cfg.registration = RegistrationConfig(**filtered_kwargs(RegistrationConfig, data["registration"]))
         if "mail" in data:
             # 过滤已废弃的 IMAP/SMTP 字段（imap_server, imap_port, smtp_*,
             # email, auth_code），让旧 config 仍然能跑而不抛 unexpected
@@ -121,6 +163,8 @@ class Config:
             cfg.team_plan = TeamPlanConfig(**filtered_kwargs(TeamPlanConfig, data["team_plan"]))
         if "captcha" in data:
             cfg.captcha = CaptchaConfig(**filtered_kwargs(CaptchaConfig, data["captcha"]))
+        if "phone" in data:
+            cfg.phone = PhoneConfig(**filtered_kwargs(PhoneConfig, data["phone"]))
         cfg.proxy = data.get("proxy")
         cfg.session_token = data.get("session_token")
         cfg.access_token = data.get("access_token")
@@ -130,11 +174,13 @@ class Config:
 
     def to_dict(self) -> dict:
         return {
+            "registration": self.registration.__dict__,
             "mail": self.mail.__dict__,
             "card": self.card.__dict__,
             "billing": self.billing.__dict__,
             "team_plan": self.team_plan.__dict__,
             "captcha": self.captcha.__dict__,
+            "phone": self.phone.__dict__,
             "proxy": self.proxy,
             "session_token": self.session_token,
             "access_token": self.access_token,

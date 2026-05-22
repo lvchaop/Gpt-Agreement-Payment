@@ -63,7 +63,7 @@
 
     <div v-if="form.mode === 'trojan-pool'" style="margin-top:16px">
       <div class="info-block">
-        <p><strong>Trojan 池模式</strong>会用 sing-box 把 <code>trojan://</code> 节点转成本地 HTTP 代理，并按阶段选择地区。</p>
+        <p><strong>Trojan / HY2 池模式</strong>会用 sing-box 把 <code>trojan://</code> / <code>hysteria2://</code> 节点转成本地 HTTP 代理，并按阶段选择地区。</p>
         <ul class="info-list">
           <li><code>register</code> 写入注册配置</li>
           <li><code>checkout</code> 写入 <code>fresh_checkout.proxy</code></li>
@@ -82,7 +82,7 @@
       </div>
 
       <div class="step-actions">
-        <TermBtn :loading="bridgeLoading" @click="startTrojan">启动 Trojan Bridge</TermBtn>
+        <TermBtn :loading="bridgeLoading" @click="startTrojan">启动代理 Bridge</TermBtn>
         <TermBtn :loading="bridgeLoading" @click="stopTrojan">停止</TermBtn>
         <TermBtn :loading="bridgeLoading" @click="refreshTrojan">刷新状态</TermBtn>
         <TermBtn :loading="bridgeLoading" @click="loadTrojanNodes">解析节点</TermBtn>
@@ -153,7 +153,7 @@ const bridgeStatus = ref<any | null>(null);
 
 const modeOptions = [
   { value: "webshare", label: "webshare", desc: "Webshare API 托管 + 12 路自愈" },
-  { value: "trojan-pool", label: "trojan", desc: "Trojan 池 + 按阶段地区" },
+  { value: "trojan-pool", label: "trojan/hy2", desc: "Trojan/HY2 池 + 按阶段地区" },
   { value: "manual", label: "manual", desc: "手动 socks5/http" },
   { value: "none", label: "none", desc: "不用代理（直连）" },
 ];

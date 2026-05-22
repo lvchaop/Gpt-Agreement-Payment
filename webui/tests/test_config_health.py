@@ -79,6 +79,71 @@ def test_config_health_ok_with_cloudflare_secrets(client, tmp_path, monkeypatch)
     assert not body["blocking"]
 
 
+def test_config_health_phone_register_requires_provider(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed_configs(tmp_path, monkeypatch)
+
+    db = get_db()
+    db.clear_runtime_data()
+    db.set_runtime_json("secrets", {
+        "cloudflare": {
+            "api_token": "tok-abc",
+            "account_id": "acct-123",
+            "otp_kv_namespace_id": "kv-123",
+        }
+    })
+
+    r = client.post("/api/config/health", json={
+        "mode": "single",
+        "paypal": True,
+        "register_mode": "phone_browser",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    names = {c["name"] for c in body["blocking"]}
+    assert "phone_provider" in names
+
+
+def test_config_health_phone_register_hero_sms_ok(client, tmp_path, monkeypatch):
+    _login(client)
+    _pay_path, reg_path = _seed_configs(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "secret-token")
+
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    reg["phone"] = {
+        "enabled": True,
+        "provider": "hero_sms",
+        "base_url": "https://hero-sms.com/stubs/handler_api.php",
+        "api_key_env": "HERO_SMS_API_KEY",
+        "service": "tg",
+        "country": "2",
+    }
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+
+    db = get_db()
+    db.clear_runtime_data()
+    db.set_runtime_json("secrets", {
+        "cloudflare": {
+            "api_token": "tok-abc",
+            "account_id": "acct-123",
+            "otp_kv_namespace_id": "kv-123",
+        }
+    })
+
+    r = client.post("/api/config/health", json={
+        "mode": "single",
+        "paypal": True,
+        "register_mode": "phone_browser",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    phone_check = next(c for c in body["checks"] if c["name"] == "phone_provider")
+    assert phone_check["status"] == "ok"
+    assert "service=tg" in phone_check["details"]
+
+
 def test_run_start_blocked_by_config_health(client, tmp_path, monkeypatch):
     _login(client)
     _seed_configs(tmp_path, monkeypatch)

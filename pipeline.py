@@ -20,6 +20,8 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
   python pipeline.py --config CTF-pay/config.paypal.json --paypal --batch 5 --delay 30
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -567,29 +569,57 @@ class RegistrationError(RuntimeError):
     pass
 
 
+def _normalize_register_method(value: str | None) -> str:
+    v = (value or "").strip().lower().replace("-", "_")
+    if v in ("", "default", "auto"):
+        return ""
+    if v in ("browser", "camoufox", "playwright", "email_browser"):
+        return "browser"
+    if v in ("protocol", "http", "api", "auth_flow", "email_protocol"):
+        return "protocol"
+    if v in ("phone", "phone_browser", "phone_camoufox", "phone_playwright"):
+        return "phone_browser"
+    raise RegistrationError(f"未知注册路径: {value}")
+
+
+def _register_method_from_config(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        reg = cfg.get("registration") if isinstance(cfg.get("registration"), dict) else {}
+        return _normalize_register_method(reg.get("method"))
+    except RegistrationError:
+        raise
+    except Exception:
+        return ""
+
+
 def register(cardw_config_path, proxy=None, python="python3", timeout=600,
-             browser: bool | None = None):
+             browser: bool | None = None, register_method: str | None = None):
     """注册一个新 ChatGPT 账号。
 
-    `browser` 优先级：显式参数 > `WEBUI_REG_MODE` 环境变量 > 默认 True。
-    `WEBUI_REG_MODE=protocol` 走 `auth_flow.AuthFlow.run_register`（HTTP
-    直连，sentinel + OTP 协议链路），`=browser` 走 Camoufox/Playwright。
+    注册路径优先级：显式 register_method > WEBUI_REG_METHOD/WEBUI_REG_MODE >
+    config.registration.method > 旧 browser 参数 > 默认 browser。
+    `phone_browser` 走手机号入口注册，并仍返回兼容的 email/session/access_token
+    结构。
     WebUI 在 Run 页加了切换按钮，每次启动 pipeline 时把选择透传成环境变量。
 
     返回 dict: {email, session_token, access_token, device_id, ...}
     """
-    if browser is None:
-        mode = (os.environ.get("WEBUI_REG_MODE") or "").strip().lower()
-        if mode in ("protocol", "http", "api", "auth_flow"):
-            browser = False
-        elif mode in ("browser", "camoufox", "playwright"):
-            browser = True
-        else:
-            browser = True
     cardw_config_path = str(Path(cardw_config_path).resolve())
     auth_bundle_dir = str(CARDW_DIR)
+    method = (
+        _normalize_register_method(register_method)
+        or _normalize_register_method(os.environ.get("WEBUI_REG_METHOD") or os.environ.get("WEBUI_REG_MODE"))
+        or _register_method_from_config(cardw_config_path)
+    )
+    if not method:
+        if browser is None:
+            method = "browser"
+        else:
+            method = "browser" if browser else "protocol"
 
-    if browser:
+    if method == "browser":
         script = r"""
 import json, logging, os, sys
 auth_bundle_dir = sys.argv[1]
@@ -602,6 +632,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 cfg = Config.from_file(config_path)
 mail = MailProvider.from_config(cfg.mail, config_path=config_path)
 result = browser_register(cfg, mail)
+try:
+    mail.mark_used(result.get("email", ""))
+except Exception:
+    pass
+print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
+"""
+    elif method == "phone_browser":
+        script = r"""
+import json, logging, os, sys
+auth_bundle_dir = sys.argv[1]
+config_path = sys.argv[2]
+sys.path.insert(0, auth_bundle_dir)
+from config import Config
+from mail_provider import MailProvider
+from phone_register import phone_register
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+cfg = Config.from_file(config_path)
+mail = MailProvider.from_config(cfg.mail, config_path=config_path)
+result = phone_register(cfg, mail)
 try:
     mail.mark_used(result.get("email", ""))
 except Exception:
@@ -640,7 +689,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         pass
 
     cmd = [python, "-c", script, auth_bundle_dir, cardw_config_path]
-    print(f"[register] 注册新账号 (config={os.path.basename(cardw_config_path)}) ...")
+    print(f"[register] 注册新账号 (method={method}, config={os.path.basename(cardw_config_path)}) ...")
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -675,6 +724,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
     print(f"[register] 注册成功: {email}")
     try:
         entry = dict(result_json)
+        entry.setdefault("register_method", method)
         entry["ts"] = datetime.now(timezone.utc).isoformat()
         get_db().add_registered_account(entry)
     except Exception as e:
@@ -877,7 +927,8 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
              use_gopay=False, gopay_otp_file=None,
              timeout_reg=300, timeout_pay=600,
              pool=None, team_client=None, card_cfg=None, proxy_pool=None,
-             proxy_stage_allocator=None, proxy_stage_plan=None):
+             proxy_stage_allocator=None, proxy_stage_plan=None,
+             register_method: str | None = None):
     """全链路: 注册 → 支付 → (可选) gpt-team 导入探测 → 更新域池
     proxy_pool 非空时从 pool 挑代理，同时覆盖 CTF-reg + CTF-pay 两个 config 的 proxy 字段"""
     card_config_path = str(Path(card_config_path).resolve())
@@ -932,7 +983,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
         print(f"[pipeline] Step 1/2: 注册 ChatGPT 账号")
         print(f"{'='*60}")
         try:
-            reg = register(effective_cardw, timeout=timeout_reg)
+            reg = register(effective_cardw, timeout=timeout_reg, register_method=register_method)
             record["registration"] = {"status": "ok", "email": reg.get("email", "")}
         except RegistrationError as e:
             record["registration"] = {"status": "error", "error": str(e)[:200]}
@@ -1024,6 +1075,7 @@ def _register_one(args_tuple):
     pool = args_tuple[2] if len(args_tuple) >= 3 else None
     proxy_stage_allocator = args_tuple[3] if len(args_tuple) >= 4 else None
     proxy_stage_plan = args_tuple[4] if len(args_tuple) >= 5 else None
+    register_method = args_tuple[5] if len(args_tuple) >= 6 else None
     stage_plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
     picked_domain = ""
     temp_cardw = None
@@ -1035,7 +1087,7 @@ def _register_one(args_tuple):
         if picked_domain or stage_plan.register:
             temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, stage_plan.register)
             effective = temp_cardw
-        r = register(effective)
+        r = register(effective, register_method=register_method)
         return {
             "index": idx,
             "status": "ok",
@@ -1070,6 +1122,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     gopay_otp_file = kwargs.pop("gopay_otp_file", "")
     proxy_stage_allocator = kwargs.get("proxy_stage_allocator")
     proxy_stage_plan = kwargs.get("proxy_stage_plan")
+    register_method = kwargs.get("register_method")
 
     # 构造共享 pool + team_client（所有 worker 复用）
     card_cfg = _read_card_cfg(card_config_path)
@@ -1093,7 +1146,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                     temp_cardw = _rewrite_cardw_with_domain(cardw_path, "", plan.register)
                     effective_cardw = temp_cardw
                     print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
-                r = register(effective_cardw)
+                r = register(effective_cardw, register_method=register_method)
                 r["batch_index"] = i
                 if plan.has_any():
                     r["proxy_stage_plan"] = plan.to_dict()
@@ -3303,7 +3356,8 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
                 members_count=4, timeout_reg=300, timeout_pay=600,
                 invite_accept_gap_s=3,
                 resume_owner_email: str = "",
-                proxy_stage_allocator=None, proxy_stage_plan=None):
+                proxy_stage_allocator=None, proxy_stage_plan=None,
+                register_method: str | None = None):
     """自产自销（state machine 2nd form）：
       Step 1 (1 次)：注册 - 支付 - 推送 team+cpa    →  现成 pipeline()
       Step 2 (N 次)：注册 - 邀请上车 - 推送 cpa     →  register() + invite/accept + relogin + cpa_push
@@ -3331,6 +3385,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
             use_paypal=use_paypal, timeout_reg=timeout_reg, timeout_pay=timeout_pay,
             proxy_stage_allocator=proxy_stage_allocator,
             proxy_stage_plan=proxy_stage_plan,
+            register_method=register_method,
         )
         owner_email = (owner_record.get("payment") or {}).get("email") \
             or (owner_record.get("registration") or {}).get("email") or ""
@@ -3422,7 +3477,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
                     print(f"[self-dealer] rewrite cardw 异常: {e}; 沿用原 cardw")
 
             try:
-                reg = register(effective_cardw, timeout=timeout_reg)
+                reg = register(effective_cardw, timeout=timeout_reg, register_method=register_method)
             except Exception as e:
                 print(f"[self-dealer] ✗ member {i} 注册失败: {e}")
                 entry["status"] = f"register_error: {str(e)[:120]}"
@@ -3520,7 +3575,8 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
 
 
 def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0,
-                       proxy_stage_allocator=None, proxy_stage_plan=None):
+                       proxy_stage_allocator=None, proxy_stage_plan=None,
+                       register_method: str | None = None):
     """free_only mode：注册免费 ChatGPT 号 + 单独跑 OAuth 拿 rt + 推 CPA(free)。
 
     跟 daemon/self_dealer 不同：不进入支付步骤。
@@ -3581,7 +3637,7 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0,
 
         try:
             try:
-                reg = register(effective_cardw)
+                reg = register(effective_cardw, register_method=register_method)
             except RegistrationError as e:
                 print(f"[free-register] {iteration} 注册失败: {e}")
                 failed += 1
@@ -3793,6 +3849,9 @@ def main():
                         help="webui 模式: gopay.py 从该文件读取 WhatsApp OTP")
     parser.add_argument("--register-only", action="store_true",
                         help="仅注册，不支付")
+    parser.add_argument("--register-method", default="",
+                        choices=("", "browser", "protocol", "phone_browser"),
+                        help="注册路径：browser / protocol / phone_browser；空则读 WEBUI_REG_MODE 或注册配置")
     parser.add_argument("--pay-only", action="store_true",
                         help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,
@@ -3827,7 +3886,7 @@ def main():
     parser.add_argument("--fresh-checkout-proxy", default="",
                         help="仅覆盖 ChatGPT payments/checkout 阶段代理；优先级高于 --proxy 的 checkout 默认值")
     parser.add_argument("--trojan-pool-file", default="",
-                        help="Trojan 池文件。支持：REGION trojan://... 或 JSON nodes")
+                        help="代理池文件。支持：REGION trojan://... / hysteria2://... 或 JSON nodes")
     parser.add_argument("--trojan-http-start-port", type=int, default=18081,
                         help="Trojan bridge 本地 HTTP 起始端口，默认 18081")
     parser.add_argument("--trojan-bridge-bin", default="sing-box",
@@ -3857,7 +3916,8 @@ def main():
             free_register_loop(args.config, cardw_config_path=args.cardw_config,
                                 count=args.count,
                                 proxy_stage_allocator=proxy_stage_allocator,
-                                proxy_stage_plan=proxy_stage_plan)
+                                proxy_stage_plan=proxy_stage_plan,
+                                register_method=args.register_method or None)
             return
         if args.free_backfill_rt:
             free_backfill_rt_loop(
@@ -3881,7 +3941,8 @@ def main():
                         use_paypal=args.paypal, members_count=args.self_dealer,
                         resume_owner_email=args.self_dealer_resume,
                         proxy_stage_allocator=proxy_stage_allocator,
-                        proxy_stage_plan=proxy_stage_plan)
+                        proxy_stage_plan=proxy_stage_plan,
+                        register_method=args.register_method or None)
             return
 
         target_emails_list: list[str] = []
@@ -3919,7 +3980,8 @@ def main():
                   register_only=args.register_only, pay_only=args.pay_only,
                   use_gopay=args.gopay, gopay_otp_file=args.gopay_otp_file,
                   proxy_stage_allocator=proxy_stage_allocator,
-                  proxy_stage_plan=proxy_stage_plan)
+                  proxy_stage_plan=proxy_stage_plan,
+                  register_method=args.register_method or None)
 
         elif "--batch" in sys.argv:
             print(f"[ERROR] --batch 参数必须 ≥ 1（当前 {args.batch}）", file=sys.stderr)
@@ -3940,7 +4002,7 @@ def main():
                     temp_cardw = _rewrite_cardw_with_domain(cardw_cfg, "", plan.register)
                     effective_cardw = temp_cardw
                     print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
-                result = register(effective_cardw)
+                result = register(effective_cardw, register_method=args.register_method or None)
                 if plan.has_any():
                     result["proxy_stage_plan"] = plan.to_dict()
             finally:
@@ -3964,7 +4026,8 @@ def main():
                      use_paypal=args.paypal, use_gopay=args.gopay,
                      gopay_otp_file=args.gopay_otp_file,
                      proxy_stage_allocator=proxy_stage_allocator,
-                     proxy_stage_plan=proxy_stage_plan)
+                     proxy_stage_plan=proxy_stage_plan,
+                     register_method=args.register_method or None)
 
     except (RegistrationError, PaymentError, TrojanBridgeError) as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)

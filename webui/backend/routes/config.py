@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ..auth import CurrentUser
 from ..config_health import build_config_health
 from ..config_writer import write_configs
@@ -21,6 +21,8 @@ class HealthRequest(BaseModel):
     workers: int = 3
     self_dealer: int = 0
     count: int = 0
+    register_mode: str = "browser"
+    phone: dict = Field(default_factory=dict)
 
 
 @router.post("/export")

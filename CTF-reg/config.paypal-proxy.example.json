@@ -1,4 +1,7 @@
 {
+  "registration": {
+    "method": "browser"
+  },
   "mail": {
     "_comment": "OTP 走 Cloudflare Email Worker → KV（见 scripts/setup_cf_email_worker.py + scripts/otp_email_worker.js）。CF 凭证存 SQLite runtime_meta[secrets].cloudflare 段，不在这里。",
     "catch_all_domain": "subdomain.example.com",
@@ -43,6 +46,24 @@
   "captcha": {
     "api_url": "https://YOUR_CAPTCHA_PROVIDER",
     "client_key": "YOUR_CAPTCHA_API_KEY"
+  },
+  "phone": {
+    "enabled": false,
+    "provider": "hero_sms",
+    "base_url": "https://hero-sms.com/stubs/handler_api.php",
+    "api_key_env": "HERO_SMS_API_KEY",
+    "country": "2",
+    "service": "tg",
+    "maxPrice": "",
+    "lease_ttl_s": 300,
+    "allocate_path": "/api/phones/allocate",
+    "otp_path": "/api/phones/{lease_id}/otp",
+    "otp_method": "GET",
+    "otp_timeout_s": 180,
+    "otp_poll_interval_s": 3,
+    "release_path": "/api/phones/{lease_id}/release",
+    "fail_path": "/api/phones/{lease_id}/fail",
+    "verified_path": "/api/phones/{lease_id}/verified"
   },
   "proxy": "socks5://USER:PASS@PROXY_HOST:PORT",
   "session_token": "",

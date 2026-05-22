@@ -244,7 +244,7 @@ def trojan_nodes(pool_file: str = "output/trojan_pool.txt", http_start_port: int
             "regions": sorted({n.region for n in nodes}),
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Trojan 池解析失败: {e}")
+        raise HTTPException(status_code=400, detail=f"代理池解析失败: {e}")
 
 
 @router.post("/trojan/start")

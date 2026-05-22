@@ -39,11 +39,65 @@ _active_gopay_phone: str = ""          # digits-only phone for the running gopay
 _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls across iterations
 
 
+_PHONE_CONFIG_KEYS = {
+    "enabled", "provider", "base_url", "api_key_env", "country", "service",
+    "maxPrice", "max_price", "lease_ttl_s", "request_timeout_s", "allocate_path", "otp_path",
+    "otp_method", "otp_timeout_s", "otp_poll_interval_s", "release_path",
+    "fail_path", "verified_path", "headers", "allocate_payload",
+}
+
+
 def _read_pay_config() -> dict:
     try:
         return json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _read_reg_config() -> dict:
+    try:
+        return json.loads(s.REG_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _runtime_phone_config(phone: Optional[dict]) -> tuple[str, dict]:
+    """Create a temporary reg config for Run-page phone overrides.
+
+    The API key is passed via environment instead of being written to disk.
+    """
+    phone = phone or {}
+    reg_cfg = _read_reg_config()
+    if not isinstance(reg_cfg, dict):
+        reg_cfg = {}
+    current = reg_cfg.get("phone") if isinstance(reg_cfg.get("phone"), dict) else {}
+    merged = dict(current)
+    for key, value in phone.items():
+        if key == "api_key":
+            continue
+        if key in _PHONE_CONFIG_KEYS and value not in (None, ""):
+            merged[key] = value
+    merged["enabled"] = True
+    merged.setdefault("provider", "hero_sms")
+    merged.setdefault("base_url", "https://hero-sms.com/stubs/handler_api.php")
+    merged.setdefault("api_key_env", "HERO_SMS_API_KEY")
+    merged.setdefault("country", "2")
+    merged.setdefault("service", "tg")
+    reg_cfg["phone"] = merged
+    reg_cfg["registration"] = {"method": "phone_browser"}
+
+    env_overrides: dict = {}
+    api_key = str(phone.get("api_key") or "").strip()
+    if api_key:
+        key_env = str(merged.get("api_key_env") or "HERO_SMS_API_KEY").strip() or "HERO_SMS_API_KEY"
+        merged["api_key_env"] = key_env
+        env_overrides[key_env] = api_key
+
+    out_dir = s.get_data_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "runtime-reg-phone.json"
+    path.write_text(json.dumps(reg_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path), env_overrides
 
 
 _LINK_OK_RE = re.compile(r"\[gopay\]\s+midtrans linking ok\s+reference=(\S+)")
@@ -89,10 +143,13 @@ def _gopay_auto_otp_enabled() -> bool:
 def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: int,
               register_only: bool, pay_only: bool, gopay: bool = False,
               gopay_otp_file: str = "", count: int = 0,
-              target_emails: Optional[list] = None, rt_only: bool = False) -> list[str]:
+              target_emails: Optional[list] = None, rt_only: bool = False,
+              register_mode: str = "browser", cardw_config_path: str = "") -> list[str]:
     """根据参数拼出最终命令行。"""
     cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
            "--config", str(s.PAY_CONFIG_PATH)]
+    if cardw_config_path:
+        cmd.extend(["--cardw-config", str(cardw_config_path)])
 
     def _append_proxy_args() -> None:
         cfg = _read_pay_config()
@@ -118,12 +175,15 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
                 cmd.extend([flag, value])
 
     _append_proxy_args()
+    rm = (register_mode or "browser").strip().lower().replace("-", "_")
     # free_only 两个子模式不需要 paypal / gopay 支付段
     if mode in ("free_register", "free_backfill_rt"):
         if mode == "free_register":
             cmd.append("--free-register")
             if count > 0:
                 cmd.extend(["--count", str(count)])
+            if rm in ("protocol", "phone_browser"):
+                cmd.extend(["--register-method", rm])
         else:
             cmd.append("--free-backfill-rt")
         return cmd
@@ -133,6 +193,8 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.extend(["--gopay-otp-file", gopay_otp_file])
     elif paypal:
         cmd.append("--paypal")
+    if rm in ("protocol", "phone_browser"):
+        cmd.extend(["--register-method", rm])
     # mode 决定循环结构（daemon ∞ / self_dealer / batch N / 单次）
     if mode == "daemon":
         cmd.append("--daemon")
@@ -176,7 +238,8 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
           self_dealer: int = 0, register_only: bool = False, pay_only: bool = False,
           gopay: bool = False, count: int = 0, register_mode: str = "browser",
           env_overrides: Optional[dict] = None,
-          target_emails: Optional[list] = None, rt_only: bool = False) -> dict:
+          target_emails: Optional[list] = None, rt_only: bool = False,
+          phone: Optional[dict] = None) -> dict:
     global _proc, _started_at, _ended_at, _exit_code, _cmd, _mode
     global _log_lines, _seq_counter, _otp_file, _otp_to_db, _otp_pending, _otp_file_is_temp
     global _active_gopay_phone
@@ -187,10 +250,19 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         # OTP 默认走 WebUI SQLite endpoint；不再创建临时 FIFO 文件。
         otp_p: Optional[Path] = None
 
+        rm = (register_mode or "browser").strip().lower()
+        cardw_config_path = ""
+        runtime_env_overrides = dict(env_overrides or {})
+        if rm in ("phone", "phone_browser"):
+            cardw_config_path, phone_env = _runtime_phone_config(phone)
+            runtime_env_overrides.update(phone_env)
+
         cmd = build_cmd(mode, paypal, batch, workers, self_dealer,
                         register_only, pay_only, gopay=gopay,
                         gopay_otp_file="", count=count,
-                        target_emails=target_emails, rt_only=rt_only)
+                        target_emails=target_emails, rt_only=rt_only,
+                        register_mode=register_mode,
+                        cardw_config_path=cardw_config_path)
 
         # GoPay link-state pre-flight: if the configured phone is currently
         # linked from a prior successful charge, GoPay will reject the next
@@ -226,11 +298,10 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         if gopay:
             env["WEBUI_GOPAY_OTP_URL"] = wa_relay.otp_url()
-        # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow HTTP 直连
-        rm = (register_mode or "browser").strip().lower()
-        env["WEBUI_REG_MODE"] = "protocol" if rm == "protocol" else "browser"
-        if env_overrides:
-            for k, v in env_overrides.items():
+        # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_browser=手机号入口
+        env["WEBUI_REG_MODE"] = "phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser")
+        if runtime_env_overrides:
+            for k, v in runtime_env_overrides.items():
                 if v is None:
                     env.pop(str(k), None)
                 else:

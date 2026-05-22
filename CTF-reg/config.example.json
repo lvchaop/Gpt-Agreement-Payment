@@ -1,4 +1,7 @@
 {
+  "registration": {
+    "method": "browser"
+  },
   "mail": {
     "_comment": "mode=cloudflare_kv 走 Cloudflare Email Worker → KV；mode=imap_list 走 email_accounts.csv 的 Gmail/Outlook/IMAP 账号密码",
     "mode": "cloudflare_kv",
@@ -35,6 +38,24 @@
   "captcha": {
     "api_url": "https://YOUR_CAPTCHA_PROVIDER",
     "client_key": ""
+  },
+  "phone": {
+    "enabled": false,
+    "provider": "hero_sms",
+    "base_url": "https://hero-sms.com/stubs/handler_api.php",
+    "api_key_env": "HERO_SMS_API_KEY",
+    "country": "2",
+    "service": "tg",
+    "maxPrice": "",
+    "lease_ttl_s": 300,
+    "allocate_path": "/api/phones/allocate",
+    "otp_path": "/api/phones/{lease_id}/otp",
+    "otp_method": "GET",
+    "otp_timeout_s": 180,
+    "otp_poll_interval_s": 3,
+    "release_path": "/api/phones/{lease_id}/release",
+    "fail_path": "/api/phones/{lease_id}/fail",
+    "verified_path": "/api/phones/{lease_id}/verified"
   },
   "proxy": null,
   "session_token": null,

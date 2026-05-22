@@ -4,6 +4,27 @@
     <h2 class="step-h">$&nbsp;mail source<span class="term-cursor"></span></h2>
     <p class="step-sub">选择注册邮箱来源。Cloudflare 走 catch-all；邮箱列表支持 Gmail / Outlook / 自定义邮箱账号密码或 App Password。</p>
 
+    <div class="term-divider" data-tail="──────────" style="margin-top:20px">注册路径</div>
+    <TermChoice v-model="registrationMethod" :options="registrationOptions" :cols="3" />
+
+    <div v-if="registrationMethod === 'phone_browser'" class="form-stack" style="margin-top:22px">
+      <TermChoice v-model="phoneForm.provider" :options="phoneProviderOptions" :cols="2" />
+      <TermField v-model="phoneForm.base_url" label="手机号服务 · base_url" placeholder="https://hero-sms.com/stubs/handler_api.php" />
+      <TermField v-model="phoneForm.api_key" label="Hero API Key · api_key" type="password" placeholder="YOUR_SECRET_TOKEN" />
+      <TermField v-model="phoneForm.api_key_env" label="API Key 环境变量 · api_key_env" placeholder="HERO_SMS_API_KEY" />
+      <TermField v-if="phoneProviderKind === 'hero_sms'" v-model="phoneForm.service" label="Hero 服务 · service" placeholder="tg" />
+      <TermField v-model="phoneForm.country" :label="phoneProviderKind === 'hero_sms' ? 'Hero 国家码 · country' : '国家 · country'" :placeholder="phoneProviderKind === 'hero_sms' ? '2' : 'US'" />
+      <TermField v-if="phoneProviderKind === 'hero_sms'" v-model="phoneForm.maxPrice" label="Hero 最高价格 · maxPrice" placeholder="12.5" />
+      <template v-if="phoneProviderKind !== 'hero_sms'">
+        <TermField v-model="phoneForm.allocate_path" label="拿号接口 · allocate_path" placeholder="/api/phones/allocate" />
+        <TermField v-model="phoneForm.otp_path" label="取码接口 · otp_path" placeholder="/api/phones/{lease_id}/otp" />
+        <TermField v-model="phoneForm.otp_method" label="取码方法 · otp_method" placeholder="GET" />
+      </template>
+      <TermField v-model="phoneForm.otp_timeout_s" label="取码超时秒 · otp_timeout_s" />
+      <TermField v-model="phoneForm.otp_poll_interval_s" label="轮询间隔秒 · otp_poll_interval_s" />
+    </div>
+
+    <div class="term-divider" data-tail="──────────" style="margin-top:24px">邮箱来源</div>
     <TermChoice v-model="mailMode" :options="mailModeOptions" :cols="2" @update:modelValue="onMailModeChange" />
 
     <div v-if="mailMode === 'cloudflare_kv'" class="form-stack" style="margin-top:22px">
@@ -102,6 +123,29 @@ import TermBtn from "../term/TermBtn.vue";
 import TermChoice from "../term/TermChoice.vue";
 
 const store = useWizardStore();
+const registrationInit = store.answers.registration ?? {};
+const phoneInit = store.answers.phone ?? {};
+const registrationMethod = ref(registrationInit.method ?? "browser");
+const phoneForm = ref({
+  enabled: phoneInit.enabled ?? false,
+  provider: phoneInit.provider ?? "hero_sms",
+  base_url: phoneInit.base_url ?? "https://hero-sms.com/stubs/handler_api.php",
+  api_key: phoneInit.api_key ?? "",
+  api_key_env: phoneInit.api_key_env ?? "HERO_SMS_API_KEY",
+  country: phoneInit.country ?? "2",
+  service: phoneInit.service ?? "tg",
+  maxPrice: String(phoneInit.maxPrice ?? phoneInit.max_price ?? ""),
+  lease_ttl_s: String(phoneInit.lease_ttl_s ?? 300),
+  request_timeout_s: String(phoneInit.request_timeout_s ?? 20),
+  allocate_path: phoneInit.allocate_path ?? "/api/phones/allocate",
+  otp_path: phoneInit.otp_path ?? "/api/phones/{lease_id}/otp",
+  otp_method: phoneInit.otp_method ?? "GET",
+  otp_timeout_s: String(phoneInit.otp_timeout_s ?? 180),
+  otp_poll_interval_s: String(phoneInit.otp_poll_interval_s ?? 3),
+  release_path: phoneInit.release_path ?? "/api/phones/{lease_id}/release",
+  fail_path: phoneInit.fail_path ?? "/api/phones/{lease_id}/fail",
+  verified_path: phoneInit.verified_path ?? "/api/phones/{lease_id}/verified",
+});
 const mailInit = store.answers.mail ?? {};
 const mailMode = ref(mailInit.mode ?? "cloudflare_kv");
 const init = store.answers.cloudflare ?? {};
@@ -125,6 +169,16 @@ const mailModeOptions = [
   { value: "cloudflare_kv", label: "Cloudflare KV", desc: "catch-all 域名 + Worker/KV 自动取码" },
   { value: "imap_list", label: "IMAP 列表", desc: "Gmail / Outlook / 自定义邮箱账号密码" },
 ];
+const registrationOptions = [
+  { value: "browser", label: "邮箱浏览器", desc: "Camoufox 走邮箱注册" },
+  { value: "protocol", label: "邮箱协议", desc: "auth_flow HTTP 链路" },
+  { value: "phone_browser", label: "手机号", desc: "Phone 入口 + provider 拿号/取码" },
+];
+const phoneProviderOptions = [
+  { value: "hero_sms", label: "Hero SMS", desc: "getNumberV2 + getStatusV2" },
+  { value: "http", label: "HTTP JSON", desc: "自建 allocate / otp 接口" },
+];
+const phoneProviderKind = computed(() => (phoneForm.value.provider || "hero_sms").replace("-", "_"));
 const zoneText = computed({
   get: () => form.value.zone_names.join("\n"),
   set: (v: string) => (form.value.zone_names = v.split("\n").map((s) => s.trim()).filter(Boolean)),
@@ -147,6 +201,7 @@ async function run() {
 
 watch(form, () => store.setAnswer("cloudflare", form.value), { deep: true });
 watch(mailForm, () => persistMailAnswer(), { deep: true });
+watch([registrationMethod, phoneForm], () => persistRegistrationAnswer(), { deep: true });
 
 function onMailModeChange(v: string) {
   mailMode.value = v;
@@ -160,6 +215,30 @@ function persistMailAnswer() {
     accounts_path: mailForm.value.accounts_path || "output/email_accounts.csv",
     otp_timeout: Number(mailForm.value.otp_timeout || 180),
     mark_seen: mailForm.value.mark_seen,
+  });
+}
+
+function persistRegistrationAnswer() {
+  store.setAnswer("registration", { method: registrationMethod.value });
+  store.setAnswer("phone", {
+    enabled: registrationMethod.value === "phone_browser",
+    provider: phoneForm.value.provider || "hero_sms",
+    base_url: phoneForm.value.base_url,
+    api_key: phoneForm.value.api_key,
+    api_key_env: phoneForm.value.api_key_env || (phoneProviderKind.value === "hero_sms" ? "HERO_SMS_API_KEY" : "PHONE_PROVIDER_API_KEY"),
+    country: phoneForm.value.country || (phoneProviderKind.value === "hero_sms" ? "2" : "US"),
+    service: phoneForm.value.service || "tg",
+    maxPrice: phoneForm.value.maxPrice,
+    lease_ttl_s: Number(phoneForm.value.lease_ttl_s || 300),
+    request_timeout_s: Number(phoneForm.value.request_timeout_s || 20),
+    allocate_path: phoneForm.value.allocate_path || "/api/phones/allocate",
+    otp_path: phoneForm.value.otp_path || "/api/phones/{lease_id}/otp",
+    otp_method: (phoneForm.value.otp_method || "GET").toUpperCase(),
+    otp_timeout_s: Number(phoneForm.value.otp_timeout_s || 180),
+    otp_poll_interval_s: Number(phoneForm.value.otp_poll_interval_s || 3),
+    release_path: phoneForm.value.release_path || "/api/phones/{lease_id}/release",
+    fail_path: phoneForm.value.fail_path || "/api/phones/{lease_id}/fail",
+    verified_path: phoneForm.value.verified_path || "/api/phones/{lease_id}/verified",
   });
 }
 
@@ -234,6 +313,7 @@ function shortDate(v: string) {
 }
 
 onMounted(() => {
+  persistRegistrationAnswer();
   persistMailAnswer();
   loadMailStatus();
 });

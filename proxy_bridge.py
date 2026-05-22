@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Trojan pool -> local HTTP proxy bridge helpers.
+"""Trojan/Hysteria2 pool -> local HTTP proxy bridge helpers.
 
 The pipeline needs stable per-stage proxy URLs while existing code only accepts
 ordinary HTTP/SOCKS proxy strings.  This module keeps that boundary explicit:
-Trojan nodes are bridged by sing-box to local HTTP ports, then the rest of the
-project consumes those local HTTP URLs.
+Trojan/Hysteria2 nodes are bridged by sing-box to local HTTP ports, then the
+rest of the project consumes those local HTTP URLs.
 """
 
 from __future__ import annotations
@@ -43,6 +43,8 @@ PAYMENT_STAGE_PROXY_KEYS = (
     "telemetry_poll",
     "poll",
 )
+
+SUPPORTED_NODE_SCHEMES = {"trojan", "hysteria2", "hy2"}
 
 
 class TrojanBridgeError(RuntimeError):
@@ -119,7 +121,19 @@ def _region_key(value: str) -> str:
     return str(value or "").strip().upper()
 
 
-def _name_from_trojan_url(url: str, fallback: str) -> str:
+def _node_scheme(url: str) -> str:
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+    except Exception:
+        scheme = ""
+    return "hysteria2" if scheme == "hy2" else scheme
+
+
+def _is_supported_node_url(url: str) -> bool:
+    return _node_scheme(url) in SUPPORTED_NODE_SCHEMES
+
+
+def _name_from_node_url(url: str, fallback: str) -> str:
     try:
         parsed = urllib.parse.urlsplit(url)
         if parsed.fragment:
@@ -129,7 +143,7 @@ def _name_from_trojan_url(url: str, fallback: str) -> str:
     return fallback
 
 
-def _region_from_trojan_url(url: str) -> str:
+def _region_from_node_url(url: str) -> str:
     try:
         parsed = urllib.parse.urlsplit(url)
         query = urllib.parse.parse_qs(parsed.query)
@@ -147,54 +161,61 @@ def _parse_pool_line(line: str, index: int) -> tuple[str, str, str]:
         item = json.loads(text)
         return _parse_pool_item(item, index)
 
-    if text.startswith("trojan://"):
-        region = _region_from_trojan_url(text) or "default"
-        return region, text, _name_from_trojan_url(text, f"{region}-{index + 1}")
+    if _is_supported_node_url(text):
+        region = _region_from_node_url(text) or "default"
+        return region, text, _name_from_node_url(text, f"{region}-{index + 1}")
 
     for sep in (",", "\t", " "):
         if sep in text:
             left, right = text.split(sep, 1)
             region = left.strip()
             url = right.strip()
-            if url.startswith("trojan://"):
-                return region, url, _name_from_trojan_url(url, f"{region}-{index + 1}")
+            if _is_supported_node_url(url):
+                return region, url, _name_from_node_url(url, f"{region}-{index + 1}")
 
     if "=" in text:
         region, url = text.split("=", 1)
-        if url.strip().startswith("trojan://"):
-            return region.strip(), url.strip(), _name_from_trojan_url(url.strip(), f"{region.strip()}-{index + 1}")
+        url = url.strip()
+        if _is_supported_node_url(url):
+            return region.strip(), url, _name_from_node_url(url, f"{region.strip()}-{index + 1}")
 
-    raise ValueError(f"无法解析 Trojan 池行: {line[:80]}")
+    raise ValueError(f"无法解析代理池行: {line[:80]}")
 
 
 def _parse_pool_item(item: Any, index: int) -> tuple[str, str, str]:
     if isinstance(item, str):
         return _parse_pool_line(item, index)
     if not isinstance(item, dict):
-        raise ValueError("Trojan 池 JSON 项必须是对象或字符串")
+        raise ValueError("代理池 JSON 项必须是对象或字符串")
 
-    url = str(item.get("url") or item.get("trojan") or "").strip()
-    if not url.startswith("trojan://"):
-        raise ValueError("Trojan 池项缺少 trojan:// url")
+    url = str(
+        item.get("url")
+        or item.get("trojan")
+        or item.get("hysteria2")
+        or item.get("hy2")
+        or ""
+    ).strip()
+    if not _is_supported_node_url(url):
+        raise ValueError("代理池项缺少 trojan:// 或 hysteria2:// url")
     region = (
         str(item.get("region") or item.get("country") or item.get("group") or "").strip()
-        or _region_from_trojan_url(url)
+        or _region_from_node_url(url)
         or "default"
     )
     name = str(item.get("name") or item.get("tag") or "").strip()
     if not name:
-        name = _name_from_trojan_url(url, f"{region}-{index + 1}")
+        name = _name_from_node_url(url, f"{region}-{index + 1}")
     return region, url, name
 
 
 def load_trojan_pool(path: str | os.PathLike[str], *, http_start_port: int = 18081) -> list[TrojanNode]:
     pool_path = Path(path).expanduser()
     if not pool_path.exists():
-        raise TrojanBridgeError(f"Trojan 池文件不存在: {pool_path}")
+        raise TrojanBridgeError(f"代理池文件不存在: {pool_path}")
 
     raw = pool_path.read_text(encoding="utf-8").strip()
     if not raw:
-        raise TrojanBridgeError(f"Trojan 池文件为空: {pool_path}")
+        raise TrojanBridgeError(f"代理池文件为空: {pool_path}")
 
     parsed_items: list[Any]
     if raw[0] in "[{":
@@ -223,8 +244,30 @@ def load_trojan_pool(path: str | os.PathLike[str], *, http_start_port: int = 180
         )
 
     if not nodes:
-        raise TrojanBridgeError(f"Trojan 池没有可用节点: {pool_path}")
+        raise TrojanBridgeError(f"代理池没有可用节点: {pool_path}")
     return nodes
+
+
+def _outbound_tag(node: TrojanNode) -> str:
+    return f"{_node_scheme(node.url)}-{node.index}"
+
+
+def _url_password(parsed: urllib.parse.SplitResult, query: dict[str, list[str]]) -> str:
+    return urllib.parse.unquote(parsed.username or "") or _first_query(query, "password", "pass")
+
+
+def _tls_from_query(query: dict[str, list[str]]) -> dict:
+    tls = {"enabled": True}
+    server_name = _first_query(query, "sni", "peer", "servername", "serverName")
+    if server_name:
+        tls["server_name"] = server_name
+    insecure = _first_query(query, "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify")
+    if _truthy(insecure):
+        tls["insecure"] = True
+    alpn = _first_query(query, "alpn")
+    if alpn:
+        tls["alpn"] = [p.strip() for p in alpn.split(",") if p.strip()]
+    return tls
 
 
 def _trojan_outbound(node: TrojanNode) -> dict:
@@ -234,14 +277,14 @@ def _trojan_outbound(node: TrojanNode) -> dict:
     host = parsed.hostname or ""
     if not host:
         raise TrojanBridgeError(f"Trojan URL 缺 host: {node.url[:80]}")
-    password = urllib.parse.unquote(parsed.username or "")
+    query = urllib.parse.parse_qs(parsed.query)
+    password = _url_password(parsed, query)
     if not password:
         raise TrojanBridgeError(f"Trojan URL 缺 password: {node.name}")
 
-    query = urllib.parse.parse_qs(parsed.query)
     outbound = {
         "type": "trojan",
-        "tag": f"trojan-{node.index}",
+        "tag": _outbound_tag(node),
         "server": host,
         "server_port": int(parsed.port or 443),
         "password": password,
@@ -249,17 +292,7 @@ def _trojan_outbound(node: TrojanNode) -> dict:
 
     security = _first_query(query, "security", "tls")
     if str(security or "tls").lower() not in {"none", "false", "0"}:
-        tls = {"enabled": True}
-        server_name = _first_query(query, "sni", "peer", "servername", "serverName")
-        if server_name:
-            tls["server_name"] = server_name
-        insecure = _first_query(query, "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify")
-        if _truthy(insecure):
-            tls["insecure"] = True
-        alpn = _first_query(query, "alpn")
-        if alpn:
-            tls["alpn"] = [p.strip() for p in alpn.split(",") if p.strip()]
-        outbound["tls"] = tls
+        outbound["tls"] = _tls_from_query(query)
 
     transport_type = _first_query(query, "type", "transport")
     if transport_type.lower() in {"ws", "websocket"}:
@@ -275,6 +308,46 @@ def _trojan_outbound(node: TrojanNode) -> dict:
     return outbound
 
 
+def _hysteria2_outbound(node: TrojanNode) -> dict:
+    parsed = urllib.parse.urlsplit(node.url)
+    if _node_scheme(node.url) != "hysteria2":
+        raise TrojanBridgeError(f"非 hysteria2 URL: {node.url[:80]}")
+    host = parsed.hostname or ""
+    if not host:
+        raise TrojanBridgeError(f"Hysteria2 URL 缺 host: {node.url[:80]}")
+    query = urllib.parse.parse_qs(parsed.query)
+    password = _url_password(parsed, query)
+    if not password:
+        raise TrojanBridgeError(f"Hysteria2 URL 缺 password: {node.name}")
+
+    outbound = {
+        "type": "hysteria2",
+        "tag": _outbound_tag(node),
+        "server": host,
+        "server_port": int(parsed.port or 443),
+        "password": password,
+        "tls": _tls_from_query(query),
+    }
+
+    obfs = _first_query(query, "obfs", "obfs_type", "obfs-type")
+    obfs_password = _first_query(query, "obfs-password", "obfs_password", "obfsPassword")
+    if obfs:
+        outbound["obfs"] = {
+            "type": obfs,
+            "password": obfs_password or password,
+        }
+    return outbound
+
+
+def _node_outbound(node: TrojanNode) -> dict:
+    scheme = _node_scheme(node.url)
+    if scheme == "trojan":
+        return _trojan_outbound(node)
+    if scheme == "hysteria2":
+        return _hysteria2_outbound(node)
+    raise TrojanBridgeError(f"不支持的代理协议: {scheme or node.url[:20]}")
+
+
 def build_sing_box_config(nodes: list[TrojanNode]) -> dict:
     inbounds = []
     outbounds = [{"type": "direct", "tag": "direct"}]
@@ -282,7 +355,7 @@ def build_sing_box_config(nodes: list[TrojanNode]) -> dict:
 
     for node in nodes:
         in_tag = f"http-{node.index}"
-        out_tag = f"trojan-{node.index}"
+        out_tag = _outbound_tag(node)
         inbounds.append(
             {
                 "type": "http",
@@ -291,7 +364,7 @@ def build_sing_box_config(nodes: list[TrojanNode]) -> dict:
                 "listen_port": node.local_http_port,
             }
         )
-        outbounds.append(_trojan_outbound(node))
+        outbounds.append(_node_outbound(node))
         rules.append({"inbound": [in_tag], "outbound": out_tag})
 
     return {

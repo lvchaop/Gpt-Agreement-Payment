@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS registered_accounts (
   id_token TEXT DEFAULT '',
   refresh_token TEXT DEFAULT '',
   cookie_header TEXT DEFAULT '',
+  register_method TEXT DEFAULT '',
+  phone_number TEXT DEFAULT '',
+  phone_dial_code TEXT DEFAULT '',
+  phone_country TEXT DEFAULT '',
   created_at REAL NOT NULL,
   last_check_at REAL DEFAULT 0,
   last_check_status TEXT DEFAULT '',
@@ -168,17 +172,29 @@ class Database:
 
     def _ensure_columns(self, c: sqlite3.Connection) -> None:
         """Lightweight forward migration for DBs created by older webui builds."""
-        existing = {row["name"] for row in c.execute("PRAGMA table_info(card_results)").fetchall()}
+        def add_column(table: str, name: str, ddl: str) -> None:
+            existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if name in existing:
+                return
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e).lower():
+                    return
+                raise
+
         for name in ("invite_permission", "team_gpt_account_pk", "email_domain"):
-            if name not in existing:
-                c.execute(f"ALTER TABLE card_results ADD COLUMN {name} TEXT DEFAULT ''")
-        existing_acc = {row["name"] for row in c.execute("PRAGMA table_info(registered_accounts)").fetchall()}
-        if "last_check_at" not in existing_acc:
-            c.execute("ALTER TABLE registered_accounts ADD COLUMN last_check_at REAL DEFAULT 0")
-        if "last_check_status" not in existing_acc:
-            c.execute("ALTER TABLE registered_accounts ADD COLUMN last_check_status TEXT DEFAULT ''")
-        if "last_check_message" not in existing_acc:
-            c.execute("ALTER TABLE registered_accounts ADD COLUMN last_check_message TEXT DEFAULT ''")
+            add_column("card_results", name, "TEXT DEFAULT ''")
+        for name, ddl in (
+            ("last_check_at", "REAL DEFAULT 0"),
+            ("last_check_status", "TEXT DEFAULT ''"),
+            ("last_check_message", "TEXT DEFAULT ''"),
+            ("register_method", "TEXT DEFAULT ''"),
+            ("phone_number", "TEXT DEFAULT ''"),
+            ("phone_dial_code", "TEXT DEFAULT ''"),
+            ("phone_country", "TEXT DEFAULT ''"),
+        ):
+            add_column("registered_accounts", name, ddl)
 
     # ──────────────────────────────────────────
     # Runtime data store. SQLite is the only source of truth for runtime data.
@@ -281,8 +297,10 @@ class Database:
                 """
                 INSERT INTO registered_accounts(
                   email, ts, password, session_token, access_token, device_id,
-                  csrf_token, id_token, refresh_token, cookie_header, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  csrf_token, id_token, refresh_token, cookie_header,
+                  register_method, phone_number, phone_dial_code, phone_country,
+                  created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     email,
@@ -295,6 +313,10 @@ class Database:
                     _text(row.get("id_token")),
                     _text(row.get("refresh_token")),
                     _text(row.get("cookie_header")),
+                    _text(row.get("register_method")),
+                    _text(row.get("phone_number")),
+                    _text(row.get("phone_dial_code")),
+                    _text(row.get("phone_country")),
                     time.time(),
                 ),
             )
@@ -306,6 +328,7 @@ class Database:
                 """
                 SELECT id, email, ts, password, session_token, access_token, device_id,
                        csrf_token, id_token, refresh_token, cookie_header,
+                       register_method, phone_number, phone_dial_code, phone_country,
                        last_check_at, last_check_status, last_check_message
                 FROM registered_accounts
                 ORDER BY id ASC
@@ -319,6 +342,7 @@ class Database:
                 """
                 SELECT id, email, ts, password, session_token, access_token, device_id,
                        csrf_token, id_token, refresh_token, cookie_header,
+                       register_method, phone_number, phone_dial_code, phone_country,
                        last_check_at, last_check_status, last_check_message
                 FROM registered_accounts WHERE id = ?
                 """,

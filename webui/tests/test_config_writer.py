@@ -107,6 +107,42 @@ def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
     assert pay["gopay"]["otp"]["interval"] == 1
 
 
+def test_export_writes_phone_registration_config(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed(tmp_path, monkeypatch)
+
+    answers = {
+        "registration": {"method": "phone_browser"},
+        "phone": {
+            "enabled": True,
+            "provider": "http",
+            "base_url": "https://phone.example.com",
+            "api_key": "secret-phone-key",
+            "api_key_env": "PHONE_KEY",
+            "country": "US",
+            "service": "tg",
+            "maxPrice": "12.5",
+            "allocate_path": "/lease",
+            "otp_path": "/lease/{lease_id}/otp",
+            "otp_method": "POST",
+            "ignored": "nope",
+        },
+    }
+    r = client.post("/api/config/export", json={"answers": answers})
+    assert r.status_code == 200
+
+    reg = json.loads((tmp_path / "CTF-reg" / "config.paypal-proxy.json").read_text())
+    assert reg["registration"]["method"] == "phone_browser"
+    assert reg["phone"]["enabled"] is True
+    assert reg["phone"]["base_url"] == "https://phone.example.com"
+    assert reg["phone"]["api_key"] == "secret-phone-key"
+    assert reg["phone"]["service"] == "tg"
+    assert reg["phone"]["maxPrice"] == "12.5"
+    assert reg["phone"]["allocate_path"] == "/lease"
+    assert reg["phone"]["otp_method"] == "POST"
+    assert "ignored" not in reg["phone"]
+
+
 def test_export_writes_hosted_checkout_link_mode(client, tmp_path, monkeypatch):
     _login(client)
     _seed(tmp_path, monkeypatch)

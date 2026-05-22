@@ -66,12 +66,29 @@
               <input type="radio" value="protocol" v-model="form.register_mode" />
               纯协议 (auth_flow)
             </label>
+            <label class="reg-mode-opt" :class="{ active: form.register_mode === 'phone_browser' }">
+              <input type="radio" value="phone_browser" v-model="form.register_mode" />
+              手机号 (API)
+            </label>
           </div>
           <p v-if="!form.pay_only" class="ctl-hint">
             <code>browser</code> 走 Camoufox + Turnstile 真实执行（稳但慢，OpenAI 改 modal 后可能失败）；
             <code>protocol</code> 走 <code>auth_flow.AuthFlow</code> HTTP 直连（快，但可能被风控）。
+            <code>phone_browser</code> 进入手机号入口后调用 <code>phone</code> provider 拿号/取码。
             选择会自动持久化到 localStorage。
           </p>
+          <div v-if="!form.pay_only && form.register_mode === 'phone_browser'" class="phone-runtime">
+            <div class="phone-runtime-head">
+              <span>Hero SMS</span>
+              <code>getNumberV2 / getStatusV2</code>
+            </div>
+            <TermField v-model="phoneRunForm.api_key" label="API Key" type="password" placeholder="YOUR_SECRET_TOKEN" />
+            <TermField v-model="phoneRunForm.base_url" label="base_url" placeholder="https://hero-sms.com/stubs/handler_api.php" />
+            <TermField v-model="phoneRunForm.service" label="service" placeholder="tg" />
+            <TermField v-model="phoneRunForm.country" label="country" placeholder="2" />
+            <TermField v-model="phoneRunForm.maxPrice" label="maxPrice" placeholder="12.5" />
+            <TermField v-model="phoneRunForm.api_key_env" label="key env" placeholder="HERO_SMS_API_KEY" />
+          </div>
           <p v-else class="ctl-hint">
             <code>{{ form.mode }}</code> 不走支付步骤；OTP 经 CF KV 取，OAuth 拿 rt 后推 CPA 用 <code>cpa.free_plan_tag</code>。
           </p>
@@ -568,8 +585,47 @@ const form = ref({
   workers: 3,
   self_dealer: 4,
   count: 0, // free_register 模式：注册多少个后停（0 = 无限）
-  register_mode: (localStorage.getItem("webui.register_mode") || "browser") as "browser" | "protocol",
+  register_mode: (localStorage.getItem("webui.register_mode") || "browser") as "browser" | "protocol" | "phone_browser",
 });
+const phoneRunForm = ref({
+  provider: "hero_sms",
+  base_url: "https://hero-sms.com/stubs/handler_api.php",
+  api_key: "270145eAbcAA882c83eA0A5dAb417359",
+  api_key_env: "HERO_SMS_API_KEY",
+  country: "2",
+  service: "tg",
+  maxPrice: "",
+  otp_timeout_s: 180,
+  otp_poll_interval_s: 3,
+});
+
+function applyPhoneAnswer(phone: any) {
+  if (!phone || typeof phone !== "object") return;
+  phoneRunForm.value = {
+    ...phoneRunForm.value,
+    provider: phone.provider || phoneRunForm.value.provider,
+    base_url: phone.base_url || phoneRunForm.value.base_url,
+    api_key: phone.api_key || phoneRunForm.value.api_key,
+    api_key_env: phone.api_key_env || phoneRunForm.value.api_key_env,
+    country: phone.country || phoneRunForm.value.country,
+    service: phone.service || phoneRunForm.value.service,
+    maxPrice: phone.maxPrice || phone.max_price || phoneRunForm.value.maxPrice,
+    otp_timeout_s: Number(phone.otp_timeout_s || phoneRunForm.value.otp_timeout_s),
+    otp_poll_interval_s: Number(phone.otp_poll_interval_s || phoneRunForm.value.otp_poll_interval_s),
+  };
+}
+
+function runPayload() {
+  const payload: any = { ...form.value };
+  if (!form.value.pay_only && form.value.register_mode === "phone_browser") {
+    payload.phone = {
+      ...phoneRunForm.value,
+      enabled: true,
+      provider: phoneRunForm.value.provider || "hero_sms",
+    };
+  }
+  return payload;
+}
 
 watch(() => form.value.register_mode, (v) => {
   try { localStorage.setItem("webui.register_mode", v); } catch {}
@@ -1251,7 +1307,7 @@ async function refreshInventory() {
 
 async function refreshPreview() {
   try {
-    const r = await api.post("/run/preview", form.value);
+    const r = await api.post("/run/preview", runPayload());
     cmdPreview.value = r.data.cmd_str;
   } catch {}
 }
@@ -1267,7 +1323,7 @@ async function checkConfigHealth() {
   if (configHealthLoading.value) return configHealth.value;
   configHealthLoading.value = true;
   try {
-    const r = await api.post<ConfigHealthResponse>("/config/health", form.value);
+    const r = await api.post<ConfigHealthResponse>("/config/health", runPayload());
     configHealth.value = r.data;
     return r.data;
   } catch (e: any) {
@@ -1287,7 +1343,7 @@ async function start() {
       message.error(first?.message || "配置健康检查未通过，已阻止启动");
       return;
     }
-    await api.post("/run/start", form.value);
+    await api.post("/run/start", runPayload());
     message.success("已启动");
     lines.value = [];
     await refreshStatus();
@@ -1438,7 +1494,14 @@ const isFreeMode = computed(() =>
 );
 
 watch(
-  () => [form.value.mode, form.value.paypal, form.value.gopay, form.value.pay_only, form.value.register_only, form.value.batch, form.value.workers, form.value.self_dealer, form.value.count, form.value.register_mode],
+  () => [
+    form.value.mode, form.value.paypal, form.value.gopay, form.value.pay_only,
+    form.value.register_only, form.value.batch, form.value.workers,
+    form.value.self_dealer, form.value.count, form.value.register_mode,
+    phoneRunForm.value.api_key, phoneRunForm.value.base_url,
+    phoneRunForm.value.api_key_env, phoneRunForm.value.country,
+    phoneRunForm.value.service, phoneRunForm.value.maxPrice,
+  ],
   () => {
     configHealth.value = null;
     refreshPreview();
@@ -1453,6 +1516,7 @@ onMounted(async () => {
   // 从 wizard store 推断默认支付方式：card 不带 --paypal，其它都带
   try {
     await store.loadFromServer();
+    applyPhoneAnswer((store.answers.phone as any) || {});
     const pm = (store.answers.payment as any)?.method;
     if (pm === "gopay") {
       form.value.gopay = true;
@@ -1933,7 +1997,30 @@ onBeforeUnmount(() => {
 .logs-meta { color: var(--fg-tertiary); font-size: 11px; font-weight: 400; }
 .auto-scroll-toggle { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--fg-secondary); cursor: pointer; user-select: none; font-weight: 400; letter-spacing: 0; }
 .auto-scroll-toggle input { accent-color: var(--accent); }
-
+.phone-runtime {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-base);
+}
+.phone-runtime-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+.phone-runtime-head code {
+  color: var(--fg-tertiary);
+  font-size: 10px;
+  font-weight: 400;
+  white-space: nowrap;
+}
 .logs-stream { flex: 1; overflow-y: auto; padding: 8px 16px 12px; font-size: 11px; background: var(--bg-base); }
 .logs-empty { color: var(--fg-tertiary); padding: 32px 0; text-align: center; }
 .log-line { display: grid; grid-template-columns: 70px 1fr; gap: 10px; padding: 1px 0; align-items: baseline; }

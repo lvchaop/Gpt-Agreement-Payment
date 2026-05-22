@@ -154,6 +154,14 @@ def _payment_kind(req: dict) -> str:
     return "card"
 
 
+def _registration_method(req: dict, reg_cfg: dict | None = None) -> str:
+    requested = _text(req.get("register_mode")).lower().replace("-", "_")
+    if requested:
+        return requested
+    reg = (reg_cfg or {}).get("registration") if isinstance((reg_cfg or {}).get("registration"), dict) else {}
+    return _text(reg.get("method")).lower().replace("-", "_") or "browser"
+
+
 def _config_has_embedded_auth(pay_cfg: dict) -> bool:
     auth = _get(pay_cfg, "fresh_checkout.auth", {})
     if not isinstance(auth, dict):
@@ -260,6 +268,53 @@ def _check_cloudflare_kv(checks: list[dict], req: dict, reg_cfg: dict | None = N
 def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> None:
     if not _requires_registration(req):
         return
+    method = _registration_method(req, reg_cfg)
+    if method == "phone_browser":
+        phone = reg_cfg.get("phone") if isinstance(reg_cfg.get("phone"), dict) else {}
+        phone_override = req.get("phone") if isinstance(req.get("phone"), dict) else {}
+        if phone_override:
+            phone = {
+                **phone,
+                **{k: v for k, v in phone_override.items() if v not in (None, "")},
+            }
+        provider = _text(phone.get("provider")).lower().replace("-", "_") or "http"
+        is_hero_sms = provider in {"hero", "hero_sms", "smshub", "sms_hub", "sms_activate", "smsactivate"}
+        required = ("base_url", "service", "country") if is_hero_sms else ("base_url", "allocate_path", "otp_path")
+        missing_phone = [key for key in required if _is_missing(phone.get(key))]
+        runtime_enabled = _text(req.get("register_mode")).lower().replace("-", "_") == "phone_browser"
+        if not phone.get("enabled") and not runtime_enabled:
+            missing_phone.insert(0, "enabled")
+        if is_hero_sms and _text(phone.get("country")) and not _text(phone.get("country")).isdigit():
+            missing_phone.append("country")
+        auth_hint = _text(phone.get("api_key")) or _text(os.getenv(_text(phone.get("api_key_env")) or "PHONE_PROVIDER_API_KEY"))
+        if is_hero_sms and not auth_hint:
+            missing_phone.append("api_key/api_key_env")
+        if missing_phone:
+            _check(
+                checks,
+                "phone_provider",
+                "fail",
+                "Hero SMS 手机号注册配置不完整" if is_hero_sms else "手机号注册需要 phone provider 配置",
+                missing=[f"phone.{x}" for x in missing_phone],
+                action=(
+                    "在 Web 配置向导步骤 03 选择手机号，填写 Hero API Key；或配置 provider=hero_sms、base_url=https://hero-sms.com/stubs/handler_api.php、service=tg、country=2，并设置 HERO_SMS_API_KEY；拿号/取码使用 getNumberV2/getStatusV2"
+                    if is_hero_sms
+                    else "在注册配置里启用 phone，并配置拿号接口 allocate_path 与验证码接口 otp_path"
+                ),
+            )
+        else:
+            _check(
+                checks,
+                "phone_provider",
+                "ok" if auth_hint or is_hero_sms else "warn",
+                "Hero SMS provider 已配置" if is_hero_sms else ("手机号 provider 已配置" if auth_hint else "手机号 provider 已配置；未检测到 API key（若接口无需鉴权可忽略）"),
+                blocking=False,
+                details=(
+                    f"{_text(phone.get('base_url'))} service={_text(phone.get('service'))} country={_text(phone.get('country'))} maxPrice={_text(phone.get('maxPrice') or phone.get('max_price')) or '<empty>'}"
+                    if is_hero_sms
+                    else _text(phone.get("base_url"))
+                ),
+            )
     mail = reg_cfg.get("mail") if isinstance(reg_cfg.get("mail"), dict) else {}
     if _text(mail.get("mode")) == "imap_list":
         accounts_path = Path(_text(mail.get("accounts_path")))

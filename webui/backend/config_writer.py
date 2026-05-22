@@ -124,6 +124,22 @@ def _project_reg(answers: dict) -> dict:
     """Map flat wizard answers onto CTF-reg config schema."""
     out: dict = {}
     pm = _payment_method(answers)
+    if "registration" in answers:
+        reg = answers.get("registration") or {}
+        method = str(reg.get("method") or "").strip()
+        if method:
+            out["registration"] = {"method": method}
+    if "phone" in answers:
+        phone = answers.get("phone") or {}
+        if phone.get("enabled") or phone.get("base_url"):
+            allowed = {
+                "enabled", "provider", "base_url", "api_key", "api_key_env",
+                "country", "service", "maxPrice", "max_price", "lease_ttl_s", "request_timeout_s", "allocate_path",
+                "otp_path", "otp_method", "otp_timeout_s", "otp_poll_interval_s",
+                "release_path", "fail_path", "verified_path", "headers",
+                "allocate_payload",
+            }
+            out["phone"] = {k: v for k, v in phone.items() if k in allowed}
     mail_mode = ((answers.get("mail") or {}).get("mode") or "cloudflare_kv").strip()
     if mail_mode == "imap_list":
         mail = answers.get("mail") or {}

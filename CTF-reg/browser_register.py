@@ -82,6 +82,31 @@ def _parse_proxy(proxy_url: str):
     }
 
 
+def _env_bool(name: str):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return None
+
+
+def _camoufox_headless() -> bool:
+    """Allow local debugging to force a visible Camoufox window."""
+    for name in ("REG_HEADLESS", "CAMOUFOX_HEADLESS", "HEADLESS"):
+        forced = _env_bool(name)
+        if forced is not None:
+            return forced
+    for name in ("REG_VISIBLE", "CAMOUFOX_VISIBLE"):
+        visible = _env_bool(name)
+        if visible is not None:
+            return not visible
+    return not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def _page_text(page) -> str:
     try:
         return page.inner_text("body", timeout=3000)
@@ -152,10 +177,11 @@ def browser_register(cfg, mail_provider) -> dict:
     logger.info(f"[browser-reg] 密码: {password}  姓名: {first_name} {last_name}")
 
     cf_proxy = _parse_proxy(cfg.proxy)
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    headless = _camoufox_headless()
 
     tmp_profile = tempfile.mkdtemp(prefix="chatgpt_reg_")
     logger.info(f"[browser-reg] 临时 profile: {tmp_profile}")
+    logger.info("[browser-reg] Camoufox headless=%s", headless)
 
     result = {
         "email": email,
@@ -171,7 +197,7 @@ def browser_register(cfg, mail_provider) -> dict:
 
     try:
         with Camoufox(
-            headless=not has_display,
+            headless=headless,
             humanize=True,
             persistent_context=True,
             user_data_dir=tmp_profile,

@@ -58,3 +58,19 @@ def test_clear_runtime_data_preserves_durable_runtime_config(db):
     assert db.get_runtime_json("wa_session_snapshot", {})["data"] == "snapshot"
     assert db.get_runtime_json("daemon_state", {}) == {}
     assert db.get_runtime_json("wa_state", {}) == {}
+
+
+def test_registered_account_stores_phone_registration_fields(db):
+    db.add_registered_account({
+        "email": "phone@example.com",
+        "register_method": "phone_browser",
+        "phone_number": "81234567890",
+        "phone_dial_code": "62",
+        "phone_country": "2",
+    })
+
+    row = db.iter_registered_accounts()[0]
+    assert row["register_method"] == "phone_browser"
+    assert row["phone_number"] == "81234567890"
+    assert row["phone_dial_code"] == "62"
+    assert row["phone_country"] == "2"
