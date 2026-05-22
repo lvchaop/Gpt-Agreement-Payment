@@ -56,6 +56,7 @@
     "service": "tg",
     "maxPrice": "",
     "lease_ttl_s": 300,
+    "max_number_attempts": 3,
     "allocate_path": "/api/phones/allocate",
     "otp_path": "/api/phones/{lease_id}/otp",
     "otp_method": "GET",

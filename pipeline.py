@@ -579,6 +579,8 @@ def _normalize_register_method(value: str | None) -> str:
         return "protocol"
     if v in ("phone", "phone_browser", "phone_camoufox", "phone_playwright"):
         return "phone_browser"
+    if v in ("phone_protocol", "phone_http", "phone_api"):
+        return "phone_protocol"
     raise RegistrationError(f"未知注册路径: {value}")
 
 
@@ -600,8 +602,8 @@ def register(cardw_config_path, proxy=None, python="python3", timeout=600,
 
     注册路径优先级：显式 register_method > WEBUI_REG_METHOD/WEBUI_REG_MODE >
     config.registration.method > 旧 browser 参数 > 默认 browser。
-    `phone_browser` 走手机号入口注册，并仍返回兼容的 email/session/access_token
-    结构。
+    `phone_browser` 走手机号入口注册；`phone_protocol` 走手机号纯协议注册，
+    两者都返回兼容的 email/session/access_token 结构。
     WebUI 在 Run 页加了切换按钮，每次启动 pipeline 时把选择透传成环境变量。
 
     返回 dict: {email, session_token, access_token, device_id, ...}
@@ -656,6 +658,32 @@ try:
 except Exception:
     pass
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
+"""
+    elif method == "phone_protocol":
+        script = r"""
+import json, logging, os, sys
+auth_bundle_dir = sys.argv[1]
+config_path = sys.argv[2]
+sys.path.insert(0, auth_bundle_dir)
+from config import Config
+from auth_flow import AuthFlow
+from mail_provider import MailProvider
+from phone_provider import PhoneProvider
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+cfg = Config.from_file(config_path)
+try:
+    cfg.phone.enabled = True
+except Exception:
+    pass
+mail = MailProvider.from_config(cfg.mail, config_path=config_path)
+phone = PhoneProvider.from_config(cfg.phone)
+flow = AuthFlow(cfg)
+result = flow.run_phone_register(mail, phone)
+try:
+    mail.mark_used(result.email)
+except Exception:
+    pass
+print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False), flush=True)
 """
     else:
         script = r"""
@@ -1089,11 +1117,12 @@ def _register_one(args_tuple):
             effective = temp_cardw
         r = register(effective, register_method=register_method)
         return {
+            **r,
             "index": idx,
+            "batch_index": idx,
             "status": "ok",
             "picked_domain": picked_domain,
             "proxy_stage_plan": stage_plan.to_dict() if stage_plan.has_any() else {},
-            **r,
         }
     except Exception as e:
         return {
@@ -1111,7 +1140,7 @@ def _register_one(args_tuple):
 
 def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     """批量运行 N 次。可选 modifier:
-       - register_only=True: 每次只 register（不付费），workers 串行
+       - register_only=True: 每次只 register（不付费），workers>1 并发
        - pay_only=True:      每次只 pay_only（复用未付账号），workers 串行
        - 都不开:              每次走完整 pipeline（注册+付费）
     """
@@ -1128,41 +1157,68 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     card_cfg = _read_card_cfg(card_config_path)
     cardw_path = _load_cardw_path_from_card_cfg(card_cfg, kwargs.get("cardw_config_path"))
 
-    # ── register-only batch：每次 register，串行（避免并行同 IP 触发风控）
+    # ── register-only batch：每次 register；workers>1 时并发
     if is_register_only:
         if not cardw_path:
             print("[batch:register-only] 缺 cardw_config_path", file=sys.stderr)
             sys.exit(2)
-        print(f"\n[batch] === register-only × {count} 串行 ===")
         results = []
         ok_count = 0
-        for i in range(count):
-            print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (register-only)\n{'#'*60}")
-            plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
-            effective_cardw = cardw_path
-            temp_cardw = None
-            try:
-                if plan.register:
-                    temp_cardw = _rewrite_cardw_with_domain(cardw_path, "", plan.register)
-                    effective_cardw = temp_cardw
-                    print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
-                r = register(effective_cardw, register_method=register_method)
-                r["batch_index"] = i
-                if plan.has_any():
-                    r["proxy_stage_plan"] = plan.to_dict()
-                if r.get("status") == "ok":
-                    ok_count += 1
-            except Exception as e:
-                r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
-                print(f"[batch] ✗ 注册异常: {e}")
-            finally:
-                if temp_cardw and os.path.exists(temp_cardw):
-                    try: os.unlink(temp_cardw)
-                    except Exception: pass
-            results.append(r)
-            print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
-            if i < count - 1 and delay > 0:
-                time.sleep(delay)
+
+        if workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            print(f"\n[batch] === register-only × {count} 并发 workers={workers} ===")
+            tasks = [
+                (i, cardw_path, None, proxy_stage_allocator, proxy_stage_plan, register_method)
+                for i in range(count)
+            ]
+            results = [None] * count
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_register_one, task): task[0] for task in tasks}
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    r = future.result()
+                    r["batch_index"] = idx
+                    results[idx] = r
+                    if r.get("status") == "ok":
+                        ok_count += 1
+                    mark = "✓" if r.get("status") == "ok" else "✗"
+                    email = r.get("email") or "?"
+                    err = f" error={r.get('error', '')}" if r.get("status") != "ok" else ""
+                    done = sum(1 for item in results if item)
+                    print(f"[batch] {mark} register-only [{done}/{count}] idx={idx} email={email}{err}")
+            results = [r for r in results if r is not None]
+        else:
+            print(f"\n[batch] === register-only × {count} 串行 ===")
+            for i in range(count):
+                print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (register-only)\n{'#'*60}")
+                plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+                effective_cardw = cardw_path
+                temp_cardw = None
+                try:
+                    if plan.register:
+                        temp_cardw = _rewrite_cardw_with_domain(cardw_path, "", plan.register)
+                        effective_cardw = temp_cardw
+                        print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
+                    r = register(effective_cardw, register_method=register_method)
+                    r.setdefault("status", "ok")
+                    r["batch_index"] = i
+                    if plan.has_any():
+                        r["proxy_stage_plan"] = plan.to_dict()
+                    if r.get("status") == "ok":
+                        ok_count += 1
+                except Exception as e:
+                    r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
+                    print(f"[batch] ✗ 注册异常: {e}")
+                finally:
+                    if temp_cardw and os.path.exists(temp_cardw):
+                        try: os.unlink(temp_cardw)
+                        except Exception: pass
+                results.append(r)
+                print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
+                if i < count - 1 and delay > 0:
+                    time.sleep(delay)
         print(f"\n[batch] register-only 完成: {ok_count}/{count} 成功")
         return results
 
@@ -3850,8 +3906,8 @@ def main():
     parser.add_argument("--register-only", action="store_true",
                         help="仅注册，不支付")
     parser.add_argument("--register-method", default="",
-                        choices=("", "browser", "protocol", "phone_browser"),
-                        help="注册路径：browser / protocol / phone_browser；空则读 WEBUI_REG_MODE 或注册配置")
+                        choices=("", "browser", "protocol", "phone_browser", "phone_protocol"),
+                        help="注册路径：browser / protocol / phone_browser / phone_protocol；空则读 WEBUI_REG_MODE 或注册配置")
     parser.add_argument("--pay-only", action="store_true",
                         help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,

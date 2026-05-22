@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from webui.backend.db import get_db
 
 
@@ -79,7 +81,8 @@ def test_config_health_ok_with_cloudflare_secrets(client, tmp_path, monkeypatch)
     assert not body["blocking"]
 
 
-def test_config_health_phone_register_requires_provider(client, tmp_path, monkeypatch):
+@pytest.mark.parametrize("register_mode", ["phone_browser", "phone_protocol"])
+def test_config_health_phone_register_requires_provider(client, tmp_path, monkeypatch, register_mode):
     _login(client)
     _seed_configs(tmp_path, monkeypatch)
 
@@ -96,7 +99,7 @@ def test_config_health_phone_register_requires_provider(client, tmp_path, monkey
     r = client.post("/api/config/health", json={
         "mode": "single",
         "paypal": True,
-        "register_mode": "phone_browser",
+        "register_mode": register_mode,
     })
     assert r.status_code == 200
     body = r.json()
@@ -105,7 +108,8 @@ def test_config_health_phone_register_requires_provider(client, tmp_path, monkey
     assert "phone_provider" in names
 
 
-def test_config_health_phone_register_hero_sms_ok(client, tmp_path, monkeypatch):
+@pytest.mark.parametrize("register_mode", ["phone_browser", "phone_protocol"])
+def test_config_health_phone_register_hero_sms_ok(client, tmp_path, monkeypatch, register_mode):
     _login(client)
     _pay_path, reg_path = _seed_configs(tmp_path, monkeypatch)
     monkeypatch.setenv("HERO_SMS_API_KEY", "secret-token")
@@ -134,7 +138,7 @@ def test_config_health_phone_register_hero_sms_ok(client, tmp_path, monkeypatch)
     r = client.post("/api/config/health", json={
         "mode": "single",
         "paypal": True,
-        "register_mode": "phone_browser",
+        "register_mode": register_mode,
     })
     assert r.status_code == 200
     body = r.json()

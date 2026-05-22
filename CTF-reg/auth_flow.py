@@ -40,6 +40,10 @@ class AuthResult:
         self.id_token: str = ""
         self.refresh_token: str = ""
         self.cookie_header: str = ""
+        self.register_method: str = ""
+        self.phone_number: str = ""
+        self.phone_dial_code: str = ""
+        self.phone_country: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -55,6 +59,10 @@ class AuthResult:
             "id_token": self.id_token,
             "refresh_token": self.refresh_token,
             "cookie_header": self.cookie_header,
+            "register_method": self.register_method,
+            "phone_number": self.phone_number,
+            "phone_dial_code": self.phone_dial_code,
+            "phone_country": self.phone_country,
         }
 
 
@@ -85,6 +93,7 @@ class AuthFlow:
         self._client_auth_session_id: str = ""
         self._dump_login_verifier: str = ""
         self._codex_rt_attempted: bool = False
+        self._last_register_password_error: str = ""
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
             "1", "true", "yes", "on"
@@ -939,6 +948,334 @@ class AuthFlow:
             logger.warning("add-phone 阶段未成功: %s", last_err)
         return continue_url or ""
 
+    def _send_phone_otp(self) -> str:
+        """Trigger phone OTP delivery for the phone-as-username signup state."""
+        headers = self._common_headers("https://auth.openai.com/create-account/password")
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        headers.pop("Origin", None)
+        resp = self.session.get(
+            "https://auth.openai.com/api/accounts/phone-otp/send",
+            headers=headers,
+            timeout=30,
+            allow_redirects=False,
+        )
+        self._trace_http("phone_otp_send", resp)
+        if resp.status_code not in (200, 302):
+            raise RuntimeError(f"phone-otp/send 失败: {resp.status_code} - {(resp.text or '')[:220]}")
+        return (resp.headers.get("Location", "") or "").strip()
+
+    @staticmethod
+    def _phone_protocol_password() -> str:
+        return f"{secrets.token_urlsafe(14)}Aa1"
+
+    @staticmethod
+    def _phone_protocol_max_number_attempts(phone_provider) -> int:
+        cfg = getattr(phone_provider, "cfg", None)
+        raw = (
+            os.getenv("PHONE_PROTOCOL_MAX_NUMBER_ATTEMPTS", "")
+            or str(getattr(cfg, "max_number_attempts", "") or "")
+            or "3"
+        )
+        try:
+            return max(1, min(int(raw), 10))
+        except Exception:
+            return 3
+
+    @staticmethod
+    def _is_invalid_phone_register_error(message: str) -> bool:
+        text = str(message or "").lower()
+        return (
+            "number you provided is not valid" in text
+            or "phone number" in text and "not valid" in text
+        )
+
+    def _reset_phone_protocol_attempt_state(self) -> None:
+        self.session = create_http_session(
+            proxy=self.config.proxy,
+            impersonate=self._impersonate_candidates[self._impersonate_idx],
+        )
+        self.result.device_id = ""
+        self.result.csrf_token = ""
+        self._last_sentinel_token = ""
+        self._last_register_password_error = ""
+        self._client_auth_session_dump = {}
+        self._client_auth_session_id = ""
+        self._dump_login_verifier = ""
+
+    @staticmethod
+    def _lease_national_phone(lease) -> str:
+        national = str(getattr(lease, "phone_national", "") or "").strip()
+        if national:
+            return national
+        e164_digits = re.sub(r"\D+", "", str(getattr(lease, "phone_e164", "") or ""))
+        dial = re.sub(r"\D+", "", str(getattr(lease, "country_phone_code", "") or ""))
+        if dial and e164_digits.startswith(dial):
+            return e164_digits[len(dial):]
+        return e164_digits
+
+    @staticmethod
+    def _bounded_otp_timeout(value: Any, *, default: int = 120) -> int:
+        try:
+            raw = int(value or default)
+        except Exception:
+            raw = default
+        return max(1, min(raw, 120))
+
+    def _mail_otp_timeout_s(self, mail_provider: MailProvider) -> int:
+        return self._bounded_otp_timeout(
+            os.getenv("OTP_TIMEOUT", str(getattr(mail_provider, "otp_timeout", 120) or 120))
+        )
+
+    def _build_platform_authorize_url(self, phone_e164: str) -> tuple[str, str, str, str]:
+        client_id = (os.getenv("OPENAI_PLATFORM_CLIENT_ID", "") or "").strip() or "app_2SKx67EdpoN0G6j64rFvigXD"
+        redirect_uri = (
+            (os.getenv("OPENAI_PLATFORM_REDIRECT_URI", "") or "").strip()
+            or "https://platform.openai.com/auth/callback"
+        )
+        scope = (os.getenv("OPENAI_PLATFORM_SCOPE", "") or "").strip() or "openid profile email offline_access"
+        verifier, challenge = self._build_pkce_pair()
+        state = self._b64url_no_pad(secrets.token_bytes(40))
+        nonce = self._b64url_no_pad(secrets.token_bytes(40))
+        device_id = (self.result.device_id or self.session.cookies.get("oai-did", "") or str(uuid.uuid4())).strip()
+        self.result.device_id = device_id
+        params = {
+            "issuer": "https://auth.openai.com",
+            "client_id": client_id,
+            "audience": "https://api.openai.com/v1",
+            "redirect_uri": redirect_uri,
+            "device_id": device_id,
+            "screen_hint": "login_or_signup",
+            "max_age": "0",
+            "login_hint": phone_e164,
+            "scope": scope,
+            "response_type": "code",
+            "response_mode": "query",
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9",
+        }
+        return f"https://auth.openai.com/api/accounts/authorize?{urlencode(params)}", verifier, redirect_uri, client_id
+
+    def _platform_oauth_token_exchange(
+        self,
+        continue_url: str,
+        *,
+        verifier: str,
+        redirect_uri: str,
+        client_id: str,
+    ) -> None:
+        code = self._extract_query_first(continue_url, ["code"])
+        if not code:
+            raise RuntimeError("Platform 邮箱绑定完成但 callback 缺 code")
+        try:
+            callback_resp = self.session.get(
+                continue_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://auth.openai.com/",
+                    "User-Agent": USER_AGENT,
+                },
+                timeout=30,
+                allow_redirects=True,
+            )
+            self._trace_http("platform_callback_page", callback_resp)
+        except Exception as e:
+            logger.debug("Platform callback 页面请求失败，继续 token exchange: %s", e)
+        headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "auth0-client": "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9",
+            "Origin": "https://platform.openai.com",
+            "Referer": "https://platform.openai.com/",
+            "User-Agent": USER_AGENT,
+        }
+        body = {
+            "client_id": client_id,
+            "code_verifier": verifier,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/oauth/token",
+            headers=headers,
+            json=body,
+            timeout=30,
+        )
+        self._trace_http("platform_oauth_token_exchange", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Platform OAuth token exchange 失败: {resp.status_code} - {(resp.text or '')[:260]}")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        self.result.id_token = data.get("id_token", self.result.id_token)
+        self.result.refresh_token = data.get("refresh_token", self.result.refresh_token)
+
+    @staticmethod
+    def _is_platform_password_login_location(location: str) -> bool:
+        loc = (location or "").strip().lower()
+        return "/log-in/password" in loc
+
+    def _platform_authorize_add_email_redirect(self, authorize_url: str, trace_step: str):
+        resp = self.session.get(
+            authorize_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://platform.openai.com/login",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=30,
+            allow_redirects=False,
+        )
+        self._trace_http(trace_step, resp)
+        location = (resp.headers.get("Location", "") or "").strip()
+        return resp, location
+
+    def _platform_password_login_for_add_email(self, location: str) -> str:
+        if not self._is_platform_password_login_location(location):
+            return ""
+
+        password = (self.result.password or "").strip()
+        if not password:
+            raise RuntimeError("Platform authorize 要求密码登录，但当前手机号注册结果缺 password")
+
+        password_page_url = urljoin("https://auth.openai.com", location)
+        logger.info("[phone-protocol] Platform authorize 要求密码登录，使用刚注册手机号密码补登录")
+        try:
+            page_resp = self.session.get(
+                password_page_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://platform.openai.com/login",
+                    "User-Agent": USER_AGENT,
+                },
+                timeout=30,
+                allow_redirects=True,
+            )
+            self._trace_http("platform_phone_password_page", page_resp)
+        except Exception as e:
+            logger.debug("打开 Platform password 页面失败，继续尝试 password/verify: %s", e)
+
+        step = self.login_password_verify(password)
+        page_type = self._extract_page_type(step)
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+        logger.info(
+            "[phone-protocol] Platform 手机号密码登录完成: page=%s continue=%s",
+            page_type or "-",
+            (continue_url or "")[:160] or "-",
+        )
+        try:
+            self.fetch_client_auth_session_dump("post_platform_phone_password_login")
+        except Exception:
+            pass
+        return continue_url
+
+    def _bind_email_protocol_via_platform(
+        self,
+        mail_provider: MailProvider,
+        *,
+        phone_e164: str,
+    ) -> str:
+        email = mail_provider.create_mailbox()
+        self.result.email = email
+        issued_at = time.time()
+        logger.info("[phone-protocol] Platform add-email: %s", email)
+
+        authorize_url, verifier, redirect_uri, client_id = self._build_platform_authorize_url(phone_e164)
+        resp, location = self._platform_authorize_add_email_redirect(authorize_url, "platform_authorize_add_email")
+        if (
+            resp.status_code in (301, 302, 303, 307, 308)
+            and "add-email" not in location
+            and self._is_platform_password_login_location(location)
+        ):
+            password_continue_url = self._platform_password_login_for_add_email(location)
+            if "add-email" in (password_continue_url or ""):
+                location = password_continue_url
+                resp = None
+            else:
+                resp, location = self._platform_authorize_add_email_redirect(
+                    authorize_url,
+                    "platform_authorize_add_email_after_password",
+                )
+
+        status_code = getattr(resp, "status_code", 302 if location else 0)
+        if status_code not in (301, 302, 303, 307, 308) or "add-email" not in location:
+            raise RuntimeError(
+                f"Platform authorize 未进入 add-email: status={status_code} location={location[:180]}"
+            )
+        location = urljoin("https://auth.openai.com", location)
+
+        try:
+            page_resp = self.session.get(
+                location,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://platform.openai.com/login",
+                    "User-Agent": USER_AGENT,
+                },
+                timeout=30,
+                allow_redirects=True,
+            )
+            self._trace_http("platform_add_email_page", page_resp)
+        except Exception as e:
+            logger.debug("打开 add-email 页面失败，继续尝试 send: %s", e)
+
+        headers = self._common_headers("https://auth.openai.com/add-email")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/add-email/send",
+            headers=headers,
+            json={"email": email},
+            timeout=30,
+        )
+        self._trace_http("platform_add_email_send", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"add-email/send 失败: {resp.status_code} - {(resp.text or '')[:260]}")
+        try:
+            send_data = resp.json()
+        except Exception:
+            send_data = {}
+        send_page = send_data.get("page") if isinstance(send_data.get("page"), dict) else {}
+        send_page_type = str(send_page.get("type") or "").strip()
+        if send_page_type and send_page_type != "email_otp_verification":
+            raise RuntimeError(f"add-email/send 未进入邮箱验证码页: page={send_page_type}")
+        self.fetch_client_auth_session_dump("post_add_email_send")
+
+        code = mail_provider.wait_for_otp(
+            email,
+            timeout=self._mail_otp_timeout_s(mail_provider),
+            issued_after=issued_at,
+        )
+        headers = self._common_headers("https://auth.openai.com/email-verification")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/email-otp/validate",
+            headers=headers,
+            json={"code": code},
+            timeout=30,
+        )
+        self._trace_http("platform_email_otp_validate", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Platform 邮箱 OTP 验证失败: {resp.status_code} - {(resp.text or '')[:260]}")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(data))
+        if not continue_url:
+            raise RuntimeError("Platform 邮箱 OTP 验证后缺 continue_url")
+        self._platform_oauth_token_exchange(
+            continue_url,
+            verifier=verifier,
+            redirect_uri=redirect_uri,
+            client_id=client_id,
+        )
+        self.result.email = email
+        return email
+
     def _codex_refresh_retry_after_add_phone(
         self,
         auth_url: str,
@@ -1298,12 +1635,32 @@ class AuthFlow:
         return csrf
 
     # ── Step 3: 获取 auth URL ──
-    def get_auth_url(self, csrf_token: str) -> str:
+    def get_auth_url(
+        self,
+        csrf_token: str,
+        *,
+        login_hint: str = "",
+        screen_hint: str = "",
+        prompt: str = "",
+    ) -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
         headers = self._common_headers("https://chatgpt.com/auth/login")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        signin_url = "https://chatgpt.com/api/auth/signin/openai"
+        query = {}
+        if login_hint or screen_hint or prompt:
+            if not self.result.device_id:
+                self.result.device_id = str(uuid.uuid4())
+            query["prompt"] = prompt or "login"
+            query["ext-oai-did"] = self.result.device_id
+            query["auth_session_logging_id"] = str(uuid.uuid4())
+            if screen_hint:
+                query["screen_hint"] = screen_hint
+            if login_hint:
+                query["login_hint"] = login_hint
+            signin_url = f"{signin_url}?{urlencode(query)}"
         resp = self.session.post(
-            "https://chatgpt.com/api/auth/signin/openai",
+            signin_url,
             headers=headers,
             data={
                 "csrfToken": csrf_token,
@@ -1464,9 +1821,10 @@ class AuthFlow:
             return True
 
     # ── Step 6.5: 注册密码 ──
-    def register_password(self, email: str) -> bool:
+    def register_password(self, username: str) -> bool:
         logger.info("[5.5/10] 注册密码...")
-        password = (self.result.password or "").strip() or self._default_password_from_email(email)
+        self._last_register_password_error = ""
+        password = (self.result.password or "").strip() or self._default_password_from_email(username)
         self.result.password = password
 
         # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
@@ -1498,11 +1856,12 @@ class AuthFlow:
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/user/register",
             headers=headers,
-            json={"password": password, "username": email},
+            json={"password": password, "username": username},
             timeout=30,
         )
         self._trace_http("register_password", resp)
         if resp.status_code != 200:
+            self._last_register_password_error = resp.text or ""
             logger.warning(f"密码注册返回 {resp.status_code}: {resp.text[:200]}")
             return False
         logger.info("密码注册成功")
@@ -2097,6 +2456,132 @@ class AuthFlow:
             return False
 
     # ── 完整注册流程 ──
+    def run_phone_register(self, mail_provider: MailProvider, phone_provider) -> AuthResult:
+        """Phone-as-username registration over HTTP protocol only."""
+        if not self.check_proxy():
+            logger.warning("网络预检查未通过，继续尝试手机号协议注册链路以获取精确错误...")
+
+        lease = None
+        bound_email = ""
+        success = False
+        max_attempts = self._phone_protocol_max_number_attempts(phone_provider)
+        try:
+            self.result.register_method = "phone_protocol"
+            self.result.password = self._phone_protocol_password()
+            phone_e164 = ""
+            otp_resp = {}
+
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    self._reset_phone_protocol_attempt_state()
+                lease = phone_provider.allocate()
+                phone_e164 = str(getattr(lease, "phone_e164", "") or "").strip()
+                if not phone_e164.startswith("+"):
+                    raise RuntimeError(f"phone provider 返回的 phone_e164 不合法: {phone_e164}")
+                self.result.phone_number = self._lease_national_phone(lease)
+                self.result.phone_dial_code = str(getattr(lease, "country_phone_code", "") or "").strip()
+                self.result.phone_country = str(getattr(getattr(phone_provider, "cfg", None), "country", "") or "")
+                logger.info(
+                    "[phone-protocol] 分配手机号 attempt=%s/%s lease=%s phone=%s country=+%s",
+                    attempt,
+                    max_attempts,
+                    getattr(lease, "lease_id", ""),
+                    getattr(lease, "masked_phone", "") or phone_e164[:4] + "***",
+                    self.result.phone_dial_code,
+                )
+
+                csrf_token = self.get_csrf_token()
+                auth_url = self.get_auth_url(
+                    csrf_token,
+                    login_hint=phone_e164,
+                    screen_hint="login_or_signup",
+                    prompt="login",
+                )
+                device_id = self.auth_oauth_init(auth_url)
+                self.get_sentinel_token(device_id)
+                if not self.register_password(phone_e164):
+                    err = self._last_register_password_error
+                    if self._is_invalid_phone_register_error(err) and attempt < max_attempts:
+                        logger.warning(
+                            "[phone-protocol] 手机号被 OpenAI 判定无效，换号重试 attempt=%s/%s lease=%s",
+                            attempt,
+                            max_attempts,
+                            getattr(lease, "lease_id", ""),
+                        )
+                        try:
+                            phone_provider.mark_failed(getattr(lease, "lease_id", ""), "invalid_phone_number")
+                        except Exception:
+                            pass
+                        lease = None
+                        continue
+                    detail = (err or "")[:220]
+                    raise RuntimeError(f"手机号协议注册密码提交失败: {detail or 'unknown'}")
+                self._send_phone_otp()
+                logger.info("[phone-protocol] 等待手机号 OTP ...")
+                try:
+                    phone_code = phone_provider.poll_otp(getattr(lease, "lease_id", ""))
+                    otp_resp = self._phone_otp_validate(phone_code)
+                    break
+                except TimeoutError as e:
+                    if attempt < max_attempts:
+                        logger.warning(
+                            "[phone-protocol] 手机号 OTP 超时，换号重试 attempt=%s/%s lease=%s: %s",
+                            attempt,
+                            max_attempts,
+                            getattr(lease, "lease_id", ""),
+                            e,
+                        )
+                        try:
+                            phone_provider.mark_failed(getattr(lease, "lease_id", ""), "phone_otp_timeout")
+                        except Exception:
+                            pass
+                        lease = None
+                        continue
+                    raise
+            else:
+                raise RuntimeError(f"手机号协议注册失败，已换号重试 {max_attempts} 次")
+            self.fetch_client_auth_session_dump("post_phone_otp_protocol")
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+            if continue_url and "/api/auth/callback/openai" in continue_url:
+                account_continue_url = continue_url
+            else:
+                account_continue_url = self.create_account()
+
+            callback_url, final_url = self.follow_redirect_chain(account_continue_url)
+            self.get_auth_session()
+            bound_email = self._bind_email_protocol_via_platform(
+                mail_provider,
+                phone_e164=phone_e164,
+            )
+            self.result.email = bound_email
+            self.get_auth_session()
+
+            if not self.result.is_valid():
+                raise RuntimeError("手机号协议注册完成但未获取有效 session/access_token")
+            if not self.result.email:
+                raise RuntimeError("手机号协议注册完成但缺绑定邮箱")
+            phone_provider.mark_verified(getattr(lease, "lease_id", ""))
+            try:
+                mail_provider.mark_used(bound_email)
+            except Exception:
+                pass
+            success = True
+            logger.info("[phone-protocol] 注册完成 email=%s", self.result.email)
+            return self.result
+        except Exception:
+            cleanup_email = bound_email or self.result.email
+            if cleanup_email:
+                try:
+                    mail_provider.mark_unused(cleanup_email)
+                except Exception:
+                    pass
+            if lease is not None and not success:
+                try:
+                    phone_provider.mark_failed(getattr(lease, "lease_id", ""), "phone_protocol_failed")
+                except Exception:
+                    pass
+            raise
+
     def run_register(self, mail_provider: MailProvider) -> AuthResult:
         """执行完整注册流程"""
         # 检查网络

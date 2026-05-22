@@ -1,5 +1,7 @@
 import json
 import sys
+import threading
+import time
 import types
 
 import pipeline
@@ -54,6 +56,52 @@ def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch
     assert selected["email"] == "retry@example.com"
     assert selected["session_token"] == "sess-retry"
     assert selected["access_token"] == "at-retry"
+
+
+def test_register_only_batch_uses_workers(tmp_path, monkeypatch):
+    cardw_config = tmp_path / "reg.json"
+    cardw_config.write_text("{}", encoding="utf-8")
+    card_config = tmp_path / "pay.json"
+    card_config.write_text(json.dumps({
+        "fresh_checkout": {
+            "auth": {
+                "auto_register": {"config_path": str(cardw_config)},
+            },
+        },
+    }), encoding="utf-8")
+
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    methods: list[str | None] = []
+
+    def fake_register(*args, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            methods.append(kwargs.get("register_method"))
+            idx = len(methods)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return {"email": f"user{idx}@example.test"}
+
+    monkeypatch.setattr(pipeline, "register", fake_register)
+
+    results = pipeline.batch(
+        str(card_config),
+        3,
+        delay=0,
+        workers=3,
+        register_only=True,
+        register_method="phone_protocol",
+    )
+
+    assert len(results) == 3
+    assert all(r["status"] == "ok" for r in results)
+    assert all(m == "phone_protocol" for m in methods)
+    assert peak > 1
 
 
 def test_pay_only_treats_already_paid_error_as_consumed(tmp_path, monkeypatch):

@@ -41,7 +41,7 @@ _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls 
 
 _PHONE_CONFIG_KEYS = {
     "enabled", "provider", "base_url", "api_key_env", "country", "service",
-    "maxPrice", "max_price", "lease_ttl_s", "request_timeout_s", "allocate_path", "otp_path",
+    "maxPrice", "max_price", "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path", "otp_path",
     "otp_method", "otp_timeout_s", "otp_poll_interval_s", "release_path",
     "fail_path", "verified_path", "headers", "allocate_payload",
 }
@@ -61,7 +61,7 @@ def _read_reg_config() -> dict:
         return {}
 
 
-def _runtime_phone_config(phone: Optional[dict]) -> tuple[str, dict]:
+def _runtime_phone_config(phone: Optional[dict], *, method: str = "phone_browser") -> tuple[str, dict]:
     """Create a temporary reg config for Run-page phone overrides.
 
     The API key is passed via environment instead of being written to disk.
@@ -84,7 +84,7 @@ def _runtime_phone_config(phone: Optional[dict]) -> tuple[str, dict]:
     merged.setdefault("country", "2")
     merged.setdefault("service", "tg")
     reg_cfg["phone"] = merged
-    reg_cfg["registration"] = {"method": "phone_browser"}
+    reg_cfg["registration"] = {"method": method if method in {"phone_browser", "phone_protocol"} else "phone_browser"}
 
     env_overrides: dict = {}
     api_key = str(phone.get("api_key") or "").strip()
@@ -182,7 +182,7 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.append("--free-register")
             if count > 0:
                 cmd.extend(["--count", str(count)])
-            if rm in ("protocol", "phone_browser"):
+            if rm in ("protocol", "phone_browser", "phone_protocol"):
                 cmd.extend(["--register-method", rm])
         else:
             cmd.append("--free-backfill-rt")
@@ -193,7 +193,7 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.extend(["--gopay-otp-file", gopay_otp_file])
     elif paypal:
         cmd.append("--paypal")
-    if rm in ("protocol", "phone_browser"):
+    if rm in ("protocol", "phone_browser", "phone_protocol"):
         cmd.extend(["--register-method", rm])
     # mode 决定循环结构（daemon ∞ / self_dealer / batch N / 单次）
     if mode == "daemon":
@@ -253,8 +253,11 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         rm = (register_mode or "browser").strip().lower()
         cardw_config_path = ""
         runtime_env_overrides = dict(env_overrides or {})
-        if rm in ("phone", "phone_browser"):
-            cardw_config_path, phone_env = _runtime_phone_config(phone)
+        if rm in ("phone", "phone_browser", "phone_protocol"):
+            cardw_config_path, phone_env = _runtime_phone_config(
+                phone,
+                method="phone_protocol" if rm == "phone_protocol" else "phone_browser",
+            )
             runtime_env_overrides.update(phone_env)
 
         cmd = build_cmd(mode, paypal, batch, workers, self_dealer,
@@ -298,8 +301,12 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         if gopay:
             env["WEBUI_GOPAY_OTP_URL"] = wa_relay.otp_url()
-        # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_browser=手机号入口
-        env["WEBUI_REG_MODE"] = "phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser")
+        # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_*=手机号入口/协议
+        env["WEBUI_REG_MODE"] = (
+            "phone_protocol"
+            if rm == "phone_protocol"
+            else ("phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser"))
+        )
         if runtime_env_overrides:
             for k, v in runtime_env_overrides.items():
                 if v is None:

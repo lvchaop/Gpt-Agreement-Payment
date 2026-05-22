@@ -70,14 +70,19 @@
               <input type="radio" value="phone_browser" v-model="form.register_mode" />
               手机号 (API)
             </label>
+            <label class="reg-mode-opt" :class="{ active: form.register_mode === 'phone_protocol' }">
+              <input type="radio" value="phone_protocol" v-model="form.register_mode" />
+              手机号 (纯协议)
+            </label>
           </div>
           <p v-if="!form.pay_only" class="ctl-hint">
             <code>browser</code> 走 Camoufox + Turnstile 真实执行（稳但慢，OpenAI 改 modal 后可能失败）；
             <code>protocol</code> 走 <code>auth_flow.AuthFlow</code> HTTP 直连（快，但可能被风控）。
-            <code>phone_browser</code> 进入手机号入口后调用 <code>phone</code> provider 拿号/取码。
+            <code>phone_browser</code> 进入手机号入口后调用 <code>phone</code> provider 拿号/取码；
+            <code>phone_protocol</code> 复用同一 provider 走纯协议。
             选择会自动持久化到 localStorage。
           </p>
-          <div v-if="!form.pay_only && form.register_mode === 'phone_browser'" class="phone-runtime">
+          <div v-if="!form.pay_only && isPhoneRegisterMode" class="phone-runtime">
             <div class="phone-runtime-head">
               <span>Hero SMS</span>
               <code>getNumberV2 / getStatusV2</code>
@@ -585,7 +590,7 @@ const form = ref({
   workers: 3,
   self_dealer: 4,
   count: 0, // free_register 模式：注册多少个后停（0 = 无限）
-  register_mode: (localStorage.getItem("webui.register_mode") || "browser") as "browser" | "protocol" | "phone_browser",
+  register_mode: (localStorage.getItem("webui.register_mode") || "browser") as "browser" | "protocol" | "phone_browser" | "phone_protocol",
 });
 const phoneRunForm = ref({
   provider: "hero_sms",
@@ -617,7 +622,7 @@ function applyPhoneAnswer(phone: any) {
 
 function runPayload() {
   const payload: any = { ...form.value };
-  if (!form.value.pay_only && form.value.register_mode === "phone_browser") {
+  if (!form.value.pay_only && isPhoneRegisterMode.value) {
     payload.phone = {
       ...phoneRunForm.value,
       enabled: true,
@@ -1491,6 +1496,9 @@ function stopOtpPolling() {
 
 const isFreeMode = computed(() =>
   form.value.mode === "free_register" || form.value.mode === "free_backfill_rt"
+);
+const isPhoneRegisterMode = computed(() =>
+  form.value.register_mode === "phone_browser" || form.value.register_mode === "phone_protocol"
 );
 
 watch(

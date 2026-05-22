@@ -269,7 +269,7 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
     if not _requires_registration(req):
         return
     method = _registration_method(req, reg_cfg)
-    if method == "phone_browser":
+    if method in {"phone_browser", "phone_protocol"}:
         phone = reg_cfg.get("phone") if isinstance(reg_cfg.get("phone"), dict) else {}
         phone_override = req.get("phone") if isinstance(req.get("phone"), dict) else {}
         if phone_override:
@@ -281,7 +281,7 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
         is_hero_sms = provider in {"hero", "hero_sms", "smshub", "sms_hub", "sms_activate", "smsactivate"}
         required = ("base_url", "service", "country") if is_hero_sms else ("base_url", "allocate_path", "otp_path")
         missing_phone = [key for key in required if _is_missing(phone.get(key))]
-        runtime_enabled = _text(req.get("register_mode")).lower().replace("-", "_") == "phone_browser"
+        runtime_enabled = _text(req.get("register_mode")).lower().replace("-", "_") in {"phone_browser", "phone_protocol"}
         if not phone.get("enabled") and not runtime_enabled:
             missing_phone.insert(0, "enabled")
         if is_hero_sms and _text(phone.get("country")) and not _text(phone.get("country")).isdigit():

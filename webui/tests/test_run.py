@@ -35,13 +35,14 @@ def test_run_preview_batch(client):
     assert "--workers" in body["cmd_str"]
 
 
-def test_run_preview_phone_register_mode(client):
+@pytest.mark.parametrize("register_mode", ["phone_browser", "phone_protocol"])
+def test_run_preview_phone_register_mode(client, register_mode):
     _login(client)
-    r = client.post("/api/run/preview", json={"mode": "single", "register_mode": "phone_browser"})
+    r = client.post("/api/run/preview", json={"mode": "single", "register_mode": register_mode})
     assert r.status_code == 200
     body = r.json()
     assert "--register-method" in body["cmd_str"]
-    assert "phone_browser" in body["cmd_str"]
+    assert register_mode in body["cmd_str"]
 
 
 def test_run_preview_self_dealer(client):

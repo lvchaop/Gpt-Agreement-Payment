@@ -81,7 +81,7 @@ class CaptchaConfig:
 @dataclass
 class RegistrationConfig:
     """注册路径配置。method 为空时由 pipeline / WEBUI_REG_MODE 决定。"""
-    method: str = ""  # browser | protocol | phone_browser
+    method: str = ""  # browser | protocol | phone_browser | phone_protocol
 
 
 @dataclass
@@ -103,6 +103,7 @@ class PhoneConfig:
     maxPrice: str = ""
     max_price: str = ""
     lease_ttl_s: int = 300
+    max_number_attempts: int = 3
     request_timeout_s: int = 20
     allocate_path: str = "/api/phones/allocate"
     otp_path: str = "/api/phones/{lease_id}/otp"

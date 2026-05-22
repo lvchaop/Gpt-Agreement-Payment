@@ -5,9 +5,9 @@
     <p class="step-sub">选择注册邮箱来源。Cloudflare 走 catch-all；邮箱列表支持 Gmail / Outlook / 自定义邮箱账号密码或 App Password。</p>
 
     <div class="term-divider" data-tail="──────────" style="margin-top:20px">注册路径</div>
-    <TermChoice v-model="registrationMethod" :options="registrationOptions" :cols="3" />
+    <TermChoice v-model="registrationMethod" :options="registrationOptions" :cols="2" />
 
-    <div v-if="registrationMethod === 'phone_browser'" class="form-stack" style="margin-top:22px">
+    <div v-if="isPhoneRegistrationMethod" class="form-stack" style="margin-top:22px">
       <TermChoice v-model="phoneForm.provider" :options="phoneProviderOptions" :cols="2" />
       <TermField v-model="phoneForm.base_url" label="手机号服务 · base_url" placeholder="https://hero-sms.com/stubs/handler_api.php" />
       <TermField v-model="phoneForm.api_key" label="Hero API Key · api_key" type="password" placeholder="YOUR_SECRET_TOKEN" />
@@ -172,13 +172,17 @@ const mailModeOptions = [
 const registrationOptions = [
   { value: "browser", label: "邮箱浏览器", desc: "Camoufox 走邮箱注册" },
   { value: "protocol", label: "邮箱协议", desc: "auth_flow HTTP 链路" },
-  { value: "phone_browser", label: "手机号", desc: "Phone 入口 + provider 拿号/取码" },
+  { value: "phone_browser", label: "手机号浏览器", desc: "Phone 入口 + provider 拿号/取码" },
+  { value: "phone_protocol", label: "手机号协议", desc: "手机号纯协议 + provider 拿号/取码" },
 ];
 const phoneProviderOptions = [
   { value: "hero_sms", label: "Hero SMS", desc: "getNumberV2 + getStatusV2" },
   { value: "http", label: "HTTP JSON", desc: "自建 allocate / otp 接口" },
 ];
 const phoneProviderKind = computed(() => (phoneForm.value.provider || "hero_sms").replace("-", "_"));
+const isPhoneRegistrationMethod = computed(() =>
+  registrationMethod.value === "phone_browser" || registrationMethod.value === "phone_protocol"
+);
 const zoneText = computed({
   get: () => form.value.zone_names.join("\n"),
   set: (v: string) => (form.value.zone_names = v.split("\n").map((s) => s.trim()).filter(Boolean)),
@@ -221,7 +225,7 @@ function persistMailAnswer() {
 function persistRegistrationAnswer() {
   store.setAnswer("registration", { method: registrationMethod.value });
   store.setAnswer("phone", {
-    enabled: registrationMethod.value === "phone_browser",
+    enabled: isPhoneRegistrationMethod.value,
     provider: phoneForm.value.provider || "hero_sms",
     base_url: phoneForm.value.base_url,
     api_key: phoneForm.value.api_key,
