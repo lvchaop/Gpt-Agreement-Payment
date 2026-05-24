@@ -97,6 +97,20 @@ function saveState(state) {
   } catch (_) {}
 }
 
+function persistResult(result) {
+  try { fs.writeFileSync(T('result.json'), JSON.stringify(result, null, 2)); } catch (_) {}
+}
+
+async function closeBrowserSafe(browser, timeoutMs = 5000) {
+  if (!browser) return;
+  try {
+    await Promise.race([
+      browser.close(),
+      sleep(timeoutMs),
+    ]);
+  } catch (_) {}
+}
+
 function redactSensitiveText(value) {
   return String(value || '')
     .replace(/([?&]key=)[^&\s"']+/gi, '$1<redacted>')
@@ -195,6 +209,17 @@ function randPass() {
   return p.split('').sort(() => Math.random() - 0.5).join('');
 }
 
+function shortNameToken(value, fallback) {
+  const token = String(value || '').replace(/[^A-Za-z]/g, '');
+  if (token.length >= 3 && token.length <= 5) {
+    return token[0].toUpperCase() + token.slice(1).toLowerCase();
+  }
+  const firstNames = ['Amy', 'Ann', 'Ben', 'Bob', 'Dan', 'Eli', 'Eva', 'Ian', 'Ivy', 'Jay', 'Joe', 'Jon', 'Kim', 'Leo', 'Max', 'Mia', 'Nia', 'Noah', 'Owen', 'Ray', 'Rex', 'Roy', 'Sam', 'Sue', 'Tom', 'Zoe'];
+  const lastNames = ['Bell', 'Bond', 'Boyd', 'Cobb', 'Cole', 'Cook', 'Cox', 'Cruz', 'Dean', 'Dunn', 'Ford', 'Fox', 'Gray', 'Hall', 'Hill', 'Holt', 'King', 'Lane', 'Lee', 'Long', 'Love', 'Lowe', 'May', 'Mills', 'Moon', 'Page', 'Park', 'Reed', 'Rice', 'Ross', 'Ryan', 'Shaw', 'Sims', 'Stone', 'West', 'Woods', 'Young'];
+  const pool = /smith|last|surname/i.test(String(fallback || '')) ? lastNames : firstNames;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 function normalizeExpiry(expiry) {
   const parts = String(expiry || '').replace(/\//g, ' ').split(/\s+/).filter(Boolean);
   if (parts.length >= 2) {
@@ -284,6 +309,63 @@ const fillByIdScript = ({ id, val }) => {
   return true;
 };
 
+const fillNameScript = ({ id, val }) => {
+  const clean = String(val || '').replace(/[^A-Za-z]/g, '').slice(0, 6);
+  if (!clean) return false;
+  const selectorMap = {
+    firstName: [
+      '#firstName',
+      'input[name="firstName"]',
+      'input[name="fname"]',
+      'input[name="first_name"]',
+      'input[autocomplete="given-name"]',
+    ],
+    lastName: [
+      '#lastName',
+      'input[name="lastName"]',
+      'input[name="lname"]',
+      'input[name="last_name"]',
+      'input[name="surname"]',
+      'input[autocomplete="family-name"]',
+    ],
+  };
+  const selectors = selectorMap[id] || [`#${CSS.escape(id)}`, `input[name="${CSS.escape(id)}"]`];
+  const visible = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    return el.offsetParent !== null
+      && r.width > 0
+      && r.height > 0
+      && s.visibility !== 'hidden'
+      && s.display !== 'none';
+  };
+  const setValue = (el, value) => {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    try { el.focus(); } catch (_) {}
+    if (desc && desc.set) desc.set.call(el, ''); else el.value = '';
+    for (const ev of ['input', 'change']) {
+      try { el.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
+    }
+    if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    for (const ev of ['keydown', 'input', 'keyup', 'change', 'blur']) {
+      try { el.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
+    }
+  };
+  let count = 0;
+  const seen = new Set();
+  for (const sel of selectors) {
+    for (const el of Array.from(document.querySelectorAll(sel))) {
+      if (seen.has(el) || !visible(el)) continue;
+      seen.add(el);
+      setValue(el, clean);
+      count++;
+    }
+  }
+  return count ? { value: clean, count } : false;
+};
+
 const fillSelScript = ({ sel, val }) => {
   const el = document.querySelector(sel);
   if (!el) return false;
@@ -339,6 +421,14 @@ async function fillAny(page, id, val) {
   const ok = res.some(Boolean);
   if (ok) log('fill', id, 'ok');
   return ok;
+}
+
+async function fillNameAny(page, id, val) {
+  const clean = String(val || '').replace(/[^A-Za-z]/g, '').slice(0, 5);
+  const res = await evalAllFrames(page, fillNameScript, { id, val: clean });
+  const hit = res.filter((x) => x && x.count > 0)[0];
+  if (hit) log('fill', id, `ok value=${hit.value}`);
+  return Boolean(hit);
 }
 
 async function fillSelectorAny(page, sel, val) {
@@ -436,6 +526,8 @@ async function waitForPaypalSignupFields(page, timeoutMs = 10000) {
 
 async function fillPaypalSignupForm(page, addr, profile) {
   const result = {};
+  const firstName = shortNameToken(profile.firstName, 'James');
+  const lastName = shortNameToken(profile.lastName, 'Smith');
   result.email = await fillAny(page, 'email', profile.email)
     || await fillSelectorAny(page, 'input[type="email"]', profile.email);
   result.phone = await fillAny(page, 'phone', profile.phone);
@@ -443,8 +535,8 @@ async function fillPaypalSignupForm(page, addr, profile) {
   result.cardExpiry = await fillAny(page, 'cardExpiry', profile.cardExpiry);
   result.cardCvv = await fillAny(page, 'cardCvv', profile.cardCvv);
   result.password = await fillAny(page, 'password', profile.password);
-  result.firstName = await fillAny(page, 'firstName', profile.firstName);
-  result.lastName = await fillAny(page, 'lastName', profile.lastName);
+  result.firstName = await fillNameAny(page, 'firstName', firstName);
+  result.lastName = await fillNameAny(page, 'lastName', lastName);
   result.billingLine1 = await fillAny(page, 'billingLine1', addr.street);
   result.billingCity = await fillAny(page, 'billingCity', addr.city);
   result.billingPostalCode = await fillAny(page, 'billingPostalCode', addr.zip);
@@ -824,12 +916,34 @@ async function clickSubmitLike(page) {
   if (await clickSelectorAny(page, [
     'button[data-testid="submit-button"]',
     'button[data-testid="hosted-payment-submit-button"]',
-    'button[data-atomic-wait-intent="Submit_Email"]',
     'button.SubmitButton--complete',
     '#submitButton',
     '#continue',
   ], 'submit-selector')) return true;
   return clickByText(page, /^(下一页|next|subscribe|pay|continue|agree|agree and continue|verify|confirm|create account|agree\s*&\s*continue)$/i, 'submit-text', 3000);
+}
+
+function paypalClientCfci(rawUrl) {
+  try {
+    return new URL(rawUrl).searchParams.get('paypal_client_cfci') || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function resetPaypalNoInteractionRoute(page, rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    u.searchParams.delete('paypal_client_cfci');
+    u.searchParams.delete('ctxId');
+    log('paypal no_interaction route; reset to clean /pay for Pay_With_Card', u.toString().slice(0, 220));
+    await page.goto(u.toString(), { waitUntil: 'commit', timeout: 60000, referer: rawUrl });
+    await sleep(2500);
+    return true;
+  } catch (e) {
+    log('paypal no_interaction reset failed', e && e.message ? e.message : e);
+    return false;
+  }
 }
 
 function extractOtpFromSmsResponse(text, opts = {}) {
@@ -1416,9 +1530,10 @@ async function main() {
     cardExpiry,
     cardCvv,
     password,
-    firstName: payload.firstName || 'James',
-    lastName: payload.lastName || 'Smith',
+    firstName: shortNameToken(payload.firstName, 'James'),
+    lastName: shortNameToken(payload.lastName, 'Smith'),
   };
+  log('signup profile name', `${signupProfile.firstName}/${signupProfile.lastName}`);
   const smsApiUrl = payload.smsApiUrl || process.env.PPS_SMS_API_URL || '';
   const fallbackConsentDelayMs = Math.max(0, Number(
     payload.fallbackConsentDelayMs
@@ -1584,6 +1699,7 @@ async function main() {
   let paypalLegacyStartLastClick = 0;
   let paypalLegacyStartSeenAt = 0;
   let paypalSignupGuestNormalized = false;
+  let paypalNoInteractionResets = 0;
   let captchaSnapSaved = false;
 
   let initialReferer = payload.referer || '';
@@ -1628,7 +1744,7 @@ async function main() {
       await pageSnapshot(page, T('cc_linked')).catch(() => {});
       const finalUrl = page.url();
       await releaseIfHeld();
-      await browser.close();
+      await closeBrowserSafe(browser);
       return {
         success: false,
         error: 'paypal_cc_linked_to_full_account',
@@ -1641,7 +1757,7 @@ async function main() {
       await pageSnapshot(page, T('datadome')).catch(() => {});
       const finalUrl = page.url();
       await releaseIfHeld();
-      await browser.close();
+      await closeBrowserSafe(browser);
       return {
         success: false,
         error: 'paypal_datadome_blocked',
@@ -1654,7 +1770,7 @@ async function main() {
       await pageSnapshot(page, T('card_invalid')).catch(() => {});
       const finalUrl = page.url();
       await releaseIfHeld();
-      await browser.close();
+      await closeBrowserSafe(browser);
       return {
         success: false,
         error: 'paypal_create_card_account_validation_error',
@@ -1667,7 +1783,7 @@ async function main() {
       await pageSnapshot(page, T('address_invalid')).catch(() => {});
       const finalUrl = page.url();
       await releaseIfHeld();
-      await browser.close();
+      await closeBrowserSafe(browser);
       return {
         success: false,
         error: 'paypal_address_validation_error',
@@ -1738,10 +1854,11 @@ async function main() {
         log('paypal fallback billing missing Agree and Continue; retry with a fresh PayPal signup');
         await pageSnapshot(page, T('no_agree_continue'));
         const finalUrl = page.url();
-        await browser.close();
+        await closeBrowserSafe(browser);
         return {
           success: false,
           error: 'paypal_fallback_missing_agree_continue_retry_new_paypal_account',
+          cause: decisiveError || '',
           finalUrl,
           returnUrl: capturedReturnUrl,
         };
@@ -1754,7 +1871,7 @@ async function main() {
       log('decisive PayPal error', err.slice(0, 300));
       await pageSnapshot(page, T('error_page'));
       const finalUrl = page.url();
-      await browser.close();
+      await closeBrowserSafe(browser);
       return {
         success: false,
         error: err,
@@ -1772,10 +1889,12 @@ async function main() {
     const chatgptLandingAfterReturn = /chatgpt\.com\/?/i.test(host) && !!capturedReturnUrl;
     if (chatgptSuccess || chatgptLandingAfterReturn || pmRedirectSuccess) {
       log('success url reached');
-      await sleep(3000);
       const finalUrl = page.url();
-      await browser.close();
-      return { success: true, finalUrl, returnUrl: capturedReturnUrl };
+      const result = { success: true, finalUrl, returnUrl: capturedReturnUrl };
+      persistResult(result);
+      log('success result persisted; closing browser');
+      await closeBrowserSafe(browser);
+      return result;
     }
     if (openaiRedirectSucceeded) {
       log('openai redirect_status=succeeded seen; waiting for chatgpt success landing');
@@ -1831,6 +1950,26 @@ async function main() {
       const isUlOnboardRedirectApprove = isAgreementsApprove && /ulOnboardRedirect=true/i.test(url);
       const isPaypalPayRoute = /\/pay\/?$/i.test(pathname);
       const isSigninRoute = /\/signin/i.test(pathname);
+      const paypalNoInteractionRoute = /no_interaction/i.test(paypalClientCfci(url));
+      if (paypalNoInteractionRoute && !/\/checkoutweb\/signup/i.test(pathname)) {
+        if (paypalNoInteractionResets < 2) {
+          paypalNoInteractionResets++;
+          await pageSnapshot(page, T(`paypal_no_interaction_${paypalNoInteractionResets}`)).catch(() => {});
+          const reset = await resetPaypalNoInteractionRoute(page, url);
+          if (reset) continue;
+        }
+        log('paypal no_interaction state persisted; retry with a fresh PayPal signup');
+        await pageSnapshot(page, T('paypal_no_interaction_stuck')).catch(() => {});
+        const finalUrl = page.url();
+        await releaseIfHeld();
+        await closeBrowserSafe(browser);
+        return {
+          success: false,
+          error: 'paypal_no_interaction_after_pay_with_card_retry_new_paypal_account',
+          finalUrl,
+          returnUrl: capturedReturnUrl,
+        };
+      }
       if (/\/checkoutweb\/signup/i.test(pathname) && !/modxo_redirect_reason=guest_user/i.test(url) && !paypalSignupGuestNormalized) {
         try {
           const u = new URL(url);
@@ -1948,7 +2087,7 @@ async function main() {
             await pageSnapshot(page, T('onboarding_email_stuck'));
           }
           const finalUrl = page.url();
-          await browser.close();
+          await closeBrowserSafe(browser);
           return {
             success: false,
             error: 'paypal_onboarding_email_stuck_retry_new_paypal_account',
@@ -1991,7 +2130,7 @@ async function main() {
           log('paypal legacy start onboarding stuck; retry with fresh PayPal signup');
           await pageSnapshot(page, T('legacy_start_stuck'));
           const finalUrl = page.url();
-          await browser.close();
+          await closeBrowserSafe(browser);
           return {
             success: false,
             error: 'paypal_legacy_start_onboarding_stuck_retry_new_paypal_account',
@@ -2090,10 +2229,11 @@ async function main() {
           if (Date.now() - paypalBillingNoConsentSeenAt > 25000) {
             log('paypal billing still missing Agree and Continue; retry with a fresh PayPal signup');
             const finalUrl = page.url();
-            await browser.close();
+            await closeBrowserSafe(browser);
             return {
               success: false,
               error: 'paypal_billing_missing_agree_continue_retry_new_paypal_account',
+              cause: decisiveError || '',
               finalUrl,
               returnUrl: capturedReturnUrl,
             };
@@ -2183,7 +2323,7 @@ async function main() {
           await pageSnapshot(page, T('datadome')).catch(() => {});
           const finalUrl = page.url();
           await releaseIfHeld();
-          await browser.close();
+          await closeBrowserSafe(browser);
           return {
             success: false,
             error: 'paypal_datadome_blocked',
@@ -2292,22 +2432,21 @@ async function main() {
     timeout: true,
   });
   const finalUrl = page.url();
-  await browser.close();
+  await closeBrowserSafe(browser);
   return { success: false, error: 'timeout', finalUrl, returnUrl: capturedReturnUrl };
 }
 
 main()
   .then((result) => {
-    try { fs.writeFileSync(T('result.json'), JSON.stringify(result, null, 2)); } catch (_) {}
-    process.stdout.write(JSON.stringify(result, null, 2));
+    persistResult(result);
+    process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(0));
   })
   .catch((err) => {
     const result = {
       success: false,
       error: String(err && err.stack || err),
     };
-    try { fs.writeFileSync(T('result.json'), JSON.stringify(result, null, 2)); } catch (_) {}
+    persistResult(result);
     try { fs.writeFileSync(T('error.json'), JSON.stringify(result, null, 2)); } catch (_) {}
-    process.stdout.write(JSON.stringify(result, null, 2));
-    process.exitCode = 1;
+    process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(1));
   });

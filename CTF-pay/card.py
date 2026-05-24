@@ -5489,13 +5489,15 @@ def _paypal_generated_new_user_password(paypal_cfg: dict) -> str:
     cached = str(paypal_cfg.get("_generated_new_user_password") or "").strip()
     if cached:
         return cached
-    words = ["Atlas", "Beacon", "Cedar", "Delta", "Harbor", "Maple", "Orbit", "Quartz", "Rocket", "Summit", "Vector"]
-    password = (
-        "Tst!"
-        + random.choice(words)
-        + str(random.randrange(1000, 9999))
-        + "".join(random.choices(string.ascii_letters + string.digits, k=6))
-    )
+    chars = string.ascii_letters + string.digits
+    parts = [
+        random.choice(string.ascii_uppercase),
+        random.choice(string.ascii_lowercase),
+        random.choice(string.digits),
+        *random.choices(chars, k=9),
+    ]
+    random.shuffle(parts)
+    password = "".join(parts)
     paypal_cfg["_generated_new_user_password"] = password
     return password
 
@@ -5612,9 +5614,21 @@ def _paypal_resolve_new_user_card(paypal_cfg: dict, account: dict, payment_card:
         raw_index = account.get("card_index")
         if raw_index in (None, ""):
             raw_index = paypal_cfg.get("card_index")
-        if raw_index in (None, "", "round_robin"):
+        cached_index = paypal_cfg.get("_resolved_new_user_card_index")
+        if raw_index in (None, "", "random"):
+            try:
+                index = int(cached_index)
+            except Exception:
+                index = random.randrange(len(rows))
+                paypal_cfg["_resolved_new_user_card_index"] = index
+                _log(f"      [B-new] PayPal 测试卡随机选择 card_index={index}/{len(rows)}")
+        elif raw_index == "round_robin":
             raw_index = int(account.get("_source_index") or 0) % len(rows)
-        index = int(raw_index)
+            index = int(raw_index)
+            paypal_cfg["_resolved_new_user_card_index"] = index
+        else:
+            index = int(raw_index)
+            paypal_cfg["_resolved_new_user_card_index"] = index
         if index < 0 or index >= len(rows):
             raise RuntimeError(f"PayPal 测试卡 card_index={index} 越界，卡池共 {len(rows)} 条")
         row = dict(rows[index])
@@ -5654,13 +5668,34 @@ def _paypal_us_state_code(value: str) -> str:
     return _PAYPAL_US_STATE_ABBR.get(raw.upper(), raw.upper())
 
 
+_PAYPAL_SHORT_FIRST_NAMES = [
+    "Amy", "Ann", "Ben", "Bob", "Dan", "Eli", "Eva", "Ian", "Ivy", "Jay",
+    "Joe", "Jon", "Kim", "Leo", "Max", "Mia", "Nia", "Noah", "Owen", "Ray",
+    "Rex", "Roy", "Sam", "Sue", "Tom", "Zoe",
+]
+_PAYPAL_SHORT_LAST_NAMES = [
+    "Bell", "Bond", "Boyd", "Cobb", "Cole", "Cook", "Cox", "Cruz", "Dean",
+    "Dunn", "Ford", "Fox", "Gray", "Hall", "Hill", "Holt", "King", "Lane",
+    "Lee", "Long", "Love", "Lowe", "May", "Mills", "Moon", "Page", "Park",
+    "Reed", "Rice", "Ross", "Ryan", "Shaw", "Sims", "Stone", "West", "Woods",
+    "Young",
+]
+
+
+def _paypal_random_name_token(kind: str = "first") -> str:
+    pool = _PAYPAL_SHORT_LAST_NAMES if kind == "last" else _PAYPAL_SHORT_FIRST_NAMES
+    return random.choice(pool)
+
+
 def _paypal_short_name_token(token: str, fallback: str) -> str:
-    token = re.sub(r"[^A-Za-z]", "", str(token or "")).title()
-    if 2 <= len(token) <= 6:
-        return token
-    if len(token) > 6:
-        return token[:6]
-    return fallback
+    kind = "last" if str(fallback or "").strip().lower() in {"smith", "last", "lastname"} else "first"
+    return _paypal_random_name_token(kind)
+
+
+def _paypal_short_name_pair(first: str, last: str) -> tuple[str, str, str]:
+    first = _paypal_short_name_token(first, "James")
+    last = _paypal_short_name_token(last, "Smith")
+    return first, last, f"{first} {last}".strip()
 
 
 def _paypal_split_full_name(value: str) -> tuple[str, str]:
@@ -5676,6 +5711,7 @@ def _paypal_split_full_name(value: str) -> tuple[str, str]:
 
 def _paypal_meiguodizhi_address_from_raw(raw: dict) -> dict:
     first_name, last_name = _paypal_split_full_name(str(raw.get("Full_Name") or ""))
+    first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
     return {
         "country": "US",
         "line1": str(raw.get("Address") or "").strip(),
@@ -5685,7 +5721,7 @@ def _paypal_meiguodizhi_address_from_raw(raw: dict) -> dict:
         "postal_code": str(raw.get("Zip_Code") or "").strip()[:5],
         "first_name": first_name,
         "last_name": last_name,
-        "full_name": f"{first_name} {last_name}",
+        "full_name": full_name,
         "telephone": str(raw.get("Telephone") or "").strip(),
         "autoCompleteType": "MANUAL",
         "isUserModified": False,
@@ -5755,7 +5791,7 @@ def _paypal_name_parts(account: dict, payment_card: dict | None = None) -> tuple
     if not full:
         full = f"{first} {last}".strip()
     first, last = _paypal_split_full_name(f"{first} {last}".strip() or full)
-    return first, last, f"{first} {last}".strip()
+    return _paypal_short_name_pair(first, last)
 
 
 def _paypal_first_visible_locator(page, selectors: list[str]):
@@ -6363,12 +6399,7 @@ def _paypal_complete_new_user_checkout(
     full_name = str(address.get("full_name") or "").strip()
     if not first_name or not last_name:
         first_name, last_name, full_name = _paypal_name_parts(account, payment_card)
-    first_name = _paypal_short_name_token(first_name, "James")
-    last_name = _paypal_short_name_token(last_name, "Smith")
-    if not full_name:
-        full_name = f"{first_name} {last_name}".strip()
-    else:
-        full_name = f"{first_name} {last_name}".strip()
+    first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
     email = _paypal_checkout_email(paypal_cfg, account)
     phone = phone_row["phone"]
     new_password = _paypal_generated_new_user_password(paypal_cfg)
@@ -8032,8 +8063,7 @@ def _paypal_protocol_persona(pps, paypal_cfg: dict, account: dict, address: dict
         first_name = "James"
     if not last_name:
         last_name = "Smith"
-    first_name = _paypal_short_name_token(first_name, "James")
-    last_name = _paypal_short_name_token(last_name, "Smith")
+    first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
     email = _paypal_checkout_email(paypal_cfg, account)
     password = _paypal_generated_new_user_password(paypal_cfg)
     return pps.Persona(
@@ -8087,12 +8117,12 @@ def _paypal_signup_payloads(paypal_cfg: dict, account: dict, payment_card: dict 
     last_name = str(address.get("last_name") or "").strip()
     if not first_name or not last_name:
         first_name, last_name, _full = _paypal_name_parts(account, payment_card)
-    first_name = _paypal_short_name_token(first_name, "James")
-    last_name = _paypal_short_name_token(last_name, "Smith")
+    first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
     if first_name:
         signup_address["first_name"] = first_name
     if last_name:
         signup_address["last_name"] = last_name
+    signup_address["full_name"] = full_name
     return phone, signup_card, signup_address
 
 
@@ -8175,8 +8205,11 @@ def _paypal_signup_node_rpa(
         or os.environ.get("PPS_PAYPAL_SIGNUP_LAST_NAME")
         or "Smith"
     )
-    first_name = _paypal_short_name_token(first_name, "James")
-    last_name = _paypal_short_name_token(last_name, "Smith")
+    first_name, last_name, _full_name = _paypal_short_name_pair(first_name, last_name)
+    signup_billing_address["first_name"] = first_name
+    signup_billing_address["last_name"] = last_name
+    signup_billing_address["full_name"] = _full_name
+    _log(f"      [node-rpa] PayPal signup 姓名: first={first_name} last={last_name}")
 
     profile_dir = tempfile.mkdtemp(prefix="paypal_node_rpa_")
     keep_profile = _paypal_bool_cfg(paypal_cfg, "keep_node_rpa_profile", default=False) or bool(os.environ.get("PPS_PAYPAL_KEEP_PROFILE"))
@@ -8222,6 +8255,46 @@ def _paypal_signup_node_rpa(
             os.unlink(f"{tmp_base}_{suffix}")
         except FileNotFoundError:
             pass
+        except Exception:
+            pass
+
+    def _read_node_result_marker() -> dict:
+        try:
+            with open(f"{tmp_base}_result.json", "r", encoding="utf-8") as rf:
+                result = json.load(rf)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+        try:
+            with open(f"{tmp_base}_state.json", "r", encoding="utf-8") as sf:
+                state = json.load(sf)
+            if not isinstance(state, dict):
+                return {}
+            url = str(state.get("url") or "")
+            return_url = str(state.get("capturedReturnUrl") or "")
+            if (
+                re.search(r"chatgpt\.com/(?:payments/success)?", url, re.I)
+                and re.search(r"pm-redirects\.stripe\.com/return/.*status=success", return_url, re.I)
+            ) or re.search(r"pay\.openai\.com/.*redirect_status=succeeded", url, re.I):
+                return {
+                    "success": True,
+                    "finalUrl": url,
+                    "returnUrl": return_url,
+                    "source": "state_marker",
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _stop_node_proc_after_success() -> None:
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
         except Exception:
             pass
 
@@ -8300,6 +8373,12 @@ def _paypal_signup_node_rpa(
         try:
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            result = _read_node_result_marker()
+            if result.get("success") is True:
+                paypal_cfg["_last_node_rpa_result"] = result
+                _log("      [node-rpa] 进程未退出，但 result/state 已成功，按成功处理")
+                _stop_node_proc_after_success()
+                return True
             _log(f"      [node-rpa] 超时 {timeout_s}s，终止 Node/Chromium")
             paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "node_rpa_timeout"}
             try:
@@ -10447,8 +10526,18 @@ def run(
         for stage_name in sorted(stage_proxy_cfg):
             _log(f"        - {stage_name}: {_describe_proxy_cfg(stage_proxy_cfg.get(stage_name))}")
 
-    with _http_session_stage_proxy(http, stage_proxy_cfg, "fingerprint"):
-        reg_guid, reg_muid, reg_sid = register_fingerprint(http)
+    node_full_checkout_requested = (
+        use_paypal
+        and _paypal_is_new_user_flow(paypal_cfg)
+        and (_paypal_bool_cfg(paypal_cfg, "node_rpa", default=False) or _paypal_bool_cfg(paypal_cfg, "browser_rpa", default=False))
+        and not _paypal_bool_cfg(paypal_cfg, "node_rpa_paypal_only", default=False)
+    )
+    if node_full_checkout_requested:
+        reg_guid = reg_muid = reg_sid = ""
+        _log("      [node-rpa-full] 纯浏览器 checkout：跳过 Stripe fingerprint/init/elements/address 协议预热")
+    else:
+        with _http_session_stage_proxy(http, stage_proxy_cfg, "fingerprint"):
+            reg_guid, reg_muid, reg_sid = register_fingerprint(http)
 
     effective_checkout_input = checkout_input
     fresh_cfg = cfg.get("fresh_checkout") or {}
@@ -10469,6 +10558,161 @@ def run(
     if not fresh_cfg.get("auto_refresh_on_due_mismatch", True):
         due_refresh_limit = 0
     due_refresh_count = 0
+
+    def _run_paypal_node_full_checkout_only(
+        *,
+        session_id: str,
+        stripe_checkout_url: str,
+        browser_checkout_url: str,
+    ) -> dict:
+        _log("[3/6] Node RPA full-checkout 接管：从 checkout 页进入浏览器，对齐老项目流程 ...")
+        try:
+            from paypal_plus import signup as pps  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"paypal_plus 模块不可用，无法启动 Node full-checkout RPA: {e!r}")
+        try:
+            max_node_attempts = max(
+                1,
+                int(
+                    paypal_cfg.get("node_rpa_identity_retries")
+                    or paypal_cfg.get("node_rpa_account_retries")
+                    or paypal_cfg.get("node_rpa_address_retries")
+                    or paypal_cfg.get("address_validation_retries")
+                    or 3
+                ),
+            )
+        except Exception:
+            max_node_attempts = 3
+        try:
+            expected_due_cents = int(expected_due if expected_due is not None else 0)
+        except Exception:
+            expected_due_cents = 0
+
+        def _clear_paypal_new_user_runtime() -> None:
+            for key in (
+                "_resolved_new_user_account",
+                "_generated_new_user_email",
+                "_generated_new_user_password",
+                "_resolved_meiguodizhi_address",
+            ):
+                paypal_cfg.pop(key, None)
+
+        def _advance_paypal_card_index(reason: str) -> bool:
+            cards_file = (
+                paypal_cfg.get("cards_file")
+                or paypal_cfg.get("new_user_cards_file")
+                or paypal_cfg.get("card_pool_file")
+                or ""
+            )
+            if not cards_file:
+                return False
+            try:
+                rows, _card_path = _paypal_read_card_rows(str(cards_file))
+            except Exception as e:
+                _log(f"      [node-rpa-full] PayPal 卡池读取失败，无法换卡: {e}")
+                return False
+            if len(rows) <= 1:
+                return False
+            raw_index = paypal_cfg.get("_resolved_new_user_card_index")
+            if raw_index in (None, ""):
+                raw_index = paypal_cfg.get("card_index")
+            try:
+                cur_index = int(raw_index) if raw_index not in (None, "", "round_robin", "random") else -1
+            except Exception:
+                cur_index = -1
+            candidates = [i for i in range(len(rows)) if i != cur_index]
+            if not candidates:
+                return False
+            next_index = random.choice(candidates)
+            paypal_cfg["card_index"] = next_index
+            paypal_cfg["_resolved_new_user_card_index"] = next_index
+            _log(
+                "      [node-rpa-full] "
+                f"{reason}，切换 PayPal 测试卡 card_index {cur_index} -> {next_index}"
+            )
+            return True
+
+        last_node_result = {}
+        for node_attempt in range(1, max_node_attempts + 1):
+            if node_attempt > 1:
+                _log(f"      [node-rpa-full] 重试 PayPal 新用户流程 ({node_attempt}/{max_node_attempts})")
+            account = _paypal_resolve_new_user_account(paypal_cfg)
+            address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
+            persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
+            phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, card)
+            if not phone:
+                raise RuntimeError("PayPal Node full-checkout 缺少手机号")
+            sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
+            manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
+            otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
+            ok = _paypal_signup_node_rpa(
+                redirect_url="",
+                checkout_url=browser_checkout_url or stripe_checkout_url,
+                full_checkout=True,
+                expected_due_cents=expected_due_cents,
+                stripe_email=str(card.get("email") or ""),
+                paypal_cfg=paypal_cfg,
+                proxy_url=proxy_url or "",
+                phone=phone,
+                signup_card=signup_card,
+                signup_billing_address=signup_billing_address,
+                persona=persona,
+                sms_api_url=sms_api_url,
+                manual_otp_file=manual_otp_file,
+                otp_timeout=otp_timeout,
+            )
+            last_node_result = paypal_cfg.get("_last_node_rpa_result") or {}
+            if ok:
+                _log("      PayPal Node full-checkout 完成")
+                return {
+                    "state": "succeeded",
+                    "session_id": session_id,
+                    "return_url": str(last_node_result.get("returnUrl") or last_node_result.get("finalUrl") or ""),
+                    "payment_channel": "paypal",
+                    "paypal_node_result": last_node_result,
+                }
+            result_hay = json.dumps(last_node_result or {}, ensure_ascii=False)
+            if re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I):
+                if node_attempt < max_node_attempts:
+                    paypal_cfg.pop("_resolved_meiguodizhi_address", None)
+                    _log(
+                        "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
+                        f"({node_attempt + 1}/{max_node_attempts})"
+                    )
+                    continue
+                raise RuntimeError(
+                    "PayPal Node full-checkout 地址校验失败，已重试 "
+                    f"{max_node_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
+                )
+            funding_rejected = re.search(
+                r"INSTRUMENT_SHARING_LIMIT_EXCEEDED|paypal_cc_linked_to_full_account|CARD_GENERIC_ERROR|ISSUER_DECLINE",
+                result_hay,
+                re.I,
+            )
+            reroll_new_account = re.search(
+                r"retry_new_paypal_account|paypal_create_card_account_validation_error|CREATE_CARD_ACCOUNT_CANDIDATE_VALIDATION_ERROR",
+                result_hay,
+                re.I,
+            )
+            if reroll_new_account or funding_rejected:
+                if node_attempt < max_node_attempts:
+                    _clear_paypal_new_user_runtime()
+                    reason = "PayPal 卡/账号组合被拒" if funding_rejected else "PayPal 新用户流程要求重建身份"
+                    if funding_rejected and not _advance_paypal_card_index(reason):
+                        _log(f"      [node-rpa-full] {reason}，但没有可轮换的 PayPal 卡池，使用新身份重试")
+                    else:
+                        _log(f"      [node-rpa-full] {reason}，重新生成 PayPal 邮箱/密码/地址后重试")
+                    continue
+                raise RuntimeError(
+                    "PayPal Node full-checkout 多次重建新用户仍失败: "
+                    f"{str(last_node_result.get('error') or '')[:200]}"
+                )
+            raise RuntimeError(
+                "PayPal Node full-checkout 授权失败或超时"
+                + (f": {str(last_node_result.get('error') or '')[:200]}" if last_node_result else "")
+            )
+        raise RuntimeError("PayPal Node full-checkout 授权失败或超时")
+
     while True:
         init_attempt += 1
         _log("[1/6] 解析 checkout session ID ...")
@@ -10488,6 +10732,36 @@ def run(
         _log(f"      stripe_url: {stripe_checkout_url}")
         if browser_checkout_url != stripe_checkout_url:
             _log(f"      browser_checkout_url: {browser_checkout_url[:160]}")
+
+        if node_full_checkout_requested:
+            result = _run_paypal_node_full_checkout_only(
+                session_id=session_id,
+                stripe_checkout_url=stripe_checkout_url,
+                browser_checkout_url=browser_checkout_url,
+            )
+            chatgpt_email = fresh_cfg.get("_chatgpt_email", card.get("email", ""))
+            extra_info = {}
+            try:
+                ru = result.get("return_url", "") if isinstance(result, dict) else ""
+                if ru:
+                    import urllib.parse as _up
+                    qs = _up.parse_qs(_up.urlparse(ru).query)
+                    aid = (qs.get("account_id") or [""])[0]
+                    if aid:
+                        extra_info["team_account_id"] = aid
+            except Exception:
+                pass
+            _record_result(
+                status=result.get("state", "unknown"),
+                chatgpt_email=chatgpt_email,
+                session_id=session_id,
+                payment_channel="paypal",
+                processor_entity=str((fresh_info or {}).get("processor_entity") or ""),
+                config_path=resolved_config_path,
+                extra=extra_info if extra_info else None,
+            )
+            _log(f"\n日志已保存到: {LOG_FILE}")
+            return result
 
         try:
             with _http_session_stage_proxy(http, stage_proxy_cfg, "fetch_publishable_key"):

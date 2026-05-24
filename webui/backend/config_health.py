@@ -491,12 +491,14 @@ def _check_payment_config(checks: list[dict], req: dict, pay_cfg: dict) -> None:
                 try:
                     card_rows, card_path = _load_json_rows(cards_file, "card pool")
                     raw_card_index = pp.get("card_index")
-                    if raw_card_index in (None, "", "round_robin"):
+                    if raw_card_index in (None, "", "round_robin", "random"):
                         raw_card_index = 0
                     card_index = int(raw_card_index)
                     if card_index < 0 or card_index >= len(card_rows):
                         raise IndexError(f"card_index={card_index}, rows={len(card_rows)}")
                     selected_card = card_rows[card_index]
+                    if pp.get("card_index") == "random":
+                        selected_card = next((c for c in card_rows if _card_ready(c)), selected_card)
                     if not _card_ready(selected_card):
                         raise ValueError("selected card missing number/cvc/expiry")
                 except Exception as e:

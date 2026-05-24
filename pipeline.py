@@ -1130,8 +1130,60 @@ def _run_one(args_tuple):
 
 
 def _run_one_pay_only(args_tuple):
-    """PayPal 并发模式下：注册已完成，只串行支付用（预留占位，batch 里不再单独使用）"""
-    return {"batch_index": args_tuple[0], "status": "error", "error": "deprecated path"}
+    """单个 pay-only 任务。并发时必须传入 target_email，避免多个 worker 抢同一账号。"""
+    idx, card_config_path, kwargs, target_email = args_tuple
+    local_kwargs = dict(kwargs or {})
+    paypal_batch = bool(local_kwargs.pop("_paypal_new_user_batch_config", False))
+    phone_allocator = local_kwargs.pop("_paypal_phone_index_allocator", None)
+    use_paypal = bool(local_kwargs.get("use_paypal", False))
+    use_gopay = bool(local_kwargs.get("use_gopay", False))
+    gopay_otp_file = str(local_kwargs.get("gopay_otp_file") or "")
+    proxy_stage_allocator = local_kwargs.get("proxy_stage_allocator")
+    proxy_stage_plan = local_kwargs.get("proxy_stage_plan")
+    temp_card = None
+    effective_card = card_config_path
+    phone_index = None
+    try:
+        if paypal_batch:
+            if phone_allocator is not None:
+                phone_index = phone_allocator.get()
+            temp_card = _rewrite_paypal_new_user_batch_config(
+                card_config_path,
+                idx,
+                phone_index=phone_index,
+            )
+            effective_card = temp_card
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = pay_only(
+            effective_card,
+            use_paypal=use_paypal,
+            use_gopay=use_gopay,
+            gopay_otp_file=gopay_otp_file,
+            prefer_recent=False,
+            target_email=target_email,
+            proxy_stage_plan=plan,
+        )
+        r["batch_index"] = idx
+        r["target_email"] = target_email
+        return r
+    except Exception as e:
+        return {
+            "batch_index": idx,
+            "target_email": target_email,
+            "status": "error",
+            "error": str(e)[:500],
+        }
+    finally:
+        if phone_allocator is not None and phone_index is not None:
+            try:
+                phone_allocator.put(phone_index)
+            except Exception:
+                pass
+        if temp_card and os.path.exists(temp_card):
+            try:
+                os.unlink(temp_card)
+            except Exception:
+                pass
 
 
 _PAYPAL_NEW_USER_BATCH_FLOWS = {"new_user", "sandbox_new_user", "guest", "guest_checkout"}
@@ -1230,7 +1282,7 @@ def _rewrite_paypal_new_user_batch_config(src_path: str, batch_index: int, *, ph
         "card_pool_file",
     )
     if card_count:
-        paypal_cfg["card_index"] = batch_index % card_count
+        paypal_cfg["card_index"] = "random"
 
     paypal_cfg["manual_otp_file"] = _indexed_path(
         str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"),
@@ -1301,7 +1353,7 @@ def _register_one(args_tuple):
 def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     """批量运行 N 次。可选 modifier:
        - register_only=True: 每次只 register（不付费），workers>1 并发
-       - pay_only=True:      每次只 pay_only（复用未付账号），workers 串行
+       - pay_only=True:      每次只 pay_only；workers>1 时先领取不同账号再并发
        - 都不开:              每次走完整 pipeline（注册+付费）
     """
     use_paypal = kwargs.get("use_paypal", False)
@@ -1321,11 +1373,36 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
 
     def _batch_run_kwargs():
         run_kwargs = dict(kwargs)
+        run_kwargs["use_gopay"] = use_gopay
+        run_kwargs["gopay_otp_file"] = gopay_otp_file
         if paypal_new_user_batch:
             run_kwargs["_paypal_new_user_batch_config"] = True
             if phone_allocator is not None:
                 run_kwargs["_paypal_phone_index_allocator"] = phone_allocator
         return run_kwargs
+
+    def _ensure_paypal_new_user_allocator() -> None:
+        nonlocal phone_allocator
+        if not paypal_new_user_batch or phone_allocator is not None:
+            return
+        paypal_cfg = (card_cfg.get("paypal") or {})
+        phone_count = _paypal_cfg_pool_count(
+            paypal_cfg,
+            "phones_file",
+            "new_user_phones_file",
+            "phone_pool_file",
+            default="output/paypal_test_phones.jsonl",
+        )
+        if phone_count:
+            from queue import Queue
+
+            phone_allocator = Queue()
+            for phone_idx in range(phone_count):
+                phone_allocator.put(phone_idx)
+        print(
+            "[batch:paypal-new-user] 启用新用户并发分配: "
+            f"runtime_identity=yes phones={phone_count or '?'}"
+        )
 
     # ── register-only batch：每次 register；workers>1 时并发
     if is_register_only:
@@ -1392,8 +1469,43 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         print(f"\n[batch] register-only 完成: {ok_count}/{count} 成功")
         return results
 
-    # ── pay-only batch：每次 pay_only（复用未付账号），串行
+    # ── pay-only batch：复用未付账号；workers>1 时先领取不同账号再并发
     if is_pay_only:
+        if workers > 1:
+            _ensure_paypal_new_user_allocator()
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            accounts = _select_recent_registered_accounts_for_pay_only(count)
+            if not accounts:
+                print("[batch] pay-only 没有可并发领取的未支付账号，回退串行 config/pay-only")
+            else:
+                if len(accounts) < count:
+                    print(f"[batch] pay-only 可用未支付账号不足: requested={count} available={len(accounts)}")
+                task_count = len(accounts)
+                print(f"\n[batch] === pay-only × {task_count} 并发 workers={workers} ===")
+                tasks = [
+                    (i, card_config_path, _batch_run_kwargs(), accounts[i]["email"])
+                    for i in range(task_count)
+                ]
+                results = [None] * task_count
+                ok_count = 0
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {executor.submit(_run_one_pay_only, task): task[0] for task in tasks}
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        r = future.result()
+                        results[idx] = r
+                        if r.get("status") == "succeeded":
+                            ok_count += 1
+                        mark = "✓" if r.get("status") == "succeeded" else "✗"
+                        email = r.get("target_email") or accounts[idx].get("email") or "?"
+                        err = f" error={r.get('error', '')}" if r.get("status") != "succeeded" else ""
+                        done = sum(1 for item in results if item)
+                        print(f"[batch] {mark} pay-only [{done}/{task_count}] idx={idx} email={email}{err}")
+                results = [r for r in results if r is not None]
+                print(f"\n[batch] pay-only 完成: {ok_count}/{task_count} 成功")
+                return results
+
         print(f"\n[batch] === pay-only × {count} 串行 ===")
         results = []
         ok_count = 0
@@ -1439,25 +1551,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     kwargs.setdefault("card_cfg", card_cfg)
     kwargs.setdefault("proxy_pool", proxy_pool)
 
-    if paypal_new_user_batch:
-        paypal_cfg = (card_cfg.get("paypal") or {})
-        phone_count = _paypal_cfg_pool_count(
-            paypal_cfg,
-            "phones_file",
-            "new_user_phones_file",
-            "phone_pool_file",
-            default="output/paypal_test_phones.jsonl",
-        )
-        if phone_count:
-            from queue import Queue
-
-            phone_allocator = Queue()
-            for phone_idx in range(phone_count):
-                phone_allocator.put(phone_idx)
-        print(
-            "[batch:paypal-new-user] 启用新用户并发分配: "
-            f"runtime_identity=yes phones={phone_count or '?'}"
-        )
+    _ensure_paypal_new_user_allocator()
 
     if workers > 1 and use_paypal and not paypal_new_user_batch:
         # PayPal 模式：并行注册 → 串行支付（共用 PayPal 账号不能并行 2FA）
@@ -1675,11 +1769,18 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
     completed but payment was blocked by captcha/OTP/DataDome/etc.  The selected
     account is returned with its original session/access/device credentials.
     """
+    selected = _select_recent_registered_accounts_for_pay_only(1)
+    return selected[0] if selected else None
+
+
+def _select_recent_registered_accounts_for_pay_only(limit: int) -> list[dict]:
+    """Pick up to limit distinct reusable registered accounts for pay-only workers."""
     accounts = _load_registered_accounts()
     if not accounts:
-        return None
+        return []
 
     consumed = _paid_or_consumed_emails()
+    selected_accounts: list[dict] = []
     seen: set[str] = set()
     for acc in reversed(accounts):
         if not isinstance(acc, dict):
@@ -1696,8 +1797,10 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
             continue
         selected = dict(acc)
         selected["email"] = email
-        return selected
-    return None
+        selected_accounts.append(selected)
+        if len(selected_accounts) >= max(1, int(limit or 1)):
+            break
+    return selected_accounts
 
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
