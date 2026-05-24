@@ -337,7 +337,13 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
 
 
 def _detect_otp_wait_target(line: str) -> tuple[str, Optional[Path]]:
-    """Return (kind, path) from GoPay OTP wait markers."""
+    """Return (kind, path) from OTP wait markers."""
+    if "PAYPAL_NEW_USER_OTP_REQUEST" in line:
+        m = re.search(r"\bpath=(.+?)\s*$", line)
+        if m:
+            return "file", Path(m.group(1).strip().strip("'\""))
+        return "file", _otp_file
+
     if "GOPAY_OTP_REQUEST" in line:
         m = re.search(r"\bpath=(.+?)\s*$", line)
         if m:

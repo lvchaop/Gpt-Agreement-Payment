@@ -200,9 +200,12 @@ def build_accounts_inventory() -> dict:
         oauth = oauth_map.get(email.lower()) or oauth_map.get(email) or {}
         latest = latest_payment.get(email) or {}
         error = str(latest.get("error") or "")
+        check_status = str(acc.get("last_check_status") or "")
         pay_state = "reusable"
         if consumed:
             pay_state = "consumed"
+        elif check_status == "coupon_ineligible":
+            pay_state = "coupon_ineligible"
         elif not has_auth:
             pay_state = "no_auth"
         rt_state = _rt_state(has_rt, oauth)
@@ -256,9 +259,12 @@ def build_accounts_inventory() -> dict:
             "latest_payment_source": latest.get("source") or "",
             "latest_payment_error": error[:200],
             "latest_payment_is_already_paid": "user is already paid" in error.lower(),
-            "last_check_status": acc.get("last_check_status") or "",
+            "last_check_status": check_status,
             "last_check_message": acc.get("last_check_message") or "",
             "last_check_at": acc.get("last_check_at") or 0,
+            "sale_status": acc.get("sale_status") or "available",
+            "sold_at": acc.get("sold_at") or 0,
+            "sale_note": acc.get("sale_note") or "",
         })
 
     return {

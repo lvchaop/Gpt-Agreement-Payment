@@ -74,3 +74,65 @@ def test_registered_account_stores_phone_registration_fields(db):
     assert row["phone_number"] == "81234567890"
     assert row["phone_dial_code"] == "62"
     assert row["phone_country"] == "2"
+
+
+def test_registered_account_has_sale_state_fields(db):
+    db.add_registered_account({"email": "sale@example.com", "session_token": "sess"})
+
+    row = db.iter_registered_accounts()[0]
+    assert row["sale_status"] == "available"
+    assert row["sold_at"] == 0
+    assert row["sale_note"] == ""
+
+
+def test_claim_account_for_sale_marks_one_available_plus_account(db):
+    db.add_registered_account({"email": "nopass-plus@example.com", "password": ""})
+    db.add_card_result({"chatgpt_email": "nopass-plus@example.com", "status": "succeeded"})
+    db.add_registered_account({"email": "free@example.com", "password": "pfree"})
+    db.add_registered_account({"email": "team@example.com", "password": "pteam"})
+    db.add_card_result({"chatgpt_email": "team@example.com", "status": "succeeded", "team_account_id": "team-1"})
+    db.add_registered_account({"email": "first@example.com", "password": "p1"})
+    db.add_card_result({"chatgpt_email": "first@example.com", "status": "succeeded"})
+    db.add_registered_account({"email": "second@example.com", "password": "p2"})
+    db.add_pipeline_result({
+        "registration": {"status": "ok", "email": "second@example.com"},
+        "payment": {"status": "succeeded", "email": "second@example.com"},
+    })
+
+    claimed = db.claim_account_for_sale("order-1")
+
+    assert claimed["email"] == "first@example.com"
+    assert claimed["password"] == "p1"
+    assert claimed["sale_status"] == "sold"
+    assert claimed["sold_at"] > 0
+    assert claimed["sale_note"] == "order-1"
+
+    by_email = {row["email"]: row for row in db.iter_registered_accounts()}
+    assert by_email["nopass-plus@example.com"]["sale_status"] == "available"
+    assert by_email["free@example.com"]["sale_status"] == "available"
+    assert by_email["team@example.com"]["sale_status"] == "available"
+    assert by_email["first@example.com"]["sale_status"] == "sold"
+    assert by_email["first@example.com"]["sale_note"] == "order-1"
+    assert by_email["second@example.com"]["sale_status"] == "available"
+
+    claimed2 = db.claim_account_for_sale("order-2")
+    assert claimed2["email"] == "second@example.com"
+    assert db.claim_account_for_sale("order-3") == {}
+
+
+def test_toggle_account_sale_status(db):
+    db.add_registered_account({"email": "toggle@example.com", "password": "pw"})
+    account_id = db.iter_registered_accounts()[0]["id"]
+
+    sold = db.toggle_account_sale_status(account_id, "manual sold")
+    assert sold["email"] == "toggle@example.com"
+    assert sold["sale_status"] == "sold"
+    assert sold["sold_at"] > 0
+    assert sold["sale_note"] == "manual sold"
+
+    available = db.toggle_account_sale_status(account_id)
+    assert available["sale_status"] == "available"
+    assert available["sold_at"] == 0
+    assert available["sale_note"] == ""
+
+    assert db.toggle_account_sale_status(999999) == {}

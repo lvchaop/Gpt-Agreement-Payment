@@ -102,6 +102,9 @@ def test_inventory_summarizes_pay_and_rt_states(client):
 
     by_email = {acc["email"]: acc for acc in body["accounts"]}
     assert by_email["paid@example.com"]["pay_state"] == "consumed"
+    assert by_email["paid@example.com"]["sale_status"] == "available"
+    assert by_email["paid@example.com"]["sold_at"] == 0
+    assert by_email["paid@example.com"]["sale_note"] == ""
     assert by_email["retry@example.com"]["pay_state"] == "reusable"
     assert by_email["retry@example.com"]["rt_state"] == "cooldown"
     assert by_email["retry@example.com"]["can_backfill_rt"] is False
@@ -118,6 +121,67 @@ def test_inventory_summarizes_pay_and_rt_states(client):
 def test_delete_requires_auth(client):
     r = client.post("/api/inventory/accounts/delete", json={"ids": [1]})
     assert r.status_code == 401
+
+
+def test_sale_claim_requires_auth(client):
+    r = client.post("/api/inventory/accounts/sale/claim", json={})
+    assert r.status_code == 401
+
+
+def test_sale_claim_returns_password_and_marks_sold(client):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    db.add_registered_account({"email": "empty-plus@example.com", "password": ""})
+    db.add_card_result({"chatgpt_email": "empty-plus@example.com", "status": "succeeded"})
+    db.add_registered_account({"email": "free@example.com", "password": "free-pass"})
+    db.add_registered_account({"email": "sell@example.com", "password": "secret-pass"})
+    db.add_card_result({"chatgpt_email": "sell@example.com", "status": "succeeded"})
+
+    r = client.post("/api/inventory/accounts/sale/claim", json={"note": "order-42"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["email"] == "sell@example.com"
+    assert body["password"] == "secret-pass"
+    assert body["sale_status"] == "sold"
+    assert body["sold_at"] > 0
+    assert body["sale_note"] == "order-42"
+
+    by_email = {row["email"]: row for row in db.iter_registered_accounts()}
+    assert by_email["empty-plus@example.com"]["sale_status"] == "available"
+    assert by_email["free@example.com"]["sale_status"] == "available"
+    assert by_email["sell@example.com"]["sale_status"] == "sold"
+    assert by_email["sell@example.com"]["sale_note"] == "order-42"
+
+    r2 = client.post("/api/inventory/accounts/sale/claim", json={"note": "order-43"})
+    assert r2.status_code == 404
+
+
+def test_sale_toggle_switches_status(client):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    db.add_registered_account({"email": "toggle@example.com", "password": "secret-pass"})
+    account_id = db.iter_registered_accounts()[0]["id"]
+
+    r = client.post("/api/inventory/accounts/sale/toggle", json={"id": account_id, "note": "sold-note"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["email"] == "toggle@example.com"
+    assert body["sale_status"] == "sold"
+    assert body["sold_at"] > 0
+    assert body["sale_note"] == "sold-note"
+
+    r2 = client.post("/api/inventory/accounts/sale/toggle", json={"id": account_id})
+    assert r2.status_code == 200
+    body2 = r2.json()
+    assert body2["sale_status"] == "available"
+    assert body2["sold_at"] == 0
+    assert body2["sale_note"] == ""
+
+    r3 = client.post("/api/inventory/accounts/sale/toggle", json={"id": 999999})
+    assert r3.status_code == 404
 
 
 def test_delete_rejects_empty_ids(client):

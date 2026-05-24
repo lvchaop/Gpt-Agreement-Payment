@@ -424,21 +424,129 @@ def _check_payment_config(checks: list[dict], req: dict, pay_cfg: dict) -> None:
 
     if kind == "paypal":
         pp = pay_cfg.get("paypal") if isinstance(pay_cfg.get("paypal"), dict) else {}
-        missing = [
-            key for key in ("email", "password")
-            if _is_missing(pp.get(key))
-        ]
-        if missing:
+        flow = _text(pp.get("flow") or "existing_account").lower().replace("-", "_")
+        if flow in {"new_user", "sandbox_new_user", "guest", "guest_checkout"}:
+            def _load_json_rows(path_value: str, label: str) -> tuple[list[dict], Path]:
+                path = Path(path_value)
+                if not path.is_absolute():
+                    path = s.ROOT / path
+                raw = path.read_text(encoding="utf-8").strip()
+                rows = json.loads(raw) if raw.startswith("[") else [
+                    json.loads(line)
+                    for line in raw.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+                if not isinstance(rows, list) or not rows:
+                    raise ValueError(f"{label} is empty")
+                if not all(isinstance(row, dict) for row in rows):
+                    raise ValueError(f"{label} rows must be objects")
+                return rows, path
+
+            phones_file = _text(
+                pp.get("phones_file")
+                or pp.get("new_user_phones_file")
+                or pp.get("phone_pool_file")
+                or "output/paypal_test_phones.jsonl"
+            )
+            try:
+                phone_rows, phone_path = _load_json_rows(phones_file, "phone pool")
+                raw_phone_index = pp.get("phone_index")
+                if raw_phone_index in (None, "", "round_robin"):
+                    raw_phone_index = 0
+                phone_index = int(raw_phone_index)
+                if phone_index < 0 or phone_index >= len(phone_rows):
+                    raise IndexError(f"phone_index={phone_index}, rows={len(phone_rows)}")
+                selected_phone = phone_rows[phone_index]
+                if _is_missing(
+                    selected_phone.get("phone") or selected_phone.get("phone_number") or selected_phone.get("number"),
+                    allow_example=True,
+                ):
+                    raise ValueError("selected phone missing phone/phone_number/number")
+            except Exception as e:
+                _check(
+                    checks,
+                    "paypal_phone_pool",
+                    "fail",
+                    "PayPal 新用户手机号池不可用",
+                    details=str(e),
+                    action="检查 paypal.phones_file；新用户身份已运行时生成，不需要账号池",
+                )
+                return
+
+            def _card_ready(card: dict) -> bool:
+                if not isinstance(card, dict):
+                    return False
+                has_number = not _is_missing(card.get("number") or card.get("card_number"), allow_example=True)
+                has_cvc = not _is_missing(card.get("cvc") or card.get("cvv"), allow_example=True)
+                has_expiry = not _is_missing(card.get("expiry") or card.get("exp"), allow_example=True)
+                has_exp_parts = (
+                    not _is_missing(card.get("exp_month") or card.get("month"), allow_example=True)
+                    and not _is_missing(card.get("exp_year") or card.get("year"), allow_example=True)
+                )
+                return has_number and has_cvc and (has_expiry or has_exp_parts)
+
+            cards_file = _text(pp.get("cards_file") or pp.get("new_user_cards_file") or pp.get("card_pool_file"))
+            selected_card = None
+            if cards_file:
+                try:
+                    card_rows, card_path = _load_json_rows(cards_file, "card pool")
+                    raw_card_index = pp.get("card_index")
+                    if raw_card_index in (None, "", "round_robin"):
+                        raw_card_index = 0
+                    card_index = int(raw_card_index)
+                    if card_index < 0 or card_index >= len(card_rows):
+                        raise IndexError(f"card_index={card_index}, rows={len(card_rows)}")
+                    selected_card = card_rows[card_index]
+                    if not _card_ready(selected_card):
+                        raise ValueError("selected card missing number/cvc/expiry")
+                except Exception as e:
+                    _check(
+                        checks,
+                        "paypal_card_pool",
+                        "fail",
+                        "PayPal 新用户测试卡池不可用",
+                        details=str(e),
+                        action="检查 paypal.cards_file，或删除该字段改用 Step 07/cards",
+                    )
+                    return
+            else:
+                cards = pay_cfg.get("cards") if isinstance(pay_cfg.get("cards"), list) else []
+                selected_card = next((c for c in cards if _card_ready(c)), None)
+                if selected_card is None:
+                    _check(
+                        checks,
+                        "paypal_card_pool",
+                        "fail",
+                        "PayPal 新用户缺少可用测试卡",
+                        missing=["paypal.cards_file 或 cards[0]"],
+                        action="在 Step 07/cards 配测试卡，或配置 paypal.cards_file 单独卡池",
+                    )
+                    return
+
             _check(
                 checks,
                 "paypal_config",
-                "fail",
-                "PayPal 支付配置不完整",
-                missing=[f"paypal.{x}" for x in missing],
-                action="在配置向导 PayPal 步骤填写邮箱和密码后重新导出",
+                "ok",
+                "PayPal 新用户运行时身份、手机号池与测试卡已配置",
+                details=f"email=random gmail; address=meiguodizhi; phones={phone_path}; card={'paypal.cards_file' if cards_file else 'cards'}",
+                blocking=False,
             )
         else:
-            _check(checks, "paypal_config", "ok", "PayPal 支付配置已配置", blocking=False)
+            missing = [
+                key for key in ("email", "password")
+                if _is_missing(pp.get(key))
+            ]
+            if missing:
+                _check(
+                    checks,
+                    "paypal_config",
+                    "fail",
+                    "PayPal 支付配置不完整",
+                    missing=[f"paypal.{x}" for x in missing],
+                    action="在配置向导 PayPal 步骤填写邮箱和密码后重新导出，或将 flow 改为 new_user 并配置手机号池",
+                )
+            else:
+                _check(checks, "paypal_config", "ok", "PayPal 支付配置已配置", blocking=False)
         return
 
     cards = pay_cfg.get("cards") if isinstance(pay_cfg.get("cards"), list) else []

@@ -66,6 +66,14 @@ class AuthResult:
         }
 
 
+class EmailAlreadyInUseError(RuntimeError):
+    """Raised when Platform accepts the OTP but rejects the mailbox as used."""
+
+    def __init__(self, email: str, detail: str):
+        self.email = email
+        super().__init__(detail)
+
+
 class AuthFlow:
     """注册/登录协议流"""
 
@@ -982,6 +990,14 @@ class AuthFlow:
             return 3
 
     @staticmethod
+    def _phone_protocol_max_email_bind_attempts() -> int:
+        raw = os.getenv("PHONE_PROTOCOL_MAX_EMAIL_BIND_ATTEMPTS", "5")
+        try:
+            return max(1, min(int(raw), 20))
+        except Exception:
+            return 5
+
+    @staticmethod
     def _is_invalid_phone_register_error(message: str) -> bool:
         text = str(message or "").lower()
         return (
@@ -1259,7 +1275,22 @@ class AuthFlow:
         )
         self._trace_http("platform_email_otp_validate", resp)
         if resp.status_code != 200:
-            raise RuntimeError(f"Platform 邮箱 OTP 验证失败: {resp.status_code} - {(resp.text or '')[:260]}")
+            detail = (resp.text or "")[:260]
+            error_code = ""
+            try:
+                data = resp.json()
+                err = data.get("error") if isinstance(data.get("error"), dict) else {}
+                error_code = str(err.get("code") or "")
+            except Exception:
+                pass
+            if resp.status_code == 403 and error_code == "email_already_in_use":
+                try:
+                    mail_provider.mark_failed(email, "email_already_in_use")
+                except Exception:
+                    pass
+                self.result.email = ""
+                raise EmailAlreadyInUseError(email, f"Platform 邮箱已被占用: {email}") from None
+            raise RuntimeError(f"Platform 邮箱 OTP 验证失败: {resp.status_code} - {detail}")
         try:
             data = resp.json()
         except Exception:
@@ -2549,10 +2580,28 @@ class AuthFlow:
 
             callback_url, final_url = self.follow_redirect_chain(account_continue_url)
             self.get_auth_session()
-            bound_email = self._bind_email_protocol_via_platform(
-                mail_provider,
-                phone_e164=phone_e164,
-            )
+            max_email_attempts = self._phone_protocol_max_email_bind_attempts()
+            for bind_attempt in range(1, max_email_attempts + 1):
+                try:
+                    bound_email = self._bind_email_protocol_via_platform(
+                        mail_provider,
+                        phone_e164=phone_e164,
+                    )
+                    break
+                except EmailAlreadyInUseError as e:
+                    bound_email = ""
+                    self.result.email = ""
+                    if bind_attempt >= max_email_attempts:
+                        raise RuntimeError(
+                            f"Platform 邮箱绑定失败，连续 {max_email_attempts} 个邮箱已被占用"
+                        ) from e
+                    logger.warning(
+                        "[phone-protocol] 邮箱已被 OpenAI 占用，换下一个邮箱重试 bind_attempt=%s/%s email=%s",
+                        bind_attempt,
+                        max_email_attempts,
+                        e.email,
+                    )
+                    continue
             self.result.email = bound_email
             self.get_auth_session()
 

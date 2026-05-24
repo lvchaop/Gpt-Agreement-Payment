@@ -861,7 +861,6 @@ def _browser_like_session_headers(locale_value: str | None) -> dict:
 
 def _elements_options_client_payload() -> dict:
     return {
-        "elements_options_client[stripe_js_locale]": "auto",
         "elements_options_client[saved_payment_method][enable_save]": "never",
         "elements_options_client[saved_payment_method][enable_redisplay]": "never",
     }
@@ -1220,6 +1219,10 @@ def _extract_email_from_access_token(token: str) -> str:
     if isinstance(profile, dict):
         return profile.get("email", "") or ""
     return ""
+
+
+def _is_probable_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(value or "").strip()))
 
 
 def _extract_plan_type_from_access_token(token: str) -> str:
@@ -2328,7 +2331,23 @@ def generate_fresh_checkout(
             "未提供 fresh_checkout.auth.access_token，且也无法通过 session_token/cookie 刷新"
         )
 
-    user_email = (auth_data.get("user") or {}).get("email", "") or _extract_email_from_access_token(access_token) or "?"
+    extracted_email = (
+        (auth_data.get("user") or {}).get("email", "")
+        or _extract_email_from_access_token(access_token)
+        or ""
+    )
+    configured_email = (
+        str(fresh_cfg.get("_chatgpt_email") or "").strip()
+        or str(auth_cfg.get("email") or auth_cfg.get("login_email") or "").strip()
+    )
+    if _is_probable_email(extracted_email):
+        user_email = extracted_email.strip()
+    elif _is_probable_email(configured_email):
+        user_email = configured_email.strip()
+        _log("      [fresh] access_token 未解析出 email，使用支付上下文账号邮箱")
+    else:
+        user_email = ""
+        _log("      [fresh] 警告: 未能解析 ChatGPT 账号邮箱，后续 RT 将跳过")
     plan_type = (auth_data.get("account") or {}).get("planType", "") or _extract_plan_type_from_access_token(access_token) or "?"
     _log(
         "      [fresh] 凭证来源: "
@@ -2336,7 +2355,7 @@ def generate_fresh_checkout(
         f"session_token={'yes' if session_token else 'no'} "
         f"cookie={'yes' if cookie_header else 'no'}"
     )
-    _log(f"      [fresh] 当前账号: {user_email}  |  planType={plan_type}")
+    _log(f"      [fresh] 当前账号: {user_email or '<unknown>'}  |  planType={plan_type}")
     # 保存到上下文供后续记录
     fresh_cfg["_chatgpt_email"] = user_email
 
@@ -2796,9 +2815,24 @@ def init_checkout(session: requests.Session, session_id: str, pk: str, locale_pr
             data["elements_session_client[client_betas][1]"] = "custom_checkout_manual_approval_1"
 
         _log(f"      初始化结账会话 (init) ... version={version[:30]}")
-        _log_request("POST", url, data=data, tag="[2b/6] init")
-        resp = session.post(url, data=data, headers=_stripe_headers())
-        _log_response(resp, tag="[2b/6] init")
+        resp = None
+        for init_attempt in range(3):
+            _log_request("POST", url, data=data, tag="[2b/6] init")
+            resp = session.post(url, data=data, headers=_stripe_headers())
+            _log_response(resp, tag="[2b/6] init")
+            if resp.status_code != 400:
+                break
+            try:
+                err = (resp.json() or {}).get("error") or {}
+            except Exception:
+                err = {}
+            bad_param = str(err.get("param") or "")
+            if err.get("code") != "parameter_unknown" or bad_param not in data:
+                break
+            _log(f"      [compat] Stripe init 不识别参数 {bad_param}，移除后重试")
+            data.pop(bad_param, None)
+            elements_options.pop(bad_param, None)
+        assert resp is not None
         _raise_if_checkout_inactive_response(resp, "init")
         if resp.status_code == 200:
             init_data = resp.json()
@@ -4724,38 +4758,56 @@ def _solve_remote_recaptcha_v3(
     """通过远端打码平台解 Google reCAPTCHA Enterprise v3"""
     if not api_key:
         return ""
-    _log(f"      [reCAPTCHA v3] 提交到打码平台 ...")
-    create_resp = requests.post(_remote_captcha_url("/createTask"), json={
-        "clientKey": api_key,
-        "task": {
-            "type": "RecaptchaV3EnterpriseTaskProxyless",
-            "websiteURL": page_url,
-            "websiteKey": site_key,
-            "pageAction": action,
-        }
-    }, timeout=30)
-    result = create_resp.json()
-    if result.get("errorId"):
-        _log(f"      [reCAPTCHA v3] 创建失败: {result.get('errorDescription', '')}")
-        return ""
-    task_id = result.get("taskId")
-    _log(f"      [reCAPTCHA v3] taskId: {task_id}")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(3)
-        poll_resp = requests.post(_remote_captcha_url("/getTaskResult"), json={
-            "clientKey": api_key, "taskId": task_id,
-        }, timeout=15)
-        poll_result = poll_resp.json()
-        status = poll_result.get("status", "")
-        if status == "ready":
-            token = poll_result.get("solution", {}).get("gRecaptchaResponse", "")
-            _log(f"      [reCAPTCHA v3] 解题成功")
-            return token
-        elif poll_result.get("errorId"):
-            _log(f"      [reCAPTCHA v3] 失败: {poll_result.get('errorDescription', '')}")
-            return ""
-    _log("      [reCAPTCHA v3] 超时")
+    task_base = {
+        "websiteURL": page_url,
+        "websiteKey": site_key,
+        "pageAction": action,
+        "isEnterprise": True,
+        "userAgent": USER_AGENT,
+    }
+    strategies = [
+        {"type": "RecaptchaV3EnterpriseTaskProxyless", **task_base},
+        {"type": "RecaptchaV3TaskProxyless", **task_base},
+        {"type": "RecaptchaV3EnterpriseTask", **task_base},
+    ]
+    for idx, task in enumerate(strategies, 1):
+        _log(f"      [reCAPTCHA v3] 提交到打码平台 strategy={idx}/{len(strategies)} type={task['type']}")
+        try:
+            create_resp = requests.post(_remote_captcha_url("/createTask"), json={
+                "clientKey": api_key,
+                "task": task,
+            }, timeout=30)
+            result = create_resp.json()
+        except Exception as e:
+            _log(f"      [reCAPTCHA v3] 创建异常: {e}")
+            continue
+        if result.get("errorId"):
+            _log(f"      [reCAPTCHA v3] 创建失败: {result.get('errorDescription', '')}")
+            continue
+        task_id = result.get("taskId")
+        _log(f"      [reCAPTCHA v3] taskId: {task_id}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                poll_resp = requests.post(_remote_captcha_url("/getTaskResult"), json={
+                    "clientKey": api_key, "taskId": task_id,
+                }, timeout=15)
+                poll_result = poll_resp.json()
+            except Exception:
+                continue
+            status = poll_result.get("status", "")
+            if status == "ready":
+                solution = poll_result.get("solution", {}) or {}
+                token = solution.get("gRecaptchaResponse") or solution.get("token") or ""
+                _log(f"      [reCAPTCHA v3] 解题成功")
+                return token
+            elif poll_result.get("errorId"):
+                _log(f"      [reCAPTCHA v3] 失败: {poll_result.get('errorDescription', '')}")
+                break
+        else:
+            _log(f"      [reCAPTCHA v3] strategy={idx} 超时")
+    _log("      [reCAPTCHA v3] 所有策略均失败")
     return ""
 
 
@@ -5087,6 +5139,1317 @@ def _safe_screenshot(page, path: str):
         page.screenshot(path=path, timeout=5000)
     except Exception:
         pass
+
+
+def _paypal_target_country(paypal_cfg: dict) -> str:
+    raw = (
+        paypal_cfg.get("country")
+        or paypal_cfg.get("region")
+        or paypal_cfg.get("country_code")
+        or "US"
+    )
+    country = str(raw).strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        _log(f"      [B-region] PayPal country={raw!r} 无效，回退 US")
+        return "US"
+    return country
+
+
+def _paypal_country_labels(country: str) -> tuple[str, ...]:
+    labels = {
+        "US": ("United States", "美国", "美國", "États-Unis", "Estados Unidos"),
+        "CN": ("China", "中国", "中國"),
+        "JP": ("Japan", "日本"),
+        "GB": ("United Kingdom", "英国", "英國"),
+        "CA": ("Canada", "加拿大"),
+    }
+    return labels.get(country, (country,))
+
+
+def _paypal_context_country(page) -> str:
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(page.url).query)
+        url_country = (qs.get("country.x") or [""])[0].strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", url_country):
+            return url_country
+    except Exception:
+        pass
+    try:
+        country = page.evaluate(
+            """() => {
+                const d = window.__INITIAL_DATA__ || {};
+                return d?.locality?.country || d?.queryParams?.["country.x"] || "";
+            }"""
+        )
+        country = str(country or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", country):
+            return country
+    except Exception:
+        pass
+    return ""
+
+
+def _paypal_visible_text_contains_country(page, selectors: list[str], country: str) -> bool:
+    labels = _paypal_country_labels(country)
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 4)
+        except Exception:
+            continue
+        for idx in range(count):
+            try:
+                item = loc.nth(idx)
+                if not item.is_visible():
+                    continue
+                text = (item.inner_text(timeout=1000) or "").strip()
+                aria = item.get_attribute("aria-label", timeout=1000) or ""
+                blob = f"{text} {aria}"
+                if any(label in blob for label in labels):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _paypal_click_country_option(page, country: str, *, timeout_ms: int = 8000) -> bool:
+    labels = _paypal_country_labels(country)
+    selectors = [
+        f'[data-value="{country}"]',
+        f'[value="{country}"]',
+        f'[data-country="{country}"]',
+        f'[data-country-code="{country}"]',
+        f'[data-testid="{country}"]',
+        f'[id="{country}"]',
+    ]
+    for label in labels:
+        selectors.extend([
+            f'#country-select-sheet [role="option"]:has-text("{label}")',
+            f'#country-select-sheet button:has-text("{label}")',
+            f'#country-select-sheet li:has-text("{label}")',
+            f'[role="dialog"] [role="option"]:has-text("{label}")',
+            f'[role="dialog"] button:has-text("{label}")',
+            f'[role="listbox"] [role="option"]:has-text("{label}")',
+            f'button:has-text("{label}")',
+            f'[role="option"]:has-text("{label}")',
+        ])
+
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                count = min(loc.count(), 6)
+            except Exception:
+                continue
+            for idx in range(count):
+                try:
+                    item = loc.nth(idx)
+                    if not item.is_visible():
+                        continue
+                    item.scroll_into_view_if_needed(timeout=1000)
+                    item.click(timeout=3000)
+                    _log(f"      [B-region] 已点击国家选项 {country}: {sel}")
+                    return True
+                except Exception:
+                    continue
+        time.sleep(0.4)
+    return False
+
+
+def _paypal_wait_region_stable(page, country: str, *, timeout_s: float = 8.0) -> bool:
+    deadline = time.time() + timeout_s
+    selectors = [
+        '[data-testid="language-selector-container"] button[role="combobox"]',
+        'button[aria-controls="country-select-sheet"]',
+        '[data-testid="footer-change-country"]',
+    ]
+    while time.time() < deadline:
+        try:
+            page.wait_for_load_state("networkidle", timeout=1500)
+        except Exception:
+            pass
+        if _paypal_context_country(page) == country:
+            return True
+        if _paypal_visible_text_contains_country(page, selectors, country):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _ensure_paypal_login_region(page, country: str) -> bool:
+    if not country:
+        return True
+    current = _paypal_context_country(page)
+    if current == country:
+        _log(f"      [B-region] PayPal login 地区已是 {country}")
+        return True
+
+    button_selectors = [
+        '[data-testid="language-selector-container"] button[role="combobox"]',
+        '[data-testid="language-selector-container"] [role="combobox"]',
+        'button[aria-controls="country-select-sheet"]',
+        'button[aria-label*="国家或地区"]',
+        'button[aria-label*="country"]',
+    ]
+    region_btn = None
+    for sel in button_selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 3)
+        except Exception:
+            continue
+        for idx in range(count):
+            try:
+                item = loc.nth(idx)
+                if item.is_visible():
+                    region_btn = item
+                    break
+            except Exception:
+                continue
+        if region_btn:
+            break
+    if not region_btn:
+        _log(
+            "      [B-region] 未找到 PayPal login 底部地区按钮"
+            + (f" (current={current or '?'}, target={country})" if current != country else "")
+        )
+        return current in ("", country)
+
+    _log(f"      [B-region] 切换 PayPal login 地区: {current or '?'} -> {country}")
+    try:
+        region_btn.scroll_into_view_if_needed(timeout=2000)
+        region_btn.click(timeout=5000)
+        time.sleep(0.8)
+    except Exception as e:
+        _log(f"      [B-region] 点击 login 地区按钮失败: {e}")
+        return False
+
+    if not _paypal_click_country_option(page, country):
+        _log(f"      [B-region] 未能在 login 地区弹层选择 {country}")
+        return False
+
+    ok = _paypal_wait_region_stable(page, country)
+    if ok:
+        _log(f"      [B-region] PayPal login 地区确认: {country}")
+    else:
+        _log(f"      [B-region] PayPal login 地区选择后未确认到 {country}")
+    return ok
+
+
+def _ensure_paypal_billing_country(page, country: str) -> bool:
+    if not country:
+        return True
+    select_selectors = [
+        'select#country[data-testid="countrySelector"]',
+        'select#country[name="country"]',
+        'select[name="country"][data-testid="countrySelector"]',
+    ]
+    for sel in select_selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() == 0:
+                continue
+            first = loc.first
+            current = (first.input_value(timeout=1000) or "").strip().upper()
+            if current == country:
+                _log(f"      [B-region] PayPal billing 国家已是 {country}")
+                return True
+            if not first.is_visible():
+                _log(f"      [B-region] PayPal billing select 当前={current or '?'} 但不可见，跳过 footer 切换")
+                return True
+            _log(f"      [B-region] 切换 PayPal billing 国家: {current or '?'} -> {country}")
+            first.select_option(country, timeout=5000)
+            time.sleep(1)
+            after = (first.input_value(timeout=1000) or "").strip().upper()
+            if after == country:
+                _log(f"      [B-region] PayPal billing 国家确认: {country}")
+                return True
+            _log(f"      [B-region] PayPal billing 国家选择后仍是 {after or '?'}")
+            return False
+        except Exception as e:
+            _log(f"      [B-region] PayPal billing 国家选择失败 ({sel}): {e}")
+            return False
+
+    footer_selectors = ['[data-testid="footer-change-country"]']
+    if _paypal_visible_text_contains_country(page, footer_selectors, country):
+        _log(f"      [B-region] PayPal footer 国家已显示 {country}")
+        return True
+
+    try:
+        footer = page.locator('[data-testid="footer-change-country"]').first
+        if footer.count() and footer.is_visible():
+            _log(f"      [B-region] 通过 footer 切换 PayPal billing 国家 -> {country}")
+            footer.scroll_into_view_if_needed(timeout=2000)
+            footer.click(timeout=5000)
+            time.sleep(0.8)
+            if _paypal_click_country_option(page, country):
+                ok = _paypal_wait_region_stable(page, country)
+                if ok:
+                    _log(f"      [B-region] PayPal footer 国家确认: {country}")
+                return ok
+    except Exception as e:
+        _log(f"      [B-region] footer 国家切换失败: {e}")
+
+    return True
+
+
+_PAYPAL_NEW_USER_FLOWS = {"new_user", "sandbox_new_user", "guest", "guest_checkout"}
+
+
+def _paypal_flow(paypal_cfg: dict) -> str:
+    return str(paypal_cfg.get("flow") or "existing_account").strip().lower().replace("-", "_")
+
+
+def _paypal_is_new_user_flow(paypal_cfg: dict) -> bool:
+    return _paypal_flow(paypal_cfg) in _PAYPAL_NEW_USER_FLOWS
+
+
+def _paypal_project_path(path: str) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    expanded = os.path.expanduser(raw)
+    if os.path.isabs(expanded):
+        return expanded
+    return os.path.abspath(os.path.join(_REPO_DIR, expanded))
+
+
+def _paypal_account_value(account: dict, *keys: str, default: str = "") -> str:
+    for key in keys:
+        cur = account
+        for part in key.split("."):
+            if not isinstance(cur, dict):
+                cur = None
+                break
+            cur = cur.get(part)
+        if cur not in (None, ""):
+            return str(cur)
+    return default
+
+
+def _paypal_read_json_rows(path: str, label: str) -> tuple[list[dict], str]:
+    resolved_path = _paypal_project_path(path)
+    if not resolved_path or not os.path.exists(resolved_path):
+        raise RuntimeError(f"{label}不存在: {resolved_path or path}")
+    with open(resolved_path, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    if not raw:
+        raise RuntimeError(f"{label}为空: {resolved_path}")
+    if raw.startswith("["):
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise RuntimeError(f"{label} JSON 顶层必须是数组: {resolved_path}")
+        return [x for x in data if isinstance(x, dict)], resolved_path
+    rows = []
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise RuntimeError(f"{label}行格式错误: {resolved_path}:{line_no}")
+        rows.append(item)
+    return rows, resolved_path
+
+
+def _paypal_read_card_rows(path: str) -> tuple[list[dict], str]:
+    return _paypal_read_json_rows(path, "PayPal 测试卡池")
+
+
+def _paypal_read_phone_rows(path: str) -> tuple[list[dict], str]:
+    return _paypal_read_json_rows(path, "PayPal 手机号池")
+
+
+def _paypal_resolve_new_user_account(paypal_cfg: dict) -> dict:
+    cached = paypal_cfg.get("_resolved_new_user_account")
+    if isinstance(cached, dict):
+        return cached
+    account = {"_source": "runtime"}
+    paypal_cfg["_resolved_new_user_account"] = account
+    return account
+
+
+def _paypal_random_gmail_email(length: int = 17) -> str:
+    length = max(1, int(length or 17))
+    local = "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return f"{local}@gmail.com"
+
+
+def _paypal_generated_new_user_email(paypal_cfg: dict) -> str:
+    cached = str(paypal_cfg.get("_generated_new_user_email") or "").strip()
+    if cached:
+        return cached
+    email = _paypal_random_gmail_email(17)
+    paypal_cfg["_generated_new_user_email"] = email
+    return email
+
+
+def _paypal_generated_new_user_password(paypal_cfg: dict) -> str:
+    cached = str(paypal_cfg.get("_generated_new_user_password") or "").strip()
+    if cached:
+        return cached
+    words = ["Atlas", "Beacon", "Cedar", "Delta", "Harbor", "Maple", "Orbit", "Quartz", "Rocket", "Summit", "Vector"]
+    password = (
+        "Tst!"
+        + random.choice(words)
+        + str(random.randrange(1000, 9999))
+        + "".join(random.choices(string.ascii_letters + string.digits, k=6))
+    )
+    paypal_cfg["_generated_new_user_password"] = password
+    return password
+
+
+def _paypal_checkout_email(paypal_cfg: dict, account: dict | None = None) -> str:
+    if _paypal_is_new_user_flow(paypal_cfg):
+        return _paypal_generated_new_user_email(paypal_cfg)
+    if account:
+        email = _paypal_account_value(account, "email")
+        if email:
+            return email
+    return str(
+        paypal_cfg.get("email")
+        or paypal_cfg.get("new_user_email")
+        or ""
+    ).strip()
+
+
+def _paypal_phone_from_source(source: dict) -> dict:
+    return {
+        "phone": _paypal_account_value(source, "phone", "phone_number", "number"),
+        "country": _paypal_account_value(source, "phone_country", "country", "country_code", "region"),
+        "dial_code": _paypal_account_value(source, "dial_code", "calling_code", "country_calling_code"),
+        "_source_path": str(source.get("_source_path") or ""),
+        "_source_index": source.get("_source_index"),
+    }
+
+
+def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
+    account_phone = _paypal_account_value(account, "phone", "phone_number")
+    if account_phone:
+        phone = _paypal_phone_from_source(account)
+        phone["_source"] = "account.phone"
+        return phone
+
+    inline_phone = str(paypal_cfg.get("phone") or paypal_cfg.get("phone_number") or "").strip()
+    if inline_phone:
+        return {
+            "phone": inline_phone,
+            "country": _paypal_account_value(paypal_cfg, "phone_country", "country", "country_code", "region"),
+            "dial_code": _paypal_account_value(paypal_cfg, "dial_code", "calling_code", "country_calling_code"),
+            "_source": "paypal.phone",
+        }
+
+    phones_file = (
+        paypal_cfg.get("phones_file")
+        or paypal_cfg.get("new_user_phones_file")
+        or paypal_cfg.get("phone_pool_file")
+        or "output/paypal_test_phones.jsonl"
+    )
+    rows, phone_path = _paypal_read_phone_rows(phones_file)
+    if not rows:
+        raise RuntimeError(f"PayPal 手机号池没有可用行: {phones_file}")
+
+    raw_index = paypal_cfg.get("phone_index")
+    if raw_index in (None, "", "round_robin"):
+        raw_index = 0
+    index = int(raw_index)
+    if index < 0 or index >= len(rows):
+        raise RuntimeError(f"PayPal 手机号 phone_index={index} 越界，手机号池共 {len(rows)} 条")
+    row = dict(rows[index])
+    row["_source_index"] = index
+    row["_source_path"] = phone_path
+    phone = _paypal_phone_from_source(row)
+    if not phone["phone"]:
+        raise RuntimeError(f"PayPal 手机号池第 {index} 行缺少 phone/phone_number/number")
+    return phone
+
+
+def _paypal_expiry_from_card(card: dict) -> str:
+    expiry = _paypal_account_value(card, "expiry", "exp")
+    if expiry:
+        return expiry
+    month = _paypal_account_value(card, "exp_month", "month")
+    year = _paypal_account_value(card, "exp_year", "year")
+    if month and year:
+        return f"{str(month).zfill(2)}/{str(year)[-2:]}"
+    return ""
+
+
+def _paypal_card_from_source(source: dict) -> dict:
+    return {
+        "number": _paypal_account_value(source, "number", "card_number"),
+        "cvc": _paypal_account_value(source, "cvc", "cvv"),
+        "expiry": _paypal_expiry_from_card(source),
+        "_source_path": str(source.get("_source_path") or ""),
+        "_source_index": source.get("_source_index"),
+    }
+
+
+def _paypal_resolve_new_user_card(paypal_cfg: dict, account: dict, payment_card: dict | None = None) -> dict:
+    account_card = account.get("card") if isinstance(account.get("card"), dict) else None
+    if account_card:
+        card = _paypal_card_from_source(account_card)
+        card["_source"] = "account.card"
+        return card
+
+    inline_card = paypal_cfg.get("card") if isinstance(paypal_cfg.get("card"), dict) else None
+    if inline_card:
+        card = _paypal_card_from_source(inline_card)
+        card["_source"] = "paypal.card"
+        return card
+
+    cards_file = (
+        paypal_cfg.get("cards_file")
+        or paypal_cfg.get("new_user_cards_file")
+        or paypal_cfg.get("card_pool_file")
+        or ""
+    )
+    if cards_file:
+        rows, card_path = _paypal_read_card_rows(cards_file)
+        if not rows:
+            raise RuntimeError(f"PayPal 测试卡池没有可用行: {cards_file}")
+        raw_index = account.get("card_index")
+        if raw_index in (None, ""):
+            raw_index = paypal_cfg.get("card_index")
+        if raw_index in (None, "", "round_robin"):
+            raw_index = int(account.get("_source_index") or 0) % len(rows)
+        index = int(raw_index)
+        if index < 0 or index >= len(rows):
+            raise RuntimeError(f"PayPal 测试卡 card_index={index} 越界，卡池共 {len(rows)} 条")
+        row = dict(rows[index])
+        row["_source_index"] = index
+        row["_source_path"] = card_path
+        return _paypal_card_from_source(row)
+
+    card = _paypal_card_from_source(payment_card or {})
+    card["_source"] = "config.cards"
+    return card
+
+
+_PAYPAL_US_STATE_ABBR = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",
+    "CALIFORNIA": "CA", "COLORADO": "CO", "CONNECTICUT": "CT",
+    "DELAWARE": "DE", "DISTRICT OF COLUMBIA": "DC", "FLORIDA": "FL",
+    "GEORGIA": "GA", "HAWAII": "HI", "IDAHO": "ID", "ILLINOIS": "IL",
+    "INDIANA": "IN", "IOWA": "IA", "KANSAS": "KS", "KENTUCKY": "KY",
+    "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN",
+    "MISSISSIPPI": "MS", "MISSOURI": "MO", "MONTANA": "MT",
+    "NEBRASKA": "NE", "NEVADA": "NV", "NEW HAMPSHIRE": "NH",
+    "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND", "OHIO": "OH",
+    "OKLAHOMA": "OK", "OREGON": "OR", "PENNSYLVANIA": "PA",
+    "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC", "SOUTH DAKOTA": "SD",
+    "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT",
+    "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI", "WYOMING": "WY",
+}
+
+
+def _paypal_us_state_code(value: str) -> str:
+    raw = str(value or "").strip()
+    if len(raw) == 2 and raw.isalpha():
+        return raw.upper()
+    return _PAYPAL_US_STATE_ABBR.get(raw.upper(), raw.upper())
+
+
+def _paypal_short_name_token(token: str, fallback: str) -> str:
+    token = re.sub(r"[^A-Za-z]", "", str(token or "")).title()
+    if 2 <= len(token) <= 6:
+        return token
+    if len(token) > 6:
+        return token[:6]
+    return fallback
+
+
+def _paypal_split_full_name(value: str) -> tuple[str, str]:
+    clean = re.sub(r"[^A-Za-z.\-' ]+", " ", str(value or "")).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    parts = [p for p in clean.split(" ") if p]
+    first = _paypal_short_name_token(parts[0] if parts else "", "James")
+    last = _paypal_short_name_token(parts[-1] if len(parts) >= 2 else "", "Smith")
+    if len(parts) == 1:
+        last = "".join(random.choices(string.ascii_lowercase, k=6)).capitalize()
+    return first, last
+
+
+def _paypal_meiguodizhi_address_from_raw(raw: dict) -> dict:
+    first_name, last_name = _paypal_split_full_name(str(raw.get("Full_Name") or ""))
+    return {
+        "country": "US",
+        "line1": str(raw.get("Address") or "").strip(),
+        "line2": "",
+        "city": str(raw.get("City") or "").strip(),
+        "state": _paypal_us_state_code(str(raw.get("State") or raw.get("State_Full") or "")),
+        "postal_code": str(raw.get("Zip_Code") or "").strip()[:5],
+        "first_name": first_name,
+        "last_name": last_name,
+        "full_name": f"{first_name} {last_name}",
+        "telephone": str(raw.get("Telephone") or "").strip(),
+        "autoCompleteType": "MANUAL",
+        "isUserModified": False,
+        "_source": "meiguodizhi",
+    }
+
+
+def _paypal_fetch_meiguodizhi_address(paypal_cfg: dict) -> dict:
+    cached = paypal_cfg.get("_resolved_meiguodizhi_address")
+    if isinstance(cached, dict):
+        return cached
+
+    timeout_s = int(paypal_cfg.get("meiguodizhi_timeout_s") or 20)
+    attempts = max(1, int(paypal_cfg.get("meiguodizhi_attempts") or 3))
+    last_err = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(
+                "https://www.meiguodizhi.com/api/v1/dz",
+                json={"city": "", "path": "/", "method": "address"},
+                headers={
+                    "Origin": "https://www.meiguodizhi.com",
+                    "Referer": "https://www.meiguodizhi.com/",
+                    "Accept": "application/json, text/plain, */*",
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+                timeout=timeout_s,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data.get("address") if isinstance(data, dict) else None
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"unexpected response: {str(data)[:160]}")
+            address = _paypal_meiguodizhi_address_from_raw(raw)
+            if not all([address["line1"], address["city"], address["state"], address["postal_code"]]):
+                raise RuntimeError(f"incomplete address: {address}")
+            paypal_cfg["_resolved_meiguodizhi_address"] = address
+            _log(
+                "      [B-new] meiguodizhi 地址: "
+                f"{address['line1']}, {address['city']}, {address['state']} {address['postal_code']}"
+            )
+            return address
+        except Exception as e:
+            last_err = str(e)
+            _log(f"      [B-new] meiguodizhi 地址获取失败 ({attempt}/{attempts}): {last_err}")
+            if attempt < attempts:
+                time.sleep(1.0)
+    raise RuntimeError(f"PayPal meiguodizhi 地址获取失败: {last_err}")
+
+
+def _paypal_resolve_new_user_address(paypal_cfg: dict, account: dict, payment_card: dict | None = None) -> dict:
+    return _paypal_fetch_meiguodizhi_address(paypal_cfg)
+
+
+def _paypal_name_parts(account: dict, payment_card: dict | None = None) -> tuple[str, str, str]:
+    card_name = str((payment_card or {}).get("name") or "").strip()
+    first = _paypal_account_value(account, "first_name", "fname")
+    last = _paypal_account_value(account, "last_name", "lname")
+    full = _paypal_account_value(account, "full_name", "name", default=card_name)
+    if (not first or not last) and full:
+        parts = full.split()
+        if not first and parts:
+            first = parts[0]
+        if not last and len(parts) > 1:
+            last = " ".join(parts[1:])
+    if not full:
+        full = f"{first} {last}".strip()
+    first, last = _paypal_split_full_name(f"{first} {last}".strip() or full)
+    return first, last, f"{first} {last}".strip()
+
+
+def _paypal_first_visible_locator(page, selectors: list[str]):
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 6)
+        except Exception:
+            continue
+        for idx in range(count):
+            item = loc.nth(idx)
+            try:
+                if item.is_visible(timeout=800):
+                    return item, sel
+            except Exception:
+                continue
+    return None, ""
+
+
+def _paypal_human_pause(min_s: float = 1.5, max_s: float = 4.0) -> None:
+    time.sleep(random.uniform(min_s, max_s))
+
+
+def _paypal_click_timeout_ms(paypal_cfg: dict | None = None, default: int = 30000) -> int:
+    raw = None
+    if paypal_cfg:
+        raw = paypal_cfg.get("click_timeout_ms")
+    if raw in (None, ""):
+        raw = os.environ.get("PAYPAL_CLICK_TIMEOUT_MS")
+    try:
+        return max(1000, int(raw or default))
+    except Exception:
+        return default
+
+
+def _paypal_click_locator(page, item, *, timeout_ms: int | None = None) -> None:
+    try:
+        item.scroll_into_view_if_needed(timeout=2000)
+    except TypeError:
+        try:
+            item.scroll_into_view_if_needed()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    item.click(timeout=timeout_ms or _paypal_click_timeout_ms())
+
+
+def _paypal_fill_visible(page, selectors: list[str], value: str, label: str, *, required: bool = False) -> bool:
+    if value in (None, ""):
+        if required:
+            raise RuntimeError(f"PayPal 新用户缺少字段: {label}")
+        return False
+    item, sel = _paypal_first_visible_locator(page, selectors)
+    if not item:
+        if required:
+            raise RuntimeError(f"PayPal 新用户页面找不到字段: {label}")
+        return False
+    item.scroll_into_view_if_needed(timeout=2000)
+    try:
+        _paypal_click_locator(page, item, timeout_ms=2000)
+    except Exception:
+        pass
+    item.fill(str(value), timeout=5000)
+    _paypal_human_pause()
+    _log(f"      [B-new] 填写 {label}: {sel}")
+    return True
+
+
+def _paypal_select_visible(page, selectors: list[str], value: str, label: str, *, required: bool = False) -> bool:
+    if value in (None, ""):
+        if required:
+            raise RuntimeError(f"PayPal 新用户缺少字段: {label}")
+        return False
+    item, sel = _paypal_first_visible_locator(page, selectors)
+    if not item:
+        if required:
+            raise RuntimeError(f"PayPal 新用户页面找不到下拉字段: {label}")
+        return False
+    try:
+        current = (item.input_value(timeout=1000) or "").strip()
+        if current == str(value).strip():
+            _log(f"      [B-new] {label} 已是目标值: {sel}={value}")
+            return True
+    except Exception:
+        pass
+    item.scroll_into_view_if_needed(timeout=2000)
+    try:
+        _paypal_click_locator(page, item, timeout_ms=2000)
+    except Exception:
+        pass
+    item.select_option(str(value), timeout=5000)
+    _paypal_human_pause()
+    _log(f"      [B-new] 选择 {label}: {sel}={value}")
+    return True
+
+
+def _paypal_click_visible(
+    page,
+    selectors: list[str],
+    label: str,
+    *,
+    required: bool = False,
+    timeout_ms: int | None = None,
+) -> bool:
+    item, sel = _paypal_first_visible_locator(page, selectors)
+    if not item:
+        if required:
+            raise RuntimeError(f"PayPal 新用户页面找不到按钮: {label}")
+        return False
+    item.scroll_into_view_if_needed(timeout=2000)
+    _paypal_click_locator(page, item, timeout_ms=timeout_ms)
+    _paypal_human_pause()
+    _log(f"      [B-new] 点击 {label}: {sel}")
+    return True
+
+
+def _paypal_visible_any(page, selectors: list[str]) -> bool:
+    item, _sel = _paypal_first_visible_locator(page, selectors)
+    return bool(item)
+
+
+def _paypal_bool_cfg(paypal_cfg: dict, key: str, env_key: str = "", default: bool = False) -> bool:
+    raw = paypal_cfg.get(key)
+    if raw in (None, "") and env_key:
+        raw = os.environ.get(env_key)
+    if raw in (None, ""):
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def _paypal_manual_browser_visible(paypal_cfg: dict) -> bool:
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) or _paypal_bool_cfg(
+        paypal_cfg,
+        "visible_browser",
+        "PAYPAL_VISIBLE_BROWSER",
+        False,
+    )
+
+
+def _paypal_recaptcha_visible(page) -> bool:
+    if _paypal_visible_any(page, [
+        '#captchaComponent',
+        '#captchaComponent iframe[src*="recaptcha"]',
+        '#captchaComponent #captcha-standalone',
+        '#captcha-standalone',
+        '.captcha-overlay',
+        '.captcha-container',
+        '.ngrl-anomalydetection-div',
+        'iframe[name="recaptcha"]',
+        'iframe[src*="/recaptcha/"]',
+        'iframe[src*="google.com/recaptcha"]',
+    ]):
+        return True
+    try:
+        body_text = (page.locator("body").inner_text(timeout=1000) or "").lower()
+        if "security challenge" in body_text and ("not a robot" in body_text or "recaptcha" in body_text):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _paypal_wait_manual_recaptcha(page, paypal_cfg: dict, *, browser_visible: bool) -> bool:
+    if not _paypal_recaptcha_visible(page):
+        return False
+    screenshot = "/tmp/paypal_recaptcha_required.png"
+    _safe_screenshot(page, screenshot)
+    _log(f"PAYPAL_RECAPTCHA_REQUIRED screenshot={screenshot}")
+    if not browser_visible:
+        raise RuntimeError(
+            "PayPal reCAPTCHA 已出现；当前浏览器是后台/不可视模式，无法手动点。"
+            "请在 Step06 打开 visible_browser，或设置 PAYPAL_VISIBLE_BROWSER=1 后重跑。"
+        )
+
+    timeout_s = int(paypal_cfg.get("manual_recaptcha_timeout_s") or 300)
+    _log(f"      [B-recaptcha] 请在弹出的 PayPal 浏览器里完成人机验证；timeout={timeout_s}s")
+    deadline = time.time() + timeout_s
+    last_log = 0.0
+    while time.time() < deadline:
+        if not _paypal_recaptcha_visible(page):
+            _log("      [B-recaptcha] reCAPTCHA 已消失，继续后续流程")
+            _paypal_human_pause()
+            return True
+        now = time.time()
+        if now - last_log >= 30:
+            last_log = now
+            _log("      [B-recaptcha] 等待你在浏览器中完成 reCAPTCHA ...")
+        time.sleep(1)
+    _safe_screenshot(page, "/tmp/paypal_recaptcha_timeout.png")
+    raise RuntimeError("等待人工完成 PayPal reCAPTCHA 超时")
+
+
+def _paypal_new_user_form_visible(page) -> bool:
+    selectors = [
+        'input#phone',
+        'input[data-testid="phone"]',
+        'input#cardNumber',
+        'input[name="cardnumber"]',
+        'input#billingLine1',
+        'button[data-testid="submit-button"]',
+    ]
+    item, _sel = _paypal_first_visible_locator(page, selectors)
+    return bool(item)
+
+
+def _paypal_new_user_email_gate_visible(page) -> bool:
+    if not _paypal_visible_any(page, [
+        'input#email',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="email"]',
+        'input[placeholder="Email"]',
+    ]):
+        return False
+    try:
+        body_text = (page.locator("body").inner_text(timeout=1000) or "").lower()
+    except Exception:
+        body_text = ""
+    if "create a paypal account" in body_text or "continue to payment" in body_text:
+        return True
+    return _paypal_visible_any(page, [
+        'button:has-text("Continue to Payment")',
+        'button:has-text("继续付款")',
+        'button:has-text("继续")',
+    ])
+
+
+def _paypal_email_gate_loading(page) -> bool:
+    try:
+        return bool(page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 1 &&
+                        rect.height > 1 &&
+                        rect.bottom > 0 &&
+                        rect.right > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden" &&
+                        Number.parseFloat(style.opacity || "1") > 0.05;
+                };
+                const buttons = Array.from(document.querySelectorAll("button, [role='button']"))
+                    .filter(visible);
+                for (const btn of buttons) {
+                    const text = (btn.innerText || btn.textContent || "").trim().toLowerCase();
+                    const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+                    const busy = btn.getAttribute("aria-busy") === "true";
+                    const disabled = btn.disabled || btn.getAttribute("aria-disabled") === "true";
+                    const hasSpinner = Boolean(btn.querySelector(
+                        "[role='progressbar'], [class*='spinner'], [class*='loading'], svg, progress"
+                    ));
+                    const looksSubmit =
+                        btn.type === "submit" ||
+                        /continue|payment|付款|继续|下一步|next/.test(text + " " + aria);
+                    if (looksSubmit && (busy || disabled || hasSpinner || !text)) return true;
+                }
+                return Boolean(document.querySelector(
+                    "[role='progressbar'], [aria-busy='true'], [class*='spinner'], [class*='loading']"
+                ));
+            }"""
+        ))
+    except Exception:
+        return False
+
+
+def _paypal_collect_visible_errors(page) -> str:
+    selectors = [
+        '[role="alert"]',
+        '[data-testid*="error"]',
+        '[id*="error"]',
+        '[class*="error"]',
+        '.notification-critical',
+        '.ppvx_alert',
+    ]
+    messages: list[str] = []
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 6)
+        except Exception:
+            continue
+        for idx in range(count):
+            try:
+                item = loc.nth(idx)
+                if not item.is_visible(timeout=500):
+                    continue
+                text = (item.inner_text(timeout=800) or "").strip()
+                if text and text not in messages:
+                    messages.append(text)
+            except Exception:
+                continue
+    return " | ".join(messages[:4])
+
+
+def _paypal_submit_new_user_email_button(page, paypal_cfg: dict, *, required: bool = True) -> bool:
+    return _paypal_click_visible(
+        page,
+        [
+            'button:has-text("Continue to Payment")',
+            'button:has-text("继续付款")',
+            'button:has-text("继续")',
+            'button:has-text("Next")',
+            'button:has-text("下一步")',
+            'button[type="submit"]',
+        ],
+        "continue to payment",
+        required=required,
+        timeout_ms=_paypal_click_timeout_ms(paypal_cfg),
+    )
+
+
+def _paypal_visible_password_input(page):
+    selectors = [
+        'input[name="login_password"]',
+        'input#password',
+        'input[type="password"]',
+    ]
+    js_visible = """
+        (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            const opacity = Number.parseFloat(style.opacity || "1");
+            const inViewport =
+                rect.width >= 80 &&
+                rect.height >= 18 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth;
+            const hiddenParent = el.closest("[hidden], [aria-hidden='true']");
+            return Boolean(
+                inViewport &&
+                !hiddenParent &&
+                style.display !== "none" &&
+                style.visibility !== "hidden" &&
+                opacity > 0.1 &&
+                !el.disabled
+            );
+        }
+    """
+    for sel in selectors:
+        try:
+            for item in page.query_selector_all(sel):
+                try:
+                    if item.is_visible() and item.evaluate(js_visible):
+                        return item
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+def _paypal_wait_new_user_form(page, *, timeout_s: float = 25.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _paypal_new_user_form_visible(page):
+            return True
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _paypal_wait_new_user_or_password(page, *, timeout_s: float = 30.0) -> tuple[str, object | None]:
+    deadline = time.time() + timeout_s
+    password_seen_at = None
+    password_item = None
+    logged_candidate = False
+    while time.time() < deadline:
+        if _paypal_new_user_form_visible(page):
+            return "new_user", None
+        if _paypal_otp_visible(page):
+            return "otp", None
+        if _paypal_new_user_email_gate_visible(page):
+            return "new_user_email", None
+
+        current_password = _paypal_visible_password_input(page)
+        if current_password:
+            password_item = current_password
+            if password_seen_at is None:
+                password_seen_at = time.time()
+                if not logged_candidate:
+                    _log("      [B3] 检测到密码框候选，等待页面稳定确认 ...")
+                    logged_candidate = True
+            elif time.time() - password_seen_at >= 2.0:
+                return "password", password_item
+        else:
+            password_seen_at = None
+            password_item = None
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    return "", password_item
+
+
+def _paypal_submit_new_user_email_gate(
+    page,
+    paypal_cfg: dict,
+    account: dict,
+) -> tuple[str, object | None]:
+    email = _paypal_checkout_email(paypal_cfg, account)
+    _log(f"      [B-new] 进入创建账号邮箱页，填写邮箱: {email}")
+    _paypal_fill_visible(
+        page,
+        [
+            'input#email',
+            'input[name="email"]',
+            'input[type="email"]',
+            'input[autocomplete="email"]',
+            'input[placeholder="Email"]',
+        ],
+        email,
+        "new user email",
+        required=True,
+    )
+    _safe_screenshot(page, "/tmp/paypal_new_user_email_gate_filled.png")
+    _paypal_submit_new_user_email_button(page, paypal_cfg, required=True)
+
+    timeout_s = float(paypal_cfg.get("email_gate_wait_timeout_s") or 90)
+    retry_after_s = float(paypal_cfg.get("email_gate_retry_after_s") or 18)
+    max_retries = max(0, int(paypal_cfg.get("email_gate_max_retries") or 2))
+    deadline = time.time() + timeout_s
+    last_log = 0.0
+    last_retry = time.time()
+    retries = 0
+    while time.time() < deadline:
+        if _paypal_new_user_form_visible(page):
+            return "new_user", None
+        password_input = _paypal_visible_password_input(page)
+        if password_input:
+            return "password", password_input
+        if _paypal_otp_visible(page):
+            return "otp", None
+        if _paypal_recaptcha_visible(page):
+            _paypal_wait_manual_recaptcha(
+                page,
+                paypal_cfg,
+                browser_visible=_paypal_manual_browser_visible(paypal_cfg),
+            )
+            last_retry = time.time()
+            continue
+
+        email_gate = _paypal_new_user_email_gate_visible(page)
+        loading = email_gate and _paypal_email_gate_loading(page)
+        visible_error = _paypal_collect_visible_errors(page)
+        if visible_error:
+            _log(f"      [B-new] 创建账号邮箱页提示: {visible_error}")
+
+        now = time.time()
+        if email_gate and not loading and retries < max_retries and now - last_retry >= retry_after_s:
+            retries += 1
+            _log(f"      [B-new] 创建账号邮箱页仍未跳转，重试点击 continue ({retries}/{max_retries})")
+            _paypal_submit_new_user_email_button(page, paypal_cfg, required=False)
+            last_retry = now
+            continue
+
+        if now - last_log >= 10:
+            last_log = now
+            state = "email gate loading" if loading else ("email gate idle" if email_gate else "waiting")
+            _log(f"      [B-new] 等待创建账号邮箱页跳转中: {state}, url={page.url[:90]}")
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1500)
+        except Exception:
+            pass
+        time.sleep(0.7)
+
+    _safe_screenshot(page, "/tmp/paypal_new_user_email_gate_stuck.png")
+    if _paypal_new_user_email_gate_visible(page):
+        return "new_user_email", None
+    return _paypal_wait_new_user_or_password(page, timeout_s=5)
+
+
+def _paypal_otp_visible(page) -> bool:
+    item, _sel = _paypal_first_visible_locator(page, [
+        'input[id^="ciBasic-"]',
+        '[data-testid="sca-confirm-multi-field"] input',
+        'input[autocomplete="one-time-code"]',
+        'input[inputmode="numeric"]',
+    ])
+    return bool(item)
+
+
+def _paypal_fill_new_user_otp(page, paypal_cfg: dict, account: dict) -> bool:
+    otp = _paypal_account_value(
+        account,
+        "sms_otp",
+        "otp",
+        "phone_otp",
+        default=str(paypal_cfg.get("sms_otp") or paypal_cfg.get("otp") or ""),
+    ).strip()
+    if not _paypal_otp_visible(page):
+        return False
+    if not otp:
+        return _paypal_wait_manual_new_user_otp(page, paypal_cfg)
+
+    return _paypal_submit_new_user_otp(page, otp)
+
+
+def _paypal_submit_new_user_otp(page, otp: str) -> bool:
+    digit_inputs = []
+    try:
+        digit_inputs = page.query_selector_all('input[id^="ciBasic-"]')
+    except Exception:
+        digit_inputs = []
+    if len(digit_inputs) >= len(otp):
+        for idx, ch in enumerate(otp):
+            digit_inputs[idx].fill(ch)
+        _log("      [B-new] 已逐位填写 SMS OTP")
+    else:
+        _paypal_fill_visible(
+            page,
+            ['input[autocomplete="one-time-code"]', 'input[inputmode="numeric"]'],
+            otp,
+            "sms otp",
+            required=True,
+        )
+    _paypal_click_visible(
+        page,
+        [
+            'button:has-text("Confirm")',
+            'button:has-text("Continue")',
+            'button:has-text("Next")',
+            'button:has-text("确认")',
+            'button:has-text("继续")',
+            'button[type="submit"]',
+        ],
+        "sms otp submit",
+        required=False,
+    )
+    return True
+
+
+def _paypal_wait_manual_new_user_otp(page, paypal_cfg: dict) -> bool:
+    timeout_s = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or 600)
+    otp_path = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
+    if not otp_path:
+        raise RuntimeError("PayPal 新用户手动 OTP 文件路径为空")
+    os.makedirs(os.path.dirname(otp_path), exist_ok=True)
+    try:
+        if os.path.exists(otp_path):
+            os.remove(otp_path)
+    except Exception:
+        pass
+
+    _safe_screenshot(page, "/tmp/paypal_new_user_sms_otp.png")
+    _log(f"PAYPAL_NEW_USER_OTP_REQUEST path={otp_path}")
+    _log(f"      [B-new] PayPal 短信验证码需要手动输入，请在 portal OTP 弹窗提交；timeout={timeout_s}s")
+
+    deadline = time.time() + timeout_s
+    last_log = 0.0
+    while time.time() < deadline:
+        if not _paypal_otp_visible(page):
+            _log("      [B-new] PayPal OTP 页面已消失，继续后续流程")
+            return True
+        try:
+            if os.path.exists(otp_path):
+                with open(otp_path, "r", encoding="utf-8") as f:
+                    otp = re.sub(r"\D+", "", f.read())
+                if otp:
+                    try:
+                        os.remove(otp_path)
+                    except Exception:
+                        pass
+                    _log(f"      [B-new] 收到手动 PayPal OTP (len={len(otp)})")
+                    return _paypal_submit_new_user_otp(page, otp)
+        except Exception as e:
+            _log(f"      [B-new] 读取手动 PayPal OTP 失败: {e}")
+        now = time.time()
+        if now - last_log >= 30:
+            last_log = now
+            _log("      [B-new] 等待 portal 手动提交 PayPal OTP ...")
+        time.sleep(1)
+
+    _safe_screenshot(page, "/tmp/paypal_new_user_sms_otp_timeout.png")
+    raise RuntimeError("等待手动 PayPal SMS OTP 超时")
+
+
+def _paypal_complete_new_user_checkout(
+    page,
+    paypal_cfg: dict,
+    account: dict,
+    payment_card: dict | None = None,
+) -> bool:
+    country = _paypal_target_country(paypal_cfg)
+    address = _paypal_resolve_new_user_address(paypal_cfg, account, payment_card)
+    if address.get("country"):
+        country = address["country"].upper()
+    card = _paypal_resolve_new_user_card(paypal_cfg, account, payment_card)
+    phone_row = _paypal_resolve_new_user_phone(paypal_cfg, account)
+    first_name = str(address.get("first_name") or "").strip()
+    last_name = str(address.get("last_name") or "").strip()
+    full_name = str(address.get("full_name") or "").strip()
+    if not first_name or not last_name:
+        first_name, last_name, full_name = _paypal_name_parts(account, payment_card)
+    first_name = _paypal_short_name_token(first_name, "James")
+    last_name = _paypal_short_name_token(last_name, "Smith")
+    if not full_name:
+        full_name = f"{first_name} {last_name}".strip()
+    else:
+        full_name = f"{first_name} {last_name}".strip()
+    email = _paypal_checkout_email(paypal_cfg, account)
+    phone = phone_row["phone"]
+    new_password = _paypal_generated_new_user_password(paypal_cfg)
+
+    _log(
+        "      [B-new] 填写 PayPal 新用户表单"
+        f"email={email} phone={phone_row.get('_source_index', phone_row.get('_source', '?'))} "
+        f"card={card.get('_source_index', card.get('_source', '?'))} "
+        f"address={address.get('_source', '?')}"
+    )
+    _ensure_paypal_billing_country(page, country)
+    _paypal_select_visible(
+        page,
+        ['select#country[data-testid="countrySelector"]', 'select#country[name="country"]', 'select[name="country"]'],
+        country,
+        "country",
+        required=False,
+    )
+    _paypal_fill_visible(page, ['input#email', 'input[name="email"]'], email, "email", required=False)
+    _paypal_fill_visible(page, ['input#phone', 'input[data-testid="phone"]'], phone, "phone", required=True)
+    _paypal_fill_visible(page, ['input#full-name', 'input[name="name"]'], full_name, "full name", required=False)
+    _paypal_fill_visible(page, ['input#cardNumber', 'input[name="cardnumber"]'], card["number"], "card number", required=True)
+    _paypal_fill_visible(page, ['input#cardExpiry', 'input[name="exp-date"]'], card["expiry"], "card expiry", required=True)
+    _paypal_fill_visible(page, ['input#cardCvv', 'input[name="cvv"]'], card["cvc"], "card cvc", required=True)
+    _paypal_fill_visible(page, ['input#firstName', 'input[name="fname"]'], first_name, "first name", required=False)
+    _paypal_fill_visible(page, ['input#lastName', 'input[name="lname"]'], last_name, "last name", required=False)
+    _paypal_fill_visible(page, ['input#billingLine1', 'input[name="billingLine1"]'], address["line1"], "billing line1", required=True)
+    _paypal_fill_visible(page, ['input#billingLine2', 'input[name="billingLine2"]'], address["line2"], "billing line2", required=False)
+    _paypal_fill_visible(page, ['input#billingCity', 'input[name="billingCity"]'], address["city"], "billing city", required=True)
+    _paypal_select_visible(page, ['select#billingState', 'select[name="billingState"]'], address["state"], "billing state", required=False)
+    _paypal_fill_visible(
+        page,
+        ['input#billingPostalCode', 'input[name="billingPostalCode"]'],
+        address["postal_code"],
+        "billing postal code",
+        required=True,
+    )
+    _paypal_fill_visible(
+        page,
+        ['input#password[data-testid="lazy-password-input"]', 'input#password', 'input[name="password"]'],
+        new_password,
+        "new account password",
+        required=True,
+    )
+    _safe_screenshot(page, "/tmp/paypal_new_user_filled.png")
+    _log("      [B-new] 表单截图: /tmp/paypal_new_user_filled.png")
+
+    if paypal_cfg.get("dry_fill_only"):
+        _log("      [B-new] dry_fill_only=1，仅填表不提交")
+        return True
+
+    _paypal_click_visible(
+        page,
+        ['button[data-testid="submit-button"]', 'button[name="review_your_payment"]', 'button[type="submit"]'],
+        "review your payment",
+        required=True,
+        timeout_ms=_paypal_click_timeout_ms(paypal_cfg),
+    )
+    for wait_i in range(40):
+        time.sleep(1)
+        if _paypal_otp_visible(page):
+            _paypal_fill_new_user_otp(page, paypal_cfg, account)
+        if _paypal_recaptcha_visible(page):
+            _paypal_wait_manual_recaptcha(
+                page,
+                paypal_cfg,
+                browser_visible=_paypal_manual_browser_visible(paypal_cfg),
+            )
+            continue
+        cur = page.url
+        if "checkoutweb" in cur or "/webapps/hermes" in cur or "pm-redirects" in cur:
+            _log(f"      [B-new] 新用户表单提交后到达: {cur[:100]}")
+            return True
+        if _paypal_visible_any(page, ['#consentButton', '[data-testid="consentButton"]']):
+            _log("      [B-new] 已到达 consent 页面")
+            return True
+        if wait_i in (10, 25):
+            _safe_screenshot(page, f"/tmp/paypal_new_user_after_submit_{wait_i}.png")
+            _log(f"      [B-new] 等待提交结果 {wait_i}s: {cur[:100]}")
+    _safe_screenshot(page, "/tmp/paypal_new_user_submit_timeout.png")
+    raise RuntimeError("PayPal 新用户表单提交后未进入授权/同意页面")
 
 
 def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
@@ -5502,6 +6865,7 @@ def _paypal_browser_authorize(
     paypal_cfg: dict,
     captcha_api_key: str = "",
     proxy_url: str = "",
+    payment_card: dict | None = None,
 ) -> bool:
     """Playwright 浏览器完成 PayPal 授权全流程（登录+hCaptcha+2FA+授权）。
     当纯 HTTP 因 hCaptcha 失败时的回退路径。
@@ -5509,10 +6873,19 @@ def _paypal_browser_authorize(
     from playwright.sync_api import sync_playwright
     import subprocess, shutil
 
-    paypal_email = paypal_cfg.get("email", "")
-    paypal_password = paypal_cfg.get("password", "")
-    if not paypal_email or not paypal_password:
+    is_new_user_flow = _paypal_is_new_user_flow(paypal_cfg)
+    new_user_account = _paypal_resolve_new_user_account(paypal_cfg) if is_new_user_flow else {}
+    paypal_email = _paypal_checkout_email(paypal_cfg, new_user_account)
+    paypal_password = str(paypal_cfg.get("password") or "")
+    paypal_country = _paypal_target_country(paypal_cfg)
+    if is_new_user_flow:
+        _log(
+            "      [Browser] PayPal flow=new_user "
+            f"runtime_email={paypal_email}"
+        )
+    elif not paypal_email or not paypal_password:
         raise RuntimeError("PayPal 浏览器模式需要 email + password")
+    _log(f"      [Browser] PayPal target country={paypal_country}")
 
     # VLM 配置（用于 hCaptcha 视觉识别）
     vlm_base_url = os.environ.get("CTF_VLM_BASE_URL", "https://YOUR_VLM_ENDPOINT/api")
@@ -5521,7 +6894,13 @@ def _paypal_browser_authorize(
 
     _log("      [Browser] 启动 Camoufox 反检测浏览器 ...")
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    _log(f"      [Browser] display={'yes' if has_display else 'no (virtual)'}")
+    visible_browser = _paypal_bool_cfg(paypal_cfg, "visible_browser", "PAYPAL_VISIBLE_BROWSER", False)
+    browser_headless = not (has_display or visible_browser)
+    _log(
+        "      [Browser] display="
+        f"{'yes' if not browser_headless else 'no (virtual)'} "
+        f"visible_browser={'yes' if visible_browser else 'no'}"
+    )
 
     # 代理配置 (Camoufox 格式 — socks5 auth 需要 gost 中继)
     cf_proxy = None
@@ -5553,13 +6932,22 @@ def _paypal_browser_authorize(
     # 后续跑批量时跳过 email+password+2FA，直接到 /agreements/approve
     # 保存在项目目录（/tmp 会重启丢失 + tmpfs 空间有限）
     # 若遇到损坏/DDC 失败状态，删除 CTF-pay/paypal_cf_persist 即可重置
-    _persist_profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paypal_cf_persist")
+    if is_new_user_flow:
+        account_key = str(paypal_email or f"new_user_{new_user_account.get('_source_index', 0)}")
+        account_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", account_key)[:80]
+        _persist_profile = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "paypal_cf_persist_new_user",
+            account_key,
+        )
+    else:
+        _persist_profile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paypal_cf_persist")
     os.makedirs(_persist_profile, exist_ok=True)
     profile_existed = any(os.scandir(_persist_profile))
     _log(f"      [Browser] 持久化 profile: {_persist_profile} (existed={profile_existed})")
     with Camoufox(
-        headless=not has_display,
-        humanize=False,
+        headless=browser_headless,
+        humanize=True,
         persistent_context=True,
         user_data_dir=_persist_profile,
         os="windows",
@@ -5570,6 +6958,7 @@ def _paypal_browser_authorize(
     ) as ctx:
         # persistent_context 返回的是 BrowserContext 而不是 Browser
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        setattr(page, "_paypal_camoufox_humanize", True)
 
         # 不注入旧 cookies — 过期 cookies 会让 DDC 更严格
 
@@ -5748,11 +7137,26 @@ def _paypal_browser_authorize(
                     _safe_screenshot(page, "/tmp/paypal_ddc_timeout.png")
                     _log(f"      [B-DDC] DDC 50s 超时: {page.url[:80]}")
 
+            try:
+                _ensure_paypal_login_region(page, paypal_country)
+                _ensure_paypal_billing_country(page, paypal_country)
+            except Exception as e_region:
+                _log(f"      [B-region] PayPal 地区确认异常，继续旧流程: {e_region}")
+
+            new_user_completed = False
+            if is_new_user_flow and _paypal_new_user_form_visible(page):
+                _log("      [B-new] 当前已是新用户表单，直接填写")
+                _paypal_complete_new_user_checkout(page, paypal_cfg, new_user_account, payment_card)
+                new_user_completed = True
+
             # [B2-onetouch] 持久化 profile 识别账号时 PayPal 会显示 "Continue as XXX" /
             # WebAuthn 等一键登录入口，此时 login_email input 仍在 DOM 但被隐藏。
             # 先尝试顺着登录态走一键登录，避免落到 B2 死等 email input 可见。
             onetouch_clicked = False
             try:
+                if is_new_user_flow:
+                    _log("      [B2-onetouch] 新用户模式跳过一键登录")
+                    raise StopIteration()
                 onetouch_selectors = [
                     'button[data-testid*="one-touch"]',
                     'button[data-testid*="continue"]:not([disabled])',
@@ -5775,12 +7179,13 @@ def _paypal_browser_authorize(
                             btn.click()
                             onetouch_clicked = True
                             _log("      [B2-onetouch] 已点击一键登录，等待跳转 ...")
-                            time.sleep(3)
+                            _paypal_human_pause()
                         except Exception as e_o:
                             _log(f"      [B2-onetouch] 点击异常: {e_o}")
                         break
             except Exception as e_det:
-                _log(f"      [B2-onetouch] 检测异常: {e_det}")
+                if not isinstance(e_det, StopIteration):
+                    _log(f"      [B2-onetouch] 检测异常: {e_det}")
 
             # 一键登录后若仍在 /signin，说明需要进一步认证，继续走 B2
             email_visible = False
@@ -5791,16 +7196,20 @@ def _paypal_browser_authorize(
                 pass
 
             # [B2] 需要填写邮箱登录的条件：没走一键登录 + (仍在 signin 页 or email input 可见)
-            if (not onetouch_clicked) and ("/signin" in page.url or email_visible):
+            if (not new_user_completed) and (not onetouch_clicked) and ("/signin" in page.url or email_visible):
                 _log("      [B2] 需要登录，填写邮箱 ...")
                 page.wait_for_selector('input[name="login_email"]', state="visible", timeout=15000)
+                try:
+                    _ensure_paypal_login_region(page, paypal_country)
+                except Exception as e_region:
+                    _log(f"      [B-region] B2 login 地区确认异常，继续: {e_region}")
                 # 先关闭 cookie 弹窗（如果有）
                 for cookie_sel in ['button:has-text("接受")', 'button:has-text("Accept")', '#acceptAllButton']:
                     try:
                         cb = page.query_selector(cookie_sel)
                         if cb and cb.is_visible():
                             cb.click()
-                            time.sleep(0.5)
+                            _paypal_human_pause()
                             break
                     except Exception:
                         pass
@@ -5819,7 +7228,7 @@ def _paypal_browser_authorize(
                     pass
                 if not skip_fill:
                     page.fill('input[name="login_email"]', paypal_email)
-                    time.sleep(random.uniform(0.8, 1.5))
+                    _paypal_human_pause()
 
                 # 点击 Next (下一步)
                 _log("      [B2] 点击 Next ...")
@@ -5829,39 +7238,73 @@ def _paypal_browser_authorize(
                     btn = page.query_selector(btn_sel)
                     if btn and btn.is_visible():
                         btn.click()
+                        _paypal_human_pause()
                         _log(f"      [B2] 点击了: {btn_sel}")
                         break
 
-                # [B3] 等待密码输入框变为可见
-                _log("      [B3] 等待密码输入框 ...")
-                try:
-                    page.wait_for_selector(
-                        'input[name="login_password"]',
-                        state="visible", timeout=30000,
+                # [B3] 老账号会出现 login_password；新用户会进入 phone/card/address 表单。
+                _log("      [B3] 等待密码框或新用户表单 ...")
+                wait_state, wait_password_input = _paypal_wait_new_user_or_password(page, timeout_s=30)
+
+                if is_new_user_flow and wait_state == "new_user_email":
+                    wait_state, wait_password_input = _paypal_submit_new_user_email_gate(
+                        page,
+                        paypal_cfg,
+                        new_user_account,
                     )
-                except Exception:
-                    # 可能是单页登录或需要更长等待
-                    _log("      [B3] 标准等待超时，尝试等待 URL 变化 ...")
-                    time.sleep(5)
-                pwd_input = page.query_selector('input[name="login_password"]:visible') or \
-                            page.query_selector('input[type="password"]:visible')
+
+                if is_new_user_flow and wait_state == "otp":
+                    _log("      [B3] PayPal 新用户邮箱页后出现 OTP，等待手动验证码")
+                    _paypal_fill_new_user_otp(page, paypal_cfg, new_user_account)
+                    wait_state, wait_password_input = _paypal_wait_new_user_or_password(page, timeout_s=60)
+
+                if is_new_user_flow and wait_state == "new_user":
+                    _log("      [B3] 进入 PayPal 新用户表单")
+                    _paypal_complete_new_user_checkout(page, paypal_cfg, new_user_account, payment_card)
+                    new_user_completed = True
+                    pwd_input = None
+                else:
+                    if is_new_user_flow and wait_state == "new_user_email":
+                        _safe_screenshot(page, "/tmp/paypal_new_user_email_gate_stuck.png")
+                        raise RuntimeError("PayPal 创建账号邮箱页提交后仍未进入付款资料表单")
+                    if is_new_user_flow and wait_state == "password":
+                        _safe_screenshot(page, "/tmp/paypal_new_user_existing_account.png")
+                        raise RuntimeError(
+                            "PayPal 新用户模式停留在登录密码页；该 email 可能已存在，或 PayPal 未进入 guest checkout"
+                        )
+                    if is_new_user_flow:
+                        _log("      [B3] 未检测到新用户表单，继续短等 URL/DOM ...")
+                        if _paypal_wait_new_user_form(page, timeout_s=8):
+                            _paypal_complete_new_user_checkout(page, paypal_cfg, new_user_account, payment_card)
+                            new_user_completed = True
+                            pwd_input = None
+                        else:
+                            pwd_input = None
+                    else:
+                        pwd_input = wait_password_input or _paypal_visible_password_input(page)
                 if pwd_input:
                     _log("      [B3] 密码框可见，填写密码 ...")
                     pwd_input.fill(paypal_password)
-                    time.sleep(random.uniform(0.5, 1))
+                    _paypal_human_pause()
                     for btn_sel in ['#btnLogin', 'button[name="signin-submit"]',
                                     'button:has-text("登录")', 'button:has-text("Log In")',
                                     'button[type="submit"]']:
                         btn = page.query_selector(btn_sel)
                         if btn and btn.is_visible():
                             btn.click()
+                            _paypal_human_pause()
                             _log(f"      [B3] 登录按钮: {btn_sel}")
                             break
-                    time.sleep(4)
                 else:
-                    _log("      [B3] 密码框仍不可见")
-                    _safe_screenshot(page, "/tmp/paypal_no_pwd.png")
-                    _log("      [B3] 截图: /tmp/paypal_no_pwd.png")
+                    if is_new_user_flow and new_user_completed:
+                        _log("      [B3] 新用户表单已提交")
+                    elif is_new_user_flow:
+                        _safe_screenshot(page, "/tmp/paypal_new_user_form_missing.png")
+                        raise RuntimeError("PayPal 新用户模式未出现 phone/card/address 表单")
+                    else:
+                        _log("      [B3] 密码框仍不可见")
+                        _safe_screenshot(page, "/tmp/paypal_no_pwd.png")
+                        _log("      [B3] 截图: /tmp/paypal_no_pwd.png")
 
             # 登录后截图 + 状态
             time.sleep(2)
@@ -5869,6 +7312,10 @@ def _paypal_browser_authorize(
             _log(f"      [B-diag] 登录后 URL: {page.url[:100]}")
             _log(f"      [B-diag] frames: {[f.url[:60] for f in page.frames[:5]]}")
             _log(f"      [B-diag] 截图: /tmp/paypal_after_login.png")
+            try:
+                _ensure_paypal_billing_country(page, paypal_country)
+            except Exception as e_region:
+                _log(f"      [B-region] 登录后 billing 国家确认异常，继续: {e_region}")
 
             # [B4] 处理 hCaptcha（如果出现）
             hcaptcha_frame = None
@@ -5930,7 +7377,7 @@ def _paypal_browser_authorize(
                 # 等待安全检查完成（最长 60 秒）
                 _log("      [B4] 等待安全检查完成 ...")
                 captcha_passed = False
-                for wait_sec in range(25):
+                for wait_sec in range(60):
                     cur = page.url
                     # 检查是否跳转到 hermes/consent/2FA/pay
                     if any(kw in cur for kw in ["/webapps/hermes", "/pay/", "/pay?",
@@ -6084,9 +7531,28 @@ def _paypal_browser_authorize(
 
             # [B6] 等待到达 consent 页面 / hermes
             _log("      [B6] 等待授权页面 ...")
-            for wait_i in range(30):
+            reached_authorize_page = False
+            b6_timeout_s = int(paypal_cfg.get("authorize_wait_timeout_s") or 60)
+            for wait_i in range(b6_timeout_s):
                 cur = page.url
-                if "/webapps/hermes" in cur or "checkoutweb" in cur:
+                if _paypal_recaptcha_visible(page):
+                    _paypal_wait_manual_recaptcha(
+                        page,
+                        paypal_cfg,
+                        browser_visible=not browser_headless,
+                    )
+                    continue
+                if wait_i in (0, 5, 15):
+                    try:
+                        _ensure_paypal_billing_country(page, paypal_country)
+                    except Exception as e_region:
+                        _log(f"      [B-region] B6 billing 国家确认异常，继续: {e_region}")
+                if (
+                    "/webapps/hermes" in cur
+                    or "checkoutweb" in cur
+                    or _paypal_visible_any(page, ['#consentButton', '[data-testid="consentButton"]'])
+                ):
+                    reached_authorize_page = True
                     _log(f"      [B6] 到达授权页: {cur[:80]}")
                     break
                 if "chatgpt.com" in cur or "pm-redirects" in cur:
@@ -6116,8 +7582,13 @@ def _paypal_browser_authorize(
                 time.sleep(1)
 
             if not success:
-                # [B7] 到达 hermes 页面 — 提取参数，用纯 HTTP 完成 authorize + return
-                _log("      [B7] 到达 hermes，提取授权参数 ...")
+                if not reached_authorize_page:
+                    _safe_screenshot(page, "/tmp/paypal_authorize_page_timeout.png")
+                    _log(f"      [B6] 授权页面等待超时: {page.url[:100]}")
+                    raise RuntimeError("PayPal 授权页面未出现或仍在跳转中")
+
+                # [B7] 到达授权页面 — 优先提取参数，用纯 HTTP 完成 authorize + return
+                _log("      [B7] 到达授权页，提取授权参数 ...")
                 hermes_html = page.content()
                 hermes_url = page.url
                 # 提取 cookies 供 HTTP 使用
@@ -6226,6 +7697,7 @@ def _paypal_browser_authorize(
                 else:
                     # 监听网络请求（捕获 pm-redirects return URL）
                     captured_return_url = []
+                    consent_click_timeout_ms = _paypal_click_timeout_ms(paypal_cfg)
                     def _on_request(request):
                         if "pm-redirects" in request.url and "/return/" in request.url:
                             captured_return_url.append(request.url)
@@ -6233,11 +7705,40 @@ def _paypal_browser_authorize(
                     page.on("request", _on_request)
 
                     _log("      [B7] 通过浏览器点击 consent 按钮 ...")
+                    if _paypal_recaptcha_visible(page):
+                        _paypal_wait_manual_recaptcha(
+                            page,
+                            paypal_cfg,
+                            browser_visible=not browser_headless,
+                        )
                     for sel in ['button#consentButton', 'button:has-text("Agree")',
                                 'button:has-text("同意并继续")', 'button[type="submit"]']:
+                        if _paypal_recaptcha_visible(page):
+                            _paypal_wait_manual_recaptcha(
+                                page,
+                                paypal_cfg,
+                                browser_visible=not browser_headless,
+                            )
                         btn = page.query_selector(sel)
                         if btn and btn.is_visible():
-                            btn.click()
+                            try:
+                                _paypal_click_locator(page, btn, timeout_ms=consent_click_timeout_ms)
+                                _paypal_human_pause()
+                            except Exception:
+                                if _paypal_recaptcha_visible(page):
+                                    _paypal_wait_manual_recaptcha(
+                                        page,
+                                        paypal_cfg,
+                                        browser_visible=not browser_headless,
+                                    )
+                                    btn = page.query_selector(sel)
+                                    if btn and btn.is_visible():
+                                        _paypal_click_locator(page, btn, timeout_ms=consent_click_timeout_ms)
+                                    else:
+                                        raise
+                                    _paypal_human_pause()
+                                else:
+                                    raise
                             _log(f"      [B7] 已点击: {sel}")
                             break
                     # 等待完整重定向链
@@ -6405,6 +7906,771 @@ def _solve_hcaptcha_via_vlm(page, hcaptcha_frame, vlm_base_url, vlm_api_key, vlm
     return False
 
 
+_PAYPAL_DIAL_CODES = {
+    "US": "1",
+    "CA": "1",
+    "GB": "44",
+    "UK": "44",
+    "FR": "33",
+    "CN": "86",
+    "JP": "81",
+}
+
+
+def _paypal_phone_e164(phone: str, country: str = "US") -> str:
+    raw = str(phone or "").strip()
+    digits = re.sub(r"\D+", "", raw)
+    if not digits:
+        return ""
+    if raw.startswith("+"):
+        return "+" + digits
+
+    country_key = str(country or "US").strip().upper()
+    dial_code = ""
+    if re.fullmatch(r"\+?\d{1,4}", country_key):
+        dial_code = re.sub(r"\D+", "", country_key)
+    else:
+        dial_code = _PAYPAL_DIAL_CODES.get(country_key, "")
+
+    if dial_code:
+        if digits.startswith(dial_code) and len(digits) > len(dial_code):
+            return "+" + digits
+        national = digits
+        if dial_code != "1" and national.startswith("0"):
+            national = national[1:]
+        return "+" + dial_code + national
+
+    return "+" + digits
+
+
+def _paypal_sms_api_url(paypal_cfg: dict, phone_e164: str) -> str:
+    if _paypal_bool_cfg(paypal_cfg, "manual_otp", default=False) or not _paypal_bool_cfg(
+        paypal_cfg,
+        "sms_api_enabled",
+        default=True,
+    ):
+        return ""
+
+    template = str(
+        paypal_cfg.get("sms_api_url_template")
+        or paypal_cfg.get("sms_url_template")
+        or paypal_cfg.get("otp_api_url_template")
+        or paypal_cfg.get("sms_api_url")
+        or paypal_cfg.get("otp_api_url")
+        or ""
+    ).strip()
+    if not template:
+        return ""
+
+    api_key_env = str(paypal_cfg.get("sms_api_key_env") or "NEXSMS_API_KEY").strip()
+    api_key = str(paypal_cfg.get("sms_api_key") or paypal_cfg.get("sms_key") or "").strip()
+    if not api_key and api_key_env:
+        api_key = str(os.environ.get(api_key_env) or "").strip()
+    if "{api_key" in template and not api_key:
+        _log(f"      [signup_no_card] 未配置短信 API key，设置 paypal.sms_api_key 或环境变量 {api_key_env}")
+        return ""
+
+    phone_value = str(phone_e164 or "").strip()
+    if phone_value and not phone_value.startswith("+"):
+        phone_country = str(
+            paypal_cfg.get("dial_code")
+            or paypal_cfg.get("phone_country")
+            or paypal_cfg.get("country")
+            or paypal_cfg.get("locale_country")
+            or "US"
+        ).upper()
+        phone_value = _paypal_phone_e164(phone_value, phone_country)
+
+    digits = re.sub(r"\D+", "", phone_value)
+    values = {
+        "phone": digits,
+        "phone_number": digits,
+        "phone_e164": phone_value,
+        "phone_e164_url": urllib.parse.quote(phone_value, safe=""),
+        "api_key": urllib.parse.quote(api_key, safe=""),
+        "api_key_raw": api_key,
+    }
+    try:
+        return template.format(**values)
+    except Exception as e:
+        _log(f"      [signup_no_card] sms_api_url_template 格式化失败: {e}")
+        return ""
+
+
+def _paypal_card_type(number: str) -> str:
+    digits = re.sub(r"\D+", "", str(number or ""))
+    if digits.startswith("4"):
+        return "VISA"
+    if re.match(r"^(5[1-5]|2[2-7])", digits):
+        return "MASTERCARD"
+    if re.match(r"^3[47]", digits):
+        return "AMEX"
+    if digits.startswith("6"):
+        return "DISCOVER"
+    return "VISA"
+
+
+def _paypal_signup_expiry(expiry: str) -> str:
+    value = str(expiry or "").strip()
+    parts = re.findall(r"\d+", value)
+    if len(parts) >= 2:
+        month = parts[0].zfill(2)[:2]
+        year = parts[1]
+        if len(year) == 2:
+            year = "20" + year
+        return f"{month}/{year}"
+    return value
+
+
+def _paypal_protocol_persona(pps, paypal_cfg: dict, account: dict, address: dict, payment_card: dict | None):
+    first_name = str(address.get("first_name") or "").strip()
+    last_name = str(address.get("last_name") or "").strip()
+    full_name = str(address.get("full_name") or "").strip()
+    if not first_name or not last_name:
+        first_name, last_name, full_name = _paypal_name_parts(account, payment_card)
+    if not first_name:
+        first_name = "James"
+    if not last_name:
+        last_name = "Smith"
+    first_name = _paypal_short_name_token(first_name, "James")
+    last_name = _paypal_short_name_token(last_name, "Smith")
+    email = _paypal_checkout_email(paypal_cfg, account)
+    password = _paypal_generated_new_user_password(paypal_cfg)
+    return pps.Persona(
+        first_name=first_name,
+        last_name=last_name,
+        email=email,
+        password=password,
+        line1=address.get("line1") or "123 Main St",
+        city=address.get("city") or "New York",
+        state=address.get("state") or "NY",
+        postal_code=address.get("postal_code") or "10001",
+        country=(address.get("country") or _paypal_target_country(paypal_cfg) or "US").upper(),
+        raw={"source": "CTF-pay.runtime", "full_name": full_name},
+    )
+
+
+def _paypal_signup_payloads(paypal_cfg: dict, account: dict, payment_card: dict | None) -> tuple[str, dict | None, dict]:
+    country = _paypal_target_country(paypal_cfg)
+    address = _paypal_resolve_new_user_address(paypal_cfg, account, payment_card)
+    if address.get("country"):
+        country = str(address["country"]).upper()
+    phone_row = _paypal_resolve_new_user_phone(paypal_cfg, account)
+    phone_country = str(
+        phone_row.get("dial_code")
+        or phone_row.get("country")
+        or paypal_cfg.get("dial_code")
+        or paypal_cfg.get("phone_country")
+        or country
+    ).strip()
+    phone = _paypal_phone_e164(phone_row["phone"], phone_country)
+    card = _paypal_resolve_new_user_card(paypal_cfg, account, payment_card)
+    signup_card = None
+    if card.get("number"):
+        signup_card = {
+            "cardNumber": re.sub(r"\D+", "", str(card.get("number") or "")),
+            "expirationDate": _paypal_signup_expiry(str(card.get("expiry") or "")),
+            "securityCode": str(card.get("cvc") or ""),
+            "type": _paypal_card_type(str(card.get("number") or "")),
+        }
+    signup_address = {
+        "country": country,
+        "line1": address.get("line1") or "123 Main St",
+        "line2": address.get("line2") or "",
+        "city": address.get("city") or "New York",
+        "state": address.get("state") or "NY",
+        "postal_code": address.get("postal_code") or "10001",
+        "autoCompleteType": "MANUAL",
+        "isUserModified": False,
+    }
+    first_name = str(address.get("first_name") or "").strip()
+    last_name = str(address.get("last_name") or "").strip()
+    if not first_name or not last_name:
+        first_name, last_name, _full = _paypal_name_parts(account, payment_card)
+    first_name = _paypal_short_name_token(first_name, "James")
+    last_name = _paypal_short_name_token(last_name, "Smith")
+    if first_name:
+        signup_address["first_name"] = first_name
+    if last_name:
+        signup_address["last_name"] = last_name
+    return phone, signup_card, signup_address
+
+
+def _paypal_install_pps_log_bridge(pps) -> None:
+    import logging
+
+    logger = logging.getLogger(pps.__name__)
+    if any(getattr(h, "_ctf_pay_bridge", False) for h in logger.handlers):
+        return
+
+    class _PayPalPlusLogHandler(logging.Handler):
+        _ctf_pay_bridge = True
+
+        def emit(self, record):
+            try:
+                _log("      [paypal_plus] " + self.format(record))
+            except Exception:
+                pass
+
+    handler = _PayPalPlusLogHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def _paypal_signup_node_rpa(
+    *,
+    redirect_url: str,
+    checkout_url: str = "",
+    full_checkout: bool = False,
+    expected_due_cents: int = 0,
+    stripe_email: str = "",
+    paypal_cfg: dict,
+    proxy_url: str,
+    phone: str,
+    signup_card: dict | None,
+    signup_billing_address: dict | None,
+    persona=None,
+    sms_api_url: str = "",
+    manual_otp_file: str = "",
+    otp_timeout: int = 600,
+) -> bool:
+    """Use the reference Node/Chromium PayPal RPA helper for guest checkout."""
+    paypal_cfg["_last_node_rpa_result"] = {}
+    if not signup_card:
+        _log("      [node-rpa] 缺少 signup_card，无法按 userscript 填 PayPal 临时号")
+        paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "missing_signup_card"}
+        return False
+
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "paypal_node_rpa.js")
+    if not os.path.exists(helper):
+        _log(f"      [node-rpa] helper 不存在: {helper}")
+        paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "helper_missing"}
+        return False
+
+    node_bin = (
+        os.environ.get("OPENAI_SENTINEL_NODE_PATH", "").strip()
+        or shutil.which("node")
+        or "node"
+    )
+    card_number = str(signup_card.get("cardNumber") or signup_card.get("number") or "").replace(" ", "")
+    if not card_number:
+        _log("      [node-rpa] signup_card 缺少 cardNumber")
+        paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "missing_card_number"}
+        return False
+
+    signup_billing_address = signup_billing_address or {}
+    first_name = (
+        paypal_cfg.get("signup_first_name")
+        or signup_billing_address.get("first_name")
+        or getattr(persona, "first_name", "")
+        or os.environ.get("PPS_PAYPAL_SIGNUP_FIRST_NAME")
+        or "James"
+    )
+    last_name = (
+        paypal_cfg.get("signup_last_name")
+        or signup_billing_address.get("last_name")
+        or getattr(persona, "last_name", "")
+        or os.environ.get("PPS_PAYPAL_SIGNUP_LAST_NAME")
+        or "Smith"
+    )
+    first_name = _paypal_short_name_token(first_name, "James")
+    last_name = _paypal_short_name_token(last_name, "Smith")
+
+    profile_dir = tempfile.mkdtemp(prefix="paypal_node_rpa_")
+    keep_profile = _paypal_bool_cfg(paypal_cfg, "keep_node_rpa_profile", default=False) or bool(os.environ.get("PPS_PAYPAL_KEEP_PROFILE"))
+    payload = {
+        "redirectUrl": redirect_url,
+        "proxy": proxy_url or "",
+        "phone": phone,
+        "email": getattr(persona, "email", "") or paypal_cfg.get("_generated_new_user_email") or "",
+        "password": getattr(persona, "password", "") or paypal_cfg.get("_generated_new_user_password") or "",
+        "stripeEmail": stripe_email or "",
+        "cardNumber": card_number,
+        "cardExpiry": signup_card.get("expirationDate") or paypal_cfg.get("card_expiry") or "03/30",
+        "cardCvv": signup_card.get("securityCode") or signup_card.get("cvc") or signup_card.get("cvv") or "",
+        "address": signup_billing_address,
+        "firstName": first_name,
+        "lastName": last_name,
+        "smsApiUrl": sms_api_url or "",
+        "manualOtpFile": "" if sms_api_url else (manual_otp_file or ""),
+        "expectedDueCents": int(expected_due_cents or 0),
+        "timeoutMs": int(paypal_cfg.get("node_rpa_timeout_s") or paypal_cfg.get("browser_rpa_timeout_s") or 720) * 1000,
+        "otpTimeoutMs": int(otp_timeout or paypal_cfg.get("otp_timeout_s") or 600) * 1000,
+        "fallbackConsentDelayMs": int(
+            paypal_cfg.get("fallback_consent_delay_ms")
+            or os.environ.get("PPS_PAYPAL_FALLBACK_CONSENT_DELAY_MS")
+            or 12000
+        ),
+        "headless": bool(paypal_cfg.get("node_rpa_headless") or paypal_cfg.get("browser_rpa_headless")),
+        "profileDir": profile_dir,
+        "keepProfile": keep_profile,
+    }
+    if full_checkout and checkout_url:
+        payload["checkoutUrl"] = checkout_url
+        payload["fullCheckout"] = True
+
+    worker_id = (
+        os.environ.get("NCPP_WORKER_ID")
+        or str(paypal_cfg.get("node_rpa_worker_id") or "")
+        or f"pay_{os.getpid()}_{int(time.time() * 1000)}"
+    ).strip().replace("/", "_")
+    tmp_base = "/tmp/paypal_node_rpa" + (f"_{worker_id}" if worker_id else "")
+    for suffix in ("result.json", "state.json", "live.log", "last.json"):
+        try:
+            os.unlink(f"{tmp_base}_{suffix}")
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    _log(
+        (
+            "      [node-rpa-full] 启动整页浏览器 checkout+PayPal RPA "
+            if payload.get("fullCheckout")
+            else "      [node-rpa] 启动 Node/Chromium PayPal RPA "
+        )
+        + f"card=****{card_number[-4:]} phone={str(phone)[-4:].rjust(len(str(phone)), '*')} "
+        f"otp={'sms_api' if sms_api_url else 'portal'} headless={payload['headless']}"
+    )
+
+    env = os.environ.copy()
+    node_paths = [
+        env.get("NODE_PATH", ""),
+        "/app/webui/frontend/node_modules",
+        os.path.join(_REPO_DIR_BOOT, "webui", "frontend", "node_modules"),
+        "/usr/local/lib/node_modules",
+    ]
+    env["NODE_PATH"] = ":".join([p for p in node_paths if p])
+    if proxy_url:
+        env.setdefault("HTTPS_PROXY", proxy_url)
+        env.setdefault("HTTP_PROXY", proxy_url)
+        env.setdefault("ALL_PROXY", proxy_url)
+    env["NCPP_WORKER_ID"] = worker_id
+
+    cmd = [node_bin, helper]
+    use_xvfb = (
+        not bool(payload["headless"])
+        and not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        and bool(shutil.which("xvfb-run"))
+    )
+    if use_xvfb:
+        cmd = [
+            shutil.which("xvfb-run") or "xvfb-run",
+            "-a",
+            "-s",
+            "-screen 0 1440x900x24",
+            *cmd,
+        ]
+        _log("      [node-rpa] 无 DISPLAY，使用 xvfb-run 跑 headed Chromium")
+
+    timeout_s = int(payload["timeoutMs"] / 1000) + 120
+    stderr_lines: list[str] = []
+    raw = ""
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=_REPO_DIR_BOOT,
+            bufsize=1,
+        )
+
+        def _drain_stderr() -> None:
+            try:
+                assert proc is not None and proc.stderr is not None
+                for line in proc.stderr:
+                    line = line.rstrip("\n")
+                    stderr_lines.append(line)
+                    if line.strip():
+                        _log("      " + line[:500])
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_drain_stderr, daemon=True)
+        t.start()
+        if proc.stdin is not None:
+            proc.stdin.write(json.dumps(payload, ensure_ascii=False))
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _log(f"      [node-rpa] 超时 {timeout_s}s，终止 Node/Chromium")
+            paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "node_rpa_timeout"}
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return False
+        try:
+            raw = (proc.stdout.read() if proc.stdout is not None else "") or ""
+        except Exception:
+            raw = ""
+        t.join(timeout=2)
+    except Exception as e:
+        _log(f"      [node-rpa] 启动异常: {e!r}")
+        paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": f"node_rpa_start_error: {e!r}"}
+        return False
+    finally:
+        if not keep_profile:
+            try:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    result = {}
+    raw = raw.strip()
+    if raw:
+        try:
+            result = json.loads(raw)
+        except Exception:
+            result = {}
+    if not result:
+        try:
+            with open(f"{tmp_base}_result.json", "r", encoding="utf-8") as rf:
+                result = json.load(rf)
+        except Exception:
+            result = {}
+    if not result:
+        m = re.search(r"(\{\s*\"success\"\s*:\s*(?:true|false).*?\})\s*$", raw, re.S)
+        if m:
+            try:
+                result = json.loads(m.group(1))
+            except Exception:
+                result = {}
+    if not result:
+        result = {"success": False, "error": f"no JSON result; stdout={raw[:300]}"}
+    paypal_cfg["_last_node_rpa_result"] = result
+
+    try:
+        with open(f"{tmp_base}_last.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "returncode": proc.returncode if proc is not None else None,
+                    "result": result,
+                    "stderr_tail": stderr_lines[-200:],
+                    "stdout_tail": raw.splitlines()[-200:],
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+    if proc is not None and proc.returncode not in (0, None) and result.get("success") is not True:
+        _log(f"      [node-rpa] 进程失败 rc={proc.returncode} error={str(result.get('error') or '')[:300]}")
+        return False
+    if bool(result.get("success")):
+        _log(
+            "      [node-rpa] PayPal 浏览器流程完成 "
+            f"final={str(result.get('finalUrl') or '')[:160]}"
+        )
+        return True
+    _log(
+        "      [node-rpa] 未完成 "
+        f"final={str(result.get('finalUrl') or '')[:160]} "
+        f"error={str(result.get('error') or '')[:300]}"
+    )
+    return False
+
+
+def _paypal_signup_no_card(
+    redirect_url: str,
+    paypal_cfg: dict,
+    *,
+    http,
+    proxy_url: str = "",
+    captcha_api_key: str = "",
+    checkout_url: str = "",
+    expected_due_cents: int = 0,
+    account: dict | None = None,
+    payment_card: dict | None = None,
+) -> bool:
+    """Run the mature PayPal guest-signup protocol path from CTF-reg/paypal_plus.
+
+    This avoids driving the brittle PayPal email gate DOM.  Browser use is only
+    for optional Camoufox DataDome/EC seeding; account creation itself uses the
+    captured PayPal GraphQL flow.
+    """
+    try:
+        from paypal_plus import signup as pps  # type: ignore
+    except Exception as e:
+        _log(f"      [signup_no_card] paypal_plus 模块不可用: {e!r}")
+        return False
+    _paypal_install_pps_log_bridge(pps)
+
+    def _ba_from_url(url: str) -> str:
+        try:
+            return urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("ba_token", [""])[0]
+        except Exception:
+            return ""
+
+    def _resolve_paypal_approve_url(url: str) -> tuple[str, str]:
+        cur = (url or "").strip()
+        for i in range(6):
+            ba = _ba_from_url(cur)
+            if ba:
+                return cur, ba
+            if not cur:
+                break
+            try:
+                r = http.get(
+                    cur,
+                    allow_redirects=False,
+                    timeout=30,
+                    headers={
+                        "Referer": "https://checkout.stripe.com/",
+                        "Sec-Fetch-Site": "cross-site",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Dest": "document",
+                    },
+                )
+            except Exception as e:
+                _log(f"      [signup_no_card] resolve ba_token 请求失败: {type(e).__name__}: {e}")
+                break
+            loc = (getattr(r, "headers", {}) or {}).get("location") or (getattr(r, "headers", {}) or {}).get("Location")
+            if loc:
+                nxt = urllib.parse.urljoin(cur, loc)
+                _log(
+                    "      [signup_no_card] pm-redirect "
+                    f"step={i + 1} status={getattr(r, 'status_code', '?')} -> {nxt[:140]}"
+                )
+                cur = nxt
+                continue
+            body = ""
+            try:
+                body = (getattr(r, "text", "") or "")[:12000]
+            except Exception:
+                pass
+            m = (
+                re.search(r"https?://(?:www\.)?paypal\.com/agreements/approve\?[^\s<>\"']+", body)
+                or re.search(r"ba_token=(BA-[A-Za-z0-9_.-]+)", body)
+            )
+            if m:
+                val = m.group(0)
+                if val.startswith("http"):
+                    val = val.replace("\\u0026", "&").replace("&amp;", "&")
+                    return val, _ba_from_url(val)
+                return cur, m.group(1)
+            _log(
+                "      [signup_no_card] pm-redirect "
+                f"step={i + 1} status={getattr(r, 'status_code', '?')} 无 Location/ba_token"
+            )
+            break
+        return url, ""
+
+    account = account or _paypal_resolve_new_user_account(paypal_cfg)
+    address = _paypal_resolve_new_user_address(paypal_cfg, account, payment_card)
+    persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, payment_card)
+    phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, payment_card)
+    if not phone:
+        _log("      [signup_no_card] 缺少手机号")
+        return False
+
+    original_redirect_url = (redirect_url or "").strip()
+    approve_url, ba_token = _resolve_paypal_approve_url(original_redirect_url)
+    if not ba_token:
+        _log(f"      [signup_no_card] redirect_url 缺 ba_token: {approve_url[:120]}")
+        return False
+
+    locale_country = (paypal_cfg.get("locale_country") or paypal_cfg.get("country") or "US").upper()
+    locale_lang = (paypal_cfg.get("locale_lang") or "en").lower()
+    otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
+    sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
+    manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
+    persist_to = _paypal_project_path(str(paypal_cfg.get("persist_to") or "output/no_card_paypal_plus_latest.json"))
+
+    card_hint = ""
+    if signup_card:
+        card_hint = f" card={signup_card.get('type')} ****{str(signup_card.get('cardNumber') or '')[-4:]}"
+    _log(
+        f"      [signup_no_card] ba_token={ba_token} email={persona.email} "
+        f"phone=****{phone[-4:]} locale={locale_country}/{locale_lang}{card_hint}"
+    )
+    if sms_api_url:
+        _log("      [signup_no_card] SMS OTP: API polling enabled")
+    else:
+        _log(f"      [signup_no_card] SMS OTP: manual file {manual_otp_file}")
+
+    if _paypal_bool_cfg(paypal_cfg, "node_rpa", default=False) or _paypal_bool_cfg(paypal_cfg, "browser_rpa", default=False):
+        use_full_checkout = bool(checkout_url) and not _paypal_bool_cfg(paypal_cfg, "node_rpa_paypal_only", default=False)
+        rpa_redirect_url = approve_url
+        try:
+            orig_host = urllib.parse.urlparse(original_redirect_url).hostname or ""
+        except Exception:
+            orig_host = ""
+        if use_full_checkout:
+            _log("      [node-rpa-full] 使用 checkout URL 进入浏览器，对齐老项目整页链路")
+        elif "pm-redirects.stripe.com" in orig_host:
+            rpa_redirect_url = original_redirect_url
+            _log("      [node-rpa] 使用原始 Stripe authorize URL 进入浏览器，让 PayPal 自己完成跳转/风控")
+        return _paypal_signup_node_rpa(
+            redirect_url=rpa_redirect_url,
+            checkout_url=checkout_url if use_full_checkout else "",
+            full_checkout=use_full_checkout,
+            expected_due_cents=expected_due_cents,
+            stripe_email=str(payment_card.get("email") or ""),
+            paypal_cfg=paypal_cfg,
+            proxy_url=proxy_url,
+            phone=phone,
+            signup_card=signup_card,
+            signup_billing_address=signup_billing_address,
+            persona=persona,
+            sms_api_url=sms_api_url,
+            manual_otp_file=manual_otp_file,
+            otp_timeout=otp_timeout,
+        )
+
+    seed = None
+    seed_profile_dir = ""
+    skip_seed = bool(paypal_cfg.get("skip_camoufox_seed"))
+    seed_retries = max(1, int(paypal_cfg.get("seed_retries") or paypal_cfg.get("camoufox_seed_retries") or 1))
+    if not skip_seed:
+        seed_errors: list[str] = []
+        camo_proxy = proxy_url
+        if camo_proxy and camo_proxy.startswith("socks5://") and "@" in camo_proxy:
+            relay_port = 18899
+            try:
+                import socket as _s
+                with _s.create_connection(("127.0.0.1", relay_port), timeout=2):
+                    pass
+                camo_proxy = f"socks5://127.0.0.1:{relay_port}"
+                _log(f"      [signup_no_card] using gost relay {camo_proxy}")
+            except Exception:
+                _log(f"      [signup_no_card] need gost relay: gost -L=socks5://:{relay_port} -F=<proxy>")
+        for attempt in range(1, seed_retries + 1):
+            if seed_profile_dir:
+                shutil.rmtree(seed_profile_dir, ignore_errors=True)
+                seed_profile_dir = ""
+            try:
+                _log(f"      [signup_no_card] Camoufox seeding datadome + EC ({attempt}/{seed_retries}) ...")
+                seed_profile_dir = tempfile.mkdtemp(prefix=f"pps_seed_profile_{attempt}_")
+                seed = pps.seed_via_camoufox(
+                    approve_url,
+                    proxy=camo_proxy or None,
+                    headless=not _paypal_manual_browser_visible(paypal_cfg),
+                    locale_country=locale_country,
+                    locale_lang=locale_lang,
+                    user_data_dir=seed_profile_dir,
+                )
+                seed["user_data_dir"] = seed_profile_dir
+                _log(f"      [signup_no_card] seed ok ec={seed.get('ec_token')} cookies={len(seed.get('cookies') or {})}")
+                break
+            except Exception as e:
+                seed = None
+                seed_errors.append(repr(e))
+                _log(f"      [signup_no_card] seed attempt {attempt}/{seed_retries} 失败: {e!r}")
+                if seed_profile_dir:
+                    shutil.rmtree(seed_profile_dir, ignore_errors=True)
+                    seed_profile_dir = ""
+                if attempt < seed_retries:
+                    time.sleep(1.5)
+        if seed is None:
+            if _paypal_bool_cfg(paypal_cfg, "no_http_fallback_on_seed_fail", default=False):
+                _log(
+                    "      [signup_no_card] seed 失败，按配置不回退纯 HTTP，"
+                    "避免触发 hcaptchapassive"
+                )
+                return False
+            _log("      [signup_no_card] seed 失败，继续纯 HTTP fallback: " + ("; ".join(seed_errors[-2:]) or "unknown"))
+
+    captcha_api_url = (_REMOTE_CAPTCHA_BASE_URL or os.environ.get("CTF_CAPTCHA_API_URL", "") or "").rstrip("/")
+    env_updates = {
+        "PPS_ENABLE_IDAPPS": "1",
+        "PPS_PURE_PROTOCOL": "1",
+        "PPS_PAYPAL_PHONE_E164": phone,
+        "PPS_PAYPAL_CAPTCHA_PROXY": proxy_url or "",
+        "PPS_PAYPAL_SIGNUP_FIRST_NAME": persona.first_name,
+        "PPS_PAYPAL_SIGNUP_LAST_NAME": persona.last_name,
+    }
+    if _paypal_bool_cfg(paypal_cfg, "disable_idapps", default=False):
+        env_updates["PPS_DISABLE_IDAPPS"] = "1"
+    if _paypal_bool_cfg(paypal_cfg, "browser_form_warmup", default=False):
+        env_updates["PPS_ENABLE_BROWSER_FORM_WARMUP"] = "1"
+    if _paypal_bool_cfg(paypal_cfg, "allow_browser_recaptcha", default=False):
+        env_updates["PPS_ALLOW_BROWSER_RECAPTCHA"] = "1"
+    if _paypal_bool_cfg(paypal_cfg, "signup_address_autocomplete", default=False):
+        env_updates["PPS_ENABLE_GOOGLE_ADDRESS"] = "1"
+    if sms_api_url:
+        env_updates["PPS_SMS_API_URL"] = sms_api_url
+        env_updates["PPS_PAYPAL_MANUAL_OTP_FILE"] = ""
+    else:
+        env_updates["PPS_SMS_API_URL"] = ""
+        env_updates["PPS_PAYPAL_MANUAL_OTP_FILE"] = manual_otp_file
+    if captcha_api_key:
+        env_updates["PPS_PAYPAL_CAPTCHA_API_KEY"] = captcha_api_key
+        env_updates["PPS_PAYPAL_CAPTCHA_CLIENT_KEY"] = captcha_api_key
+    if captcha_api_url and "YOUR_CAPTCHA_PROVIDER" not in captcha_api_url:
+        env_updates["PPS_PAYPAL_CAPTCHA_API_URL"] = captcha_api_url
+    old_env: dict[str, str | None] = {}
+    try:
+        for k, v in env_updates.items():
+            old_env[k] = os.environ.get(k)
+            os.environ[k] = str(v)
+        result = pps.signup_no_card(
+            ba_token=ba_token,
+            seed=seed,
+            proxy=proxy_url or None,
+            persona=persona,
+            phone_e164=phone,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            otp_timeout=otp_timeout,
+            signup_card=signup_card,
+            signup_billing_address=signup_billing_address,
+            max_persona_retries=int(paypal_cfg.get("signup_persona_retries") or paypal_cfg.get("max_signup_persona_retries") or 0),
+        )
+    except pps.CaptchaRequired as e:
+        _log(f"      [signup_no_card] 卡 captcha: {e}")
+        return False
+    except Exception as e:
+        _log(f"      [signup_no_card] 异常: {e!r}")
+        return False
+    finally:
+        for k, old in old_env.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+        if seed_profile_dir:
+            shutil.rmtree(seed_profile_dir, ignore_errors=True)
+
+    try:
+        os.makedirs(os.path.dirname(persist_to), exist_ok=True)
+        with open(persist_to, "w", encoding="utf-8") as f:
+            json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
+        _log(f"      [signup_no_card] 持久化注册结果 -> {persist_to}")
+    except Exception as e:
+        _log(f"      [signup_no_card] 持久化失败: {e!r}")
+
+    if not result.success:
+        _log(f"      [signup_no_card] 失败: {result.error_code} {result.error}")
+        return False
+
+    _log(
+        "      [signup_no_card] 注册成功 "
+        f"user={result.user_id} ec={result.ec_token} ba={result.ba_token} "
+        f"return={(result.return_url or '')[:120]}"
+    )
+    if result.return_url:
+        try:
+            r = http.get(result.return_url, allow_redirects=True, timeout=30)
+            _log(f"      [signup_no_card] Stripe callback: {r.status_code} {str(r.url)[:120]}")
+        except Exception as e:
+            _log(f"      [signup_no_card] callback 异常(仍按成功处理): {e!r}")
+    return True
+
+
 def _handle_paypal_redirect(
     redirect_url: str,
     paypal_cfg: dict,
@@ -6412,15 +8678,24 @@ def _handle_paypal_redirect(
     ctx: dict = None,
 ) -> bool:
     """纯 HTTP 完成 PayPal 授权。
-    支持两种路径：
+    支持三种路径：
+      0. New user signup_no_card — PayPal guest signup protocol + SMS OTP
       1. Cookied Login (ud-token) — 需要 paypal.cookies
       2. Full Login (邮箱→密码→hCaptcha→2FA) — 需要 email/password/imap
     """
     ctx = ctx or {}
     proxy_url = str(ctx.get("proxy_url") or "").strip()
     captcha_api_key = ctx.get("captcha_api_key", "")
+    payment_card = ctx.get("payment_card") if isinstance(ctx.get("payment_card"), dict) else None
+    checkout_url = str(ctx.get("checkout_url") or ctx.get("stripe_checkout_url") or "").strip()
+    try:
+        expected_due_cents = int(ctx.get("expected_due_cents") or ctx.get("expected_due") or 0)
+    except Exception:
+        expected_due_cents = 0
     paypal_cookies_str = paypal_cfg.get("cookies", "")
-    paypal_email = paypal_cfg.get("email", "")
+    is_new_user_flow = _paypal_is_new_user_flow(paypal_cfg)
+    new_user_account = _paypal_resolve_new_user_account(paypal_cfg) if is_new_user_flow else {}
+    paypal_email = _paypal_checkout_email(paypal_cfg, new_user_account)
     paypal_password = paypal_cfg.get("password", "")
     ud_return_url = ""
 
@@ -6469,23 +8744,45 @@ def _handle_paypal_redirect(
                 k, v = pair.split("=", 1)
                 http.cookies.set(k.strip(), v.strip(), domain=".paypal.com", path="/")
 
+    # [0] 新用户优先走成熟的 signup_no_card 协议分支，避免 PayPal email gate DOM 卡 loading。
+    if is_new_user_flow and not _paypal_bool_cfg(paypal_cfg, "browser_new_user", default=False):
+        _log("      [0] PayPal 新用户模式: 使用 signup_no_card 协议链路")
+        ok = _paypal_signup_no_card(
+            redirect_url,
+            paypal_cfg,
+            http=http,
+            proxy_url=proxy_url,
+            captcha_api_key=captcha_api_key,
+            checkout_url=checkout_url,
+            expected_due_cents=expected_due_cents,
+            account=new_user_account,
+            payment_card=payment_card,
+        )
+        if ok:
+            return True
+        if not _paypal_bool_cfg(paypal_cfg, "fallback_browser_new_user", default=False):
+            return False
+        _log("      [0] signup_no_card 未完成，按配置 fallback 到浏览器新用户表单")
+
     # [1] 跟随 Stripe redirect → PayPal /agreements/approve
     # 默认跳过 hermes 纯 HTTP 路径——PayPal 对非浏览器 session 返回 genericError(DEFAULT)，
     # 实测 2026-04 近期所有 daemon 日志 hermes 100% 失败（55+ 次全 fallback），每次浪费 5-10s。
     # 如需保留旧路径作为逆向参考，设 SKIP_HERMES_FAST_PATH=0。
     if str(os.environ.get("SKIP_HERMES_FAST_PATH", "1")).lower() in ("1", "true", "yes", "on"):
-        if paypal_email and paypal_password:
+        if is_new_user_flow or (paypal_email and paypal_password):
             _log("      [1] SKIP_HERMES_FAST_PATH=1，直接走浏览器模式")
             return _paypal_browser_authorize(
                 redirect_url, paypal_cfg,
                 captcha_api_key=captcha_api_key, proxy_url=proxy_url,
+                payment_card=payment_card,
             )
     # 如果有有效 cookies，尝试纯 HTTP 路径；否则直接走浏览器（跳过必失败的 HTTP）
-    if not paypal_cookies_str and paypal_email and paypal_password:
+    if not paypal_cookies_str and (is_new_user_flow or (paypal_email and paypal_password)):
         _log("      [1] 无 PayPal cookies，直接走浏览器模式（跳过 HTTP）")
         return _paypal_browser_authorize(
             redirect_url, paypal_cfg,
             captcha_api_key=captcha_api_key, proxy_url=proxy_url,
+            payment_card=payment_card,
         )
     _log("      [1] 跟随 Stripe redirect → PayPal ...")
     resp1 = http.get(redirect_url, allow_redirects=True, timeout=30)
@@ -6495,6 +8792,7 @@ def _handle_paypal_redirect(
         return _paypal_browser_authorize(
             redirect_url, paypal_cfg,
             captcha_api_key=captcha_api_key, proxy_url=proxy_url,
+            payment_card=payment_card,
         )
     html = resp1.text
     ba_token = urllib.parse.parse_qs(
@@ -6573,6 +8871,14 @@ def _handle_paypal_redirect(
             _log("      [2-UD] cookied login 失败，回退到完整登录")
 
     if not logged_in:
+        if is_new_user_flow:
+            _log("      [PayPal] 新用户模式跳过纯 HTTP 登录，回退浏览器表单")
+            return _paypal_browser_authorize(
+                redirect_url, paypal_cfg,
+                captcha_api_key=captcha_api_key,
+                proxy_url=proxy_url,
+                payment_card=payment_card,
+            )
         if not paypal_email or not paypal_password:
             raise RuntimeError(
                 "PayPal 授权需要: (1) 有效 cookies 或 (2) email + password"
@@ -6589,6 +8895,7 @@ def _handle_paypal_redirect(
                 redirect_url, paypal_cfg,
                 captcha_api_key=captcha_api_key,
                 proxy_url=proxy_url,
+                payment_card=payment_card,
             )
 
     # ── [H] GET hermes ──
@@ -6637,6 +8944,7 @@ def _handle_paypal_redirect(
             return _paypal_browser_authorize(
                 redirect_url, paypal_cfg,
                 captcha_api_key=captcha_api_key, proxy_url=proxy_url,
+                payment_card=payment_card,
             )
         raise RuntimeError(
             f"hermes 参数缺失 (可能需要登录): funding={funding_id} ec={ec_token}"
@@ -8016,10 +10324,20 @@ def run(
         raise ValueError("--paypal 与 --gopay 互斥")
     paypal_cfg = cfg.get("paypal") or {}
     if use_paypal:
-        has_login_creds = paypal_cfg.get("email") and paypal_cfg.get("password")
-        has_cookies = paypal_cfg.get("cookies")
-        if not has_login_creds and not has_cookies:
-            raise ValueError("PayPal 模式需要提供 paypal.email + paypal.password，或 paypal.cookies")
+        if _paypal_is_new_user_flow(paypal_cfg):
+            account = _paypal_resolve_new_user_account(paypal_cfg)
+            account_email = _paypal_checkout_email(paypal_cfg, account)
+            phone_row = _paypal_resolve_new_user_phone(paypal_cfg, account)
+            _log(
+                "  PayPal 新用户运行时身份: "
+                f"email={account_email} address=meiguodizhi "
+                f"phone={phone_row.get('_source_path') or phone_row.get('_source', 'inline')}"
+            )
+        else:
+            has_login_creds = paypal_cfg.get("email") and paypal_cfg.get("password")
+            has_cookies = paypal_cfg.get("cookies")
+            if not has_login_creds and not has_cookies:
+                raise ValueError("PayPal 模式需要提供 paypal.email + paypal.password，或 paypal.cookies")
         billing_country = card.get("address", {}).get("country", "").upper()
         if billing_country and billing_country not in EU_COUNTRIES:
             _log(
@@ -8080,7 +10398,11 @@ def run(
     _log(f"\n{'='*60}")
     if use_paypal:
         _log(f"  Stripe 自动化支付 (PayPal 渠道)")
-        _log(f"  PayPal 账号: {paypal_cfg['email']}")
+        if _paypal_is_new_user_flow(paypal_cfg):
+            pp_account = _paypal_resolve_new_user_account(paypal_cfg)
+            _log(f"  PayPal 新用户邮箱: {_paypal_checkout_email(paypal_cfg, pp_account)}")
+        else:
+            _log(f"  PayPal 账号: {paypal_cfg['email']}")
     else:
         _log(f"  Stripe 自动化支付")
         _log(f"  使用卡: ****{card['number'][-4:]}  ({card['name']})")
@@ -8151,19 +10473,35 @@ def run(
         init_attempt += 1
         _log("[1/6] 解析 checkout session ID ...")
         session_id, stripe_checkout_url = parse_checkout_url(effective_checkout_input)
+        browser_checkout_url = ""
+        if isinstance(fresh_info, dict):
+            browser_checkout_url = (
+                str(fresh_info.get("provider_url") or "").strip()
+                or str(fresh_info.get("url") or "").strip()
+            )
+        browser_checkout_url = browser_checkout_url or str(effective_checkout_input or "").strip()
         _log(f"      session_id: {session_id}")
         if "chatgpt.com" in effective_checkout_input:
             _log("      输入格式: ChatGPT 嵌入式链接 → 转换为 Stripe URL")
         elif _should_generate_fresh_checkout(checkout_input, force_fresh):
             _log("      输入格式: fresh/auto → 已从 ChatGPT 后端生成新的 checkout")
         _log(f"      stripe_url: {stripe_checkout_url}")
+        if browser_checkout_url != stripe_checkout_url:
+            _log(f"      browser_checkout_url: {browser_checkout_url[:160]}")
 
         try:
             with _http_session_stage_proxy(http, stage_proxy_cfg, "fetch_publishable_key"):
                 pk = fetch_publishable_key(http, session_id, stripe_checkout_url)
             with _http_session_stage_proxy(http, stage_proxy_cfg, "stripe_init"):
                 init_resp, stripe_ver, init_ctx = init_checkout(http, session_id, pk, locale_profile=locale_profile)
+            init_ctx["checkout_url"] = browser_checkout_url
+            init_ctx["stripe_checkout_url"] = stripe_checkout_url
             pricing = _extract_checkout_totals(init_resp)
+            if pricing.get("due") is not None:
+                try:
+                    init_ctx["expected_due_cents"] = int(pricing.get("due") or 0)
+                except Exception:
+                    pass
             _log(
                 "      pricing: "
                 f"due={pricing.get('due')} "
@@ -8240,6 +10578,7 @@ def run(
     init_ctx["min_time_on_page_ms"] = int(behavior_cfg.get("min_time_on_page_ms", 0) or 0)
     init_ctx["include_terms_of_service_consent"] = behavior_cfg.get("include_terms_of_service_consent")
     init_ctx["merchant_account_id"] = init_resp.get("account_settings", {}).get("account_id", "")
+    init_ctx["payment_card"] = card
     # 全局代理 URL 传入 ctx，供 PayPal Playwright 浏览器使用
     if proxy_cfg:
         init_ctx["proxy_url"] = _build_proxy_url_from_cfg(proxy_cfg)
@@ -8639,7 +10978,80 @@ def run(
             session=http,
         )
 
-    if manual_token:
+    node_full_checkout_direct_success = False
+    node_full_checkout_direct = (
+        use_paypal
+        and _paypal_is_new_user_flow(paypal_cfg)
+        and (_paypal_bool_cfg(paypal_cfg, "node_rpa", default=False) or _paypal_bool_cfg(paypal_cfg, "browser_rpa", default=False))
+        and not _paypal_bool_cfg(paypal_cfg, "node_rpa_paypal_only", default=False)
+        and bool(init_ctx.get("checkout_url"))
+    )
+    if node_full_checkout_direct:
+        _log("[3/6] Node RPA full-checkout 接管：从 checkout 页进入浏览器，对齐老项目流程 ...")
+        try:
+            from paypal_plus import signup as pps  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"paypal_plus 模块不可用，无法启动 Node full-checkout RPA: {e!r}")
+        try:
+            max_node_address_attempts = max(
+                1,
+                int(
+                    paypal_cfg.get("node_rpa_address_retries")
+                    or paypal_cfg.get("address_validation_retries")
+                    or 3
+                ),
+            )
+        except Exception:
+            max_node_address_attempts = 3
+        last_node_result = {}
+        for node_attempt in range(1, max_node_address_attempts + 1):
+            if node_attempt > 1:
+                paypal_cfg.pop("_resolved_meiguodizhi_address", None)
+                _log(
+                    "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
+                    f"({node_attempt}/{max_node_address_attempts})"
+                )
+            account = _paypal_resolve_new_user_account(paypal_cfg)
+            address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
+            persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
+            phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, card)
+            if not phone:
+                raise RuntimeError("PayPal Node full-checkout 缺少手机号")
+            sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
+            manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
+            otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
+            ok = _paypal_signup_node_rpa(
+                redirect_url="",
+                checkout_url=str(init_ctx.get("checkout_url") or ""),
+                full_checkout=True,
+                expected_due_cents=int(init_ctx.get("expected_due_cents") or 0),
+                stripe_email=str(card.get("email") or ""),
+                paypal_cfg=paypal_cfg,
+                proxy_url=init_ctx.get("proxy_url") or "",
+                phone=phone,
+                signup_card=signup_card,
+                signup_billing_address=signup_billing_address,
+                persona=persona,
+                sms_api_url=sms_api_url,
+                manual_otp_file=manual_otp_file,
+                otp_timeout=otp_timeout,
+            )
+            last_node_result = paypal_cfg.get("_last_node_rpa_result") or {}
+            if ok:
+                break
+            result_hay = json.dumps(last_node_result or {}, ensure_ascii=False)
+            if re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I):
+                if node_attempt < max_node_address_attempts:
+                    continue
+                raise RuntimeError(
+                    "PayPal Node full-checkout 地址校验失败，已重试 "
+                    f"{max_node_address_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
+                )
+            raise RuntimeError("PayPal Node full-checkout 授权失败或超时")
+        node_full_checkout_direct_success = True
+        _log("      PayPal Node full-checkout 完成，继续 poll 结果 ...")
+
+    if not node_full_checkout_direct_success and manual_token:
         _log(f"[3/6] 使用手动传入的 token (长度: {len(manual_token)})")
         max_confirm_attempts = 3
         for confirm_attempt in range(1, max_confirm_attempts + 1):
@@ -8652,7 +11064,7 @@ def run(
                     raise
                 _log(f"      {e}")
                 _log(f"      重新 confirm 获取新的 challenge ({confirm_attempt}/{max_confirm_attempts}) ...")
-    else:
+    elif not node_full_checkout_direct_success:
         if pre_solve_passive_captcha:
             _log("[3/6] 先按真实链路解 passive captcha，再提交 confirm ...")
         else:
@@ -8734,7 +11146,7 @@ def run(
     # auto-loop 不需要 RT，可设 SKIP_PAY_RT_EXCHANGE=1 跳过整段。
     if (
         result_state == "succeeded"
-        and chatgpt_email
+        and _is_probable_email(chatgpt_email)
         and str(os.environ.get("SKIP_PAY_RT_EXCHANGE", "")).strip().lower() not in ("1", "true", "yes", "on")
     ):
         try:
@@ -8784,6 +11196,8 @@ def run(
                 _log(f"      [RT] 缺少 mail_cfg，跳过（无邮件渠道接 OTP）")
         except Exception as e:
             _log(f"      [RT] 获取异常: {e}")
+    elif result_state == "succeeded" and chatgpt_email and not _is_probable_email(chatgpt_email):
+        _log(f"      [RT] 跳过: ChatGPT 邮箱无效 ({chatgpt_email!r})")
 
     _record_result(
         status=result_state,

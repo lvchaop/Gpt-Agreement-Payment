@@ -284,7 +284,10 @@
             <span class="inventory-label">最近刷新</span>
             <span class="inventory-value">{{ inventoryUpdatedText }}</span>
           </div>
-          <TermBtn variant="ghost" :loading="inventoryLoading" @click="refreshInventory">刷新库存</TermBtn>
+          <div class="inventory-head-actions">
+            <TermBtn variant="ghost" :loading="inventoryBusy" @click="claimSaleAccount">取 Plus 邮箱密码并标记已售</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryLoading" @click="refreshInventory">刷新库存</TermBtn>
+          </div>
         </div>
         <div v-if="inventoryError" class="inventory-error">
           库存刷新失败：{{ inventoryError }}。如果刚更新过代码，重启后端 <code>python -m webui.server</code>。
@@ -346,6 +349,11 @@
             <option value="consumed">已消耗</option>
             <option value="no_auth">缺 auth</option>
           </select>
+          <select v-model="invFilters.sale" class="inv-filter-sel">
+            <option value="">所有售卖</option>
+            <option value="available">可售</option>
+            <option value="sold">已售</option>
+          </select>
           <select v-model="invFilters.rt" class="inv-filter-sel">
             <option value="">所有 RT</option>
             <option value="has_rt">有 RT</option>
@@ -392,8 +400,10 @@
                 <template v-else>{{ checkLabel(acc.last_check_status) }}</template>
               </span>
               <span class="badge" :class="payBadgeClass(acc.pay_state)">{{ payStateLabel(acc) }}</span>
+              <span class="badge" :class="saleBadgeClass(acc.sale_status)" :title="saleStatusTitle(acc)">{{ saleStatusLabel(acc) }}</span>
               <span class="badge" :class="rtBadgeClass(acc.rt_state)">{{ rtStateLabel(acc) }}</span>
               <span class="badge" :class="cpaBadgeClass(acc)" :title="acc.cpa_status">{{ cpaLabel(acc) }}</span>
+              <button class="inventory-row-action" :disabled="inventoryBusy" @click="toggleSaleStatus(acc)">{{ saleToggleLabel(acc) }}</button>
               <button v-if="!acc.cpa_pushed" class="inventory-row-action" :disabled="inventoryBusy" @click="pushOneToCpa(acc.id)">推送→CPA</button>
             </div>
             <div class="inventory-row-sub">
@@ -426,13 +436,13 @@
             <button
               class="otp-close"
               :disabled="otpDialog.submitting"
-              title="关闭（gopay.py 已自行从 API 取到 OTP / 想手动跳过）"
+              title="关闭弹窗"
               @click="dismissOtpModal"
             >×</button>
             <div class="otp-head">
-              <span class="otp-prompt">$</span> GoPay WhatsApp OTP
+              <span class="otp-prompt">$</span> 支付验证码 OTP
             </div>
-            <p class="otp-desc">查 WhatsApp，把刚收到的 6 位 OTP 输进来。提交后 gopay.py 自动继续。</p>
+            <p class="otp-desc">查手机短信或 WhatsApp，把刚收到的验证码输进来。提交后当前支付流程会自动继续。</p>
             <input
               class="otp-input"
               v-model="otpDialog.value"
@@ -519,7 +529,7 @@ interface InventoryAccount {
   has_access_token: boolean;
   has_device_id: boolean;
   has_refresh_token: boolean;
-  pay_state: "reusable" | "consumed" | "no_auth";
+  pay_state: "reusable" | "consumed" | "coupon_ineligible" | "no_auth";
   pay_only_eligible: boolean;
   rt_state: "has_rt" | "oauth_succeeded" | "dead" | "cooldown" | "retryable" | "missing";
   can_backfill_rt: boolean;
@@ -531,9 +541,12 @@ interface InventoryAccount {
   latest_payment_source: string;
   latest_payment_error: string;
   latest_payment_is_already_paid: boolean;
-  last_check_status: "" | "valid" | "invalid" | "unknown";
+  last_check_status: "" | "valid" | "invalid" | "unknown" | "coupon_ineligible";
   last_check_message: string;
   last_check_at: number;
+  sale_status: "available" | "sold" | string;
+  sold_at: number;
+  sale_note: string;
   plan_tag: "free" | "plus" | "team" | string;
   cpa_status: string;
   cpa_pushed: boolean;
@@ -557,6 +570,15 @@ interface InventoryResponse {
     rt_dead: number;
   };
   accounts: InventoryAccount[];
+}
+
+interface SaleClaimResponse {
+  id: number;
+  email: string;
+  password: string;
+  sale_status: "sold" | string;
+  sold_at: number;
+  sale_note: string;
 }
 
 interface ConfigHealthCheck {
@@ -961,6 +983,7 @@ function authSummary(acc: InventoryAccount) {
 function payStateLabel(acc: InventoryAccount) {
   if (acc.pay_state === "reusable") return "可复用";
   if (acc.pay_state === "consumed") return "已消耗";
+  if (acc.pay_state === "coupon_ineligible") return "优惠不适用";
   return "缺 auth";
 }
 
@@ -984,7 +1007,30 @@ function rtStateLabel(acc: InventoryAccount) {
 function payBadgeClass(state: InventoryAccount["pay_state"]) {
   if (state === "reusable") return "badge-ok";
   if (state === "consumed") return "badge-err";
+  if (state === "coupon_ineligible") return "badge-warn";
   return "badge-warn";
+}
+
+function saleStatusLabel(acc: InventoryAccount) {
+  if (acc.sale_status === "sold") return "已售";
+  return "可售";
+}
+
+function saleStatusTitle(acc: InventoryAccount) {
+  const parts: string[] = [];
+  parts.push(acc.sale_status === "sold" ? "已售" : "可售");
+  if (acc.sold_at) parts.push(formatTs(Math.floor(acc.sold_at)));
+  if (acc.sale_note) parts.push(acc.sale_note);
+  return parts.join(" / ");
+}
+
+function saleBadgeClass(status: InventoryAccount["sale_status"]) {
+  if (status === "sold") return "badge-warn";
+  return "badge-ghost";
+}
+
+function saleToggleLabel(acc: InventoryAccount) {
+  return acc.sale_status === "sold" ? "恢复可售" : "标记已售";
 }
 
 function rtBadgeClass(state: InventoryAccount["rt_state"]) {
@@ -1031,12 +1077,14 @@ function scheduleScrollToBottom() {
 function checkLabel(s: InventoryAccount["last_check_status"]) {
   if (s === "valid") return "✓ 有效";
   if (s === "invalid") return "✗ 失效";
+  if (s === "coupon_ineligible") return "优惠不适用";
   if (s === "unknown") return "？未知";
   return "○ 未验";
 }
 function checkBadgeClass(s: InventoryAccount["last_check_status"]) {
   if (s === "valid") return "badge-ok";
   if (s === "invalid") return "badge-err";
+  if (s === "coupon_ineligible") return "badge-warn";
   if (s === "unknown") return "badge-warn";
   return "badge-ghost";
 }
@@ -1064,6 +1112,7 @@ const invFilters = ref({
   plan: "",
   check: "",
   pay: "",
+  sale: "",
   rt: "",
   cpa: "",
 });
@@ -1084,6 +1133,11 @@ const filteredAccounts = computed<InventoryAccount[]>(() => {
       } else if (acc.last_check_status !== f.check) return false;
     }
     if (f.pay && acc.pay_state !== f.pay) return false;
+    if (f.sale) {
+      const saleStatus = acc.sale_status || "available";
+      if (f.sale === "sold" && saleStatus !== "sold") return false;
+      if (f.sale === "available" && saleStatus === "sold") return false;
+    }
     if (f.rt && acc.rt_state !== f.rt) return false;
     if (f.cpa) {
       if (f.cpa === "pushed" && !acc.cpa_pushed) return false;
@@ -1094,7 +1148,7 @@ const filteredAccounts = computed<InventoryAccount[]>(() => {
 });
 
 function resetInvFilters() {
-  invFilters.value = { search: "", plan: "", check: "", pay: "", rt: "", cpa: "" };
+  invFilters.value = { search: "", plan: "", check: "", pay: "", sale: "", rt: "", cpa: "" };
 }
 
 const allFilteredSelected = computed(() => {
@@ -1292,6 +1346,65 @@ async function pushCpa(ids: number[], label: string) {
 function pushOneToCpa(id: number) { pushCpa([id], "推送 CPA"); }
 function pushSelectedToCpa() { pushCpa(Array.from(selectedIds.value), "批量推送选中"); }
 function pushAllUnpushed() { pushCpa(unpushedIds.value, "推送所有未推送"); }
+
+function saleCredentialText(acc: SaleClaimResponse) {
+  return `${acc.email}----${acc.password}`;
+}
+
+async function copyText(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    message.success(label);
+  } catch {
+    message.warning("复制失败，请手动复制弹窗里的内容");
+  }
+}
+
+async function claimSaleAccount() {
+  inventoryBusy.value = true;
+  try {
+    const r = await api.post("/inventory/accounts/sale/claim", { note: "portal claim" });
+    const acc = r.data as SaleClaimResponse;
+    const credential = saleCredentialText(acc);
+    await refreshInventory();
+    dialog.success({
+      title: "已取出并标记已售",
+      content: () => h("div", { style: "font-size:12px; line-height:1.7; word-break:break-all" }, [
+        h("div", `email: ${acc.email}`),
+        h("div", `password: ${acc.password}`),
+        h("pre", {
+          style: "margin-top:8px; padding:8px; border-radius:6px; background:#111827; color:#f9fafb; white-space:pre-wrap",
+        }, credential),
+      ]),
+      positiveText: "复制",
+      negativeText: "关闭",
+      onPositiveClick: () => copyText(credential, "已复制邮箱密码"),
+    });
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || e;
+    message.error(`获取失败：${detail}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
+
+async function toggleSaleStatus(acc: InventoryAccount) {
+  inventoryBusy.value = true;
+  try {
+    const r = await api.post("/inventory/accounts/sale/toggle", {
+      id: acc.id,
+      note: acc.sale_status === "sold" ? "" : "portal toggle sold",
+    });
+    const next = r.data?.sale_status === "sold" ? "已售" : "可售";
+    message.success(`${acc.email} 已改为${next}`);
+    await refreshInventory();
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || e;
+    message.error(`修改售卖状态失败：${detail}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
 
 async function refreshInventory() {
   if (inventoryLoading.value) return;
@@ -1794,6 +1907,13 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+}
+.inventory-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .inventory-label {
   color: var(--fg-tertiary);

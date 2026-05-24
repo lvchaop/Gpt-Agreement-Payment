@@ -27,6 +27,15 @@ class CheckRequest(IdsRequest):
     max_workers: int = 3
 
 
+class SaleClaimRequest(BaseModel):
+    note: str = ""
+
+
+class SaleToggleRequest(BaseModel):
+    id: int
+    note: str = ""
+
+
 def _load_cpa_cfg() -> dict:
     try:
         cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -110,6 +119,24 @@ def delete_accounts(req: IdsRequest, user: str = CurrentUser):
         raise HTTPException(status_code=400, detail="ids 不能为空")
     n = get_db().delete_registered_accounts(req.ids)
     return {"deleted": n, "requested": len(req.ids)}
+
+
+@router.post("/accounts/sale/claim")
+def claim_sale_account(req: SaleClaimRequest, user: str = CurrentUser):
+    """Return one available Plus email/password pair and mark the account as sold."""
+    acc = get_db().claim_account_for_sale(req.note)
+    if not acc:
+        raise HTTPException(status_code=404, detail="没有可售且带密码的 Plus 账号")
+    return acc
+
+
+@router.post("/accounts/sale/toggle")
+def toggle_sale_account(req: SaleToggleRequest, user: str = CurrentUser):
+    """Toggle one account between available and sold."""
+    acc = get_db().toggle_account_sale_status(req.id, req.note)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return acc
 
 
 @router.post("/accounts/cpa-push")

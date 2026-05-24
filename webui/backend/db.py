@@ -77,7 +77,10 @@ CREATE TABLE IF NOT EXISTS registered_accounts (
   created_at REAL NOT NULL,
   last_check_at REAL DEFAULT 0,
   last_check_status TEXT DEFAULT '',
-  last_check_message TEXT DEFAULT ''
+  last_check_message TEXT DEFAULT '',
+  sale_status TEXT DEFAULT 'available',
+  sold_at REAL DEFAULT 0,
+  sale_note TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_registered_accounts_email_id
   ON registered_accounts(email, id);
@@ -189,6 +192,9 @@ class Database:
             ("last_check_at", "REAL DEFAULT 0"),
             ("last_check_status", "TEXT DEFAULT ''"),
             ("last_check_message", "TEXT DEFAULT ''"),
+            ("sale_status", "TEXT DEFAULT 'available'"),
+            ("sold_at", "REAL DEFAULT 0"),
+            ("sale_note", "TEXT DEFAULT ''"),
             ("register_method", "TEXT DEFAULT ''"),
             ("phone_number", "TEXT DEFAULT ''"),
             ("phone_dial_code", "TEXT DEFAULT ''"),
@@ -329,7 +335,8 @@ class Database:
                 SELECT id, email, ts, password, session_token, access_token, device_id,
                        csrf_token, id_token, refresh_token, cookie_header,
                        register_method, phone_number, phone_dial_code, phone_country,
-                       last_check_at, last_check_status, last_check_message
+                       last_check_at, last_check_status, last_check_message,
+                       sale_status, sold_at, sale_note
                 FROM registered_accounts
                 ORDER BY id ASC
                 """
@@ -343,7 +350,8 @@ class Database:
                 SELECT id, email, ts, password, session_token, access_token, device_id,
                        csrf_token, id_token, refresh_token, cookie_header,
                        register_method, phone_number, phone_dial_code, phone_country,
-                       last_check_at, last_check_status, last_check_message
+                       last_check_at, last_check_status, last_check_message,
+                       sale_status, sold_at, sale_note
                 FROM registered_accounts WHERE id = ?
                 """,
                 (int(account_id),),
@@ -362,6 +370,113 @@ class Database:
                 (time.time(), _text(status), _text(message)[:500], int(account_id)),
             )
         return cur.rowcount > 0
+
+    def claim_account_for_sale(self, note: str = "") -> dict:
+        """Return one available Plus account credential and mark it sold atomically."""
+        sold_at = time.time()
+        sale_note = (_text(note).strip() or "portal claim")[:500]
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute(
+                    """
+                    SELECT id, email, password
+                    FROM registered_accounts AS ra
+                    WHERE coalesce(ra.password, '') != ''
+                      AND coalesce(ra.sale_status, 'available') != 'sold'
+                      AND (
+                        EXISTS (
+                          SELECT 1
+                          FROM card_results AS cr
+                          WHERE lower(coalesce(cr.chatgpt_email, cr.email)) = lower(ra.email)
+                            AND (
+                              lower(coalesce(cr.status, '')) = 'succeeded'
+                              OR lower(coalesce(cr.error, '')) LIKE '%user is already paid%'
+                            )
+                        )
+                        OR EXISTS (
+                          SELECT 1
+                          FROM pipeline_results AS pr
+                          WHERE lower(coalesce(pr.payment_email, pr.registration_email)) = lower(ra.email)
+                            AND (
+                              lower(coalesce(pr.payment_status, pr.status, '')) = 'succeeded'
+                              OR lower(coalesce(pr.payment_error, pr.error, '')) LIKE '%user is already paid%'
+                            )
+                        )
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM card_results AS team_cr
+                        WHERE lower(coalesce(team_cr.chatgpt_email, team_cr.email)) = lower(ra.email)
+                          AND coalesce(team_cr.team_account_id, '') != ''
+                      )
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if not row:
+                    c.execute("COMMIT")
+                    return {}
+                c.execute(
+                    """
+                    UPDATE registered_accounts
+                    SET sale_status = 'sold', sold_at = ?, sale_note = ?
+                    WHERE id = ?
+                    """,
+                    (sold_at, sale_note, int(row["id"])),
+                )
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        out = dict(row)
+        out["sale_status"] = "sold"
+        out["sold_at"] = sold_at
+        out["sale_note"] = sale_note
+        return out
+
+    def toggle_account_sale_status(self, account_id: int, note: str = "") -> dict:
+        """Flip one account between available and sold."""
+        sale_note = _text(note).strip()[:500]
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute(
+                    """
+                    SELECT id, email, coalesce(sale_status, 'available') AS sale_status
+                    FROM registered_accounts
+                    WHERE id = ?
+                    """,
+                    (int(account_id),),
+                ).fetchone()
+                if not row:
+                    c.execute("COMMIT")
+                    return {}
+                next_status = "available" if row["sale_status"] == "sold" else "sold"
+                sold_at = time.time() if next_status == "sold" else 0
+                if not sale_note and next_status == "sold":
+                    sale_note = "portal toggle sold"
+                c.execute(
+                    """
+                    UPDATE registered_accounts
+                    SET sale_status = ?, sold_at = ?, sale_note = ?
+                    WHERE id = ?
+                    """,
+                    (next_status, sold_at, sale_note, int(account_id)),
+                )
+                out = c.execute(
+                    """
+                    SELECT id, email, sale_status, sold_at, sale_note
+                    FROM registered_accounts
+                    WHERE id = ?
+                    """,
+                    (int(account_id),),
+                ).fetchone()
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return dict(out) if out else {}
 
     def delete_registered_accounts(self, ids: list[int]) -> int:
         """Hard-delete accounts by id. Returns number of rows deleted.

@@ -1,5 +1,5 @@
 {
-  "randomize_identity": false,
+  "randomize_identity": true,
   "pre_solve_passive_captcha": false,
   "browser_challenge": {
     "enabled": true,

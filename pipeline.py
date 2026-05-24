@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -831,7 +832,7 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 
 
 def pay(card_config_path, session_token=None, access_token=None,
-        device_id=None, use_paypal=False, use_gopay=False,
+        device_id=None, account_email: str = "", use_paypal=False, use_gopay=False,
         gopay_otp_file=None, python="python3", timeout=600,
         proxy_stage_plan=None):
     """执行 Stripe 支付流程。
@@ -847,6 +848,7 @@ def pay(card_config_path, session_token=None, access_token=None,
 
     card_config_path = str(Path(card_config_path).resolve())
     cfg_for_env = {}
+    account_email = _norm_email(account_email)
 
     # 如果有外部凭证或 CLI/池代理覆盖，创建临时配置
     config_to_use = card_config_path
@@ -857,8 +859,12 @@ def pay(card_config_path, session_token=None, access_token=None,
             cfg = json.load(f)
         cfg_for_env = cfg
         if session_token or access_token:
-            auth = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
+            fresh_checkout_cfg = cfg.setdefault("fresh_checkout", {})
+            auth = fresh_checkout_cfg.setdefault("auth", {})
             auth["mode"] = "access_token"
+            if account_email:
+                auth["email"] = account_email
+                fresh_checkout_cfg["_chatgpt_email"] = account_email
             if session_token:
                 auth["session_token"] = session_token
             if access_token:
@@ -911,6 +917,7 @@ def pay(card_config_path, session_token=None, access_token=None,
 
     result_json = None
     datadome_slider = False
+    lines: list[str] = []
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -919,6 +926,7 @@ def pay(card_config_path, session_token=None, access_token=None,
         deadline = time.time() + timeout
         for line in proc.stdout:
             line = line.rstrip("\n")
+            lines.append(line)
             print(f"  [pay] {line}")
             if line.startswith(result_marker):
                 payload = line.split("=", 1)[1]
@@ -942,7 +950,8 @@ def pay(card_config_path, session_token=None, access_token=None,
         return {"status": status, "raw": result_json}
 
     if proc.returncode != 0:
-        raise PaymentError(f"支付失败 (exit={proc.returncode})")
+        last_lines = "\n".join(lines[-30:])
+        raise PaymentError(f"支付失败 (exit={proc.returncode}): {last_lines}")
 
     return {"status": "unknown", "raw": None}
 
@@ -1029,6 +1038,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 session_token=reg.get("session_token"),
                 access_token=reg.get("access_token"),
                 device_id=reg.get("device_id", ""),
+                account_email=reg.get("email", ""),
                 use_paypal=use_paypal,
                 use_gopay=use_gopay,
                 gopay_otp_file=gopay_otp_file,
@@ -1082,17 +1092,167 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
 def _run_one(args_tuple):
     """单个 pipeline 任务（供并行调度）"""
     idx, card_config_path, kwargs = args_tuple
+    local_kwargs = dict(kwargs or {})
+    paypal_batch = bool(local_kwargs.pop("_paypal_new_user_batch_config", False))
+    phone_allocator = local_kwargs.pop("_paypal_phone_index_allocator", None)
+    temp_card = None
+    effective_card = card_config_path
+    phone_index = None
     try:
-        r = pipeline(card_config_path, **kwargs)
+        if paypal_batch:
+            if phone_allocator is not None:
+                phone_index = phone_allocator.get()
+            temp_card = _rewrite_paypal_new_user_batch_config(
+                card_config_path,
+                idx,
+                phone_index=phone_index,
+            )
+            effective_card = temp_card
+            # Keep the config object aligned with the temp file so downstream
+            # helpers such as CPA/team plan readers see the same per-run data.
+            local_kwargs["card_cfg"] = _read_card_cfg(temp_card)
+        r = pipeline(effective_card, **local_kwargs)
         r["batch_index"] = idx
         return r
     except Exception as e:
         return {"batch_index": idx, "status": "error", "error": str(e)[:200]}
+    finally:
+        if phone_allocator is not None and phone_index is not None:
+            try:
+                phone_allocator.put(phone_index)
+            except Exception:
+                pass
+        if temp_card and os.path.exists(temp_card):
+            try:
+                os.unlink(temp_card)
+            except Exception:
+                pass
 
 
 def _run_one_pay_only(args_tuple):
     """PayPal 并发模式下：注册已完成，只串行支付用（预留占位，batch 里不再单独使用）"""
     return {"batch_index": args_tuple[0], "status": "error", "error": "deprecated path"}
+
+
+_PAYPAL_NEW_USER_BATCH_FLOWS = {"new_user", "sandbox_new_user", "guest", "guest_checkout"}
+
+
+def _is_paypal_new_user_batch_cfg(card_cfg: dict) -> bool:
+    paypal_cfg = (card_cfg or {}).get("paypal") or {}
+    flow = str(paypal_cfg.get("flow") or "existing_account").strip().lower().replace("-", "_")
+    return flow in _PAYPAL_NEW_USER_BATCH_FLOWS
+
+
+def _resolve_repo_path(path: str) -> Path:
+    raw = str(path or "").strip()
+    if not raw:
+        return Path("")
+    expanded = Path(os.path.expanduser(raw))
+    if expanded.is_absolute():
+        return expanded
+    return ROOT / expanded
+
+
+def _json_pool_count(path: str) -> int:
+    if not str(path or "").strip():
+        return 0
+    resolved = _resolve_repo_path(path)
+    if not resolved.exists() or not resolved.is_file():
+        return 0
+    raw = resolved.read_text(encoding="utf-8", errors="ignore").strip()
+    if not raw:
+        return 0
+    try:
+        if raw.startswith("["):
+            data = json.loads(raw)
+            return len([x for x in data if isinstance(x, dict)]) if isinstance(data, list) else 0
+        total = 0
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                if isinstance(json.loads(line), dict):
+                    total += 1
+            except Exception:
+                continue
+        return total
+    except Exception:
+        return 0
+
+
+def _paypal_cfg_pool_count(paypal_cfg: dict, *keys: str, default: str = "") -> int:
+    for key in keys:
+        value = paypal_cfg.get(key)
+        if value:
+            return _json_pool_count(str(value))
+    return _json_pool_count(default) if default else 0
+
+
+def _indexed_path(path: str, index: int) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return raw
+    p = Path(raw)
+    suffix = "".join(p.suffixes)
+    if suffix:
+        stem = p.name[: -len(suffix)]
+        name = f"{stem}_{index}{suffix}"
+    else:
+        name = f"{p.name}_{index}"
+    return str(p.with_name(name))
+
+
+def _rewrite_paypal_new_user_batch_config(src_path: str, batch_index: int, *, phone_index: int | None = None) -> str:
+    with open(src_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    paypal_cfg = data.setdefault("paypal", {})
+    if not isinstance(paypal_cfg, dict):
+        paypal_cfg = {}
+        data["paypal"] = paypal_cfg
+
+    phone_count = _paypal_cfg_pool_count(
+        paypal_cfg,
+        "phones_file",
+        "new_user_phones_file",
+        "phone_pool_file",
+        default="output/paypal_test_phones.jsonl",
+    )
+    if phone_index is not None:
+        paypal_cfg["phone_index"] = int(phone_index)
+    elif phone_count:
+        paypal_cfg["phone_index"] = batch_index % phone_count
+
+    card_count = _paypal_cfg_pool_count(
+        paypal_cfg,
+        "cards_file",
+        "new_user_cards_file",
+        "card_pool_file",
+    )
+    if card_count:
+        paypal_cfg["card_index"] = batch_index % card_count
+
+    paypal_cfg["manual_otp_file"] = _indexed_path(
+        str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"),
+        batch_index,
+    )
+    paypal_cfg["persist_to"] = _indexed_path(
+        str(paypal_cfg.get("persist_to") or "output/no_card_paypal_plus_latest.json"),
+        batch_index,
+    )
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="pipeline_pay_new_user_",
+        dir=str(CARD_DIR), delete=False,
+    )
+    json.dump(data, tmp, ensure_ascii=False, indent=2)
+    tmp.close()
+    print(
+        "[batch:paypal-new-user] "
+        f"idx={batch_index} "
+        f"phone_index={paypal_cfg.get('phone_index', '-')}"
+    )
+    return tmp.name
 
 
 def _register_one(args_tuple):
@@ -1156,6 +1316,16 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     # 构造共享 pool + team_client（所有 worker 复用）
     card_cfg = _read_card_cfg(card_config_path)
     cardw_path = _load_cardw_path_from_card_cfg(card_cfg, kwargs.get("cardw_config_path"))
+    paypal_new_user_batch = bool(use_paypal and _is_paypal_new_user_batch_cfg(card_cfg))
+    phone_allocator = None
+
+    def _batch_run_kwargs():
+        run_kwargs = dict(kwargs)
+        if paypal_new_user_batch:
+            run_kwargs["_paypal_new_user_batch_config"] = True
+            if phone_allocator is not None:
+                run_kwargs["_paypal_phone_index_allocator"] = phone_allocator
+        return run_kwargs
 
     # ── register-only batch：每次 register；workers>1 时并发
     if is_register_only:
@@ -1269,7 +1439,27 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     kwargs.setdefault("card_cfg", card_cfg)
     kwargs.setdefault("proxy_pool", proxy_pool)
 
-    if workers > 1 and use_paypal:
+    if paypal_new_user_batch:
+        paypal_cfg = (card_cfg.get("paypal") or {})
+        phone_count = _paypal_cfg_pool_count(
+            paypal_cfg,
+            "phones_file",
+            "new_user_phones_file",
+            "phone_pool_file",
+            default="output/paypal_test_phones.jsonl",
+        )
+        if phone_count:
+            from queue import Queue
+
+            phone_allocator = Queue()
+            for phone_idx in range(phone_count):
+                phone_allocator.put(phone_idx)
+        print(
+            "[batch:paypal-new-user] 启用新用户并发分配: "
+            f"runtime_identity=yes phones={phone_count or '?'}"
+        )
+
+    if workers > 1 and use_paypal and not paypal_new_user_batch:
         # PayPal 模式：并行注册 → 串行支付（共用 PayPal 账号不能并行 2FA）
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1354,14 +1544,14 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
             print(f"\n{'#'*60}")
             print(f"# 批次 {i + 1}/{count}")
             print(f"{'#'*60}")
-            results.append(_run_one((i, card_config_path, kwargs)))
+            results.append(_run_one((i, card_config_path, _batch_run_kwargs())))
             if i < count - 1 and delay > 0:
                 time.sleep(delay)
     else:
-        # 非 PayPal: 全并行
+        # 非 PayPal 或 PayPal 新用户: 全并行
         from concurrent.futures import ThreadPoolExecutor, as_completed
         print(f"\n[batch] 并行模式: {workers} workers × {count} 任务")
-        tasks = [(i, card_config_path, kwargs) for i in range(count)]
+        tasks = [(i, card_config_path, _batch_run_kwargs()) for i in range(count)]
         results = [None] * count
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_run_one, t): t[0] for t in tasks}
@@ -1410,6 +1600,31 @@ def _norm_email(value: str) -> str:
     return str(value or "").strip().lower()
 
 
+_COUPON_INELIGIBLE_RE = re.compile(
+    r"promo coupon.*state=not_eligible|coupon.*not_eligible|state=not_eligible.*promo",
+    re.I,
+)
+
+
+def _is_coupon_ineligible_error(text: str) -> bool:
+    return bool(_COUPON_INELIGIBLE_RE.search(str(text or "")))
+
+
+def _mark_account_coupon_ineligible(email: str, message: str = "") -> bool:
+    target = _norm_email(email)
+    if not target:
+        return False
+    for acc in reversed(_load_registered_accounts()):
+        if _norm_email(acc.get("email")) != target:
+            continue
+        account_id = acc.get("id")
+        if not account_id:
+            return False
+        note = (message or "promo coupon state=not_eligible")[:500]
+        return bool(get_db().update_account_check(int(account_id), "coupon_ineligible", note))
+    return False
+
+
 def _paid_or_consumed_emails() -> set[str]:
     """Emails that should not be retried by --pay-only.
 
@@ -1432,14 +1647,22 @@ def _paid_or_consumed_emails() -> set[str]:
             or d.get("email")
         )
         err = str(pay_block.get("error") or d.get("error") or "")
-        if email and (status == "succeeded" or "user is already paid" in err.lower()):
+        if email and (
+            status == "succeeded"
+            or "user is already paid" in err.lower()
+            or _is_coupon_ineligible_error(err)
+        ):
             consumed.add(email)
 
     for d in get_db().iter_card_results():
         status = str(d.get("status") or "").lower()
         email = _norm_email(d.get("chatgpt_email") or d.get("email"))
         err = str(d.get("error") or "")
-        if email and (status == "succeeded" or "user is already paid" in err.lower()):
+        if email and (
+            status == "succeeded"
+            or "user is already paid" in err.lower()
+            or _is_coupon_ineligible_error(err)
+        ):
             consumed.add(email)
 
     return consumed
@@ -1465,6 +1688,8 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
         if not email or email in seen:
             continue
         seen.add(email)
+        if str(acc.get("last_check_status") or "").strip().lower() == "coupon_ineligible":
+            continue
         if email in consumed:
             continue
         if not (acc.get("session_token") or acc.get("access_token")):
@@ -1533,6 +1758,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             session_token=account.get("session_token") if account else None,
             access_token=account.get("access_token") if account else None,
             device_id=account.get("device_id", "") if account else None,
+            account_email=email,
             use_paypal=use_paypal,
             use_gopay=use_gopay,
             gopay_otp_file=gopay_otp_file,
@@ -1555,7 +1781,13 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         _append_result(record)
         return result
     except PaymentError as e:
-        record["payment"] = {"status": "error", "email": email, "error": str(e)[:200]}
+        err_text = str(e)
+        if email and _is_coupon_ineligible_error(err_text):
+            if _mark_account_coupon_ineligible(email, err_text):
+                print(f"[pay-only] 标记账号 coupon_ineligible: {email}")
+            else:
+                print(f"[pay-only] ⚠ 标记 coupon_ineligible 失败: {email}")
+        record["payment"] = {"status": "error", "email": email, "error": err_text[:500]}
         _append_result(record)
         raise
 
