@@ -134,7 +134,8 @@ def _project_reg(answers: dict) -> dict:
         if phone.get("enabled") or phone.get("base_url"):
             allowed = {
                 "enabled", "provider", "base_url", "api_key", "api_key_env",
-                "country", "service", "maxPrice", "max_price", "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path",
+                "country", "countries", "service", "maxPrice", "max_price", "country_max_prices",
+                "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path",
                 "otp_path", "otp_method", "otp_timeout_s", "otp_poll_interval_s",
                 "release_path", "fail_path", "verified_path", "headers",
                 "allocate_payload",
@@ -145,7 +146,6 @@ def _project_reg(answers: dict) -> dict:
         mail = answers.get("mail") or {}
         out["mail"] = {
             "mode": "imap_list",
-            "accounts_path": mail.get("accounts_path") or str(s.get_data_dir() / "email_accounts.csv"),
             "otp_timeout": int(mail.get("otp_timeout") or 180),
             "mark_seen": bool(mail.get("mark_seen", False)),
         }

@@ -998,12 +998,32 @@ class AuthFlow:
             return 5
 
     @staticmethod
-    def _is_invalid_phone_register_error(message: str) -> bool:
+    def _phone_protocol_password_submit_attempts() -> int:
+        raw = os.getenv("PHONE_PROTOCOL_REGISTER_PASSWORD_ATTEMPTS", "5")
+        try:
+            return max(1, min(int(raw), 10))
+        except Exception:
+            return 5
+
+    @staticmethod
+    def _phone_protocol_register_retry_reason(message: str) -> str:
         text = str(message or "").lower()
-        return (
+        if (
             "number you provided is not valid" in text
             or "phone number" in text and "not valid" in text
-        )
+        ):
+            return "invalid_phone_number"
+        if (
+            "account_creation_failed" in text
+            or "failed to create account" in text
+            or "please try again" in text
+        ):
+            return "account_creation_failed"
+        return ""
+
+    @staticmethod
+    def _is_invalid_phone_register_error(message: str) -> bool:
+        return AuthFlow._phone_protocol_register_retry_reason(message) == "invalid_phone_number"
 
     def _reset_phone_protocol_attempt_state(self) -> None:
         self.session = create_http_session(
@@ -2530,9 +2550,29 @@ class AuthFlow:
                 )
                 device_id = self.auth_oauth_init(auth_url)
                 self.get_sentinel_token(device_id)
-                if not self.register_password(phone_e164):
-                    err = self._last_register_password_error
-                    if self._is_invalid_phone_register_error(err) and attempt < max_attempts:
+                password_ok = False
+                register_err = ""
+                password_submit_attempts = self._phone_protocol_password_submit_attempts()
+                for submit_attempt in range(1, password_submit_attempts + 1):
+                    if self.register_password(phone_e164):
+                        password_ok = True
+                        break
+                    register_err = self._last_register_password_error
+                    retry_reason = self._phone_protocol_register_retry_reason(register_err)
+                    if retry_reason == "account_creation_failed" and submit_attempt < password_submit_attempts:
+                        logger.warning(
+                            "[phone-protocol] 密码注册失败可原号重提 reason=%s submit_attempt=%s/%s lease=%s",
+                            retry_reason,
+                            submit_attempt,
+                            password_submit_attempts,
+                            getattr(lease, "lease_id", ""),
+                        )
+                        time.sleep(min(2.0 * submit_attempt, 6.0))
+                        continue
+                    break
+                if not password_ok:
+                    retry_reason = self._phone_protocol_register_retry_reason(register_err)
+                    if retry_reason == "invalid_phone_number" and attempt < max_attempts:
                         logger.warning(
                             "[phone-protocol] 手机号被 OpenAI 判定无效，换号重试 attempt=%s/%s lease=%s",
                             attempt,
@@ -2540,12 +2580,12 @@ class AuthFlow:
                             getattr(lease, "lease_id", ""),
                         )
                         try:
-                            phone_provider.mark_failed(getattr(lease, "lease_id", ""), "invalid_phone_number")
+                            phone_provider.mark_failed(getattr(lease, "lease_id", ""), retry_reason)
                         except Exception:
                             pass
                         lease = None
                         continue
-                    detail = (err or "")[:220]
+                    detail = (register_err or "")[:220]
                     raise RuntimeError(f"手机号协议注册密码提交失败: {detail or 'unknown'}")
                 self._send_phone_otp()
                 logger.info("[phone-protocol] 等待手机号 OTP ...")

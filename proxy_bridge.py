@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 from typing import Any
 
 
@@ -383,6 +384,39 @@ def _port_open(port: int) -> bool:
         return False
 
 
+def _probe_node_alive(node: TrojanNode, *, timeout_s: float = 8.0, url: str = "http://cloudflare.com/cdn-cgi/trace") -> tuple[bool, str]:
+    proxy = node.local_http_url
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/plain,*/*",
+            "User-Agent": "curl/8.7.1",
+        },
+        method="GET",
+    )
+    try:
+        with opener.open(req, timeout=timeout_s) as resp:
+            text = resp.read(4096).decode("utf-8", errors="replace")
+            status = int(getattr(resp, "status", 0) or 0)
+    except Exception as e:
+        return False, str(e)[:160]
+    if status >= 400:
+        return False, f"http_status={status}"
+    ip = ""
+    loc = ""
+    for line in text.splitlines():
+        if line.startswith("ip="):
+            ip = line.split("=", 1)[1].strip()
+        elif line.startswith("loc="):
+            loc = line.split("=", 1)[1].strip()
+    if not ip:
+        return False, "trace_missing_ip"
+    return True, f"ip={ip} loc={loc or '-'}"
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -472,6 +506,22 @@ class TrojanBridgeManager:
             f"nodes={len(self.nodes)} regions={','.join(self.regions)}"
         )
 
+    def alive_nodes(self, *, timeout_s: float = 8.0, probe_url: str = "") -> list[TrojanNode]:
+        self.ensure_started()
+        alive: list[TrojanNode] = []
+        probe = probe_url or "http://cloudflare.com/cdn-cgi/trace"
+        for node in self.nodes:
+            ok, detail = _probe_node_alive(node, timeout_s=timeout_s, url=probe)
+            status = "ok" if ok else "dead"
+            print(
+                f"[trojan:alive] {status} idx={node.index} region={node.region} "
+                f"port={node.local_http_port} name={node.name} {detail}"
+            )
+            if ok:
+                alive.append(node)
+        print(f"[trojan:alive] 可用节点 {len(alive)}/{len(self.nodes)}")
+        return alive
+
     def _pick_node(self, region: str) -> TrojanNode:
         wanted = _region_key(region) or "DEFAULT"
         candidates = [node for node in self.nodes if node.region == wanted]
@@ -529,6 +579,7 @@ class TrojanBridgeManager:
         register_region: str = "",
         checkout_region: str = "",
         payment_region: str = "",
+        register_nodes: list[TrojanNode] | None = None,
     ) -> "TrojanProxyStageAllocator":
         return TrojanProxyStageAllocator(
             self,
@@ -536,6 +587,7 @@ class TrojanBridgeManager:
             register_region=register_region,
             checkout_region=checkout_region,
             payment_region=payment_region,
+            register_nodes=register_nodes,
         )
 
 
@@ -548,14 +600,27 @@ class TrojanProxyStageAllocator:
         register_region: str = "",
         checkout_region: str = "",
         payment_region: str = "",
+        register_nodes: list[TrojanNode] | None = None,
     ):
         self.manager = manager
         self.all_region = all_region
         self.register_region = register_region
         self.checkout_region = checkout_region
         self.payment_region = payment_region
+        self.register_nodes = list(register_nodes or [])
+        self._register_lock = threading.Lock()
+        self._register_cursor = 0
 
     def allocate(self) -> ProxyStagePlan:
+        if self.register_nodes:
+            with self._register_lock:
+                node = self.register_nodes[self._register_cursor % len(self.register_nodes)]
+                self._register_cursor += 1
+            return ProxyStagePlan(
+                register=node.local_http_url,
+                source="trojan-pool-alive-register",
+                register_region=node.region,
+            )
         return self.manager.allocate_plan(
             all_region=self.all_region,
             register_region=self.register_region,

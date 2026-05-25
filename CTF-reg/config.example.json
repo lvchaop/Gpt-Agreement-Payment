@@ -3,11 +3,10 @@
     "method": "browser"
   },
   "mail": {
-    "_comment": "mode=cloudflare_kv 走 Cloudflare Email Worker → KV；mode=imap_list 走 email_accounts.csv 的 Gmail/Outlook/IMAP 账号密码",
+    "_comment": "mode=cloudflare_kv 走 Cloudflare Email Worker → KV；mode=imap_list 走 SQLite mail_accounts",
     "mode": "cloudflare_kv",
     "catch_all_domain": "example.com",
     "catch_all_domains": ["example.com"],
-    "accounts_path": "../output/email_accounts.csv",
     "otp_timeout": 180,
     "mark_seen": false
   },
@@ -45,8 +44,10 @@
     "base_url": "https://hero-sms.com/stubs/handler_api.php",
     "api_key_env": "HERO_SMS_API_KEY",
     "country": "2",
+    "countries": [],
     "service": "tg",
     "maxPrice": "",
+    "country_max_prices": {},
     "lease_ttl_s": 300,
     "max_number_attempts": 3,
     "allocate_path": "/api/phones/allocate",

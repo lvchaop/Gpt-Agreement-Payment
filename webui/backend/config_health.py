@@ -279,13 +279,21 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
             }
         provider = _text(phone.get("provider")).lower().replace("-", "_") or "http"
         is_hero_sms = provider in {"hero", "hero_sms", "smshub", "sms_hub", "sms_activate", "smsactivate"}
-        required = ("base_url", "service", "country") if is_hero_sms else ("base_url", "allocate_path", "otp_path")
+        countries = phone.get("countries") if isinstance(phone.get("countries"), list) else []
+        has_country = bool(_text(phone.get("country")) or countries)
+        required = ("base_url", "service") if is_hero_sms else ("base_url", "allocate_path", "otp_path")
         missing_phone = [key for key in required if _is_missing(phone.get(key))]
+        if is_hero_sms and not has_country:
+            missing_phone.append("country/countries")
         runtime_enabled = _text(req.get("register_mode")).lower().replace("-", "_") in {"phone_browser", "phone_protocol"}
         if not phone.get("enabled") and not runtime_enabled:
             missing_phone.insert(0, "enabled")
         if is_hero_sms and _text(phone.get("country")) and not _text(phone.get("country")).isdigit():
             missing_phone.append("country")
+        if is_hero_sms:
+            bad_countries = [str(c) for c in countries if str(c).strip() and not str(c).strip().isdigit()]
+            if bad_countries:
+                missing_phone.append("countries")
         auth_hint = _text(phone.get("api_key")) or _text(os.getenv(_text(phone.get("api_key_env")) or "PHONE_PROVIDER_API_KEY"))
         if is_hero_sms and not auth_hint:
             missing_phone.append("api_key/api_key_env")
@@ -310,23 +318,24 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
                 "Hero SMS provider 已配置" if is_hero_sms else ("手机号 provider 已配置" if auth_hint else "手机号 provider 已配置；未检测到 API key（若接口无需鉴权可忽略）"),
                 blocking=False,
                 details=(
-                    f"{_text(phone.get('base_url'))} service={_text(phone.get('service'))} country={_text(phone.get('country'))} maxPrice={_text(phone.get('maxPrice') or phone.get('max_price')) or '<empty>'}"
+                    f"{_text(phone.get('base_url'))} service={_text(phone.get('service'))} country={_text(phone.get('country')) or ','.join(str(c) for c in countries)} maxPrice={_text(phone.get('maxPrice') or phone.get('max_price')) or '<empty>'}"
                     if is_hero_sms
                     else _text(phone.get("base_url"))
                 ),
             )
     mail = reg_cfg.get("mail") if isinstance(reg_cfg.get("mail"), dict) else {}
     if _text(mail.get("mode")) == "imap_list":
-        accounts_path = Path(_text(mail.get("accounts_path")))
-        if not accounts_path.is_absolute():
-            accounts_path = (s.ROOT / accounts_path).resolve()
-        if accounts_path.exists():
+        try:
+            count = len(get_db().iter_mail_accounts())
+        except Exception:
+            count = 0
+        if count > 0:
             _check(
                 checks,
                 "mail_accounts",
                 "ok",
-                "IMAP 邮箱列表已配置",
-                details=str(accounts_path),
+                "IMAP 邮箱账号库已配置",
+                details=f"sqlite:mail_accounts count={count}",
                 blocking=False,
             )
         else:
@@ -334,10 +343,10 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
                 checks,
                 "mail_accounts",
                 "fail",
-                "IMAP 邮箱列表文件不存在",
-                missing=["mail.accounts_path"],
-                details=str(accounts_path),
-                action="在配置向导邮箱步骤保存账号列表后重新导出配置",
+                "IMAP 邮箱账号库为空",
+                missing=["mail_accounts"],
+                details="sqlite:mail_accounts count=0",
+                action="在配置向导邮箱步骤保存账号列表",
             )
         return
     domains = mail.get("catch_all_domains")

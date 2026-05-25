@@ -123,7 +123,7 @@ def delete_accounts(req: IdsRequest, user: str = CurrentUser):
 
 @router.post("/accounts/sale/claim")
 def claim_sale_account(req: SaleClaimRequest, user: str = CurrentUser):
-    """Return one available Plus email/password pair and mark the account as sold."""
+    """Return one available Plus email/mail-password/GPT-password bundle and mark sold."""
     acc = get_db().claim_account_for_sale(req.note)
     if not acc:
         raise HTTPException(status_code=404, detail="没有可售且带密码的 Plus 账号")

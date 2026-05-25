@@ -134,6 +134,28 @@ CREATE TABLE IF NOT EXISTS oauth_status (
   ts TEXT NOT NULL,
   fail_reason TEXT DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS mail_accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  mail_password TEXT DEFAULT '',
+  provider TEXT DEFAULT '',
+  imap_host TEXT DEFAULT '',
+  imap_port INTEGER DEFAULT 993,
+  imap_ssl INTEGER DEFAULT 1,
+  account_id TEXT DEFAULT '',
+  access_token TEXT DEFAULT '',
+  refresh_token TEXT DEFAULT '',
+  openai_password TEXT DEFAULT '',
+  first TEXT DEFAULT '',
+  last TEXT DEFAULT '',
+  status TEXT DEFAULT 'unused',
+  fail_reason TEXT DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mail_accounts_status_id
+  ON mail_accounts(status, id);
 """
 
 
@@ -154,6 +176,21 @@ def _text(value: Any) -> str:
 
 def _email(value: Any) -> str:
     return _text(value).strip().lower()
+
+
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _bool_int(value: Any, default: bool = True) -> int:
+    if value in (None, ""):
+        return 1 if default else 0
+    if isinstance(value, bool):
+        return 1 if value else 0
+    return 1 if str(value).strip().lower() in ("1", "true", "yes", "y", "on", "ssl") else 0
 
 
 class Database:
@@ -201,6 +238,24 @@ class Database:
             ("phone_country", "TEXT DEFAULT ''"),
         ):
             add_column("registered_accounts", name, ddl)
+        for name, ddl in (
+            ("mail_password", "TEXT DEFAULT ''"),
+            ("provider", "TEXT DEFAULT ''"),
+            ("imap_host", "TEXT DEFAULT ''"),
+            ("imap_port", "INTEGER DEFAULT 993"),
+            ("imap_ssl", "INTEGER DEFAULT 1"),
+            ("account_id", "TEXT DEFAULT ''"),
+            ("access_token", "TEXT DEFAULT ''"),
+            ("refresh_token", "TEXT DEFAULT ''"),
+            ("openai_password", "TEXT DEFAULT ''"),
+            ("first", "TEXT DEFAULT ''"),
+            ("last", "TEXT DEFAULT ''"),
+            ("status", "TEXT DEFAULT 'unused'"),
+            ("fail_reason", "TEXT DEFAULT ''"),
+            ("created_at", "REAL DEFAULT 0"),
+            ("updated_at", "REAL DEFAULT 0"),
+        ):
+            add_column("mail_accounts", name, ddl)
 
     # ──────────────────────────────────────────
     # Runtime data store. SQLite is the only source of truth for runtime data.
@@ -228,8 +283,149 @@ class Database:
         with self._conn() as c:
             return {
                 table: c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in ("registered_accounts", "pipeline_results", "card_results", "oauth_status")
+                for table in ("registered_accounts", "pipeline_results", "card_results", "oauth_status", "mail_accounts")
             }
+
+    def _mail_account_values(self, row: dict, *, now: float) -> tuple:
+        return (
+            _email(row.get("email")),
+            _text(row.get("mail_password") or row.get("password") or row.get("app_password")),
+            _text(row.get("provider")).strip().lower(),
+            _text(row.get("imap_host")),
+            _int(row.get("imap_port"), 993),
+            _bool_int(row.get("imap_ssl"), True),
+            _text(row.get("account_id") or row.get("id") or row.get("user_id") or row.get("uid")),
+            _text(row.get("access_token") or row.get("token") or row.get("oauth_token") or row.get("imap_token")),
+            _text(row.get("refresh_token")),
+            _text(row.get("openai_password")),
+            _text(row.get("first")),
+            _text(row.get("last")),
+            (_text(row.get("status")).strip().lower() or "unused"),
+            _text(row.get("fail_reason")),
+            now,
+            now,
+        )
+
+    def _mail_account_row_dict(self, row: sqlite3.Row) -> dict:
+        out = dict(row)
+        out["imap_ssl"] = "true" if _bool_int(out.get("imap_ssl"), True) else "false"
+        out["imap_port"] = str(_int(out.get("imap_port"), 993))
+        out["updated_at"] = "" if not out.get("updated_at") else str(out.get("updated_at"))
+        return out
+
+    def upsert_mail_accounts(self, rows: list[dict]) -> int:
+        """Compatibility wrapper; mailbox imports are append-only."""
+        return self.append_mail_accounts(rows)
+
+    def append_mail_accounts(self, rows: list[dict]) -> int:
+        """Insert new mailbox rows without modifying existing accounts."""
+        now = time.time()
+        values = [self._mail_account_values(row, now=now) for row in rows if _email(row.get("email"))]
+        inserted = 0
+        with self._conn() as c:
+            for value in values:
+                cur = c.execute(
+                    """
+                    INSERT INTO mail_accounts(
+                      email, mail_password, provider, imap_host, imap_port, imap_ssl,
+                      account_id, access_token, refresh_token, openai_password,
+                      first, last, status, fail_reason, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(email) DO NOTHING
+                    """,
+                    value,
+                )
+                inserted += max(cur.rowcount, 0)
+        return inserted
+
+    def iter_mail_accounts(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, email, mail_password, provider, imap_host, imap_port,
+                       imap_ssl, account_id, access_token, refresh_token,
+                       openai_password, first, last, status, fail_reason,
+                       created_at, updated_at
+                FROM mail_accounts
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        return [self._mail_account_row_dict(row) for row in rows]
+
+    def find_mail_account(self, email: str) -> dict:
+        target = _email(email)
+        if not target:
+            return {}
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id, email, mail_password, provider, imap_host, imap_port,
+                       imap_ssl, account_id, access_token, refresh_token,
+                       openai_password, first, last, status, fail_reason,
+                       created_at, updated_at
+                FROM mail_accounts
+                WHERE email = ?
+                LIMIT 1
+                """,
+                (target,),
+            ).fetchone()
+        return self._mail_account_row_dict(row) if row else {}
+
+    def reserve_mail_account(self) -> dict:
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute(
+                    """
+                    SELECT id, email, mail_password, provider, imap_host, imap_port,
+                           imap_ssl, account_id, access_token, refresh_token,
+                           openai_password, first, last, status, fail_reason,
+                           created_at, updated_at
+                    FROM mail_accounts
+                    WHERE coalesce(status, 'unused') IN ('', 'unused')
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if not row:
+                    c.execute("COMMIT")
+                    return {}
+                updated_at = time.time()
+                c.execute(
+                    """
+                    UPDATE mail_accounts
+                    SET status = 'reserved', fail_reason = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (updated_at, int(row["id"])),
+                )
+                out = dict(row)
+                out["status"] = "reserved"
+                out["fail_reason"] = ""
+                out["updated_at"] = updated_at
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        out["imap_ssl"] = "true" if _bool_int(out.get("imap_ssl"), True) else "false"
+        out["imap_port"] = str(_int(out.get("imap_port"), 993))
+        out["updated_at"] = str(out.get("updated_at") or "")
+        return out
+
+    def mark_mail_account(self, email: str, status: str, fail_reason: str = "") -> bool:
+        target = _email(email)
+        if not target:
+            return False
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                UPDATE mail_accounts
+                SET status = ?, fail_reason = ?, updated_at = ?
+                WHERE email = ?
+                """,
+                (_text(status).strip().lower(), _text(fail_reason)[:500], time.time(), target),
+            )
+        return cur.rowcount > 0
 
     def set_runtime_value(self, key: str, value: str) -> bool:
         key = _text(key).strip()
@@ -372,7 +568,7 @@ class Database:
         return cur.rowcount > 0
 
     def claim_account_for_sale(self, note: str = "") -> dict:
-        """Return one available Plus account credential and mark it sold atomically."""
+        """Return one available Plus account credential bundle and mark it sold atomically."""
         sold_at = time.time()
         sale_note = (_text(note).strip() or "portal claim")[:500]
         with self._conn() as c:
@@ -380,8 +576,15 @@ class Database:
             try:
                 row = c.execute(
                     """
-                    SELECT id, email, password
+                    SELECT
+                      ra.id,
+                      ra.email,
+                      ra.password,
+                      ra.password AS gpt_password,
+                      coalesce(ma.mail_password, '') AS mail_password
                     FROM registered_accounts AS ra
+                    LEFT JOIN mail_accounts AS ma
+                      ON lower(ma.email) = lower(ra.email)
                     WHERE coalesce(ra.password, '') != ''
                       AND coalesce(ra.sale_status, 'available') != 'sold'
                       AND (
@@ -410,7 +613,7 @@ class Database:
                         WHERE lower(coalesce(team_cr.chatgpt_email, team_cr.email)) = lower(ra.email)
                           AND coalesce(team_cr.team_account_id, '') != ''
                       )
-                    ORDER BY id ASC
+                    ORDER BY ra.id ASC
                     LIMIT 1
                     """
                 ).fetchone()
@@ -433,6 +636,8 @@ class Database:
         out["sale_status"] = "sold"
         out["sold_at"] = sold_at
         out["sale_note"] = sale_note
+        out["gpt_password"] = out.get("gpt_password") or out.get("password") or ""
+        out["mail_password"] = out.get("mail_password") or ""
         return out
 
     def toggle_account_sale_status(self, account_id: int, note: str = "") -> dict:

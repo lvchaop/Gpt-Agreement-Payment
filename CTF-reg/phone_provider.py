@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -223,17 +224,101 @@ class PhoneProvider:
                 query[key] = text
         return "?" + urlencode(query)
 
+    @staticmethod
+    def _split_list(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            items = value
+        else:
+            items = re.split(r"[\s,，;；]+", str(value or ""))
+        return [str(item).strip() for item in items if str(item).strip()]
+
+    @staticmethod
+    def _normalize_price_map(value: Any) -> dict[str, str]:
+        if isinstance(value, dict):
+            return {
+                str(k).strip(): str(v).strip()
+                for k, v in value.items()
+                if str(k).strip() and str(v).strip()
+            }
+        out: dict[str, str] = {}
+        for part in re.split(r"[\n,，;；]+", str(value or "")):
+            text = part.strip()
+            if not text:
+                continue
+            if "=" in text:
+                key, val = text.split("=", 1)
+            elif ":" in text:
+                key, val = text.split(":", 1)
+            else:
+                bits = text.split()
+                if len(bits) < 2:
+                    continue
+                key, val = bits[0], bits[1]
+            key = str(key).strip()
+            val = str(val).strip()
+            if key and val:
+                out[key] = val
+        return out
+
     def _hero_service_country(self) -> tuple[str, str]:
+        service, countries = self._hero_service_countries()
+        return service, countries[0]
+
+    def _hero_service_countries(self) -> tuple[str, list[str]]:
         service = str(getattr(self.cfg, "service", "") or "tg").strip()
-        country = str(getattr(self.cfg, "country", "") or "").strip()
+        countries = self._split_list(getattr(self.cfg, "countries", []) or [])
+        if countries:
+            random.shuffle(countries)
+        else:
+            countries = [str(getattr(self.cfg, "country", "") or "").strip()]
         if not service:
             raise RuntimeError("Hero SMS 需要 phone.service，例如 tg")
-        if not country or not country.isdigit():
-            raise RuntimeError(f"Hero SMS 需要 phone.country 填数字国家码，例如 2；当前={country or '<empty>'}")
-        return service, country
+        bad = [country for country in countries if not country or not country.isdigit()]
+        if bad:
+            raise RuntimeError(f"Hero SMS 需要 phone.country/countries 填数字国家码，例如 2；当前={bad[0] or '<empty>'}")
+        return service, countries
 
-    def _hero_max_price(self) -> str:
+    def _hero_max_price(self, country: str = "") -> str:
+        country_prices = self._normalize_price_map(getattr(self.cfg, "country_max_prices", {}) or {})
+        if country and country_prices.get(str(country)):
+            return country_prices[str(country)]
         return str(getattr(self.cfg, "maxPrice", "") or getattr(self.cfg, "max_price", "") or "").strip()
+
+    def _hero_allocate_attempts(self, country_count: int) -> int:
+        raw = int(getattr(self.cfg, "max_number_attempts", 3) or 3)
+        return max(1, country_count, raw)
+
+    @staticmethod
+    def _hero_allocate_retryable_error(error: Exception | str) -> bool:
+        text = str(error)
+        retryable_tokens = (
+            "HTTP 409",
+            "NO_NUMBERS",
+            "BAD_COUNTRY",
+            "BAD_SERVICE",
+            "STATUS_WAIT",
+            "TOO_MANY",
+            "RATE_LIMIT",
+            "TRY_AGAIN",
+            "TEMP",
+        )
+        fatal_tokens = ("BAD_KEY", "NO_BALANCE")
+        upper = text.upper()
+        if any(token in upper for token in fatal_tokens):
+            return False
+        return any(token in upper for token in retryable_tokens)
+
+    @staticmethod
+    def _hero_status_retryable_error(error: Exception | str) -> bool:
+        text = str(error)
+        upper = text.upper()
+        fatal_tokens = ("BAD_KEY", "BAD_ACTION", "STATUS_CANCEL", "NO_ACTIVATION")
+        if any(token in upper for token in fatal_tokens):
+            return False
+        return any(
+            token in upper
+            for token in ("HTTP 409", "STATUS_WAIT", "TRY_AGAIN", "RATE_LIMIT", "TEMP")
+        )
 
     def _otp_timeout_s(self) -> int:
         raw = int(getattr(self.cfg, "otp_timeout_s", _MAX_OTP_WAIT_S) or _MAX_OTP_WAIT_S)
@@ -265,40 +350,70 @@ class PhoneProvider:
         return f"+{e164_digits}", national, country_code
 
     def _allocate_hero_sms(self) -> PhoneLease:
-        service, country = self._hero_service_country()
-        max_price = self._hero_max_price()
-        logger.info(
-            "Hero SMS getNumberV2 service=%s country=%s maxPrice=%s base_url=%s",
-            service,
-            country,
-            max_price or "<empty>",
-            self.base_url,
-        )
-        raw = self._request_text("GET", self._hero_query("getNumberV2", service=service, country=country, maxPrice=max_price))
-        try:
-            resp = json.loads(raw)
-        except Exception as e:
-            raise RuntimeError(f"Hero SMS getNumberV2 返回非 JSON: {self._hero_error(raw)}") from e
-        if not isinstance(resp, dict):
-            raise RuntimeError(f"Hero SMS getNumberV2 JSON 顶层不是对象: {type(resp).__name__}")
-        if resp.get("error") or resp.get("message") in {"NO_NUMBERS", "NO_BALANCE", "BAD_KEY", "BAD_ACTION"}:
-            raise RuntimeError(f"Hero SMS getNumberV2 失败: {resp}")
-        lease_id = str(resp.get("activationId") or resp.get("activation_id") or "").strip()
-        if not lease_id:
-            raise RuntimeError(f"Hero SMS getNumberV2 响应缺 activationId: {resp}")
-        phone_e164, phone_national, country_phone_code = self._hero_phone_parts(
-            resp.get("phoneNumber") or resp.get("phone_number"),
-            resp.get("countryPhoneCode"),
-        )
-        return PhoneLease(
-            lease_id=lease_id,
-            phone_e164=phone_e164,
-            masked_phone=self._mask_phone(phone_e164),
-            phone_national=phone_national,
-            country_phone_code=country_phone_code,
-            expires_at=resp.get("activationEndTime") or resp.get("activation_end_time"),
-            raw=resp,
-        )
+        service, countries = self._hero_service_countries()
+        attempts = self._hero_allocate_attempts(len(countries))
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            country = countries[(attempt - 1) % len(countries)]
+            max_price = self._hero_max_price(country)
+            logger.info(
+                "Hero SMS getNumberV2 attempt=%s/%s service=%s country=%s maxPrice=%s base_url=%s",
+                attempt,
+                attempts,
+                service,
+                country,
+                max_price or "<empty>",
+                self.base_url,
+            )
+            try:
+                raw = self._request_text("GET", self._hero_query("getNumberV2", service=service, country=country, maxPrice=max_price))
+            except Exception as e:
+                last_error = str(e)
+                if attempt < attempts and self._hero_allocate_retryable_error(e):
+                    logger.warning(
+                        "Hero SMS getNumberV2 可重试失败 attempt=%s/%s country=%s: %s",
+                        attempt,
+                        attempts,
+                        country,
+                        last_error[:220],
+                    )
+                    continue
+                raise
+            try:
+                resp = json.loads(raw)
+            except Exception as e:
+                raise RuntimeError(f"Hero SMS getNumberV2 返回非 JSON: {self._hero_error(raw)}") from e
+            if not isinstance(resp, dict):
+                raise RuntimeError(f"Hero SMS getNumberV2 JSON 顶层不是对象: {type(resp).__name__}")
+            if resp.get("error") or resp.get("message") in {"NO_NUMBERS", "NO_BALANCE", "BAD_KEY", "BAD_ACTION", "BAD_COUNTRY", "BAD_SERVICE"}:
+                last_error = f"Hero SMS getNumberV2 失败: {resp}"
+                if attempt < attempts and self._hero_allocate_retryable_error(last_error):
+                    logger.warning(
+                        "Hero SMS getNumberV2 可重试失败 attempt=%s/%s country=%s: %s",
+                        attempt,
+                        attempts,
+                        country,
+                        last_error[:220],
+                    )
+                    continue
+                raise RuntimeError(last_error)
+            lease_id = str(resp.get("activationId") or resp.get("activation_id") or "").strip()
+            if not lease_id:
+                raise RuntimeError(f"Hero SMS getNumberV2 响应缺 activationId: {resp}")
+            phone_e164, phone_national, country_phone_code = self._hero_phone_parts(
+                resp.get("phoneNumber") or resp.get("phone_number"),
+                resp.get("countryPhoneCode"),
+            )
+            return PhoneLease(
+                lease_id=lease_id,
+                phone_e164=phone_e164,
+                masked_phone=self._mask_phone(phone_e164),
+                phone_national=phone_national,
+                country_phone_code=country_phone_code,
+                expires_at=resp.get("activationEndTime") or resp.get("activation_end_time"),
+                raw=resp,
+            )
+        raise RuntimeError(f"Hero SMS getNumberV2 重试耗尽: {last_error or 'unknown'}")
 
     def _hero_status_v2_code(self, resp: dict) -> str:
         for section_name in ("sms", "call"):
@@ -316,7 +431,15 @@ class PhoneProvider:
         deadline = time.time() + timeout_s
         last_status = ""
         while time.time() < deadline:
-            raw = self._request_text("GET", self._hero_query("getStatusV2", id=lease_id))
+            try:
+                raw = self._request_text("GET", self._hero_query("getStatusV2", id=lease_id))
+            except Exception as e:
+                if self._hero_status_retryable_error(e):
+                    last_status = str(e)[:200]
+                    logger.warning("Hero SMS getStatusV2 可重试失败 lease=%s: %s", lease_id, last_status)
+                    time.sleep(max(1.0, interval_s))
+                    continue
+                raise
             try:
                 resp = json.loads(raw)
             except Exception as e:

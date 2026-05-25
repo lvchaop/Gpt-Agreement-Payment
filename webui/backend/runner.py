@@ -40,8 +40,8 @@ _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls 
 
 
 _PHONE_CONFIG_KEYS = {
-    "enabled", "provider", "base_url", "api_key_env", "country", "service",
-    "maxPrice", "max_price", "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path", "otp_path",
+    "enabled", "provider", "base_url", "api_key_env", "country", "countries", "service",
+    "maxPrice", "max_price", "country_max_prices", "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path", "otp_path",
     "otp_method", "otp_timeout_s", "otp_poll_interval_s", "release_path",
     "fail_path", "verified_path", "headers", "allocate_payload",
 }

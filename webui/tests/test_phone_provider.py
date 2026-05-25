@@ -1,8 +1,10 @@
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -98,6 +100,73 @@ def test_hero_sms_v2_allocate_poll_and_status():
     assert any("action=getNumberV2" in u and "service=tg" in u and "country=2" in u and "maxPrice=12.5" in u for u in opener.urls)
     assert any("action=getStatusV2" in u and "id=635468024" in u for u in opener.urls)
     assert any("action=setStatus" in u and "status=6" in u for u in opener.urls)
+
+
+def test_hero_sms_country_pool_uses_country_specific_max_price():
+    provider = phone_provider.PhoneProvider.from_config(_cfg(
+        country="2",
+        countries=["151"],
+        maxPrice="12.5",
+        country_max_prices={"151": "0.1"},
+    ))
+    opener = _HeroOpener()
+    provider.opener = opener
+
+    provider.allocate()
+
+    assert any(
+        "action=getNumberV2" in u and "country=151" in u and "maxPrice=0.1" in u
+        for u in opener.urls
+    )
+
+
+def test_hero_sms_allocate_retries_http_409():
+    class ConflictThenOkOpener(_HeroOpener):
+        def __init__(self):
+            super().__init__()
+            self.get_number_calls = 0
+
+        def open(self, req, timeout=0):
+            self.urls.append(req.full_url)
+            if "action=getNumberV2" in req.full_url:
+                self.get_number_calls += 1
+                if self.get_number_calls == 1:
+                    raise HTTPError(req.full_url, 409, "Conflict", {}, io.BytesIO(b'{"message":"conflict"}'))
+            return super().open(req, timeout=timeout)
+
+    provider = phone_provider.PhoneProvider.from_config(_cfg(max_number_attempts=2))
+    opener = ConflictThenOkOpener()
+    provider.opener = opener
+
+    lease = provider.allocate()
+
+    assert lease.lease_id == "635468024"
+    assert opener.get_number_calls == 2
+
+
+def test_hero_sms_poll_retries_http_409():
+    class StatusConflictThenOkOpener(_HeroOpener):
+        def __init__(self):
+            super().__init__()
+            self.status_calls = 0
+
+        def open(self, req, timeout=0):
+            self.urls.append(req.full_url)
+            if "action=getStatusV2" in req.full_url:
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    raise HTTPError(req.full_url, 409, "Conflict", {}, io.BytesIO(b'{"message":"conflict"}'))
+            return super().open(req, timeout=timeout)
+
+    provider = phone_provider.PhoneProvider.from_config(_cfg())
+    opener = StatusConflictThenOkOpener()
+    provider.opener = opener
+
+    lease = provider.allocate()
+    code = provider.poll_otp(lease.lease_id)
+
+    assert code == "654321"
+    assert opener.status_calls == 2
 
 
 def test_hero_sms_status_v2_can_read_call_code():

@@ -136,6 +136,7 @@ def test_sale_claim_returns_password_and_marks_sold(client):
     db.add_card_result({"chatgpt_email": "empty-plus@example.com", "status": "succeeded"})
     db.add_registered_account({"email": "free@example.com", "password": "free-pass"})
     db.add_registered_account({"email": "sell@example.com", "password": "secret-pass"})
+    db.upsert_mail_accounts([{"email": "sell@example.com", "mail_password": "mail-secret"}])
     db.add_card_result({"chatgpt_email": "sell@example.com", "status": "succeeded"})
 
     r = client.post("/api/inventory/accounts/sale/claim", json={"note": "order-42"})
@@ -144,6 +145,8 @@ def test_sale_claim_returns_password_and_marks_sold(client):
     body = r.json()
     assert body["email"] == "sell@example.com"
     assert body["password"] == "secret-pass"
+    assert body["gpt_password"] == "secret-pass"
+    assert body["mail_password"] == "mail-secret"
     assert body["sale_status"] == "sold"
     assert body["sold_at"] > 0
     assert body["sale_note"] == "order-42"

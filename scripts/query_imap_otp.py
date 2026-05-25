@@ -17,8 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CTF_REG = ROOT / "CTF-reg"
 if str(CTF_REG) not in sys.path:
     sys.path.insert(0, str(CTF_REG))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from email_account_pool import EmailAccountPool, account_from_row, parse_accounts_text  # noqa: E402
+from email_account_pool import account_from_row, email_account_pool_from_path, parse_accounts_text  # noqa: E402
 from imap_otp_provider import ImapOtpProvider, extract_otp  # noqa: E402
 
 
@@ -43,7 +45,7 @@ def _load_accounts(args) -> list:
     if args.account:
         return [_account_from_inline(args.account)]
 
-    pool = EmailAccountPool(args.pool)
+    pool = email_account_pool_from_path(args.pool)
     if args.email:
         acc = pool.find(args.email)
         if not acc:
@@ -113,8 +115,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--pool",
-        default=str(ROOT / "output" / "email_accounts.csv"),
-        help="邮箱账号池 CSV，默认 output/email_accounts.csv",
+        default="sqlite:mail_accounts",
+        help="邮箱账号池，固定为 sqlite:mail_accounts",
     )
     parser.add_argument("--email", default="", help="只查询账号池里的指定邮箱")
     parser.add_argument("--all", action="store_true", help="查询账号池里的全部邮箱")

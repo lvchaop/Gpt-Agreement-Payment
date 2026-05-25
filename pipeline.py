@@ -4188,6 +4188,31 @@ def _build_cli_proxy_stage_controls(args):
         )
         return None, plan
 
+    def resolve_register_method_for_args() -> str:
+        method = (
+            _normalize_register_method(getattr(args, "register_method", "") or "")
+            or _normalize_register_method(os.environ.get("WEBUI_REG_METHOD") or os.environ.get("WEBUI_REG_MODE"))
+        )
+        if method:
+            return method
+        try:
+            cardw_path = getattr(args, "cardw_config", None)
+            if not cardw_path:
+                card_cfg = _read_card_cfg(str(getattr(args, "config", "") or ""))
+                cardw_path = _load_cardw_path_from_card_cfg(card_cfg, None)
+            return _register_method_from_config(str(cardw_path))
+        except RegistrationError:
+            raise
+        except Exception:
+            return ""
+
+    def should_use_all_alive_register_nodes() -> bool:
+        if not bool(getattr(args, "register_only", False)):
+            return False
+        if bool(getattr(args, "proxy_register_all_alive", False)):
+            return True
+        return resolve_register_method_for_args() == "phone_protocol"
+
     if mode == "trojan-pool":
         pool_file = str(getattr(args, "trojan_pool_file", "") or "").strip()
         if not pool_file:
@@ -4199,6 +4224,20 @@ def _build_cli_proxy_stage_controls(args):
             executable=str(getattr(args, "trojan_bridge_bin", "sing-box") or "sing-box"),
             auto_start=not bool(getattr(args, "trojan_no_start", False)),
         )
+        if should_use_all_alive_register_nodes():
+            alive = manager.alive_nodes(
+                timeout_s=float(getattr(args, "proxy_alive_timeout", 8.0) or 8.0),
+                probe_url=str(getattr(args, "proxy_alive_probe_url", "") or ""),
+            )
+            if not alive:
+                raise TrojanBridgeError("Trojan 池没有探活通过的节点可用于 phone_protocol 注册")
+            allocator = manager.allocator(register_nodes=alive)
+            print(
+                f"[ProxyStage] phone_protocol register-only 使用全部存活 Trojan 节点轮询: "
+                f"{len(alive)}/{len(manager.nodes)}"
+            )
+            return allocator, None
+
         allocator = manager.allocator(
             all_region=str(getattr(args, "proxy_region_all", "") or ""),
             register_region=str(getattr(args, "proxy_region_register", "") or ""),
@@ -4292,6 +4331,12 @@ def main():
                         help="ChatGPT payments/checkout 阶段 region，写入 fresh_checkout.proxy")
     parser.add_argument("--proxy-region-payment", default="",
                         help="Stripe/PayPal/solver 支付阶段 region，写入 CTF-pay.proxy/stage_proxies/browser_challenge")
+    parser.add_argument("--proxy-register-all-alive", action="store_true",
+                        help="register-only 时忽略 Trojan region，使用所有探活通过节点轮询；phone_protocol 会自动启用")
+    parser.add_argument("--proxy-alive-timeout", type=float, default=8.0,
+                        help="Trojan 节点探活单节点超时秒数，默认 8")
+    parser.add_argument("--proxy-alive-probe-url", default="",
+                        help="Trojan 节点探活 URL，默认 http://cloudflare.com/cdn-cgi/trace")
     args = parser.parse_args()
 
     if args.paypal and args.gopay:

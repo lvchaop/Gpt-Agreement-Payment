@@ -15,6 +15,24 @@
       <TermField v-if="phoneProviderKind === 'hero_sms'" v-model="phoneForm.service" label="Hero 服务 · service" placeholder="tg" />
       <TermField v-model="phoneForm.country" :label="phoneProviderKind === 'hero_sms' ? 'Hero 国家码 · country' : '国家 · country'" :placeholder="phoneProviderKind === 'hero_sms' ? '2' : 'US'" />
       <TermField v-if="phoneProviderKind === 'hero_sms'" v-model="phoneForm.maxPrice" label="Hero 最高价格 · maxPrice" placeholder="12.5" />
+      <label v-if="phoneProviderKind === 'hero_sms'" class="tf">
+        <span class="tf-tag">Hero 国家码池 · countries</span>
+        <textarea
+          v-model="phoneForm.countries_text"
+          class="tf-textarea"
+          placeholder="一行一个或逗号分隔，如 151&#10;2&#10;187"
+          rows="3"
+        ></textarea>
+      </label>
+      <label v-if="phoneProviderKind === 'hero_sms'" class="tf">
+        <span class="tf-tag">Hero 国家价格 · country_max_prices</span>
+        <textarea
+          v-model="phoneForm.country_max_prices_text"
+          class="tf-textarea"
+          placeholder="151=0.1&#10;2=0.2；未匹配时使用 maxPrice"
+          rows="3"
+        ></textarea>
+      </label>
       <template v-if="phoneProviderKind !== 'hero_sms'">
         <TermField v-model="phoneForm.allocate_path" label="拿号接口 · allocate_path" placeholder="/api/phones/allocate" />
         <TermField v-model="phoneForm.otp_path" label="取码接口 · otp_path" placeholder="/api/phones/{lease_id}/otp" />
@@ -52,7 +70,6 @@
     <template v-if="mailMode === 'imap_list'">
       <div class="term-divider" data-tail="──────────" style="margin-top:24px">IMAP 邮箱列表</div>
       <div class="form-stack">
-        <TermField v-model="mailForm.accounts_path" label="列表路径 · accounts_path" placeholder="output/email_accounts.csv" />
         <TermField v-model="mailForm.otp_timeout" label="OTP 超时 · otp_timeout" />
         <label class="tf">
           <span class="tf-tag">邮箱列表</span>
@@ -70,7 +87,7 @@
       </div>
 
       <div v-if="mailStatus" class="result-block result--ok" style="margin-top:14px">
-        <div class="result-head"><span class="result-icon">✓</span> {{ mailStatus.count }} 个邮箱 · {{ mailStatus.path }}</div>
+        <div class="result-head"><span class="result-icon">✓</span> {{ mailStatus.count }} 个邮箱 · {{ mailStatus.path }}{{ saveDeltaText }}</div>
         <ul class="result-list">
           <li v-for="a in mailStatus.accounts" :key="a.email" class="row-ok">
             <span class="row-name">{{ a.email }}</span>
@@ -126,6 +143,39 @@ const store = useWizardStore();
 const registrationInit = store.answers.registration ?? {};
 const phoneInit = store.answers.phone ?? {};
 const registrationMethod = ref(registrationInit.method ?? "browser");
+function listText(value: unknown) {
+  if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean).join("\n");
+  return String(value ?? "");
+}
+function priceMapText(value: unknown) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return Object.entries(value as Record<string, unknown>)
+      .map(([k, v]) => `${k}=${String(v ?? "")}`)
+      .join("\n");
+  }
+  return String(value ?? "");
+}
+function parseListText(value: string) {
+  return String(value || "")
+    .split(/[\s,，;；]+/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+function parsePriceMapText(value: string) {
+  const out: Record<string, string> = {};
+  String(value || "")
+    .split(/[\n,，;；]+/)
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .forEach((item) => {
+      const parts = item.includes("=") ? item.split("=") : item.split(":");
+      if (parts.length < 2) return;
+      const key = parts[0].trim();
+      const val = parts.slice(1).join(":").trim();
+      if (key && val) out[key] = val;
+    });
+  return out;
+}
 const phoneForm = ref({
   enabled: phoneInit.enabled ?? false,
   provider: phoneInit.provider ?? "hero_sms",
@@ -133,8 +183,10 @@ const phoneForm = ref({
   api_key: phoneInit.api_key ?? "",
   api_key_env: phoneInit.api_key_env ?? "HERO_SMS_API_KEY",
   country: phoneInit.country ?? "2",
+  countries_text: listText(phoneInit.countries),
   service: phoneInit.service ?? "tg",
   maxPrice: String(phoneInit.maxPrice ?? phoneInit.max_price ?? ""),
+  country_max_prices_text: priceMapText(phoneInit.country_max_prices),
   lease_ttl_s: String(phoneInit.lease_ttl_s ?? 300),
   request_timeout_s: String(phoneInit.request_timeout_s ?? 20),
   allocate_path: phoneInit.allocate_path ?? "/api/phones/allocate",
@@ -154,7 +206,6 @@ const form = ref({
   zone_names: (init.zone_names ?? []) as string[],
 });
 const mailForm = ref({
-  accounts_path: mailInit.accounts_path ?? "output/email_accounts.csv",
   otp_timeout: String(mailInit.otp_timeout ?? 180),
   mark_seen: Boolean(mailInit.mark_seen ?? false),
 });
@@ -164,6 +215,10 @@ const listingMail = ref(false);
 const mailStatus = ref<any>(null);
 const mailList = ref<any>(null);
 const mailError = ref("");
+const saveDeltaText = computed(() => {
+  if (!mailStatus.value || mailStatus.value.inserted_count === undefined) return "";
+  return ` · 本次新增 ${mailStatus.value.inserted_count} / 跳过 ${mailStatus.value.skipped_existing ?? 0}`;
+});
 
 const mailModeOptions = [
   { value: "cloudflare_kv", label: "Cloudflare KV", desc: "catch-all 域名 + Worker/KV 自动取码" },
@@ -216,7 +271,6 @@ function onMailModeChange(v: string) {
 function persistMailAnswer() {
   store.setAnswer("mail", {
     mode: mailMode.value,
-    accounts_path: mailForm.value.accounts_path || "output/email_accounts.csv",
     otp_timeout: Number(mailForm.value.otp_timeout || 180),
     mark_seen: mailForm.value.mark_seen,
   });
@@ -231,8 +285,10 @@ function persistRegistrationAnswer() {
     api_key: phoneForm.value.api_key,
     api_key_env: phoneForm.value.api_key_env || (phoneProviderKind.value === "hero_sms" ? "HERO_SMS_API_KEY" : "PHONE_PROVIDER_API_KEY"),
     country: phoneForm.value.country || (phoneProviderKind.value === "hero_sms" ? "2" : "US"),
+    countries: parseListText(phoneForm.value.countries_text),
     service: phoneForm.value.service || "tg",
     maxPrice: phoneForm.value.maxPrice,
+    country_max_prices: parsePriceMapText(phoneForm.value.country_max_prices_text),
     lease_ttl_s: Number(phoneForm.value.lease_ttl_s || 300),
     request_timeout_s: Number(phoneForm.value.request_timeout_s || 20),
     allocate_path: phoneForm.value.allocate_path || "/api/phones/allocate",
@@ -253,15 +309,13 @@ async function saveMailAccounts() {
   try {
     const r = await api.post("/mail/accounts/save", {
       accounts_text: accountsText.value,
-      path: mailForm.value.accounts_path,
     });
     mailStatus.value = r.data;
-    mailForm.value.accounts_path = r.data.path;
     persistMailAnswer();
     await store.saveToServer();
     const result: PreflightResult = {
       status: "ok",
-      message: `邮箱列表已保存: ${r.data.count} 个`,
+      message: `邮箱列表已保存: 总数 ${r.data.count}，本次新增 ${r.data.inserted_count ?? r.data.count}，跳过 ${r.data.skipped_existing ?? 0}`,
       checks: [],
     };
     store.setPreflight("imap_mail", result);
@@ -278,7 +332,6 @@ async function listMail() {
   listingMail.value = true;
   try {
     const r = await api.post("/mail/accounts/list", {
-      path: mailForm.value.accounts_path,
       accounts_text: accountsText.value,
       limit: 10,
     });
@@ -300,10 +353,9 @@ async function listMail() {
 async function loadMailStatus() {
   if (mailMode.value !== "imap_list") return;
   try {
-    const r = await api.get("/mail/accounts/status", { params: { path: mailForm.value.accounts_path } });
+    const r = await api.get("/mail/accounts/status");
     if (r.data.count) {
       mailStatus.value = r.data;
-      mailForm.value.accounts_path = r.data.path;
       persistMailAnswer();
     }
   } catch {}

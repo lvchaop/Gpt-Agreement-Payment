@@ -285,7 +285,7 @@
             <span class="inventory-value">{{ inventoryUpdatedText }}</span>
           </div>
           <div class="inventory-head-actions">
-            <TermBtn variant="ghost" :loading="inventoryBusy" @click="claimSaleAccount">取 Plus 邮箱密码并标记已售</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" @click="claimSaleAccount">取 Plus 三件套并标记已售</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryLoading" @click="refreshInventory">刷新库存</TermBtn>
           </div>
         </div>
@@ -576,6 +576,8 @@ interface SaleClaimResponse {
   id: number;
   email: string;
   password: string;
+  mail_password: string;
+  gpt_password: string;
   sale_status: "sold" | string;
   sold_at: number;
   sale_note: string;
@@ -1348,7 +1350,9 @@ function pushSelectedToCpa() { pushCpa(Array.from(selectedIds.value), "批量推
 function pushAllUnpushed() { pushCpa(unpushedIds.value, "推送所有未推送"); }
 
 function saleCredentialText(acc: SaleClaimResponse) {
-  return `${acc.email}----${acc.password}`;
+  const mailPassword = acc.mail_password || "";
+  const gptPassword = acc.gpt_password || acc.password || "";
+  return `邮箱: ${acc.email}\n邮箱密码: ${mailPassword}\nGPT密码: ${gptPassword}`;
 }
 
 async function copyText(text: string, label: string) {
@@ -1370,15 +1374,17 @@ async function claimSaleAccount() {
     dialog.success({
       title: "已取出并标记已售",
       content: () => h("div", { style: "font-size:12px; line-height:1.7; word-break:break-all" }, [
-        h("div", `email: ${acc.email}`),
-        h("div", `password: ${acc.password}`),
+        h("div", { style: "font-weight:600" }, "邮箱 / 邮箱密码 / GPT密码"),
+        h("div", `邮箱: ${acc.email}`),
+        h("div", `邮箱密码: ${acc.mail_password || "-"}`),
+        h("div", `GPT密码: ${acc.gpt_password || acc.password || "-"}`),
         h("pre", {
           style: "margin-top:8px; padding:8px; border-radius:6px; background:#111827; color:#f9fafb; white-space:pre-wrap",
         }, credential),
       ]),
       positiveText: "复制",
       negativeText: "关闭",
-      onPositiveClick: () => copyText(credential, "已复制邮箱密码"),
+      onPositiveClick: () => copyText(credential, "已复制邮箱三件套"),
     });
   } catch (e: any) {
     const detail = e?.response?.data?.detail || e?.message || e;

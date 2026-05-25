@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import sys
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -15,7 +14,12 @@ _CTF_REG_DIR = s.CTF_REG_DIR
 if str(_CTF_REG_DIR) not in sys.path:
     sys.path.insert(0, str(_CTF_REG_DIR))
 
-from email_account_pool import EmailAccountPool, parse_accounts_text, account_from_row  # noqa: E402
+from email_account_pool import (  # noqa: E402
+    DB_POOL_PATH,
+    email_account_pool_from_path,
+    parse_accounts_text,
+    account_from_row,
+)
 from imap_otp_provider import ImapOtpProvider  # noqa: E402
 
 
@@ -23,16 +27,12 @@ router = APIRouter(prefix="/api/mail/accounts", tags=["mail_accounts"])
 logger = logging.getLogger(__name__)
 
 
-def _default_path() -> Path:
-    return s.get_data_dir() / "email_accounts.csv"
+def _default_path() -> str:
+    return DB_POOL_PATH
 
 
-def _resolve_path(path: str = "") -> Path:
-    raw = (path or "").strip()
-    p = Path(raw).expanduser() if raw else _default_path()
-    if not p.is_absolute():
-        p = (s.ROOT / p).resolve()
-    return p
+def _pool():
+    return email_account_pool_from_path(_default_path())
 
 
 def _mask_email(email: str = "") -> str:
@@ -99,19 +99,17 @@ def _accounts_text_diagnostics(text: str) -> dict:
 
 class SaveRequest(BaseModel):
     accounts_text: str = ""
-    path: str = ""
 
 
 class ListRequest(BaseModel):
-    path: str = ""
     accounts_text: str = ""
     email: str = ""
     limit: int = Field(default=10, ge=1, le=30)
 
 
 @router.get("/status")
-def status(path: str = "", user: str = CurrentUser):
-    pool = EmailAccountPool(_resolve_path(path))
+def status(user: str = CurrentUser):
+    pool = _pool()
     rows = [a.sanitized() for a in pool.load_accounts()]
     logger.warning(
         "mail.accounts.status in path=%s -> count=%s",
@@ -123,11 +121,11 @@ def status(path: str = "", user: str = CurrentUser):
 
 @router.post("/save")
 def save(req: SaveRequest, user: str = CurrentUser):
-    pool = EmailAccountPool(_resolve_path(req.path))
+    pool = _pool()
     logger.warning(
         "mail.accounts.save in path=%s body=%s",
         pool.path,
-        {"path": req.path, **_accounts_text_diagnostics(req.accounts_text)},
+        _accounts_text_diagnostics(req.accounts_text),
     )
     if not req.accounts_text.strip():
         logger.warning("mail.accounts.save empty_text path=%s", pool.path)
@@ -142,30 +140,39 @@ def save(req: SaveRequest, user: str = CurrentUser):
             status_code=400,
             detail="没有解析到邮箱账号；支持 email----password，也兼容 email_password，一行一个",
         )
-    pool.write_rows(rows)
-    accounts = [account_from_row(r) for r in rows]
+    before = {a.email for a in pool.load_accounts()}
+    inserted = int(pool.write_rows(rows) or 0)
+    accounts = pool.load_accounts()
+    inserted_accounts = [a for a in accounts if a.email not in before]
+    skipped = max(len(rows) - inserted, 0)
     resp = {
         "path": str(pool.path),
+        "submitted_count": len(rows),
+        "inserted_count": inserted,
+        "skipped_existing": skipped,
+        "total_count": len(accounts),
         "count": len(accounts),
-        "accounts": [a.sanitized() for a in accounts],
+        "accounts": [a.sanitized() for a in inserted_accounts],
     }
     logger.warning(
-        "mail.accounts.save out path=%s count=%s accounts=%s",
+        "mail.accounts.save out path=%s submitted=%s inserted=%s skipped=%s total=%s accounts=%s",
         pool.path,
+        len(rows),
+        inserted,
+        skipped,
         len(accounts),
-        [_safe_account(a) for a in accounts[:5]],
+        [_safe_account(a) for a in inserted_accounts[:5]],
     )
     return resp
 
 
 @router.post("/list")
 def list_messages(req: ListRequest, user: str = CurrentUser):
-    resolved_path = _resolve_path(req.path)
+    resolved_path = _default_path()
     logger.warning(
         "mail.accounts.list in path=%s body=%s",
         resolved_path,
         {
-            "path": req.path,
             "email": _mask_email(req.email),
             "limit": req.limit,
             **_accounts_text_diagnostics(req.accounts_text),
@@ -186,11 +193,11 @@ def list_messages(req: ListRequest, user: str = CurrentUser):
                 )
             accounts = [account_from_row(r) for r in rows]
         else:
-            pool = EmailAccountPool(resolved_path)
+            pool = _pool()
             accounts = pool.load_accounts()
         logger.warning(
             "mail.accounts.list parsed source=%s count=%s accounts=%s",
-            "text" if req.accounts_text.strip() else "file",
+            "text" if req.accounts_text.strip() else "sqlite",
             len(accounts),
             [_safe_account(a) for a in accounts[:5]],
         )
@@ -198,7 +205,7 @@ def list_messages(req: ListRequest, user: str = CurrentUser):
             logger.warning("mail.accounts.list empty path=%s", resolved_path)
             raise HTTPException(
                 status_code=400,
-                detail=f"邮箱列表为空；请先保存邮箱列表，当前路径: {resolved_path}",
+                detail=f"邮箱列表为空；请先保存邮箱列表，当前账号库: {resolved_path}",
             )
         target = (req.email or "").strip().lower()
         if target:

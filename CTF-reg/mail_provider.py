@@ -8,7 +8,7 @@
                                             cf_kv_otp_provider 读
 
 OTP 提取由 Worker 端做（见 scripts/otp_email_worker.js），
-也支持 `mail.mode=imap_list`：从 CSV 邮箱池里取 Gmail/Outlook/自定义
+也支持 `mail.mode=imap_list`：从 SQLite 邮箱池里取 Gmail/Outlook/自定义
 IMAP 账号，用账号密码 / app password 登录邮箱读取验证码。
 
 KV 凭证读取顺序：环境变量 `CF_API_TOKEN/CF_ACCOUNT_ID/CF_OTP_KV_NAMESPACE_ID`
@@ -17,7 +17,6 @@ KV 凭证读取顺序：环境变量 `CF_API_TOKEN/CF_ACCOUNT_ID/CF_OTP_KV_NAMES
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 import random
 import threading
 import time
@@ -122,13 +121,11 @@ class MailProvider:
         catch_all_domain: str = "",
         *,
         mode: str = "cloudflare_kv",
-        accounts_path: str = "",
         otp_timeout: int = 180,
         mark_seen: bool = False,
     ):
         self.mode = (mode or "cloudflare_kv").strip().lower()
         self.catch_all_domain = catch_all_domain
-        self.accounts_path = accounts_path
         self.otp_timeout = otp_timeout
         self.mark_seen = mark_seen
         self._reuse_email: Optional[str] = None  # 兼容 register-only resume
@@ -142,13 +139,9 @@ class MailProvider:
     @classmethod
     def from_config(cls, mail_cfg, config_path: str = "") -> "MailProvider":
         mode = (getattr(mail_cfg, "mode", "") or "cloudflare_kv").strip().lower()
-        accounts_path = (getattr(mail_cfg, "accounts_path", "") or "").strip()
-        if accounts_path and not Path(accounts_path).is_absolute() and config_path:
-            accounts_path = str((Path(config_path).resolve().parent / accounts_path).resolve())
         return cls(
             getattr(mail_cfg, "catch_all_domain", "") or "",
             mode=mode,
-            accounts_path=accounts_path,
             otp_timeout=int(getattr(mail_cfg, "otp_timeout", 180) or 180),
             mark_seen=bool(getattr(mail_cfg, "mark_seen", False)),
         )
@@ -294,9 +287,7 @@ class MailProvider:
 
     def _email_pool(self):
         if self._pool is None:
-            if not self.accounts_path:
-                raise RuntimeError("mail.mode=imap_list 需要 mail.accounts_path")
-            from email_account_pool import EmailAccountPool
+            from email_account_pool import email_account_pool_from_path
 
-            self._pool = EmailAccountPool(self.accounts_path)
+            self._pool = email_account_pool_from_path()
         return self._pool

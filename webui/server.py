@@ -23,6 +23,7 @@ from .backend.routes import mail_accounts as mail_accounts_routes
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 VENV_BIN = Path(sys.prefix) / "bin"
 os.environ["PATH"] = f"{VENV_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
+INDEX_CACHE_HEADERS = {"Cache-Control": "no-store, max-age=0"}
 
 
 API_ROUTERS = (
@@ -65,17 +66,22 @@ def create_app() -> FastAPI:
             app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
             app.mount("/webui/assets", StaticFiles(directory=assets_dir), name="assets_webui")
 
+        def _serve_index(status_code: int = 200):
+            return FileResponse(FRONTEND_DIST / "index.html", status_code=status_code, headers=INDEX_CACHE_HEADERS)
+
         def _serve(full_path: str):
             if full_path.startswith("api/"):
-                return FileResponse(FRONTEND_DIST / "index.html", status_code=404)
+                return _serve_index(status_code=404)
             f = FRONTEND_DIST / full_path
             try:
                 f.resolve().relative_to(FRONTEND_DIST.resolve())
             except ValueError:
-                return FileResponse(FRONTEND_DIST / "index.html")
+                return _serve_index()
             if f.is_file():
+                if f.name == "index.html":
+                    return FileResponse(f, headers=INDEX_CACHE_HEADERS)
                 return FileResponse(f)
-            return FileResponse(FRONTEND_DIST / "index.html")
+            return _serve_index()
 
         @app.get("/webui/{full_path:path}")
         def spa_webui(full_path: str):

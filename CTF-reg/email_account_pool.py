@@ -1,27 +1,18 @@
-"""CSV-backed email account pool for IMAP mailbox mode.
+"""Email account pool for IMAP mailbox mode.
 
 The Cloudflare catch-all path can mint arbitrary addresses.  Real Gmail /
 Outlook mailboxes are different: the caller must provide concrete accounts and
-their IMAP credentials.  This module keeps that list local on disk and exposes a
-small reservation API for registration flows.
+their IMAP credentials.  The backend stores that list in WebUI SQLite.
 """
 from __future__ import annotations
 
 import csv
-import os
 import random
 import re
-import tempfile
-import time
-from contextlib import contextmanager
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Unix/macOS runtime has fcntl.
-    fcntl = None
+from typing import Iterable
 
 
 DEFAULT_COLUMNS = [
@@ -175,14 +166,16 @@ def _normalise_row(row: dict) -> dict:
         or row.get("user_id")
         or row.get("uid")
         or ""
-    ).strip()
+    )
+    out["account_id"] = str(out["account_id"] or "").strip()
     out["access_token"] = (
         row.get("access_token")
         or row.get("token")
         or row.get("oauth_token")
         or row.get("imap_token")
         or ""
-    ).strip()
+    )
+    out["access_token"] = str(out["access_token"] or "").strip()
     out["refresh_token"] = (row.get("refresh_token") or "").strip()
     out["openai_password"] = (row.get("openai_password") or "").strip()
     out["first"] = (row.get("first") or "").strip()
@@ -259,56 +252,44 @@ def account_from_row(row: dict) -> EmailAccount:
     )
 
 
-class EmailAccountPool:
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
+DB_POOL_PATH = "sqlite:mail_accounts"
 
-    @contextmanager
-    def _locked(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self.path.with_name(f"{self.path.name}.lock")
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+def is_db_pool_path(path: str | Path | None = None) -> bool:
+    raw = str(path or "").strip().lower()
+    return raw in ("", "db", "sqlite", "sqlite:db", DB_POOL_PATH)
+
+
+class DbEmailAccountPool:
+    """SQLite-backed mailbox pool."""
+
+    path = DB_POOL_PATH
+
+    def _db(self):
+        root = Path(__file__).resolve().parents[1]
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        try:
+            from webui.backend.db import get_db
+        except Exception as e:  # pragma: no cover - only for standalone misuse.
+            raise RuntimeError(
+                "DB 邮箱池需要在项目根目录运行，并确保 webui.backend.db 可导入"
+            ) from e
+        return get_db()
 
     def load_rows(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        with self.path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            return [_normalise_row(r) for r in reader if (r.get("email") or "").strip()]
+        return [_normalise_row(r) for r in self._db().iter_mail_accounts()]
 
     def load_accounts(self) -> list[EmailAccount]:
         return [account_from_row(r) for r in self.load_rows()]
 
-    def write_rows(self, rows: Iterable[dict]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def write_rows(self, rows: Iterable[dict]) -> int:
         normalised = [_normalise_row(r) for r in rows]
-        columns = list(DEFAULT_COLUMNS)
-        for row in normalised:
-            for key in row:
-                if key not in columns:
-                    columns.append(key)
-        fd, tmp_name = tempfile.mkstemp(prefix=self.path.name, dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=columns)
-                writer.writeheader()
-                for row in normalised:
-                    writer.writerow({k: row.get(k, "") for k in columns})
-            os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, self.path)
-        finally:
-            if os.path.exists(tmp_name):
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
+        return self._db().append_mail_accounts(normalised)
+
+    def upsert_rows(self, rows: Iterable[dict]) -> int:
+        normalised = [_normalise_row(r) for r in rows]
+        return self._db().upsert_mail_accounts(normalised)
 
     def save_from_text(self, text: str) -> list[EmailAccount]:
         rows = parse_accounts_text(text)
@@ -316,37 +297,20 @@ class EmailAccountPool:
         return [account_from_row(r) for r in rows]
 
     def reserve_next(self) -> EmailAccount:
-        with self._locked():
-            rows = self.load_rows()
-            for row in rows:
-                if (row.get("status") or "unused").lower() in ("", "unused"):
-                    row["status"] = "reserved"
-                    row["fail_reason"] = ""
-                    row["updated_at"] = str(int(time.time()))
-                    self.write_rows(rows)
-                    return account_from_row(row)
-        raise RuntimeError(f"邮箱池没有 unused 账号: {self.path}")
+        row = self._db().reserve_mail_account()
+        if row:
+            return account_from_row(row)
+        raise RuntimeError("邮箱池没有 unused 账号: sqlite:mail_accounts")
 
     def find(self, email: str) -> EmailAccount | None:
-        target = (email or "").strip().lower()
-        for row in self.load_rows():
-            if row.get("email") == target:
-                return account_from_row(row)
-        return None
+        row = self._db().find_mail_account(email)
+        return account_from_row(row) if row else None
 
     def mark(self, email: str, status: str, fail_reason: str = "") -> None:
-        target = (email or "").strip().lower()
-        if not target:
-            return
-        with self._locked():
-            rows = self.load_rows()
-            changed = False
-            for row in rows:
-                if row.get("email") == target:
-                    row["status"] = status
-                    row["fail_reason"] = fail_reason
-                    row["updated_at"] = str(int(time.time()))
-                    changed = True
-                    break
-            if changed:
-                self.write_rows(rows)
+        self._db().mark_mail_account(email, status, fail_reason)
+
+
+def email_account_pool_from_path(path: str | Path | None = None):
+    if not is_db_pool_path(path):
+        raise RuntimeError("IMAP 邮箱池只支持 sqlite:mail_accounts，不再支持文件路径 accounts_path")
+    return DbEmailAccountPool()
