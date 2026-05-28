@@ -137,6 +137,7 @@ def _project_reg(answers: dict) -> dict:
                 "country", "countries", "service", "maxPrice", "max_price", "country_max_prices",
                 "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path",
                 "otp_path", "otp_method", "otp_timeout_s", "otp_poll_interval_s",
+                "cancel_retry_attempts", "cancel_retry_interval_s", "stale_cancel_after_s", "watchdog_enabled",
                 "release_path", "fail_path", "verified_path", "headers",
                 "allocate_payload",
             }

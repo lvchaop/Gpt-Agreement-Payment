@@ -570,6 +570,49 @@ class RegistrationError(RuntimeError):
     pass
 
 
+def _register_error_kind(error: str) -> str:
+    text = str(error or "")
+    if re.search(r"网络检查失败|Connection timed out|curl:\s*\(28\)|timed out", text, re.I):
+        return "network_timeout"
+    if re.search(r"invalid_state", text, re.I):
+        return "invalid_state"
+    if re.search(r"Failed to create account|account_creation_failed", text, re.I):
+        return "account_creation_failed"
+    if re.search(r"Broken pipe", text, re.I):
+        return "broken_pipe"
+    if re.search(r"curl_cffi|Failed to perform|requests/session.py", text, re.I):
+        return "network_request_error"
+    return "other"
+
+
+def _register_failure_excerpt(lines: list[str], *, max_chars: int = 2400) -> str:
+    patterns = re.compile(
+        r"网络检查失败|Connection timed out|curl:\s*\(28\)|Failed to perform|"
+        r"invalid_state|Failed to create account|account_creation_failed|"
+        r"HTTP\s+(?:4|5)\d\d|Traceback|RuntimeError|curl_cffi|Broken pipe",
+        re.I,
+    )
+    picked: list[str] = []
+    for line in lines:
+        if patterns.search(line):
+            picked.append(line)
+    picked.extend(lines[-10:])
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in picked:
+        text = str(line or "")
+        if text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+
+    excerpt = "\n".join(deduped).strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[-max_chars:]
+    return excerpt
+
+
 def _normalize_register_method(value: str | None) -> str:
     v = (value or "").strip().lower().replace("-", "_")
     if v in ("", "default", "auto"):
@@ -743,7 +786,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         proc.wait()
 
     if proc.returncode != 0 and result_json is None:
-        last_lines = "\n".join(lines[-5:])
+        last_lines = _register_failure_excerpt(lines)
         raise RegistrationError(f"注册失败 (exit={proc.returncode}): {last_lines}")
 
     if result_json is None:
@@ -1004,7 +1047,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
     effective_cardw = cardw_config_path
     register_proxy = stage_plan.register
     if picked_domain or register_proxy:
-        temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, register_proxy)
+        temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, register_proxy, stage_plan)
         effective_cardw = temp_cardw
         if picked_domain:
             pool.mark_used(picked_domain)
@@ -1025,6 +1068,12 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
         except RegistrationError as e:
             record["registration"] = {"status": "error", "error": str(e)[:200]}
             record["payment"] = {"status": "skipped"}
+            _record_failed_register_node(
+                idx=-1,
+                proxy_stage_plan=stage_plan,
+                error=str(e),
+                phase="pipeline-register",
+            )
             _append_result(record)
             raise
 
@@ -1325,7 +1374,7 @@ def _register_one(args_tuple):
             picked_domain = pool.pick()
             pool.mark_used(picked_domain)
         if picked_domain or stage_plan.register:
-            temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, stage_plan.register)
+            temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, stage_plan.register, stage_plan)
             effective = temp_cardw
         r = register(effective, register_method=register_method)
         return {
@@ -1342,7 +1391,7 @@ def _register_one(args_tuple):
             "status": "error",
             "picked_domain": picked_domain,
             "proxy_stage_plan": stage_plan.to_dict() if stage_plan.has_any() else {},
-            "error": str(e)[:200],
+            "error": str(e)[:2400],
         }
     finally:
         if temp_cardw and os.path.exists(temp_cardw):
@@ -1432,9 +1481,19 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                         ok_count += 1
                     mark = "✓" if r.get("status") == "ok" else "✗"
                     email = r.get("email") or "?"
+                    proxy = ""
+                    if r.get("status") != "ok":
+                        proxy_label = _register_proxy_label(r.get("proxy_stage_plan"))
+                        proxy = f" proxy={proxy_label}" if proxy_label else ""
+                        _record_failed_register_node(
+                            idx=idx,
+                            proxy_stage_plan=r.get("proxy_stage_plan"),
+                            error=r.get("error", ""),
+                            phase="register-only",
+                        )
                     err = f" error={r.get('error', '')}" if r.get("status") != "ok" else ""
                     done = sum(1 for item in results if item)
-                    print(f"[batch] {mark} register-only [{done}/{count}] idx={idx} email={email}{err}")
+                    print(f"[batch] {mark} register-only [{done}/{count}] idx={idx}{proxy} email={email}{err}")
             results = [r for r in results if r is not None]
         else:
             print(f"\n[batch] === register-only × {count} 串行 ===")
@@ -1445,7 +1504,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                 temp_cardw = None
                 try:
                     if plan.register:
-                        temp_cardw = _rewrite_cardw_with_domain(cardw_path, "", plan.register)
+                        temp_cardw = _rewrite_cardw_with_domain(cardw_path, "", plan.register, plan)
                         effective_cardw = temp_cardw
                         print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
                     r = register(effective_cardw, register_method=register_method)
@@ -1456,8 +1515,21 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                     if r.get("status") == "ok":
                         ok_count += 1
                 except Exception as e:
-                    r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
-                    print(f"[batch] ✗ 注册异常: {e}")
+                    r = {
+                        "batch_index": i,
+                        "status": "error",
+                        "error": str(e)[:200],
+                        "proxy_stage_plan": plan.to_dict() if plan.has_any() else {},
+                    }
+                    proxy_label = _register_proxy_label(r.get("proxy_stage_plan"))
+                    proxy = f" proxy={proxy_label}" if proxy_label else ""
+                    print(f"[batch] ✗ 注册异常 idx={i}{proxy}: {e}")
+                    _record_failed_register_node(
+                        idx=i,
+                        proxy_stage_plan=r.get("proxy_stage_plan"),
+                        error=str(e),
+                        phase="register-only",
+                    )
                 finally:
                     if temp_cardw and os.path.exists(temp_cardw):
                         try: os.unlink(temp_cardw)
@@ -3298,15 +3370,82 @@ def _describe_stage_plan(plan: ProxyStagePlan) -> str:
     plan = ProxyStagePlan.from_obj(plan)
     if not plan.has_any():
         return "<none>"
+    register_name = (plan.register_meta or {}).get("name") or ""
     return (
         f"register={plan.register or '-'}"
         f" checkout={plan.checkout or '-'}"
         f" payment={plan.payment or '-'}"
         f" regions={plan.register_region or '-'}/{plan.checkout_region or '-'}/{plan.payment_region or '-'}"
+        f" register_node={register_name or '-'}"
     )
 
 
-def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
+def _proxy_endpoint_label(proxy_url: str) -> str:
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        return ""
+    match = re.match(r"^[a-z][a-z0-9+.-]*://(?:[^/@]+@)?([^/]+)", proxy_url, re.I)
+    return match.group(1) if match else proxy_url
+
+
+def _register_proxy_label(proxy_stage_plan) -> str:
+    plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    return _proxy_endpoint_label(plan.register)
+
+
+def _failed_proxy_nodes_path() -> Path:
+    raw = str(os.environ.get("FAILED_PROXY_NODES_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return OUTPUT_DIR / "failed_proxy_nodes.jsonl"
+
+
+def _register_proxy_failure_summary(proxy_stage_plan) -> dict:
+    plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    meta = dict(plan.register_meta or {})
+    server = str(meta.get("server") or "").strip()
+    server_port = str(meta.get("server_port") or "").strip()
+    server_label = f"{server}:{server_port}" if server and server_port else server
+    return {
+        "proxy": _register_proxy_label(plan),
+        "local_http_url": plan.register or str(meta.get("local_http_url") or ""),
+        "node": str(meta.get("name") or ""),
+        "node_index": meta.get("index"),
+        "region": plan.register_region or str(meta.get("region") or ""),
+        "server": server_label,
+        "source": plan.source or str(meta.get("source") or ""),
+        "scheme": str(meta.get("scheme") or ""),
+    }
+
+
+def _record_failed_register_node(*, idx: int, proxy_stage_plan, error: str, phase: str = "register") -> None:
+    summary = _register_proxy_failure_summary(proxy_stage_plan)
+    if not summary.get("proxy") and not summary.get("node") and not summary.get("server"):
+        return
+    error_text = str(error or "")
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "idx": idx,
+        "status": "error",
+        "error_kind": _register_error_kind(error_text),
+        **summary,
+        "error": error_text[:2400],
+    }
+    path = _failed_proxy_nodes_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        node = record.get("node") or "-"
+        proxy = record.get("proxy") or "-"
+        server = record.get("server") or "-"
+        print(f"[failed-node] idx={idx} proxy={proxy} node={node} server={server} -> {path}")
+    except Exception as e:
+        print(f"[failed-node] 写入失败 idx={idx}: {e}", file=sys.stderr)
+
+
+def _rewrite_cardw_with_domain(src_path, domain, proxy_url="", proxy_stage_plan=None):
     """读 CTF-reg config，把 catch_all_domain 覆盖为 domain，可选覆盖 proxy，写到临时文件返回路径"""
     with open(src_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -3315,6 +3454,26 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
         mail["catch_all_domain"] = domain
     if proxy_url:
         data["proxy"] = proxy_url
+    stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    if stage_plan.has_any():
+        data["proxy_meta"] = {
+            "register": stage_plan.register_meta or {
+                "source": stage_plan.source,
+                "region": stage_plan.register_region,
+                "local_http_url": stage_plan.register,
+            },
+            "checkout": stage_plan.checkout_meta or {
+                "source": stage_plan.source,
+                "region": stage_plan.checkout_region,
+                "local_http_url": stage_plan.checkout,
+            },
+            "payment": stage_plan.payment_meta or {
+                "source": stage_plan.source,
+                "region": stage_plan.payment_region,
+                "local_http_url": stage_plan.payment,
+            },
+            "source": stage_plan.source,
+        }
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_cardw_",
         dir=str(CARDW_DIR), delete=False,
@@ -3862,7 +4021,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
             temp_cardw = None
             if picked_domain or stage_plan.register:
                 try:
-                    temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, stage_plan.register)
+                    temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, stage_plan.register, stage_plan)
                     effective_cardw = temp_cardw
                 except Exception as e:
                     print(f"[self-dealer] rewrite cardw 异常: {e}; 沿用原 cardw")
@@ -4018,7 +4177,7 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0,
         temp_cardw = None
         effective_cardw = cardw_path
         if picked_domain or stage_plan.register:
-            temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, stage_plan.register)
+            temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, stage_plan.register, stage_plan)
             effective_cardw = temp_cardw
             if picked_domain:
                 pool.mark_used(picked_domain)
@@ -4435,12 +4594,20 @@ def main():
             effective_cardw = cardw_cfg
             try:
                 if plan.register:
-                    temp_cardw = _rewrite_cardw_with_domain(cardw_cfg, "", plan.register)
+                    temp_cardw = _rewrite_cardw_with_domain(cardw_cfg, "", plan.register, plan)
                     effective_cardw = temp_cardw
                     print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
                 result = register(effective_cardw, register_method=args.register_method or None)
                 if plan.has_any():
                     result["proxy_stage_plan"] = plan.to_dict()
+            except Exception as e:
+                _record_failed_register_node(
+                    idx=0,
+                    proxy_stage_plan=plan,
+                    error=str(e),
+                    phase="register-only",
+                )
+                raise
             finally:
                 if temp_cardw and os.path.exists(temp_cardw):
                     try: os.unlink(temp_cardw)

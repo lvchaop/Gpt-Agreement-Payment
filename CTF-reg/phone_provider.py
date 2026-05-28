@@ -13,8 +13,11 @@ import logging
 import os
 import random
 import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urljoin
@@ -34,6 +37,52 @@ _HERO_SMS_PROVIDERS = {
     "smsactivate",
 }
 _MAX_OTP_WAIT_S = 120
+_DEFAULT_STALE_CANCEL_AFTER_S = 240
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _hero_lease_log_path() -> Path:
+    raw = str(os.getenv("HERO_PHONE_LEASE_LOG") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return _project_root() / "output" / "hero_phone_leases.jsonl"
+
+
+def _append_hero_lease_event(event: dict) -> None:
+    try:
+        path = _hero_lease_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(event)
+        payload.setdefault("ts", time.time())
+        payload.setdefault("pid", os.getpid())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as e:
+        logger.warning("Hero SMS lease event write failed: %s", e)
+
+
+def _hero_lease_is_closed(lease_id: str) -> bool:
+    path = _hero_lease_log_path()
+    if not path.exists():
+        return False
+    latest_status = ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if str(row.get("lease_id") or "") != str(lease_id):
+                    continue
+                latest_status = str(row.get("status") or "")
+    except Exception as e:
+        logger.warning("Hero SMS lease event read failed lease=%s: %s", lease_id, e)
+        return False
+    return latest_status in {"closed", "verified", "cancelled", "canceled"}
 
 
 def _normalize_provider(provider: str) -> str:
@@ -52,6 +101,7 @@ class PhoneLease:
     masked_phone: str = ""
     phone_national: str = ""
     country_phone_code: str = ""
+    provider_country: str = ""
     expires_at: Any = None
     raw: dict | None = None
 
@@ -112,6 +162,10 @@ class PhoneProvider:
         if isinstance(self.extra_headers, dict):
             headers.update({str(k): str(v) for k, v in self.extra_headers.items()})
         return headers
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _redact_url(url: str) -> str:
@@ -224,6 +278,68 @@ class PhoneProvider:
                 query[key] = text
         return "?" + urlencode(query)
 
+    def _hero_watchdog_enabled(self) -> bool:
+        raw = getattr(self.cfg, "watchdog_enabled", True)
+        if isinstance(raw, bool):
+            return raw
+        return self._truthy(raw)
+
+    def _hero_stale_cancel_after_s(self) -> int:
+        raw = int(getattr(self.cfg, "stale_cancel_after_s", _DEFAULT_STALE_CANCEL_AFTER_S) or _DEFAULT_STALE_CANCEL_AFTER_S)
+        return max(30, raw)
+
+    def _record_hero_lease_open(self, lease: PhoneLease) -> None:
+        _append_hero_lease_event(
+            {
+                "event": "allocated",
+                "status": "open",
+                "lease_id": lease.lease_id,
+                "phone": lease.masked_phone,
+                "provider_country": lease.provider_country,
+                "expires_at": str(lease.expires_at or ""),
+            }
+        )
+
+    def _record_hero_lease_closed(self, lease_id: str, *, event: str, reason: str, ok: bool) -> None:
+        _append_hero_lease_event(
+            {
+                "event": event,
+                "status": "closed" if ok else "open",
+                "lease_id": lease_id,
+                "reason": reason,
+                "ok": bool(ok),
+            }
+        )
+
+    def _spawn_hero_cancel_watchdog(self, lease: PhoneLease) -> None:
+        if self.provider != "hero_sms" or not self._hero_watchdog_enabled():
+            return
+        delay_s = self._hero_stale_cancel_after_s()
+        env = dict(os.environ)
+        env["HERO_WATCHDOG_API_KEY"] = self.api_key
+        env["HERO_WATCHDOG_BASE_URL"] = self.base_url
+        env["HERO_PHONE_LEASE_LOG"] = str(_hero_lease_log_path())
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--watchdog-cancel-lease",
+            str(lease.lease_id),
+            "--delay-s",
+            str(delay_s),
+        ]
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+                env=env,
+            )
+            logger.info("Hero SMS stale cancel watchdog armed lease=%s delay=%ss", lease.lease_id, delay_s)
+        except Exception as e:
+            logger.warning("Hero SMS stale cancel watchdog start failed lease=%s: %s", lease.lease_id, e)
+
     @staticmethod
     def _split_list(value: Any) -> list[str]:
         if isinstance(value, (list, tuple, set)):
@@ -293,6 +409,14 @@ class PhoneProvider:
         text = str(error)
         retryable_tokens = (
             "HTTP 409",
+            "URLERROR",
+            "TLS/SSL",
+            "CONNECTION HAS BEEN CLOSED",
+            "CONNECTION RESET",
+            "CONNECTION ABORTED",
+            "EOF",
+            "TIMED OUT",
+            "TIMEOUT",
             "NO_NUMBERS",
             "BAD_COUNTRY",
             "BAD_SERVICE",
@@ -313,12 +437,24 @@ class PhoneProvider:
         text = str(error)
         upper = text.upper()
         fatal_tokens = ("BAD_KEY", "BAD_ACTION", "STATUS_CANCEL", "NO_ACTIVATION")
+        retryable_tokens = (
+            "HTTP 409",
+            "URLERROR",
+            "TLS/SSL",
+            "CONNECTION HAS BEEN CLOSED",
+            "CONNECTION RESET",
+            "CONNECTION ABORTED",
+            "EOF",
+            "TIMED OUT",
+            "TIMEOUT",
+            "STATUS_WAIT",
+            "TRY_AGAIN",
+            "RATE_LIMIT",
+            "TEMP",
+        )
         if any(token in upper for token in fatal_tokens):
             return False
-        return any(
-            token in upper
-            for token in ("HTTP 409", "STATUS_WAIT", "TRY_AGAIN", "RATE_LIMIT", "TEMP")
-        )
+        return any(token in upper for token in retryable_tokens)
 
     def _otp_timeout_s(self) -> int:
         raw = int(getattr(self.cfg, "otp_timeout_s", _MAX_OTP_WAIT_S) or _MAX_OTP_WAIT_S)
@@ -404,15 +540,27 @@ class PhoneProvider:
                 resp.get("phoneNumber") or resp.get("phone_number"),
                 resp.get("countryPhoneCode"),
             )
-            return PhoneLease(
+            logger.info(
+                "Hero SMS getNumberV2 success lease=%s provider_country=%s dial=+%s phone=%s expires=%s",
+                lease_id,
+                country,
+                country_phone_code,
+                self._mask_phone(phone_e164),
+                resp.get("activationEndTime") or resp.get("activation_end_time") or "",
+            )
+            lease = PhoneLease(
                 lease_id=lease_id,
                 phone_e164=phone_e164,
                 masked_phone=self._mask_phone(phone_e164),
                 phone_national=phone_national,
                 country_phone_code=country_phone_code,
+                provider_country=country,
                 expires_at=resp.get("activationEndTime") or resp.get("activation_end_time"),
                 raw=resp,
             )
+            self._record_hero_lease_open(lease)
+            self._spawn_hero_cancel_watchdog(lease)
+            return lease
         raise RuntimeError(f"Hero SMS getNumberV2 重试耗尽: {last_error or 'unknown'}")
 
     def _hero_status_v2_code(self, resp: dict) -> str:
@@ -455,25 +603,72 @@ class PhoneProvider:
             time.sleep(max(1.0, interval_s))
         raise TimeoutError(f"等待 Hero SMS getStatusV2 OTP 超时 ({timeout_s}s, last_status={last_status or 'unknown'})")
 
-    def _hero_set_status(self, lease_id: str, status: str) -> None:
+    @staticmethod
+    def _hero_cancel_too_early(msg: str) -> bool:
+        text = str(msg or "")
+        return (
+            "EARLY_CANCEL_DENIED" in text
+            or "Cannot terminate activation" in text
+            or "Minimum activation period" in text
+            or "minActivationTime" in text
+        )
+
+    def _hero_set_status(
+        self,
+        lease_id: str,
+        status: str,
+        *,
+        reason: str = "",
+        retry_on_early_cancel: bool = False,
+    ) -> bool:
         if not lease_id:
-            return
-        try:
-            raw = self._request_text("GET", self._hero_query("setStatus", id=lease_id, status=status))
-            upper = raw.upper()
-            if upper.startswith("BAD_") or upper in {"NO_ACTIVATION"}:
-                logger.warning("Hero SMS setStatus failed status=%s lease=%s response=%s", status, lease_id, raw)
-        except Exception as e:
-            msg = str(e)
-            if status == "8" and (
-                "OTP_RECEIVED" in msg
-                or "Cannot terminate activation" in msg
-                or "Minimum activation period" in msg
-                or "minActivationTime" in msg
-            ):
-                logger.info("Hero SMS setStatus status=%s ignored lease=%s: %s", status, lease_id, msg[:200])
-                return
-            logger.warning("Hero SMS setStatus failed status=%s lease=%s: %s", status, lease_id, e)
+            return False
+        attempts = 1
+        interval_s = 0.0
+        if status == "8" and retry_on_early_cancel:
+            attempts = max(1, int(getattr(self.cfg, "cancel_retry_attempts", 4) or 4))
+            interval_s = max(1.0, float(getattr(self.cfg, "cancel_retry_interval_s", 5.0) or 5.0))
+        for attempt in range(1, attempts + 1):
+            try:
+                raw = self._request_text("GET", self._hero_query("setStatus", id=lease_id, status=status))
+                upper = raw.upper()
+                if upper.startswith("BAD_") or upper in {"NO_ACTIVATION"}:
+                    logger.warning(
+                        "Hero SMS setStatus failed status=%s lease=%s reason=%s response=%s",
+                        status,
+                        lease_id,
+                        reason or "-",
+                        raw,
+                    )
+                    return False
+                logger.info(
+                    "Hero SMS setStatus ok status=%s lease=%s reason=%s response=%s",
+                    status,
+                    lease_id,
+                    reason or "-",
+                    raw[:120],
+                )
+                return True
+            except Exception as e:
+                msg = str(e)
+                if status == "8" and "OTP_RECEIVED" in msg:
+                    logger.info("Hero SMS setStatus status=%s ignored lease=%s reason=%s: %s", status, lease_id, reason or "-", msg[:200])
+                    return True
+                if status == "8" and retry_on_early_cancel and self._hero_cancel_too_early(msg) and attempt < attempts:
+                    logger.warning(
+                        "Hero SMS cancel denied, retrying lease=%s reason=%s attempt=%s/%s wait=%.1fs: %s",
+                        lease_id,
+                        reason or "-",
+                        attempt,
+                        attempts,
+                        interval_s,
+                        msg[:200],
+                    )
+                    time.sleep(interval_s)
+                    continue
+                logger.warning("Hero SMS setStatus failed status=%s lease=%s reason=%s: %s", status, lease_id, reason or "-", e)
+                return False
+        return False
 
     def allocate(self) -> PhoneLease:
         if self.provider == "hero_sms":
@@ -489,6 +684,7 @@ class PhoneProvider:
         phone = self._first_text(resp, ("phone_e164", "phone_number", "phone", "number", "e164"))
         national = self._first_text(resp, ("phone_national", "national_number", "local_number"))
         country_phone_code = self._first_text(resp, ("country_phone_code", "countryPhoneCode", "dial_code"))
+        provider_country = self._first_text(resp, ("provider_country", "country", "country_id", "countryId"))
         masked = self._first_text(resp, ("masked_phone", "masked", "display_phone"))
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         expires_at = resp.get("expires_at") or data.get("expires_at")
@@ -502,6 +698,7 @@ class PhoneProvider:
             masked_phone=masked or phone,
             phone_national=national,
             country_phone_code=re.sub(r"\D+", "", country_phone_code),
+            provider_country=provider_country,
             expires_at=expires_at,
             raw=resp,
         )
@@ -544,18 +741,106 @@ class PhoneProvider:
 
     def mark_verified(self, lease_id: str) -> None:
         if self.provider == "hero_sms":
-            self._hero_set_status(lease_id, "6")
+            ok = self._hero_set_status(lease_id, "6", reason="verified")
+            self._record_hero_lease_closed(lease_id, event="verified", reason="verified", ok=ok)
             return
         self._safe_post(getattr(self.cfg, "verified_path", ""), lease_id)
 
     def mark_failed(self, lease_id: str, reason: str = "") -> None:
         if self.provider == "hero_sms":
-            self._hero_set_status(lease_id, "8")
+            retry_cancel = "otp_timeout" in str(reason or "").lower()
+            ok = self._hero_set_status(
+                lease_id,
+                "8",
+                reason=reason,
+                retry_on_early_cancel=retry_cancel,
+            )
+            self._record_hero_lease_closed(lease_id, event="cancel", reason=reason, ok=ok)
             return
         self._safe_post(getattr(self.cfg, "fail_path", ""), lease_id, {"lease_id": lease_id, "reason": reason[:500]})
 
     def release(self, lease_id: str) -> None:
         if self.provider == "hero_sms":
-            self._hero_set_status(lease_id, "8")
+            ok = self._hero_set_status(lease_id, "8", reason="release")
+            self._record_hero_lease_closed(lease_id, event="release", reason="release", ok=ok)
             return
         self._safe_post(getattr(self.cfg, "release_path", ""), lease_id)
+
+
+def _watchdog_cancel_hero_lease(lease_id: str, delay_s: int) -> int:
+    lease_id = str(lease_id or "").strip()
+    if not lease_id:
+        return 2
+    delay_s = max(0, int(delay_s or 0))
+    if delay_s:
+        time.sleep(delay_s)
+    if _hero_lease_is_closed(lease_id):
+        _append_hero_lease_event(
+            {
+                "event": "watchdog_skip_closed",
+                "status": "closed",
+                "lease_id": lease_id,
+                "reason": "already_closed",
+                "ok": True,
+            }
+        )
+        return 0
+
+    class _Cfg:
+        enabled = True
+        provider = "hero_sms"
+        base_url = os.getenv("HERO_WATCHDOG_BASE_URL", "https://hero-sms.com/stubs/handler_api.php")
+        api_key = os.getenv("HERO_WATCHDOG_API_KEY", "")
+        api_key_env = "HERO_WATCHDOG_API_KEY"
+        request_timeout_s = 20
+        headers = {}
+        cancel_retry_attempts = 4
+        cancel_retry_interval_s = 5.0
+
+    try:
+        provider = PhoneProvider(_Cfg())
+        ok = provider._hero_set_status(
+            lease_id,
+            "8",
+            reason="watchdog_stale_4m",
+            retry_on_early_cancel=True,
+        )
+        _append_hero_lease_event(
+            {
+                "event": "watchdog_cancel",
+                "status": "closed" if ok else "open",
+                "lease_id": lease_id,
+                "reason": "watchdog_stale_4m",
+                "ok": bool(ok),
+            }
+        )
+        return 0 if ok else 1
+    except Exception as e:
+        _append_hero_lease_event(
+            {
+                "event": "watchdog_cancel_exception",
+                "status": "open",
+                "lease_id": lease_id,
+                "reason": "watchdog_stale_4m",
+                "ok": False,
+                "error": str(e)[:500],
+            }
+        )
+        return 1
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Hero SMS phone provider helper")
+    parser.add_argument("--watchdog-cancel-lease", default="")
+    parser.add_argument("--delay-s", type=int, default=_DEFAULT_STALE_CANCEL_AFTER_S)
+    args = parser.parse_args()
+    if args.watchdog_cancel_lease:
+        return _watchdog_cancel_hero_lease(args.watchdog_cancel_lease, args.delay_s)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

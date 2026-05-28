@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS registered_accounts (
   last_check_at REAL DEFAULT 0,
   last_check_status TEXT DEFAULT '',
   last_check_message TEXT DEFAULT '',
+  last_plan_type TEXT DEFAULT '',
   sale_status TEXT DEFAULT 'available',
   sold_at REAL DEFAULT 0,
   sale_note TEXT DEFAULT ''
@@ -229,6 +230,7 @@ class Database:
             ("last_check_at", "REAL DEFAULT 0"),
             ("last_check_status", "TEXT DEFAULT ''"),
             ("last_check_message", "TEXT DEFAULT ''"),
+            ("last_plan_type", "TEXT DEFAULT ''"),
             ("sale_status", "TEXT DEFAULT 'available'"),
             ("sold_at", "REAL DEFAULT 0"),
             ("sale_note", "TEXT DEFAULT ''"),
@@ -532,7 +534,7 @@ class Database:
                        csrf_token, id_token, refresh_token, cookie_header,
                        register_method, phone_number, phone_dial_code, phone_country,
                        last_check_at, last_check_status, last_check_message,
-                       sale_status, sold_at, sale_note
+                       last_plan_type, sale_status, sold_at, sale_note
                 FROM registered_accounts
                 ORDER BY id ASC
                 """
@@ -547,23 +549,35 @@ class Database:
                        csrf_token, id_token, refresh_token, cookie_header,
                        register_method, phone_number, phone_dial_code, phone_country,
                        last_check_at, last_check_status, last_check_message,
-                       sale_status, sold_at, sale_note
+                       last_plan_type, sale_status, sold_at, sale_note
                 FROM registered_accounts WHERE id = ?
                 """,
                 (int(account_id),),
             ).fetchone()
         return dict(row) if row else {}
 
-    def update_account_check(self, account_id: int, status: str, message: str = "") -> bool:
-        """Record validity probe outcome (status: 'valid' | 'invalid' | 'unknown')."""
+    def update_account_check(self, account_id: int, status: str, message: str = "",
+                              plan_type: str = "") -> bool:
+        """Record validity probe outcome (status: 'valid' | 'invalid' | 'unknown').
+
+        ``plan_type`` is optional and only written when live entitlement probing
+        returns a concrete value, so stale/failed checks do not erase the last
+        known plan.
+        """
+        sets = [
+            "last_check_at = ?",
+            "last_check_status = ?",
+            "last_check_message = ?",
+        ]
+        args: list[Any] = [time.time(), _text(status), _text(message)[:500]]
+        if plan_type:
+            sets.append("last_plan_type = ?")
+            args.append(_text(plan_type)[:80])
+        args.append(int(account_id))
         with self._conn() as c:
             cur = c.execute(
-                """
-                UPDATE registered_accounts
-                SET last_check_at = ?, last_check_status = ?, last_check_message = ?
-                WHERE id = ?
-                """,
-                (time.time(), _text(status), _text(message)[:500], int(account_id)),
+                f"UPDATE registered_accounts SET {', '.join(sets)} WHERE id = ?",
+                args,
             )
         return cur.rowcount > 0
 

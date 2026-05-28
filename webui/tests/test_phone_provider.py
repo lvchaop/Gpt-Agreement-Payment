@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -144,6 +144,30 @@ def test_hero_sms_allocate_retries_http_409():
     assert opener.get_number_calls == 2
 
 
+def test_hero_sms_allocate_retries_transient_urlerror():
+    class UrlErrorThenOkOpener(_HeroOpener):
+        def __init__(self):
+            super().__init__()
+            self.get_number_calls = 0
+
+        def open(self, req, timeout=0):
+            self.urls.append(req.full_url)
+            if "action=getNumberV2" in req.full_url:
+                self.get_number_calls += 1
+                if self.get_number_calls == 1:
+                    raise URLError("TLS/SSL connection has been closed (EOF) (_ssl.c:992)")
+            return super().open(req, timeout=timeout)
+
+    provider = phone_provider.PhoneProvider.from_config(_cfg(max_number_attempts=2))
+    opener = UrlErrorThenOkOpener()
+    provider.opener = opener
+
+    lease = provider.allocate()
+
+    assert lease.lease_id == "635468024"
+    assert opener.get_number_calls == 2
+
+
 def test_hero_sms_poll_retries_http_409():
     class StatusConflictThenOkOpener(_HeroOpener):
         def __init__(self):
@@ -160,6 +184,31 @@ def test_hero_sms_poll_retries_http_409():
 
     provider = phone_provider.PhoneProvider.from_config(_cfg())
     opener = StatusConflictThenOkOpener()
+    provider.opener = opener
+
+    lease = provider.allocate()
+    code = provider.poll_otp(lease.lease_id)
+
+    assert code == "654321"
+    assert opener.status_calls == 2
+
+
+def test_hero_sms_poll_retries_transient_urlerror():
+    class StatusUrlErrorThenOkOpener(_HeroOpener):
+        def __init__(self):
+            super().__init__()
+            self.status_calls = 0
+
+        def open(self, req, timeout=0):
+            self.urls.append(req.full_url)
+            if "action=getStatusV2" in req.full_url:
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    raise URLError("TLS/SSL connection has been closed (EOF) (_ssl.c:992)")
+            return super().open(req, timeout=timeout)
+
+    provider = phone_provider.PhoneProvider.from_config(_cfg())
+    opener = StatusUrlErrorThenOkOpener()
     provider.opener = opener
 
     lease = provider.allocate()

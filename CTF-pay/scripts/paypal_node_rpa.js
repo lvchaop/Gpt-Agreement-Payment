@@ -14,6 +14,17 @@
 
 const fs = require('fs');
 const path = require('path');
+const Module = require('module');
+
+const _EXTRA_NODE_PATHS = [
+  process.env.NODE_PATH || '',
+  '/app/webui/frontend/node_modules',
+  path.join(__dirname, '..', '..', 'webui', 'frontend', 'node_modules'),
+  '/usr/local/lib/node_modules',
+].filter(Boolean);
+process.env.NODE_PATH = _EXTRA_NODE_PATHS.join(path.delimiter);
+Module._initPaths();
+
 const { chromium } = require('playwright-core');
 
 // 多 worker 并发时, /tmp/paypal_node_rpa_* 文件名加 worker_id 防串
@@ -187,6 +198,47 @@ function proxyForPlaywright(raw) {
   } catch (_) {
     return undefined;
   }
+}
+
+function chromiumLaunchOptions(executablePath, headless, proxy, payload = {}) {
+  return {
+    executablePath,
+    headless,
+    proxy,
+    ignoreDefaultArgs: ['--enable-automation'],
+    viewport: { width: 1440, height: 900 },
+    locale: 'en-US',
+    timezoneId: 'America/Chicago',
+    userAgent: payload.userAgent || undefined,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-infobars',
+      '--window-size=1440,900',
+    ],
+    ignoreHTTPSErrors: true,
+  };
+}
+
+async function launchProjectChromium(payload = {}) {
+  const executablePath = findChromiumExecutable();
+  if (!executablePath) throw new Error('Chromium executable not found; run playwright install chromium');
+  const proxy = proxyForPlaywright(payload.proxy || '');
+  const headless = !!payload.headless;
+  const profileDir = payload.profileDir || T(`${Date.now()}`);
+  fs.mkdirSync(profileDir, { recursive: true });
+
+  log('launch chromium', executablePath, `headless=${headless}`, proxy ? `proxy=${proxy.server}` : 'proxy=none');
+  const browser = await chromium.launchPersistentContext(
+    profileDir,
+    chromiumLaunchOptions(executablePath, headless, proxy, payload),
+  );
+  await browser.addInitScript(() => {
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
+    try { window.chrome = window.chrome || { runtime: {} }; } catch (_) {}
+  });
+  return { browser, executablePath, proxy, headless, profileDir };
 }
 
 function randEmail() {
@@ -1496,9 +1548,6 @@ async function main() {
   const payload = JSON.parse(await readStdin());
   try { fs.writeFileSync(T('live.log'), ''); } catch (_) {}
   const timeoutMs = Number(payload.timeoutMs || 600000);
-  const executablePath = findChromiumExecutable();
-  if (!executablePath) throw new Error('Chromium executable not found; run playwright install chromium');
-  const proxy = proxyForPlaywright(payload.proxy || '');
   const addr = await getAddress(payload);
   const email = payload.email || randEmail();
   const password = payload.password || randPass();
@@ -1551,33 +1600,7 @@ async function main() {
       log('sms baseline error', e.message || e);
     }
   }
-  const headless = !!payload.headless;
-  const profileDir = payload.profileDir || T(`${Date.now()}`);
-  fs.mkdirSync(profileDir, { recursive: true });
-
-  log('launch chromium', executablePath, `headless=${headless}`, proxy ? `proxy=${proxy.server}` : 'proxy=none');
-  const browser = await chromium.launchPersistentContext(profileDir, {
-    executablePath,
-    headless,
-    proxy,
-    ignoreDefaultArgs: ['--enable-automation'],
-    viewport: { width: 1440, height: 900 },
-    locale: 'en-US',
-    timezoneId: 'America/Chicago',
-    userAgent: payload.userAgent || undefined,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-      '--disable-infobars',
-      '--window-size=1440,900',
-    ],
-    ignoreHTTPSErrors: true,
-  });
-  await browser.addInitScript(() => {
-    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
-    try { window.chrome = window.chrome || { runtime: {} }; } catch (_) {}
-  });
+  const { browser } = await launchProjectChromium(payload);
   const page = browser.pages()[0] || await browser.newPage();
   let capturedReturnUrl = '';
   let decisiveError = '';
@@ -2436,17 +2459,27 @@ async function main() {
   return { success: false, error: 'timeout', finalUrl, returnUrl: capturedReturnUrl };
 }
 
-main()
-  .then((result) => {
-    persistResult(result);
-    process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(0));
-  })
-  .catch((err) => {
-    const result = {
-      success: false,
-      error: String(err && err.stack || err),
-    };
-    persistResult(result);
-    try { fs.writeFileSync(T('error.json'), JSON.stringify(result, null, 2)); } catch (_) {}
-    process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(1));
-  });
+if (require.main === module) {
+  main()
+    .then((result) => {
+      persistResult(result);
+      process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(0));
+    })
+    .catch((err) => {
+      const result = {
+        success: false,
+        error: String(err && err.stack || err),
+      };
+      persistResult(result);
+      try { fs.writeFileSync(T('error.json'), JSON.stringify(result, null, 2)); } catch (_) {}
+      process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(1));
+    });
+}
+
+module.exports = {
+  T,
+  closeBrowserSafe,
+  findChromiumExecutable,
+  launchProjectChromium,
+  proxyForPlaywright,
+};

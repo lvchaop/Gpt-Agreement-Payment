@@ -116,6 +116,29 @@ def test_inventory_summarizes_pay_and_rt_states(client):
         assert "id" in acc and isinstance(acc["id"], int)
         assert acc["last_check_status"] == ""
         assert acc["last_check_at"] == 0
+        assert acc["last_plan_type"] == ""
+
+
+def test_inventory_uses_verified_plan_as_consumed(client):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    db.add_registered_account({
+        "ts": "2026-05-03T01:00:00+00:00",
+        "email": "verified-plus@example.com",
+        "session_token": "sess-plus",
+        "access_token": "at-plus",
+    })
+    account_id = db.iter_registered_accounts()[0]["id"]
+    db.update_account_check(account_id, "valid", "check/v4 ok", plan_type="plus")
+
+    r = client.get("/api/inventory/accounts")
+    assert r.status_code == 200
+    account = r.json()["accounts"][0]
+    assert account["plan_tag"] == "plus"
+    assert account["last_plan_type"] == "plus"
+    assert account["pay_state"] == "consumed"
+    assert account["plan_source"] == "rt"
 
 
 def test_delete_requires_auth(client):
@@ -242,7 +265,16 @@ def test_check_persists_results(client, monkeypatch):
     r = client.post("/api/inventory/accounts/check", json={"ids": ids})
     assert r.status_code == 200
     body = r.json()
-    assert body["summary"] == {"total": 3, "valid": 1, "invalid": 1, "unknown": 1}
+    assert body["summary"] == {
+        "total": 3,
+        "valid": 1,
+        "invalid": 1,
+        "unknown": 1,
+        "free": 0,
+        "plus": 0,
+        "team": 0,
+        "pro": 0,
+    }
 
     # results persisted
     by_email = {a["email"]: a for a in db.iter_registered_accounts()}
@@ -250,3 +282,34 @@ def test_check_persists_results(client, monkeypatch):
     assert by_email["invalid@x.com"]["last_check_status"] == "invalid"
     assert by_email["unknown@x.com"]["last_check_status"] == "unknown"
     assert by_email["valid@x.com"]["last_check_at"] > 0
+
+
+def test_check_persists_live_plan_type(client, monkeypatch):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    db.add_registered_account({
+        "email": "live-plus@x.com",
+        "session_token": "sess",
+        "access_token": "header.payload.sig",
+    })
+
+    monkeypatch.setattr(
+        "webui.backend.account_validator.validate_account",
+        lambda account, **kwargs: ("unknown", "me: http 403"),
+    )
+    monkeypatch.setattr(
+        "webui.backend.account_validator._probe_check_v4_plan",
+        lambda access_token, timeout, proxy: ("valid", "plus", "check/v4 ok; plan=plus"),
+    )
+
+    account_id = db.iter_registered_accounts()[0]["id"]
+    r = client.post("/api/inventory/accounts/check", json={"ids": [account_id]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"]["valid"] == 1
+    assert body["summary"]["plus"] == 1
+
+    row = db.get_registered_account(account_id)
+    assert row["last_check_status"] == "valid"
+    assert row["last_plan_type"] == "plus"

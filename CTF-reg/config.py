@@ -110,6 +110,10 @@ class PhoneConfig:
     otp_method: str = "GET"
     otp_timeout_s: int = 120
     otp_poll_interval_s: float = 3.0
+    cancel_retry_attempts: int = 4
+    cancel_retry_interval_s: float = 5.0
+    stale_cancel_after_s: int = 240
+    watchdog_enabled: bool = True
     release_path: str = "/api/phones/{lease_id}/release"
     fail_path: str = "/api/phones/{lease_id}/fail"
     verified_path: str = "/api/phones/{lease_id}/verified"
@@ -128,6 +132,7 @@ class Config:
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
     phone: PhoneConfig = field(default_factory=PhoneConfig)
     proxy: Optional[str] = None
+    proxy_meta: dict = field(default_factory=dict)
     # 已有凭证（可选，跳过注册直接支付时使用）
     session_token: Optional[str] = None
     access_token: Optional[str] = None
@@ -167,6 +172,7 @@ class Config:
         if "phone" in data:
             cfg.phone = PhoneConfig(**filtered_kwargs(PhoneConfig, data["phone"]))
         cfg.proxy = data.get("proxy")
+        cfg.proxy_meta = data.get("proxy_meta") if isinstance(data.get("proxy_meta"), dict) else {}
         cfg.session_token = data.get("session_token")
         cfg.access_token = data.get("access_token")
         cfg.device_id = data.get("device_id")
@@ -183,6 +189,7 @@ class Config:
             "captcha": self.captcha.__dict__,
             "phone": self.phone.__dict__,
             "proxy": self.proxy,
+            "proxy_meta": self.proxy_meta,
             "session_token": self.session_token,
             "access_token": self.access_token,
             "device_id": self.device_id,

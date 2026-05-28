@@ -368,7 +368,9 @@
             <option value="pushed">已推送</option>
             <option value="not_pushed">未推送</option>
           </select>
-          <span class="inv-filter-count">{{ filteredAccounts.length }} / {{ inventory.accounts.length }}</span>
+          <span class="inv-filter-count">
+            {{ filteredAccounts.length }} / {{ inventory.accounts.length }}
+          </span>
           <TermBtn variant="ghost" :disabled="!hasActiveFilter" @click="resetInvFilters">清除筛选</TermBtn>
         </div>
 
@@ -389,8 +391,24 @@
           </div>
         </div>
 
+        <div v-if="filteredAccounts.length" class="inventory-pagination">
+          <div class="inventory-page-meta">
+            <span>第 {{ inventoryPage }} / {{ inventoryTotalPages }} 页</span>
+            <span>{{ inventoryPageStart }}-{{ inventoryPageEnd }} / {{ filteredAccounts.length }}</span>
+          </div>
+          <div class="inventory-page-controls">
+            <button class="inventory-page-btn" :disabled="inventoryPage <= 1" @click="setInventoryPage(1)">首页</button>
+            <button class="inventory-page-btn" :disabled="inventoryPage <= 1" @click="setInventoryPage(inventoryPage - 1)">上一页</button>
+            <button class="inventory-page-btn" :disabled="inventoryPage >= inventoryTotalPages" @click="setInventoryPage(inventoryPage + 1)">下一页</button>
+            <button class="inventory-page-btn" :disabled="inventoryPage >= inventoryTotalPages" @click="setInventoryPage(inventoryTotalPages)">末页</button>
+            <select v-model.number="inventoryPageSize" class="inventory-page-size">
+              <option v-for="size in inventoryPageSizeOptions" :key="size" :value="size">{{ size }} / 页</option>
+            </select>
+          </div>
+        </div>
+
         <div v-if="filteredAccounts.length" class="inventory-list">
-          <div v-for="acc in filteredAccounts" :key="acc.id || acc.email" class="inventory-row" :class="{ 'inventory-row--selected': isSelected(acc.id) }">
+          <div v-for="acc in pagedAccounts" :key="acc.id || acc.email" class="inventory-row" :class="{ 'inventory-row--selected': isSelected(acc.id) }">
             <div class="inventory-row-top">
               <input type="checkbox" class="inventory-row-check" :checked="isSelected(acc.id)" @change="toggleSelect(acc.id)" />
               <span class="inventory-email">{{ acc.email }}</span>
@@ -422,10 +440,20 @@
             </div>
           </div>
         </div>
-        <div v-else-if="!inventory.accounts.length" class="inventory-empty">
+        <div v-if="filteredAccounts.length && inventoryTotalPages > 1" class="inventory-pagination inventory-pagination-bottom">
+          <div class="inventory-page-meta">
+            <span>第 {{ inventoryPage }} / {{ inventoryTotalPages }} 页</span>
+            <span>{{ inventoryPageStart }}-{{ inventoryPageEnd }} / {{ filteredAccounts.length }}</span>
+          </div>
+          <div class="inventory-page-controls">
+            <button class="inventory-page-btn" :disabled="inventoryPage <= 1" @click="setInventoryPage(inventoryPage - 1)">上一页</button>
+            <button class="inventory-page-btn" :disabled="inventoryPage >= inventoryTotalPages" @click="setInventoryPage(inventoryPage + 1)">下一页</button>
+          </div>
+        </div>
+        <div v-if="!inventory.accounts.length" class="inventory-empty">
           暂无账号库存；先跑一次注册/支付，等数据库同步完成后再点刷新。
         </div>
-        <div v-else class="inventory-empty">
+        <div v-if="inventory.accounts.length && !filteredAccounts.length" class="inventory-empty">
           所有账号都被筛掉了——清除筛选或调整条件。
         </div>
       </section>
@@ -544,6 +572,8 @@ interface InventoryAccount {
   last_check_status: "" | "valid" | "invalid" | "unknown" | "coupon_ineligible";
   last_check_message: string;
   last_check_at: number;
+  last_plan_type: string;
+  plan_source: "rt" | "payment" | "derived" | string;
   sale_status: "available" | "sold" | string;
   sold_at: number;
   sale_note: string;
@@ -1118,6 +1148,12 @@ const invFilters = ref({
   rt: "",
   cpa: "",
 });
+const inventoryPageSizeOptions = [10, 25, 50, 100, 200];
+const savedInventoryPageSize = Number(localStorage.getItem("webui.inventory_page_size") || "25");
+const inventoryPageSize = ref(
+  inventoryPageSizeOptions.includes(savedInventoryPageSize) ? savedInventoryPageSize : 25
+);
+const inventoryPage = ref(1);
 
 const hasActiveFilter = computed(() =>
   Object.values(invFilters.value).some(v => v !== "")
@@ -1147,6 +1183,47 @@ const filteredAccounts = computed<InventoryAccount[]>(() => {
     }
     return true;
   });
+});
+
+const inventoryTotalPages = computed(() =>
+  Math.max(1, Math.ceil(filteredAccounts.value.length / inventoryPageSize.value))
+);
+const inventoryPageStart = computed(() =>
+  filteredAccounts.value.length ? (inventoryPage.value - 1) * inventoryPageSize.value + 1 : 0
+);
+const inventoryPageEnd = computed(() =>
+  Math.min(filteredAccounts.value.length, inventoryPage.value * inventoryPageSize.value)
+);
+const pagedAccounts = computed<InventoryAccount[]>(() => {
+  const start = (inventoryPage.value - 1) * inventoryPageSize.value;
+  return filteredAccounts.value.slice(start, start + inventoryPageSize.value);
+});
+
+function setInventoryPage(page: number) {
+  const target = Math.max(1, Math.min(Math.floor(page || 1), inventoryTotalPages.value));
+  inventoryPage.value = target;
+}
+
+watch(() => ({ ...invFilters.value }), () => {
+  inventoryPage.value = 1;
+});
+
+watch(inventoryPageSize, (size) => {
+  if (!inventoryPageSizeOptions.includes(size)) {
+    inventoryPageSize.value = 25;
+    return;
+  }
+  localStorage.setItem("webui.inventory_page_size", String(size));
+  inventoryPage.value = 1;
+});
+
+watch([() => filteredAccounts.value.length, inventoryTotalPages], () => {
+  if (inventoryPage.value > inventoryTotalPages.value) {
+    inventoryPage.value = inventoryTotalPages.value;
+  }
+  if (inventoryPage.value < 1) {
+    inventoryPage.value = 1;
+  }
 });
 
 function resetInvFilters() {
@@ -2027,6 +2104,58 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+.inventory-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 0 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--fg-secondary);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.inventory-pagination-bottom {
+  margin-top: 8px;
+}
+.inventory-page-meta,
+.inventory-page-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.inventory-page-meta {
+  color: var(--fg-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.inventory-page-btn,
+.inventory-page-size {
+  min-height: 28px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--fg-secondary);
+  font: inherit;
+  font-size: 12px;
+}
+.inventory-page-btn {
+  padding: 0 9px;
+  cursor: pointer;
+}
+.inventory-page-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.inventory-page-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+.inventory-page-size {
+  padding: 0 8px;
+  cursor: pointer;
 }
 .inventory-list {
   display: flex;

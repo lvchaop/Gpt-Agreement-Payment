@@ -92,9 +92,10 @@ def get_accounts(user: str = CurrentUser):
 
 @router.post("/accounts/check")
 def check_accounts(req: CheckRequest, user: str = CurrentUser):
-    """Probe each account's session via OpenAI's /api/auth/session.
+    """Probe each account's session and live plan via OpenAI APIs.
     Body: {ids: [account_id, ...], timeout_s?, max_workers?}.
-    Returns per-account {id, email, status, message} (status: valid|invalid|unknown)."""
+    Returns per-account {id, email, status, message, plan_type}.
+    """
     if not req.ids:
         raise HTTPException(status_code=400, detail="ids 不能为空")
     if len(req.ids) > 500:
@@ -107,6 +108,10 @@ def check_accounts(req: CheckRequest, user: str = CurrentUser):
         "valid": sum(1 for r in results if r.get("status") == "valid"),
         "invalid": sum(1 for r in results if r.get("status") == "invalid"),
         "unknown": sum(1 for r in results if r.get("status") == "unknown"),
+        "free": sum(1 for r in results if r.get("plan_type") == "free"),
+        "plus": sum(1 for r in results if r.get("plan_type") == "plus"),
+        "team": sum(1 for r in results if r.get("plan_type") == "team"),
+        "pro": sum(1 for r in results if r.get("plan_type") == "pro"),
     }
     return {"results": results, "summary": summary}
 

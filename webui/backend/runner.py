@@ -42,7 +42,8 @@ _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls 
 _PHONE_CONFIG_KEYS = {
     "enabled", "provider", "base_url", "api_key_env", "country", "countries", "service",
     "maxPrice", "max_price", "country_max_prices", "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path", "otp_path",
-    "otp_method", "otp_timeout_s", "otp_poll_interval_s", "release_path",
+    "otp_method", "otp_timeout_s", "otp_poll_interval_s",
+    "cancel_retry_attempts", "cancel_retry_interval_s", "stale_cancel_after_s", "watchdog_enabled", "release_path",
     "fail_path", "verified_path", "headers", "allocate_payload",
 }
 
@@ -301,6 +302,12 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         if gopay:
             env["WEBUI_GOPAY_OTP_URL"] = wa_relay.otp_url()
+        # Portal 抓包模式：默认只保留浏览器手机号 trace；协议 auth trace 需要显式开启。
+        # 只落盘，不把每个 HTTP 片段刷到 WebUI 日志里。
+        env["AUTH_TRACE_DUMP"] = "0"
+        env["AUTH_HTTP_TRACE"] = "0"
+        env["AUTH_TRACE_INCLUDE_COOKIE"] = "0"
+        env.setdefault("PHONE_TRACE_DUMP", "1")
         # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_*=手机号入口/协议
         env["WEBUI_REG_MODE"] = (
             "phone_protocol"

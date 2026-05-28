@@ -8,11 +8,13 @@
 import json
 import base64
 import hashlib
+import ipaddress
 import logging
 import os
 import random
 import re
 import secrets
+import socket
 import subprocess
 import time
 import uuid
@@ -107,6 +109,44 @@ class AuthFlow:
             "1", "true", "yes", "on"
         )
         self._trace_dump_path = ""
+        self._init_trace_dump()
+        if self.config.proxy or getattr(self.config, "proxy_meta", None):
+            logger.info("[proxy-trace] register %s", self._register_proxy_trace())
+
+    def _init_trace_dump(self) -> None:
+        if not self._trace_dump_enabled:
+            return
+        try:
+            os.makedirs("outputs", exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            self._trace_dump_path = os.path.join("outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl")
+            logger.info("HTTP 明文抓包已启用: %s", self._trace_dump_path)
+        except Exception as e:
+            logger.warning("初始化 HTTP 抓包文件失败: %s", e)
+            self._trace_dump_enabled = False
+
+    def _register_proxy_trace(self) -> str:
+        meta_root = getattr(self.config, "proxy_meta", {}) or {}
+        meta = meta_root.get("register") if isinstance(meta_root, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+        parts = [
+            f"proxy={getattr(self.config, 'proxy', '') or '<none>'}",
+            f"proxy_region={meta.get('region') or '<empty>'}",
+            f"proxy_node={meta.get('name') or '<empty>'}",
+            f"proxy_index={meta.get('index') if meta.get('index') is not None else '<empty>'}",
+            f"proxy_server={meta.get('server') or '<empty>'}",
+        ]
+        if meta.get("server_port"):
+            parts[-1] = f"{parts[-1]}:{meta.get('server_port')}"
+        return " ".join(parts)
+
+    def _register_proxy_endpoint(self) -> str:
+        proxy = str(getattr(self.config, "proxy", "") or "").strip()
+        if not proxy:
+            return "<none>"
+        parsed = urlparse(proxy)
+        return parsed.netloc or parsed.path or proxy
 
     def _build_chatgpt_cookie_header(self) -> str:
         """
@@ -184,15 +224,6 @@ class AuthFlow:
                 cookie_pairs.append((name, value))
 
         return "; ".join(f"{name}={value}" for name, value in cookie_pairs if name and value)
-        if self._trace_dump_enabled:
-            try:
-                os.makedirs("outputs", exist_ok=True)
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                self._trace_dump_path = os.path.join("outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl")
-                logger.info(f"HTTP 明文抓包已启用: {self._trace_dump_path}")
-            except Exception as e:
-                logger.warning(f"初始化 HTTP 抓包文件失败: {e}")
-                self._trace_dump_enabled = False
 
     def _trace_http(self, step: str, resp, extra_request: dict | None = None):
         """可选 HTTP 细粒度追踪（用于协议调试）"""
@@ -1006,6 +1037,35 @@ class AuthFlow:
             return 5
 
     @staticmethod
+    def _phone_protocol_identity_kind() -> str:
+        return (os.getenv("PHONE_PROTOCOL_IDENTITY_KIND", "phone_number") or "phone_number").strip()
+
+    @staticmethod
+    def _is_isolated_ip(ip_text: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except Exception:
+            return False
+        return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+
+    @staticmethod
+    def _resolve_host_ips(host: str) -> list[str]:
+        ips: set[str] = set()
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except Exception:
+            return []
+        for item in infos:
+            try:
+                address = item[4][0]
+            except Exception:
+                continue
+            if address:
+                ips.add(str(address))
+        return sorted(ips)
+
+
+    @staticmethod
     def _phone_protocol_register_retry_reason(message: str) -> str:
         text = str(message or "").lower()
         if (
@@ -1048,6 +1108,16 @@ class AuthFlow:
         if dial and e164_digits.startswith(dial):
             return e164_digits[len(dial):]
         return e164_digits
+
+    @staticmethod
+    def _lease_trace_fields(lease) -> tuple[str, str, str]:
+        if lease is None:
+            return "", "", ""
+        return (
+            str(getattr(lease, "lease_id", "") or "").strip(),
+            str(getattr(lease, "provider_country", "") or "").strip(),
+            str(getattr(lease, "country_phone_code", "") or "").strip(),
+        )
 
     @staticmethod
     def _bounded_otp_timeout(value: Any, *, default: int = 120) -> int:
@@ -1693,6 +1763,7 @@ class AuthFlow:
         login_hint: str = "",
         screen_hint: str = "",
         prompt: str = "",
+        default_prompt: str = "login",
     ) -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
         headers = self._common_headers("https://chatgpt.com/auth/login")
@@ -1702,7 +1773,10 @@ class AuthFlow:
         if login_hint or screen_hint or prompt:
             if not self.result.device_id:
                 self.result.device_id = str(uuid.uuid4())
-            query["prompt"] = prompt or "login"
+            if prompt:
+                query["prompt"] = prompt
+            elif default_prompt:
+                query["prompt"] = default_prompt
             query["ext-oai-did"] = self.result.device_id
             query["auth_session_logging_id"] = str(uuid.uuid4())
             if screen_hint:
@@ -1792,6 +1866,7 @@ class AuthFlow:
         screen_hint: str = "signup",
         referer: str = "https://auth.openai.com/create-account",
         trace_step: str = "",
+        username_kind: str = "email",
     ) -> dict:
         """调用 /api/accounts/authorize/continue，返回 JSON。"""
         headers = self._common_headers(referer)
@@ -1799,7 +1874,7 @@ class AuthFlow:
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
         payload = {
-            "username": {"value": email, "kind": "email"},
+            "username": {"value": email, "kind": username_kind or "email"},
             "screen_hint": screen_hint,
         }
         resp = self.session.post(
@@ -1870,6 +1945,53 @@ class AuthFlow:
             self._existing_page_type = ""
             logger.info("注册邮箱已提交")
             return True
+
+    def _prepare_phone_protocol_create_password_state(self, phone_e164: str, sentinel_token: str) -> None:
+        """Submit the phone identity and require a create-password state before password registration."""
+        identity_kind = self._phone_protocol_identity_kind()
+        logger.info(
+            "[phone-protocol] signup_continue identity kind=%s phone=%s",
+            identity_kind,
+            phone_e164[:4] + "***",
+        )
+        data = self.authorize_continue(
+            email=phone_e164,
+            sentinel_token=sentinel_token,
+            screen_hint="signup",
+            referer="https://auth.openai.com/create-account",
+            trace_step="authorize_continue_phone_signup",
+            username_kind=identity_kind,
+        )
+
+        page_type = (self._extract_page_type(data) or "").strip().lower()
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(data))
+        page = (data.get("page") or {}) if isinstance(data, dict) else {}
+        payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+        verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+
+        if page_type == "create_account_password" or "/create-account/password" in (continue_url or ""):
+            self._is_existing_account = False
+            self._existing_email_verification_mode = ""
+            self._existing_page_type = page_type
+            logger.info("[phone-protocol] 已进入 create_account_password 状态")
+            return
+
+        self._existing_email_verification_mode = verification_mode
+        self._existing_page_type = page_type
+        self._is_existing_account = True
+
+        if page_type in ("login_password", "email_otp_verification") or "/log-in" in (continue_url or ""):
+            raise RuntimeError(
+                "[phone-protocol] signup_continue 识别为已有账号/登录分支，拒绝继续提交密码: "
+                f"page_type={page_type or '(empty)'} continue_url={(continue_url or '')[:180]} "
+                f"{self._register_proxy_trace()}"
+            )
+
+        raise RuntimeError(
+            "[phone-protocol] signup_continue 未进入 create_account_password，拒绝盲提密码: "
+            f"page_type={page_type or '(empty)'} continue_url={(continue_url or '')[:180]} "
+            f"{self._register_proxy_trace()}"
+        )
 
     # ── Step 6.5: 注册密码 ──
     def register_password(self, username: str) -> bool:
@@ -2509,6 +2631,7 @@ class AuthFlow:
     # ── 完整注册流程 ──
     def run_phone_register(self, mail_provider: MailProvider, phone_provider) -> AuthResult:
         """Phone-as-username registration over HTTP protocol only."""
+#         self._require_isolated_auth_hosts_for_phone_protocol()
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试手机号协议注册链路以获取精确错误...")
 
@@ -2529,27 +2652,30 @@ class AuthFlow:
                 phone_e164 = str(getattr(lease, "phone_e164", "") or "").strip()
                 if not phone_e164.startswith("+"):
                     raise RuntimeError(f"phone provider 返回的 phone_e164 不合法: {phone_e164}")
+                lease_id, provider_country, dial_code = self._lease_trace_fields(lease)
                 self.result.phone_number = self._lease_national_phone(lease)
-                self.result.phone_dial_code = str(getattr(lease, "country_phone_code", "") or "").strip()
-                self.result.phone_country = str(getattr(getattr(phone_provider, "cfg", None), "country", "") or "")
+                self.result.phone_dial_code = dial_code
+                self.result.phone_country = provider_country or str(getattr(getattr(phone_provider, "cfg", None), "country", "") or "")
                 logger.info(
-                    "[phone-protocol] 分配手机号 attempt=%s/%s lease=%s phone=%s country=+%s",
+                    "[phone-protocol] 分配手机号 attempt=%s/%s lease=%s provider_country=%s dial=+%s phone=%s %s",
                     attempt,
                     max_attempts,
-                    getattr(lease, "lease_id", ""),
+                    lease_id,
+                    provider_country or "<empty>",
+                    dial_code,
                     getattr(lease, "masked_phone", "") or phone_e164[:4] + "***",
-                    self.result.phone_dial_code,
+                    self._register_proxy_trace(),
                 )
 
                 csrf_token = self.get_csrf_token()
                 auth_url = self.get_auth_url(
                     csrf_token,
-                    login_hint=phone_e164,
-                    screen_hint="login_or_signup",
-                    prompt="login",
+                    screen_hint="signup",
+                    default_prompt="",
                 )
                 device_id = self.auth_oauth_init(auth_url)
-                self.get_sentinel_token(device_id)
+                sentinel = self.get_sentinel_token(device_id)
+                self._prepare_phone_protocol_create_password_state(phone_e164, sentinel)
                 password_ok = False
                 register_err = ""
                 password_submit_attempts = self._phone_protocol_password_submit_attempts()
@@ -2560,12 +2686,15 @@ class AuthFlow:
                     register_err = self._last_register_password_error
                     retry_reason = self._phone_protocol_register_retry_reason(register_err)
                     if retry_reason == "account_creation_failed" and submit_attempt < password_submit_attempts:
+                        lease_id, provider_country, dial_code = self._lease_trace_fields(lease)
                         logger.warning(
-                            "[phone-protocol] 密码注册失败可原号重提 reason=%s submit_attempt=%s/%s lease=%s",
+                            "[phone-protocol] 密码注册失败可原号重提 reason=%s submit_attempt=%s/%s lease=%s phone=%s proxy=%s",
                             retry_reason,
                             submit_attempt,
                             password_submit_attempts,
-                            getattr(lease, "lease_id", ""),
+                            lease_id,
+                            getattr(lease, "masked_phone", "") or phone_e164[:4] + "***",
+                            self._register_proxy_endpoint(),
                         )
                         time.sleep(min(2.0 * submit_attempt, 6.0))
                         continue
@@ -2573,11 +2702,14 @@ class AuthFlow:
                 if not password_ok:
                     retry_reason = self._phone_protocol_register_retry_reason(register_err)
                     if retry_reason == "invalid_phone_number" and attempt < max_attempts:
+                        lease_id, provider_country, dial_code = self._lease_trace_fields(lease)
                         logger.warning(
-                            "[phone-protocol] 手机号被 OpenAI 判定无效，换号重试 attempt=%s/%s lease=%s",
+                            "[phone-protocol] 手机号被 OpenAI 判定无效，换号重试 attempt=%s/%s lease=%s phone=%s proxy=%s",
                             attempt,
                             max_attempts,
-                            getattr(lease, "lease_id", ""),
+                            lease_id,
+                            getattr(lease, "masked_phone", "") or phone_e164[:4] + "***",
+                            self._register_proxy_endpoint(),
                         )
                         try:
                             phone_provider.mark_failed(getattr(lease, "lease_id", ""), retry_reason)
@@ -2586,20 +2718,37 @@ class AuthFlow:
                         lease = None
                         continue
                     detail = (register_err or "")[:220]
-                    raise RuntimeError(f"手机号协议注册密码提交失败: {detail or 'unknown'}")
+                    lease_id, provider_country, dial_code = self._lease_trace_fields(lease)
+                    raise RuntimeError(
+                        "手机号协议注册密码提交失败: "
+                        f"lease={lease_id} phone={getattr(lease, 'masked_phone', '') or phone_e164[:4] + '***'} "
+                        f"proxy={self._register_proxy_endpoint()} "
+                        f"detail={detail or 'unknown'}"
+                    )
                 self._send_phone_otp()
-                logger.info("[phone-protocol] 等待手机号 OTP ...")
+                lease_id, provider_country, dial_code = self._lease_trace_fields(lease)
+                logger.info(
+                    "[phone-protocol] 等待手机号 OTP lease=%s provider_country=%s dial=+%s phone=%s %s",
+                    lease_id,
+                    provider_country or "<empty>",
+                    dial_code,
+                    getattr(lease, "masked_phone", "") or phone_e164[:4] + "***",
+                    self._register_proxy_trace(),
+                )
                 try:
                     phone_code = phone_provider.poll_otp(getattr(lease, "lease_id", ""))
                     otp_resp = self._phone_otp_validate(phone_code)
                     break
                 except TimeoutError as e:
                     if attempt < max_attempts:
+                        lease_id, provider_country, dial_code = self._lease_trace_fields(lease)
                         logger.warning(
-                            "[phone-protocol] 手机号 OTP 超时，换号重试 attempt=%s/%s lease=%s: %s",
+                            "[phone-protocol] 手机号 OTP 超时，换号重试 attempt=%s/%s lease=%s phone=%s proxy=%s: %s",
                             attempt,
                             max_attempts,
-                            getattr(lease, "lease_id", ""),
+                            lease_id,
+                            getattr(lease, "masked_phone", "") or phone_e164[:4] + "***",
+                            self._register_proxy_endpoint(),
                             e,
                         )
                         try:

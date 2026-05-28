@@ -9,7 +9,7 @@ rest of the project consumes those local HTTP URLs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -74,6 +74,9 @@ class ProxyStagePlan:
     register_region: str = ""
     checkout_region: str = ""
     payment_region: str = ""
+    register_meta: dict = field(default_factory=dict)
+    checkout_meta: dict = field(default_factory=dict)
+    payment_meta: dict = field(default_factory=dict)
 
     @classmethod
     def from_obj(cls, value: Any) -> "ProxyStagePlan":
@@ -88,6 +91,9 @@ class ProxyStagePlan:
                 register_region=str(value.get("register_region") or ""),
                 checkout_region=str(value.get("checkout_region") or ""),
                 payment_region=str(value.get("payment_region") or ""),
+                register_meta=dict(value.get("register_meta") or {}),
+                checkout_meta=dict(value.get("checkout_meta") or {}),
+                payment_meta=dict(value.get("payment_meta") or {}),
             )
         return cls()
 
@@ -100,6 +106,9 @@ class ProxyStagePlan:
             "register_region": self.register_region,
             "checkout_region": self.checkout_region,
             "payment_region": self.payment_region,
+            "register_meta": self.register_meta,
+            "checkout_meta": self.checkout_meta,
+            "payment_meta": self.payment_meta,
         }
 
     def has_any(self) -> bool:
@@ -251,6 +260,26 @@ def load_trojan_pool(path: str | os.PathLike[str], *, http_start_port: int = 180
 
 def _outbound_tag(node: TrojanNode) -> str:
     return f"{_node_scheme(node.url)}-{node.index}"
+
+
+def _node_meta(node: TrojanNode) -> dict:
+    try:
+        parsed = urllib.parse.urlsplit(node.url)
+        server = parsed.hostname or ""
+        server_port = int(parsed.port or (3443 if _node_scheme(node.url) == "hysteria2" else 443))
+    except Exception:
+        server = ""
+        server_port = 0
+    return {
+        "source": "trojan-pool",
+        "region": node.region,
+        "name": node.name,
+        "index": node.index,
+        "scheme": _node_scheme(node.url),
+        "server": server,
+        "server_port": server_port,
+        "local_http_url": node.local_http_url,
+    }
 
 
 def _url_password(parsed: urllib.parse.SplitResult, query: dict[str, list[str]]) -> str:
@@ -570,6 +599,9 @@ class TrojanBridgeManager:
             register_region=reg_node.region,
             checkout_region=chk_node.region,
             payment_region=pay_node.region,
+            register_meta=_node_meta(reg_node),
+            checkout_meta=_node_meta(chk_node),
+            payment_meta=_node_meta(pay_node),
         )
 
     def allocator(
@@ -620,6 +652,7 @@ class TrojanProxyStageAllocator:
                 register=node.local_http_url,
                 source="trojan-pool-alive-register",
                 register_region=node.region,
+                register_meta=_node_meta(node),
             )
         return self.manager.allocate_plan(
             all_region=self.all_region,

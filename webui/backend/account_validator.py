@@ -24,6 +24,8 @@ so source IP stays close to the original registration IP.
 """
 from __future__ import annotations
 
+import base64
+import json
 import socket
 from typing import Iterable, Optional
 
@@ -40,6 +42,249 @@ _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 _ME_URL = "https://chatgpt.com/backend-api/me"
 _SESSION_URL = "https://chatgpt.com/api/auth/session"
 _CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_CHECK_V4_URL = (
+    "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+    "?timezone_offset_min=-540"
+)
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload_b64 = token.split(".", 2)[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload_b64.encode()).decode())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normal_plan_type(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if "team" in raw:
+        return "team"
+    if "pro" in raw and "plus" not in raw:
+        return "pro"
+    if "plus" in raw:
+        return "plus"
+    if "free" in raw:
+        return "free"
+    return raw[:40]
+
+
+def _access_token_plan_type(token: str) -> str:
+    payload = _decode_jwt_payload(token)
+    auth_claim = payload.get("https://api.openai.com/auth") or {}
+    if isinstance(auth_claim, dict):
+        return _normal_plan_type(str(auth_claim.get("chatgpt_plan_type") or ""))
+    return ""
+
+
+def _subscription_plan_to_normal(value: str) -> str:
+    return _normal_plan_type(value)
+
+
+def _curl_cffi_session():
+    try:
+        from curl_cffi import requests as cr
+    except Exception as e:
+        return None, str(e)
+    return cr, ""
+
+
+def _curl_proxies(proxy: Optional[str]) -> dict | None:
+    if not proxy:
+        return None
+    p = proxy.replace("socks5://", "socks5h://")
+    return {"http": p, "https": p}
+
+
+def _probe_check_v4_plan(access_token: str, timeout: float,
+                          proxy: Optional[str]) -> tuple[str, str, str]:
+    """实时读取账号 entitlement，返回 (status, plan_type, message)。"""
+    cr, err = _curl_cffi_session()
+    if cr is None:
+        return "unknown", "", f"check/v4: curl_cffi missing: {err}"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": _USER_AGENT,
+        "Referer": "https://chatgpt.com/",
+    }
+    attempts: list[tuple[str, dict | None]] = []
+    if proxy:
+        attempts.append(("proxy", _curl_proxies(proxy)))
+    attempts.append(("direct", None))
+
+    response = None
+    last_err = ""
+    for label, proxies in attempts:
+        try:
+            with cr.Session(impersonate="chrome136", proxies=proxies) as s:
+                response = s.get(_CHECK_V4_URL, headers=headers, timeout=timeout)
+            break
+        except Exception as e:
+            last_err = f"{label}: {type(e).__name__}: {str(e)[:80]}"
+            response = None
+    if response is None:
+        return "unknown", "", f"check/v4: {last_err}"
+
+    code = getattr(response, "status_code", 0)
+    if code == 401:
+        return "invalid", "", "check/v4: 401 (token revoked)"
+    if code == 403:
+        return "invalid", "", "check/v4: 403 (banned/disabled)"
+    if code != 200:
+        return "unknown", "", f"check/v4: http {code}"
+
+    try:
+        data = response.json()
+    except Exception:
+        return "unknown", "", "check/v4: 200 non-json"
+    account = ((data.get("accounts") or {}) if isinstance(data, dict) else {}).get("default") or {}
+    if not account:
+        return "unknown", "", "check/v4: no default account"
+    entitlement = account.get("entitlement") or {}
+    active = bool(entitlement.get("has_active_subscription"))
+    raw_plan = str(entitlement.get("subscription_plan") or "")
+    plan = _subscription_plan_to_normal(raw_plan)
+    if not plan:
+        plan = "free" if not active else "unknown"
+    msg = (
+        f"check/v4 ok; sub_plan={raw_plan!r} plan={plan} active={active}"
+        f" expires={entitlement.get('expires_at')}"
+    )
+    return "valid", plan, msg
+
+
+def _probe_check_v4_plan_via_cookie(account: dict, timeout: float,
+                                      proxy: Optional[str]) -> tuple[str, str, str]:
+    """Bearer 401 时用 session_token cookie 再读一次 check/v4。"""
+    cr, err = _curl_cffi_session()
+    if cr is None:
+        return "unknown", "", f"check/v4-cookie: curl_cffi missing: {err}"
+
+    session_token = (account.get("session_token") or "").strip()
+    if not session_token:
+        return "unknown", "", "check/v4-cookie: no session_token"
+    cookies = {"__Secure-next-auth.session-token": session_token}
+    csrf_token = (account.get("csrf_token") or "").strip()
+    if csrf_token:
+        cookies["__Host-next-auth.csrf-token"] = csrf_token
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": _USER_AGENT,
+        "Referer": "https://chatgpt.com/",
+    }
+
+    attempts: list[tuple[str, dict | None]] = []
+    if proxy:
+        attempts.append(("proxy", _curl_proxies(proxy)))
+    attempts.append(("direct", None))
+
+    response = None
+    last_err = ""
+    for label, proxies in attempts:
+        try:
+            with cr.Session(impersonate="chrome136", proxies=proxies) as s:
+                response = s.get(_CHECK_V4_URL, headers=headers, cookies=cookies, timeout=timeout)
+            break
+        except Exception as e:
+            last_err = f"{label}: {type(e).__name__}: {str(e)[:80]}"
+            response = None
+    if response is None:
+        return "unknown", "", f"check/v4-cookie: {last_err}"
+
+    code = getattr(response, "status_code", 0)
+    if code == 401:
+        return "invalid", "", "check/v4-cookie: 401 (session revoked)"
+    if code == 403:
+        return "invalid", "", "check/v4-cookie: 403"
+    if code != 200:
+        return "unknown", "", f"check/v4-cookie: http {code}"
+
+    try:
+        data = response.json()
+    except Exception:
+        return "unknown", "", "check/v4-cookie: 200 non-json"
+    account_data = ((data.get("accounts") or {}) if isinstance(data, dict) else {}).get("default") or {}
+    if not account_data:
+        return "unknown", "", "check/v4-cookie: no default account"
+    entitlement = account_data.get("entitlement") or {}
+    active = bool(entitlement.get("has_active_subscription"))
+    raw_plan = str(entitlement.get("subscription_plan") or "")
+    plan = _subscription_plan_to_normal(raw_plan)
+    if not plan:
+        plan = "free" if not active else "unknown"
+    msg = (
+        f"check/v4-cookie ok; sub_plan={raw_plan!r} plan={plan} active={active}"
+        f" expires={entitlement.get('expires_at')}"
+    )
+    return "valid", plan, msg
+
+
+def _refresh_at_via_session_cookie(account: dict, timeout: float,
+                                     proxy: Optional[str]) -> tuple[str, str]:
+    """用 session_token cookie 刷新 access_token，并写回 registered_accounts。"""
+    cr, err = _curl_cffi_session()
+    if cr is None:
+        return "", f"session refresh: curl_cffi missing: {err}"
+
+    session_token = (account.get("session_token") or "").strip()
+    if not session_token:
+        return "", "session refresh: no session_token"
+    cookies = {"__Secure-next-auth.session-token": session_token}
+    csrf_token = (account.get("csrf_token") or "").strip()
+    if csrf_token:
+        cookies["__Host-next-auth.csrf-token"] = csrf_token
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json",
+        "Referer": "https://chatgpt.com/",
+    }
+
+    attempts: list[tuple[str, dict | None]] = []
+    if proxy:
+        attempts.append(("proxy", _curl_proxies(proxy)))
+    attempts.append(("direct", None))
+
+    response = None
+    last_err = ""
+    for label, proxies in attempts:
+        try:
+            with cr.Session(impersonate="chrome136", proxies=proxies) as s:
+                response = s.get(_SESSION_URL, headers=headers, cookies=cookies, timeout=timeout)
+            break
+        except Exception as e:
+            last_err = f"{label}: {type(e).__name__}: {str(e)[:80]}"
+            response = None
+    if response is None:
+        return "", f"session refresh: {last_err}"
+    if getattr(response, "status_code", 0) != 200:
+        return "", f"session refresh: http {getattr(response, 'status_code', 0)}"
+
+    try:
+        data = response.json()
+    except Exception:
+        return "", "session refresh: 200 non-json"
+    new_at = str(data.get("accessToken") or "").strip() if isinstance(data, dict) else ""
+    if not new_at or new_at.count(".") != 2:
+        return "", "session refresh: no accessToken in body"
+
+    try:
+        db = get_db()
+        with db._conn() as c:
+            c.execute(
+                "UPDATE registered_accounts SET access_token = ? WHERE id = ?",
+                (new_at, int(account.get("id") or 0)),
+            )
+    except Exception:
+        pass
+    return new_at, f"session refresh ok (len={len(new_at)})"
 
 
 def _gost_alive(port: int = 18898) -> bool:
@@ -222,7 +467,12 @@ def validate_account(account: dict, *, timeout_s: float = 10.0,
 
 def validate_account_by_id(account_id: int, *, timeout_s: float = 10.0,
                               use_proxy: bool = True) -> dict:
-    """Validate one stored account, persist outcome, return summary."""
+    """Validate one stored account, persist outcome, return summary.
+
+    When an access_token is present, also read OpenAI's live account entitlement
+    from ``/backend-api/accounts/check`` and persist ``last_plan_type``. This
+    keeps portal inventory from trusting stale JWT claims after payment changes.
+    """
     db = get_db()
     account = db.get_registered_account(int(account_id))
     if not account:
@@ -230,12 +480,52 @@ def validate_account_by_id(account_id: int, *, timeout_s: float = 10.0,
                 "message": "account not found", "email": ""}
     status, message = validate_account(account, timeout_s=timeout_s,
                                           use_proxy=use_proxy)
-    db.update_account_check(int(account_id), status, message)
+    plan_type = ""
+    access_token = (account.get("access_token") or "").strip()
+    if access_token:
+        proxy = "socks5://127.0.0.1:18898" if use_proxy and _gost_alive() else None
+        live_status, live_plan, live_msg = _probe_check_v4_plan(access_token, timeout_s, proxy)
+        if live_status == "invalid" and "401" in (live_msg or "") and account.get("session_token"):
+            cookie_status, cookie_plan, cookie_msg = _probe_check_v4_plan_via_cookie(
+                account, timeout_s, proxy,
+            )
+            if cookie_status == "valid":
+                live_status = cookie_status
+                live_plan = cookie_plan
+                live_msg = f"cookie-fallback | {cookie_msg}"
+            else:
+                new_at, refresh_msg = _refresh_at_via_session_cookie(account, timeout_s, proxy)
+                if new_at and new_at != access_token:
+                    retry_status, retry_plan, retry_msg = _probe_check_v4_plan(new_at, timeout_s, proxy)
+                    live_status = retry_status
+                    live_plan = retry_plan
+                    live_msg = f"refreshed-AT | {retry_msg}"
+                    access_token = new_at
+                elif refresh_msg:
+                    live_msg = f"{live_msg} | {refresh_msg}"
+
+        if live_status == "valid":
+            if status != "valid":
+                status = "valid"
+                message = f"{message} | {live_msg}" if message else live_msg
+            if live_plan and live_plan != "unknown":
+                plan_type = live_plan
+        elif live_status == "invalid":
+            status = "invalid"
+            message = f"{message} | {live_msg}" if message else live_msg
+        else:
+            if status == "invalid" and "403" in (message or ""):
+                status = "unknown"
+                message = f"httpx invalid downgraded; live check unknown: {message} | {live_msg}"
+            plan_type = _access_token_plan_type(access_token)
+
+    db.update_account_check(int(account_id), status, message, plan_type=plan_type)
     return {
         "id": int(account_id),
         "email": account.get("email", ""),
         "status": status,
         "message": message,
+        "plan_type": plan_type,
     }
 
 
