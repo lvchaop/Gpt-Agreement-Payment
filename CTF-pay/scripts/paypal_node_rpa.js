@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const Module = require('module');
 
 const _EXTRA_NODE_PATHS = [
@@ -112,6 +113,71 @@ function persistResult(result) {
   try { fs.writeFileSync(T('result.json'), JSON.stringify(result, null, 2)); } catch (_) {}
 }
 
+let CURRENT_PAYLOAD = null;
+let FIVE_SIM_FINALIZED = false;
+let FIVE_SIM_FINAL_STATE = null;
+
+function fiveSimFromPayload(payload = {}) {
+  const provider = String(payload.smsProvider || payload.sms_provider || '').trim().toLowerCase().replace(/[-\s]/g, '_');
+  const raw = payload.fiveSim || payload.five_sim || payload.fivesim || {};
+  if (!raw || typeof raw !== 'object') return null;
+  const orderId = String(raw.orderId || raw.order_id || raw.id || '').trim();
+  const token = String(raw.token || '').trim();
+  if (!orderId || !token) return null;
+  if (provider && !['5sim', 'five_sim', 'fivesim'].includes(provider)) return null;
+  return {
+    orderId,
+    token,
+    apiBase: String(raw.apiBase || raw.api_base || 'https://5sim.net/v1/user').replace(/\/+$/, ''),
+    failAction: String(raw.failAction || raw.fail_action || 'cancel').trim().toLowerCase(),
+    pollIntervalMs: Math.max(1000, Number(raw.pollIntervalMs || raw.poll_interval_ms || 3000) || 3000),
+  };
+}
+
+function fiveSimHeaders(cfg) {
+  return {
+    Authorization: `Bearer ${cfg.token}`,
+    Accept: 'application/json',
+  };
+}
+
+function fiveSimOtpFromPayload(data) {
+  const records = Array.isArray(data && data.sms) ? data.sms : [];
+  for (const record of records.slice().reverse()) {
+    const direct = String(record && record.code || '').match(/\b(\d{4,8})\b/);
+    if (direct) return direct[1];
+    const text = String(record && record.text || '');
+    const fromText = text.match(/PayPal[^\d]{0,64}(\d{4,8})(?!\d)/i) || text.match(/\b(\d{4,8})\b/);
+    if (fromText) return fromText[1];
+  }
+  return '';
+}
+
+async function finalizeFiveSimOrder(cfg, requestedAction, reason = '') {
+  if (!cfg || !cfg.orderId || !cfg.token || FIVE_SIM_FINALIZED) return null;
+  let action = String(requestedAction || '').trim().toLowerCase();
+  if (!['finish', 'cancel', 'ban'].includes(action)) {
+    action = ['finish', 'cancel', 'ban'].includes(cfg.failAction) ? cfg.failAction : 'cancel';
+  }
+  const url = `${cfg.apiBase}/${action}/${encodeURIComponent(cfg.orderId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: fiveSimHeaders(cfg),
+      signal: AbortSignal.timeout(10000),
+    });
+    const body = (await r.text()).trim();
+    FIVE_SIM_FINALIZED = true;
+    FIVE_SIM_FINAL_STATE = { orderId: cfg.orderId, action, status: r.status, body: body.slice(0, 300) };
+    log('5sim finalize', `action=${action}`, `order=${cfg.orderId}`, `status=${r.status}`, reason ? `reason=${String(reason).slice(0, 80)}` : '', body.slice(0, 160));
+    return FIVE_SIM_FINAL_STATE;
+  } catch (e) {
+    log('5sim finalize error', `action=${action}`, `order=${cfg.orderId}`, e && e.message ? e.message : e);
+    FIVE_SIM_FINAL_STATE = { orderId: cfg.orderId, action, error: e && e.message ? e.message : String(e) };
+    return FIVE_SIM_FINAL_STATE;
+  }
+}
+
 async function closeBrowserSafe(browser, timeoutMs = 5000) {
   if (!browser) return;
   try {
@@ -169,15 +235,35 @@ function globDirs(root, prefix) {
 function findChromiumExecutable() {
   const candidates = [];
   if (process.env.PPS_CHROMIUM_EXECUTABLE) candidates.push(process.env.PPS_CHROMIUM_EXECUTABLE);
-  candidates.push(path.join(__dirname, '..', '.local', 'chromium', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'));
-  candidates.push(path.join(__dirname, '..', '.local', 'chromium', 'chrome'));
-  for (const d of globDirs('/root/.cache/ms-playwright', 'chromium-')) {
-    candidates.push(path.join(d, 'chrome-linux64', 'chrome'));
-    candidates.push(path.join(d, 'chrome-linux', 'chrome'));
+
+  const playwrightRoots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH && process.env.PLAYWRIGHT_BROWSERS_PATH !== '0'
+      ? process.env.PLAYWRIGHT_BROWSERS_PATH
+      : '',
+    path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright'),
+    path.join(os.homedir(), '.cache', 'ms-playwright'),
+    '/root/.cache/ms-playwright',
+  ].filter(Boolean);
+  for (const root of [...new Set(playwrightRoots)]) {
+    for (const d of globDirs(root, 'chromium-')) {
+      candidates.push(path.join(d, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'));
+      candidates.push(path.join(d, 'chrome-linux64', 'chrome'));
+      candidates.push(path.join(d, 'chrome-linux', 'chrome'));
+      candidates.push(path.join(d, 'chrome-win', 'chrome.exe'));
+    }
   }
+
+  candidates.push('/Applications/Chromium.app/Contents/MacOS/Chromium');
+  candidates.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
   candidates.push('/usr/bin/google-chrome');
   candidates.push('/usr/bin/chromium');
   candidates.push('/usr/bin/chromium-browser');
+
+  if (/^(1|true|yes)$/i.test(String(process.env.PPS_USE_PROJECT_CHROMIUM || ''))) {
+    candidates.push(path.join(__dirname, '..', '.local', 'chromium', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'));
+    candidates.push(path.join(__dirname, '..', '.local', 'chromium', 'chrome'));
+  }
+
   for (const c of candidates) {
     try {
       if (c && fs.existsSync(c)) return c;
@@ -1108,6 +1194,40 @@ async function getOtp(smsApiUrl, timeoutMs, baselineText = '', opts = {}) {
   const deadline = Date.now() + timeoutMs;
   const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : () => false;
   const manualOtpFile = String(opts.manualOtpFile || '').trim();
+  const fiveSim = opts.fiveSim || null;
+  if (fiveSim && fiveSim.orderId && fiveSim.token) {
+    let attempt = 0;
+    while (Date.now() < deadline) {
+      if (shouldAbort()) {
+        log('5sim otp abort: datadome captcha blocked PayPal from dispatching SMS');
+        return '__ABORTED__';
+      }
+      attempt++;
+      try {
+        const r = await fetch(`${fiveSim.apiBase}/check/${encodeURIComponent(fiveSim.orderId)}`, {
+          method: 'GET',
+          headers: fiveSimHeaders(fiveSim),
+          signal: AbortSignal.timeout(10000),
+        });
+        const t = (await r.text()).trim();
+        let data = null;
+        try { data = JSON.parse(t); } catch (_) { data = null; }
+        const status = String(data && data.status || '');
+        const smsCount = Array.isArray(data && data.sms) ? data.sms.length : 0;
+        log('5sim check', attempt, `order=${fiveSim.orderId}`, `http=${r.status}`, status ? `status=${status}` : '', `sms=${smsCount}`);
+        const code = (data && fiveSimOtpFromPayload(data)) || extractOtpFromSmsResponse(t, { afterMs: opts.afterMs || opts.afterTimeMs || 0 });
+        if (code) {
+          await finalizeFiveSimOrder(fiveSim, 'finish', 'code_received');
+          return code;
+        }
+        if (/^(CANCELED|TIMEOUT|BANNED|FINISHED)$/i.test(status)) return '';
+      } catch (e) {
+        log('5sim check error', e && e.message ? e.message : e);
+      }
+      await sleep(fiveSim.pollIntervalMs || 3000);
+    }
+    return '';
+  }
   let attempt = 0;
   if (!smsApiUrl && manualOtpFile) {
     try { fs.unlinkSync(manualOtpFile); } catch (_) {}
@@ -1546,6 +1666,7 @@ async function fillStripeCheckoutLikeUserscript(page, addr, expectedDueCents = 0
 
 async function main() {
   const payload = JSON.parse(await readStdin());
+  CURRENT_PAYLOAD = payload;
   try { fs.writeFileSync(T('live.log'), ''); } catch (_) {}
   const timeoutMs = Number(payload.timeoutMs || 600000);
   const addr = await getAddress(payload);
@@ -1583,7 +1704,8 @@ async function main() {
     lastName: shortNameToken(payload.lastName, 'Smith'),
   };
   log('signup profile name', `${signupProfile.firstName}/${signupProfile.lastName}`);
-  const smsApiUrl = payload.smsApiUrl || process.env.PPS_SMS_API_URL || '';
+  const fiveSim = fiveSimFromPayload(payload);
+  const smsApiUrl = fiveSim ? '' : (payload.smsApiUrl || process.env.PPS_SMS_API_URL || '');
   const fallbackConsentDelayMs = Math.max(0, Number(
     payload.fallbackConsentDelayMs
     ?? process.env.PPS_PAYPAL_FALLBACK_CONSENT_DELAY_MS
@@ -1591,7 +1713,9 @@ async function main() {
     ?? 12000,
   ) || 0);
   let smsBaselineText = '';
-  if (smsApiUrl) {
+  if (fiveSim) {
+    log('5sim otp enabled', `order=${fiveSim.orderId}`);
+  } else if (smsApiUrl) {
     try {
       const r = await fetch(smsApiUrl, { method: 'GET' });
       smsBaselineText = (await r.text()).trim();
@@ -2330,7 +2454,7 @@ async function main() {
       const otpInfo = await hasOtp(page);
       if (otpInfo && !otpHandled) {
         log('OTP modal detected', JSON.stringify(otpInfo));
-        if (!smsApiUrl && !payload.manualOtpFile) throw new Error('smsApiUrl/manualOtpFile missing for PayPal OTP');
+        if (!fiveSim && !smsApiUrl && !payload.manualOtpFile) throw new Error('smsApiUrl/manualOtpFile/fiveSim missing for PayPal OTP');
         const code = await getOtp(
           smsApiUrl,
           Number(payload.otpTimeoutMs || 180000),
@@ -2338,6 +2462,7 @@ async function main() {
           {
             shouldAbort: () => dataDomeBlocked,
             manualOtpFile: payload.manualOtpFile || '',
+            fiveSim,
             afterMs: lastSubmitClick || 0,
           },
         );
@@ -2461,15 +2586,30 @@ async function main() {
 
 if (require.main === module) {
   main()
-    .then((result) => {
+    .then(async (result) => {
+      const fiveSim = fiveSimFromPayload(CURRENT_PAYLOAD || {});
+      if (fiveSim && !FIVE_SIM_FINALIZED) {
+        const action = result && result.success ? 'finish' : fiveSim.failAction;
+        const finalState = await finalizeFiveSimOrder(fiveSim, action, result && result.success ? 'success' : (result && result.error || 'failed'));
+        if (finalState) result.fiveSim = { orderId: fiveSim.orderId, ...finalState };
+      } else if (FIVE_SIM_FINAL_STATE) {
+        result.fiveSim = FIVE_SIM_FINAL_STATE;
+      }
       persistResult(result);
       process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(0));
     })
-    .catch((err) => {
+    .catch(async (err) => {
       const result = {
         success: false,
         error: String(err && err.stack || err),
       };
+      const fiveSim = fiveSimFromPayload(CURRENT_PAYLOAD || {});
+      if (fiveSim && !FIVE_SIM_FINALIZED) {
+        const finalState = await finalizeFiveSimOrder(fiveSim, fiveSim.failAction, result.error);
+        if (finalState) result.fiveSim = { orderId: fiveSim.orderId, ...finalState };
+      } else if (FIVE_SIM_FINAL_STATE) {
+        result.fiveSim = FIVE_SIM_FINAL_STATE;
+      }
       persistResult(result);
       try { fs.writeFileSync(T('error.json'), JSON.stringify(result, null, 2)); } catch (_) {}
       process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(1));

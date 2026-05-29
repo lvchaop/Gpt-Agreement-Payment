@@ -5526,6 +5526,170 @@ def _paypal_phone_from_source(source: dict) -> dict:
     }
 
 
+def _paypal_sms_provider(paypal_cfg: dict) -> str:
+    return str(
+        paypal_cfg.get("sms_provider")
+        or paypal_cfg.get("sms_service")
+        or paypal_cfg.get("sms_platform")
+        or ""
+    ).strip().lower().replace("-", "_")
+
+
+def _paypal_uses_five_sim(paypal_cfg: dict) -> bool:
+    if _paypal_bool_cfg(paypal_cfg, "manual_otp", default=False):
+        return False
+    if not _paypal_bool_cfg(paypal_cfg, "sms_api_enabled", default=True):
+        return False
+    return _paypal_sms_provider(paypal_cfg) in {"5sim", "five_sim", "fivesim"}
+
+
+def _five_sim_cfg(paypal_cfg: dict) -> dict:
+    cfg = paypal_cfg.get("five_sim") or paypal_cfg.get("fivesim") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _five_sim_token(paypal_cfg: dict) -> str:
+    cfg = _five_sim_cfg(paypal_cfg)
+    token = str(
+        cfg.get("token")
+        or paypal_cfg.get("five_sim_token")
+        or paypal_cfg.get("fivesim_token")
+        or ""
+    ).strip()
+    if token:
+        return token
+    token_env = str(
+        cfg.get("token_env")
+        or paypal_cfg.get("five_sim_token_env")
+        or paypal_cfg.get("fivesim_token_env")
+        or "FIVESIM_TOKEN"
+    ).strip()
+    return str(os.environ.get(token_env) or "").strip()
+
+
+def _five_sim_api_base(paypal_cfg: dict) -> str:
+    cfg = _five_sim_cfg(paypal_cfg)
+    return str(
+        cfg.get("api_base")
+        or paypal_cfg.get("five_sim_api_base")
+        or "https://5sim.net/v1/user"
+    ).strip().rstrip("/")
+
+
+def _five_sim_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def _five_sim_buy_activation(paypal_cfg: dict) -> dict:
+    cached = paypal_cfg.get("_five_sim_order")
+    if isinstance(cached, dict) and cached.get("id") and cached.get("phone"):
+        return cached
+
+    cfg = _five_sim_cfg(paypal_cfg)
+    token = _five_sim_token(paypal_cfg)
+    if not token:
+        token_env = str(cfg.get("token_env") or paypal_cfg.get("five_sim_token_env") or "FIVESIM_TOKEN")
+        raise RuntimeError(f"5sim token 未配置：设置 paypal.five_sim.token 或环境变量 {token_env}")
+
+    country = str(cfg.get("country") or paypal_cfg.get("five_sim_country") or "usa").strip().lower()
+    operator = str(cfg.get("operator") or paypal_cfg.get("five_sim_operator") or "any").strip().lower()
+    product = str(cfg.get("product") or paypal_cfg.get("five_sim_product") or "paypal").strip().lower()
+    if not country or not operator or not product:
+        raise RuntimeError("5sim 配置缺少 country/operator/product")
+
+    url = (
+        f"{_five_sim_api_base(paypal_cfg)}/buy/activation/"
+        f"{urllib.parse.quote(country, safe='')}/"
+        f"{urllib.parse.quote(operator, safe='')}/"
+        f"{urllib.parse.quote(product, safe='')}"
+    )
+    params = {}
+    for key in ("forwarding", "number", "reuse", "voice", "ref"):
+        value = cfg.get(key)
+        if value not in (None, ""):
+            params[key] = value
+
+    _log(f"      [5sim] 买号 country={country} operator={operator} product={product}")
+    try:
+        resp = requests.get(
+            url,
+            headers=_five_sim_headers(token),
+            params=params or None,
+            timeout=int(cfg.get("timeout_s") or 30),
+        )
+    except Exception as e:
+        raise RuntimeError(f"5sim 买号请求失败: {type(e).__name__}: {e}") from e
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"5sim 买号失败 status={resp.status_code} body={resp.text[:300]}")
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"5sim 买号响应不是 JSON: {resp.text[:300]}") from e
+    if not isinstance(data, dict) or not data.get("id") or not data.get("phone"):
+        raise RuntimeError(f"5sim 买号响应缺少 id/phone: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+    order = dict(data)
+    order["_token"] = token
+    order["_api_base"] = _five_sim_api_base(paypal_cfg)
+    order["_fail_action"] = str(cfg.get("fail_action") or "cancel").strip().lower()
+    paypal_cfg["_five_sim_order"] = order
+    _log(
+        "      [5sim] 买号成功 "
+        f"id={order.get('id')} phone=****{str(order.get('phone'))[-4:]} "
+        f"operator={order.get('operator') or operator} price={order.get('price', '')}"
+    )
+    return order
+
+
+def _five_sim_payload(paypal_cfg: dict) -> dict:
+    if not _paypal_uses_five_sim(paypal_cfg):
+        return {}
+    order = paypal_cfg.get("_five_sim_order")
+    if not isinstance(order, dict) or not order.get("id"):
+        return {}
+    cfg = _five_sim_cfg(paypal_cfg)
+    token = str(order.get("_token") or _five_sim_token(paypal_cfg)).strip()
+    if not token:
+        return {}
+    return {
+        "orderId": str(order.get("id")),
+        "token": token,
+        "apiBase": str(order.get("_api_base") or _five_sim_api_base(paypal_cfg)).rstrip("/"),
+        "failAction": str(order.get("_fail_action") or cfg.get("fail_action") or "cancel").strip().lower(),
+        "pollIntervalMs": int(cfg.get("poll_interval_ms") or 3000),
+    }
+
+
+def _five_sim_finalize_order(paypal_cfg: dict, action: str = "cancel", reason: str = "") -> None:
+    order = paypal_cfg.get("_five_sim_order")
+    if not isinstance(order, dict) or not order.get("id"):
+        return
+    token = str(order.get("_token") or _five_sim_token(paypal_cfg)).strip()
+    if not token:
+        return
+    action = str(action or "").strip().lower()
+    if action not in {"finish", "cancel", "ban"}:
+        action = str(order.get("_fail_action") or "cancel").strip().lower()
+    if action not in {"finish", "cancel", "ban"}:
+        action = "cancel"
+    url = f"{str(order.get('_api_base') or _five_sim_api_base(paypal_cfg)).rstrip('/')}/{action}/{urllib.parse.quote(str(order.get('id')), safe='')}"
+    try:
+        resp = requests.get(url, headers=_five_sim_headers(token), timeout=10)
+        _log(
+            "      [5sim] 订单收尾 "
+            f"action={action} id={order.get('id')} status={resp.status_code} "
+            f"reason={reason[:80]}"
+        )
+    except Exception as e:
+        _log(f"      [5sim] 订单收尾失败 action={action} id={order.get('id')}: {type(e).__name__}: {e}")
+    finally:
+        paypal_cfg.pop("_five_sim_order", None)
+
+
 def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
     account_phone = _paypal_account_value(account, "phone", "phone_number")
     if account_phone:
@@ -5540,6 +5704,16 @@ def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
             "country": _paypal_account_value(paypal_cfg, "phone_country", "country", "country_code", "region"),
             "dial_code": _paypal_account_value(paypal_cfg, "dial_code", "calling_code", "country_calling_code"),
             "_source": "paypal.phone",
+        }
+
+    if _paypal_uses_five_sim(paypal_cfg):
+        order = _five_sim_buy_activation(paypal_cfg)
+        return {
+            "phone": str(order.get("phone") or ""),
+            "country": str(order.get("country") or _five_sim_cfg(paypal_cfg).get("country") or "usa"),
+            "dial_code": "",
+            "_source": "5sim",
+            "_five_sim_order_id": order.get("id"),
         }
 
     phones_file = (
@@ -7975,6 +8149,8 @@ def _paypal_phone_e164(phone: str, country: str = "US") -> str:
 
 
 def _paypal_sms_api_url(paypal_cfg: dict, phone_e164: str) -> str:
+    if _paypal_uses_five_sim(paypal_cfg):
+        return ""
     if _paypal_bool_cfg(paypal_cfg, "manual_otp", default=False) or not _paypal_bool_cfg(
         paypal_cfg,
         "sms_api_enabled",
@@ -8171,12 +8347,14 @@ def _paypal_signup_node_rpa(
     if not signup_card:
         _log("      [node-rpa] 缺少 signup_card，无法按 userscript 填 PayPal 临时号")
         paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "missing_signup_card"}
+        _five_sim_finalize_order(paypal_cfg, "cancel", "missing_signup_card")
         return False
 
     helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "paypal_node_rpa.js")
     if not os.path.exists(helper):
         _log(f"      [node-rpa] helper 不存在: {helper}")
         paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "helper_missing"}
+        _five_sim_finalize_order(paypal_cfg, "cancel", "helper_missing")
         return False
 
     node_bin = (
@@ -8188,6 +8366,7 @@ def _paypal_signup_node_rpa(
     if not card_number:
         _log("      [node-rpa] signup_card 缺少 cardNumber")
         paypal_cfg["_last_node_rpa_result"] = {"success": False, "error": "missing_card_number"}
+        _five_sim_finalize_order(paypal_cfg, "cancel", "missing_card_number")
         return False
 
     signup_billing_address = signup_billing_address or {}
@@ -8213,6 +8392,7 @@ def _paypal_signup_node_rpa(
 
     profile_dir = tempfile.mkdtemp(prefix="paypal_node_rpa_")
     keep_profile = _paypal_bool_cfg(paypal_cfg, "keep_node_rpa_profile", default=False) or bool(os.environ.get("PPS_PAYPAL_KEEP_PROFILE"))
+    five_sim_payload = _five_sim_payload(paypal_cfg)
     payload = {
         "redirectUrl": redirect_url,
         "proxy": proxy_url or "",
@@ -8226,8 +8406,10 @@ def _paypal_signup_node_rpa(
         "address": signup_billing_address,
         "firstName": first_name,
         "lastName": last_name,
+        "smsProvider": "5sim" if five_sim_payload else _paypal_sms_provider(paypal_cfg),
+        "fiveSim": five_sim_payload,
         "smsApiUrl": sms_api_url or "",
-        "manualOtpFile": "" if sms_api_url else (manual_otp_file or ""),
+        "manualOtpFile": "" if (sms_api_url or five_sim_payload) else (manual_otp_file or ""),
         "expectedDueCents": int(expected_due_cents or 0),
         "timeoutMs": int(paypal_cfg.get("node_rpa_timeout_s") or paypal_cfg.get("browser_rpa_timeout_s") or 720) * 1000,
         "otpTimeoutMs": int(otp_timeout or paypal_cfg.get("otp_timeout_s") or 600) * 1000,
@@ -8305,7 +8487,7 @@ def _paypal_signup_node_rpa(
             else "      [node-rpa] 启动 Node/Chromium PayPal RPA "
         )
         + f"card=****{card_number[-4:]} phone={str(phone)[-4:].rjust(len(str(phone)), '*')} "
-        f"otp={'sms_api' if sms_api_url else 'portal'} headless={payload['headless']}"
+        f"otp={'5sim' if five_sim_payload else ('sms_api' if sms_api_url else 'portal')} headless={payload['headless']}"
     )
 
     env = os.environ.copy()
@@ -8429,6 +8611,17 @@ def _paypal_signup_node_rpa(
     if not result:
         result = {"success": False, "error": f"no JSON result; stdout={raw[:300]}"}
     paypal_cfg["_last_node_rpa_result"] = result
+    if _paypal_uses_five_sim(paypal_cfg):
+        if isinstance(result, dict) and result.get("fiveSim"):
+            paypal_cfg.pop("_five_sim_order", None)
+        elif isinstance(result, dict) and result.get("success") is True:
+            _five_sim_finalize_order(paypal_cfg, "finish", "node_rpa_success")
+        else:
+            _five_sim_finalize_order(
+                paypal_cfg,
+                str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                str((result or {}).get("error") or "node_rpa_failed")[:120],
+            )
 
     try:
         with open(f"{tmp_base}_last.json", "w", encoding="utf-8") as f:
