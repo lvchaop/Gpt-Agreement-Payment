@@ -117,6 +117,70 @@ let CURRENT_PAYLOAD = null;
 let FIVE_SIM_FINALIZED = false;
 let FIVE_SIM_FINAL_STATE = null;
 
+function appendJsonl(file, obj) {
+  if (!file) return;
+  try {
+    fs.appendFileSync(file, `${JSON.stringify(obj)}\n`);
+  } catch (_) {}
+}
+
+function installNetworkCapture(page, payload = {}) {
+  if (!payload.networkCapture) return '';
+  const capturePath = String(payload.networkCapturePath || T('network_capture.jsonl')).trim();
+  if (!capturePath) return '';
+  try { fs.writeFileSync(capturePath, ''); } catch (_) {}
+  appendJsonl(capturePath, {
+    ts: new Date().toISOString(),
+    phase: 'capture_start',
+    worker: _WORKER_ID || '',
+  });
+  page.on('request', (req) => {
+    appendJsonl(capturePath, {
+      ts: new Date().toISOString(),
+      phase: 'request',
+      method: req.method(),
+      url: redactSensitiveText(req.url()),
+      resourceType: req.resourceType(),
+      headers: redactHeaders(req.headers()),
+      postData: redactSensitiveText(req.postData() || '').slice(0, 12000),
+    });
+  });
+  page.on('requestfailed', (req) => {
+    appendJsonl(capturePath, {
+      ts: new Date().toISOString(),
+      phase: 'request_failed',
+      method: req.method(),
+      url: redactSensitiveText(req.url()),
+      resourceType: req.resourceType(),
+      failure: req.failure() || null,
+    });
+  });
+  page.on('response', async (res) => {
+    const req = res.request();
+    const headers = res.headers();
+    const contentType = String(headers['content-type'] || headers['Content-Type'] || '');
+    const canReadBody = /json|text|html|javascript|xml|form|plain/i.test(contentType);
+    let body = '';
+    if (canReadBody) {
+      body = await res.text().catch(() => '');
+    }
+    appendJsonl(capturePath, {
+      ts: new Date().toISOString(),
+      phase: 'response',
+      method: req.method(),
+      url: redactSensitiveText(res.url()),
+      status: res.status(),
+      statusText: res.statusText(),
+      resourceType: req.resourceType(),
+      requestHeaders: redactHeaders(req.headers()),
+      responseHeaders: redactHeaders(headers),
+      postData: redactSensitiveText(req.postData() || '').slice(0, 12000),
+      responseBody: redactSensitiveText(body).slice(0, 20000),
+    });
+  });
+  return capturePath;
+}
+
 function fiveSimFromPayload(payload = {}) {
   const provider = String(payload.smsProvider || payload.sms_provider || '').trim().toLowerCase().replace(/[-\s]/g, '_');
   const raw = payload.fiveSim || payload.five_sim || payload.fivesim || {};
@@ -141,9 +205,22 @@ function fiveSimHeaders(cfg) {
   };
 }
 
-function fiveSimOtpFromPayload(data) {
+function fiveSimRecordTimeMs(record) {
+  for (const key of ['created_at', 'createdAt', 'date', 'time', 'timestamp']) {
+    const raw = record && record[key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    if (typeof raw === 'number') return raw > 1e12 ? raw : raw * 1000;
+    const parsed = Date.parse(String(raw));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function fiveSimOtpFromPayload(data, afterMs = 0) {
   const records = Array.isArray(data && data.sms) ? data.sms : [];
   for (const record of records.slice().reverse()) {
+    const ts = fiveSimRecordTimeMs(record);
+    if (afterMs && ts && ts < afterMs - 2000) continue;
     const direct = String(record && record.code || '').match(/\b(\d{4,8})\b/);
     if (direct) return direct[1];
     const text = String(record && record.text || '');
@@ -1215,9 +1292,9 @@ async function getOtp(smsApiUrl, timeoutMs, baselineText = '', opts = {}) {
         const status = String(data && data.status || '');
         const smsCount = Array.isArray(data && data.sms) ? data.sms.length : 0;
         log('5sim check', attempt, `order=${fiveSim.orderId}`, `http=${r.status}`, status ? `status=${status}` : '', `sms=${smsCount}`);
-        const code = (data && fiveSimOtpFromPayload(data)) || extractOtpFromSmsResponse(t, { afterMs: opts.afterMs || opts.afterTimeMs || 0 });
+        const afterMs = opts.afterMs || opts.afterTimeMs || 0;
+        const code = (data && fiveSimOtpFromPayload(data, afterMs)) || extractOtpFromSmsResponse(t, { afterMs });
         if (code) {
-          await finalizeFiveSimOrder(fiveSim, 'finish', 'code_received');
           return code;
         }
         if (/^(CANCELED|TIMEOUT|BANNED|FINISHED)$/i.test(status)) return '';
@@ -1726,6 +1803,8 @@ async function main() {
   }
   const { browser } = await launchProjectChromium(payload);
   const page = browser.pages()[0] || await browser.newPage();
+  const networkCapturePath = installNetworkCapture(page, payload);
+  if (networkCapturePath) log('network capture enabled', networkCapturePath);
   let capturedReturnUrl = '';
   let decisiveError = '';
   let ccLinkedToFullAccount = false;
@@ -2588,12 +2667,15 @@ if (require.main === module) {
   main()
     .then(async (result) => {
       const fiveSim = fiveSimFromPayload(CURRENT_PAYLOAD || {});
-      if (fiveSim && !FIVE_SIM_FINALIZED) {
+      const deferFiveSimFinalize = !!(CURRENT_PAYLOAD && CURRENT_PAYLOAD.deferFiveSimFinalize);
+      if (fiveSim && !FIVE_SIM_FINALIZED && !deferFiveSimFinalize) {
         const action = result && result.success ? 'finish' : fiveSim.failAction;
         const finalState = await finalizeFiveSimOrder(fiveSim, action, result && result.success ? 'success' : (result && result.error || 'failed'));
         if (finalState) result.fiveSim = { orderId: fiveSim.orderId, ...finalState };
       } else if (FIVE_SIM_FINAL_STATE) {
         result.fiveSim = FIVE_SIM_FINAL_STATE;
+      } else if (fiveSim && deferFiveSimFinalize) {
+        result.fiveSim = { orderId: fiveSim.orderId, deferred: true };
       }
       persistResult(result);
       process.stdout.write(JSON.stringify(result, null, 2), () => process.exit(0));
@@ -2604,11 +2686,14 @@ if (require.main === module) {
         error: String(err && err.stack || err),
       };
       const fiveSim = fiveSimFromPayload(CURRENT_PAYLOAD || {});
-      if (fiveSim && !FIVE_SIM_FINALIZED) {
+      const deferFiveSimFinalize = !!(CURRENT_PAYLOAD && CURRENT_PAYLOAD.deferFiveSimFinalize);
+      if (fiveSim && !FIVE_SIM_FINALIZED && !deferFiveSimFinalize) {
         const finalState = await finalizeFiveSimOrder(fiveSim, fiveSim.failAction, result.error);
         if (finalState) result.fiveSim = { orderId: fiveSim.orderId, ...finalState };
       } else if (FIVE_SIM_FINAL_STATE) {
         result.fiveSim = FIVE_SIM_FINAL_STATE;
+      } else if (fiveSim && deferFiveSimFinalize) {
+        result.fiveSim = { orderId: fiveSim.orderId, deferred: true };
       }
       persistResult(result);
       try { fs.writeFileSync(T('error.json'), JSON.stringify(result, null, 2)); } catch (_) {}

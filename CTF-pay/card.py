@@ -5664,7 +5664,7 @@ def _five_sim_payload(paypal_cfg: dict) -> dict:
     }
 
 
-def _five_sim_finalize_order(paypal_cfg: dict, action: str = "cancel", reason: str = "") -> None:
+def _five_sim_finalize_order(paypal_cfg: dict, action: str = "cancel", reason: str = "", clear: bool = True) -> None:
     order = paypal_cfg.get("_five_sim_order")
     if not isinstance(order, dict) or not order.get("id"):
         return
@@ -5687,7 +5687,15 @@ def _five_sim_finalize_order(paypal_cfg: dict, action: str = "cancel", reason: s
     except Exception as e:
         _log(f"      [5sim] 订单收尾失败 action={action} id={order.get('id')}: {type(e).__name__}: {e}")
     finally:
+        if not clear:
+            return
         paypal_cfg.pop("_five_sim_order", None)
+
+
+def _five_sim_keep_for_retry(paypal_cfg: dict) -> None:
+    order = paypal_cfg.get("_five_sim_order")
+    if isinstance(order, dict):
+        order["_keep_for_retry"] = True
 
 
 def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
@@ -8393,6 +8401,12 @@ def _paypal_signup_node_rpa(
     profile_dir = tempfile.mkdtemp(prefix="paypal_node_rpa_")
     keep_profile = _paypal_bool_cfg(paypal_cfg, "keep_node_rpa_profile", default=False) or bool(os.environ.get("PPS_PAYPAL_KEEP_PROFILE"))
     five_sim_payload = _five_sim_payload(paypal_cfg)
+    worker_id = (
+        os.environ.get("NCPP_WORKER_ID")
+        or str(paypal_cfg.get("node_rpa_worker_id") or "")
+        or f"pay_{os.getpid()}_{int(time.time() * 1000)}"
+    ).strip().replace("/", "_")
+    tmp_base = "/tmp/paypal_node_rpa" + (f"_{worker_id}" if worker_id else "")
     payload = {
         "redirectUrl": redirect_url,
         "proxy": proxy_url or "",
@@ -8408,8 +8422,11 @@ def _paypal_signup_node_rpa(
         "lastName": last_name,
         "smsProvider": "5sim" if five_sim_payload else _paypal_sms_provider(paypal_cfg),
         "fiveSim": five_sim_payload,
+        "deferFiveSimFinalize": bool(five_sim_payload),
         "smsApiUrl": sms_api_url or "",
         "manualOtpFile": "" if (sms_api_url or five_sim_payload) else (manual_otp_file or ""),
+        "networkCapture": _paypal_bool_cfg(paypal_cfg, "node_rpa_network_capture", default=False),
+        "networkCapturePath": f"{tmp_base}_network_capture.jsonl",
         "expectedDueCents": int(expected_due_cents or 0),
         "timeoutMs": int(paypal_cfg.get("node_rpa_timeout_s") or paypal_cfg.get("browser_rpa_timeout_s") or 720) * 1000,
         "otpTimeoutMs": int(otp_timeout or paypal_cfg.get("otp_timeout_s") or 600) * 1000,
@@ -8426,12 +8443,6 @@ def _paypal_signup_node_rpa(
         payload["checkoutUrl"] = checkout_url
         payload["fullCheckout"] = True
 
-    worker_id = (
-        os.environ.get("NCPP_WORKER_ID")
-        or str(paypal_cfg.get("node_rpa_worker_id") or "")
-        or f"pay_{os.getpid()}_{int(time.time() * 1000)}"
-    ).strip().replace("/", "_")
-    tmp_base = "/tmp/paypal_node_rpa" + (f"_{worker_id}" if worker_id else "")
     for suffix in ("result.json", "state.json", "live.log", "last.json"):
         try:
             os.unlink(f"{tmp_base}_{suffix}")
@@ -8489,6 +8500,8 @@ def _paypal_signup_node_rpa(
         + f"card=****{card_number[-4:]} phone={str(phone)[-4:].rjust(len(str(phone)), '*')} "
         f"otp={'5sim' if five_sim_payload else ('sms_api' if sms_api_url else 'portal')} headless={payload['headless']}"
     )
+    if payload.get("networkCapture"):
+        _log(f"      [node-rpa] network capture: {payload['networkCapturePath']}")
 
     env = os.environ.copy()
     node_paths = [
@@ -8610,13 +8623,19 @@ def _paypal_signup_node_rpa(
                 result = {}
     if not result:
         result = {"success": False, "error": f"no JSON result; stdout={raw[:300]}"}
+    if payload.get("networkCapturePath"):
+        result.setdefault("networkCapturePath", payload.get("networkCapturePath"))
     paypal_cfg["_last_node_rpa_result"] = result
     if _paypal_uses_five_sim(paypal_cfg):
-        if isinstance(result, dict) and result.get("fiveSim"):
+        if (
+            isinstance(result, dict)
+            and isinstance(result.get("fiveSim"), dict)
+            and not result["fiveSim"].get("deferred")
+        ):
             paypal_cfg.pop("_five_sim_order", None)
         elif isinstance(result, dict) and result.get("success") is True:
             _five_sim_finalize_order(paypal_cfg, "finish", "node_rpa_success")
-        else:
+        elif not bool(paypal_cfg.get("_defer_five_sim_finalize")):
             _five_sim_finalize_order(
                 paypal_cfg,
                 str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
@@ -10763,19 +10782,27 @@ def run(
             from paypal_plus import signup as pps  # type: ignore
         except Exception as e:
             raise RuntimeError(f"paypal_plus 模块不可用，无法启动 Node full-checkout RPA: {e!r}")
+        retry_on_any_failure = _paypal_bool_cfg(paypal_cfg, "node_rpa_retry_on_failure", default=False)
         try:
-            max_node_attempts = max(
-                1,
-                int(
-                    paypal_cfg.get("node_rpa_identity_retries")
-                    or paypal_cfg.get("node_rpa_account_retries")
-                    or paypal_cfg.get("node_rpa_address_retries")
-                    or paypal_cfg.get("address_validation_retries")
-                    or 3
-                ),
+            base_node_attempts = int(
+                paypal_cfg.get("node_rpa_identity_retries")
+                or paypal_cfg.get("node_rpa_account_retries")
+                or paypal_cfg.get("node_rpa_address_retries")
+                or paypal_cfg.get("address_validation_retries")
+                or 3
             )
         except Exception:
-            max_node_attempts = 3
+            base_node_attempts = 3
+        try:
+            same_phone_attempts = int(
+                paypal_cfg.get("node_rpa_same_phone_retries")
+                or paypal_cfg.get("node_rpa_retry_attempts")
+                or paypal_cfg.get("node_rpa_max_attempts")
+                or base_node_attempts
+            )
+        except Exception:
+            same_phone_attempts = base_node_attempts
+        max_node_attempts = max(1, same_phone_attempts if retry_on_any_failure else base_node_attempts)
         try:
             expected_due_cents = int(expected_due if expected_due is not None else 0)
         except Exception:
@@ -10825,6 +10852,23 @@ def run(
             )
             return True
 
+        retryable_same_phone_pattern = re.compile(
+            r"paypal_datadome_blocked|PayPal OTP timeout|node_rpa_timeout|timeout|"
+            r"paypal_fallback_missing_agree_continue_retry_new_paypal_account|"
+            r"paypal_no_interaction_after_pay_with_card_retry_new_paypal_account|"
+            r"paypal_onboarding_email_stuck_retry_new_paypal_account|"
+            r"paypal_legacy_start_onboarding_stuck_retry_new_paypal_account|"
+            r"paypal_billing_missing_agree_continue_retry_new_paypal_account|"
+            r"paypal_generic_error_after_agree_continue|"
+            r"smsApiUrl/manualOtpFile/fiveSim missing|"
+            r"PayPal Node full-checkout 授权失败或超时",
+            re.I,
+        )
+        hard_non_retry_pattern = re.compile(
+            r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号",
+            re.I,
+        )
+
         last_node_result = {}
         for node_attempt in range(1, max_node_attempts + 1):
             if node_attempt > 1:
@@ -10838,25 +10882,31 @@ def run(
             sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
             manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
             otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
-            ok = _paypal_signup_node_rpa(
-                redirect_url="",
-                checkout_url=browser_checkout_url or stripe_checkout_url,
-                full_checkout=True,
-                expected_due_cents=expected_due_cents,
-                stripe_email=str(card.get("email") or ""),
-                paypal_cfg=paypal_cfg,
-                proxy_url=proxy_url or "",
-                phone=phone,
-                signup_card=signup_card,
-                signup_billing_address=signup_billing_address,
-                persona=persona,
-                sms_api_url=sms_api_url,
-                manual_otp_file=manual_otp_file,
-                otp_timeout=otp_timeout,
-            )
+            paypal_cfg["_defer_five_sim_finalize"] = True
+            try:
+                ok = _paypal_signup_node_rpa(
+                    redirect_url="",
+                    checkout_url=browser_checkout_url or stripe_checkout_url,
+                    full_checkout=True,
+                    expected_due_cents=expected_due_cents,
+                    stripe_email=str(card.get("email") or ""),
+                    paypal_cfg=paypal_cfg,
+                    proxy_url=proxy_url or "",
+                    phone=phone,
+                    signup_card=signup_card,
+                    signup_billing_address=signup_billing_address,
+                    persona=persona,
+                    sms_api_url=sms_api_url,
+                    manual_otp_file=manual_otp_file,
+                    otp_timeout=otp_timeout,
+                )
+            finally:
+                paypal_cfg.pop("_defer_five_sim_finalize", None)
             last_node_result = paypal_cfg.get("_last_node_rpa_result") or {}
             if ok:
                 _log("      PayPal Node full-checkout 完成")
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(paypal_cfg, "finish", "node_rpa_success")
                 return {
                     "state": "succeeded",
                     "session_id": session_id,
@@ -10865,18 +10915,7 @@ def run(
                     "paypal_node_result": last_node_result,
                 }
             result_hay = json.dumps(last_node_result or {}, ensure_ascii=False)
-            if re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I):
-                if node_attempt < max_node_attempts:
-                    paypal_cfg.pop("_resolved_meiguodizhi_address", None)
-                    _log(
-                        "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
-                        f"({node_attempt + 1}/{max_node_attempts})"
-                    )
-                    continue
-                raise RuntimeError(
-                    "PayPal Node full-checkout 地址校验失败，已重试 "
-                    f"{max_node_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
-                )
+            address_failed = bool(re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I))
             funding_rejected = re.search(
                 r"INSTRUMENT_SHARING_LIMIT_EXCEEDED|paypal_cc_linked_to_full_account|CARD_GENERIC_ERROR|ISSUER_DECLINE",
                 result_hay,
@@ -10887,6 +10926,51 @@ def run(
                 result_hay,
                 re.I,
             )
+            is_same_phone_retryable = bool(retryable_same_phone_pattern.search(result_hay)) or (
+                retry_on_any_failure
+                and bool(result_hay.strip())
+                and not address_failed
+                and not funding_rejected
+                and not reroll_new_account
+                and not bool(hard_non_retry_pattern.search(result_hay))
+            )
+            if is_same_phone_retryable:
+                if node_attempt < max_node_attempts:
+                    _log(
+                        "      [node-rpa-full] 失败可重试，保留当前 PayPal 身份/手机号并重新拉取验证码 "
+                        f"({node_attempt + 1}/{max_node_attempts}): "
+                        f"{str(last_node_result.get('error') or '')[:160]}"
+                    )
+                    _five_sim_keep_for_retry(paypal_cfg)
+                    continue
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(
+                        paypal_cfg,
+                        str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                        str(last_node_result.get("error") or "retry_exhausted")[:120],
+                    )
+                raise RuntimeError(
+                    "PayPal Node full-checkout 多次同手机号重试仍失败: "
+                    f"{str(last_node_result.get('error') or '')[:200]}"
+                )
+            if address_failed:
+                if node_attempt < max_node_attempts:
+                    paypal_cfg.pop("_resolved_meiguodizhi_address", None)
+                    _log(
+                        "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
+                        f"({node_attempt + 1}/{max_node_attempts})"
+                    )
+                    continue
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(
+                        paypal_cfg,
+                        str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                        str(last_node_result.get("error") or "address_validation_failed")[:120],
+                    )
+                raise RuntimeError(
+                    "PayPal Node full-checkout 地址校验失败，已重试 "
+                    f"{max_node_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
+                )
             if reroll_new_account or funding_rejected:
                 if node_attempt < max_node_attempts:
                     _clear_paypal_new_user_runtime()
@@ -10896,13 +10980,31 @@ def run(
                     else:
                         _log(f"      [node-rpa-full] {reason}，重新生成 PayPal 邮箱/密码/地址后重试")
                     continue
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(
+                        paypal_cfg,
+                        str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                        str(last_node_result.get("error") or "reroll_exhausted")[:120],
+                    )
                 raise RuntimeError(
                     "PayPal Node full-checkout 多次重建新用户仍失败: "
                     f"{str(last_node_result.get('error') or '')[:200]}"
                 )
+            if _paypal_uses_five_sim(paypal_cfg):
+                _five_sim_finalize_order(
+                    paypal_cfg,
+                    str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                    str(last_node_result.get("error") or "non_retryable_failure")[:120],
+                )
             raise RuntimeError(
                 "PayPal Node full-checkout 授权失败或超时"
                 + (f": {str(last_node_result.get('error') or '')[:200]}" if last_node_result else "")
+            )
+        if _paypal_uses_five_sim(paypal_cfg):
+            _five_sim_finalize_order(
+                paypal_cfg,
+                str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                "loop_exhausted",
             )
         raise RuntimeError("PayPal Node full-checkout 授权失败或超时")
 
@@ -11459,25 +11561,59 @@ def run(
             from paypal_plus import signup as pps  # type: ignore
         except Exception as e:
             raise RuntimeError(f"paypal_plus 模块不可用，无法启动 Node full-checkout RPA: {e!r}")
+        retry_on_any_failure = _paypal_bool_cfg(paypal_cfg, "node_rpa_retry_on_failure", default=False)
         try:
-            max_node_address_attempts = max(
-                1,
-                int(
-                    paypal_cfg.get("node_rpa_address_retries")
-                    or paypal_cfg.get("address_validation_retries")
-                    or 3
-                ),
+            base_node_attempts = int(
+                paypal_cfg.get("node_rpa_identity_retries")
+                or paypal_cfg.get("node_rpa_account_retries")
+                or paypal_cfg.get("node_rpa_address_retries")
+                or paypal_cfg.get("address_validation_retries")
+                or 3
             )
         except Exception:
-            max_node_address_attempts = 3
+            base_node_attempts = 3
+        try:
+            same_phone_attempts = int(
+                paypal_cfg.get("node_rpa_same_phone_retries")
+                or paypal_cfg.get("node_rpa_retry_attempts")
+                or paypal_cfg.get("node_rpa_max_attempts")
+                or base_node_attempts
+            )
+        except Exception:
+            same_phone_attempts = base_node_attempts
+        max_node_attempts = max(1, same_phone_attempts if retry_on_any_failure else base_node_attempts)
+        retryable_same_phone_pattern = re.compile(
+            r"paypal_datadome_blocked|PayPal OTP timeout|node_rpa_timeout|timeout|"
+            r"paypal_fallback_missing_agree_continue_retry_new_paypal_account|"
+            r"paypal_no_interaction_after_pay_with_card_retry_new_paypal_account|"
+            r"paypal_onboarding_email_stuck_retry_new_paypal_account|"
+            r"paypal_legacy_start_onboarding_stuck_retry_new_paypal_account|"
+            r"paypal_billing_missing_agree_continue_retry_new_paypal_account|"
+            r"paypal_generic_error_after_agree_continue|"
+            r"smsApiUrl/manualOtpFile/fiveSim missing|"
+            r"PayPal Node full-checkout 授权失败或超时",
+            re.I,
+        )
+        hard_non_retry_pattern = re.compile(
+            r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号",
+            re.I,
+        )
         last_node_result = {}
-        for node_attempt in range(1, max_node_address_attempts + 1):
+        reroll_address_next = False
+        for node_attempt in range(1, max_node_attempts + 1):
             if node_attempt > 1:
-                paypal_cfg.pop("_resolved_meiguodizhi_address", None)
-                _log(
-                    "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
-                    f"({node_attempt}/{max_node_address_attempts})"
-                )
+                if reroll_address_next:
+                    paypal_cfg.pop("_resolved_meiguodizhi_address", None)
+                    _log(
+                        "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
+                        f"({node_attempt}/{max_node_attempts})"
+                    )
+                    reroll_address_next = False
+                else:
+                    _log(
+                        "      [node-rpa-full] 重试 PayPal 新用户流程，保留当前手机号并重新拉取验证码 "
+                        f"({node_attempt}/{max_node_attempts})"
+                    )
             account = _paypal_resolve_new_user_account(paypal_cfg)
             address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
             persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
@@ -11487,32 +11623,78 @@ def run(
             sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
             manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
             otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
-            ok = _paypal_signup_node_rpa(
-                redirect_url="",
-                checkout_url=str(init_ctx.get("checkout_url") or ""),
-                full_checkout=True,
-                expected_due_cents=int(init_ctx.get("expected_due_cents") or 0),
-                stripe_email=str(card.get("email") or ""),
-                paypal_cfg=paypal_cfg,
-                proxy_url=init_ctx.get("proxy_url") or "",
-                phone=phone,
-                signup_card=signup_card,
-                signup_billing_address=signup_billing_address,
-                persona=persona,
-                sms_api_url=sms_api_url,
-                manual_otp_file=manual_otp_file,
-                otp_timeout=otp_timeout,
-            )
+            paypal_cfg["_defer_five_sim_finalize"] = True
+            try:
+                ok = _paypal_signup_node_rpa(
+                    redirect_url="",
+                    checkout_url=str(init_ctx.get("checkout_url") or ""),
+                    full_checkout=True,
+                    expected_due_cents=int(init_ctx.get("expected_due_cents") or 0),
+                    stripe_email=str(card.get("email") or ""),
+                    paypal_cfg=paypal_cfg,
+                    proxy_url=init_ctx.get("proxy_url") or "",
+                    phone=phone,
+                    signup_card=signup_card,
+                    signup_billing_address=signup_billing_address,
+                    persona=persona,
+                    sms_api_url=sms_api_url,
+                    manual_otp_file=manual_otp_file,
+                    otp_timeout=otp_timeout,
+                )
+            finally:
+                paypal_cfg.pop("_defer_five_sim_finalize", None)
             last_node_result = paypal_cfg.get("_last_node_rpa_result") or {}
             if ok:
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(paypal_cfg, "finish", "node_rpa_success")
                 break
             result_hay = json.dumps(last_node_result or {}, ensure_ascii=False)
-            if re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I):
-                if node_attempt < max_node_address_attempts:
+            address_failed = bool(re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I))
+            is_same_phone_retryable = bool(retryable_same_phone_pattern.search(result_hay)) or (
+                retry_on_any_failure
+                and bool(result_hay.strip())
+                and not address_failed
+                and not bool(hard_non_retry_pattern.search(result_hay))
+            )
+            if is_same_phone_retryable:
+                if node_attempt < max_node_attempts:
+                    _log(
+                        "      [node-rpa-full] 失败可重试，保留当前 PayPal 身份/手机号并重新拉取验证码 "
+                        f"({node_attempt + 1}/{max_node_attempts}): "
+                        f"{str(last_node_result.get('error') or '')[:160]}"
+                    )
+                    _five_sim_keep_for_retry(paypal_cfg)
                     continue
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(
+                        paypal_cfg,
+                        str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                        str(last_node_result.get("error") or "retry_exhausted")[:120],
+                    )
+                raise RuntimeError(
+                    "PayPal Node full-checkout 多次同手机号重试仍失败: "
+                    f"{str(last_node_result.get('error') or '')[:200]}"
+                )
+            if address_failed:
+                if node_attempt < max_node_attempts:
+                    reroll_address_next = True
+                    _five_sim_keep_for_retry(paypal_cfg)
+                    continue
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(
+                        paypal_cfg,
+                        str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                        str(last_node_result.get("error") or "address_validation_failed")[:120],
+                    )
                 raise RuntimeError(
                     "PayPal Node full-checkout 地址校验失败，已重试 "
-                    f"{max_node_address_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
+                    f"{max_node_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
+                )
+            if _paypal_uses_five_sim(paypal_cfg):
+                _five_sim_finalize_order(
+                    paypal_cfg,
+                    str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                    str(last_node_result.get("error") or "non_retryable_failure")[:120],
                 )
             raise RuntimeError("PayPal Node full-checkout 授权失败或超时")
         node_full_checkout_direct_success = True
