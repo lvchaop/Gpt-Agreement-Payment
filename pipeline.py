@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,22 @@ DOMAIN_STATE_KEY = "email_domain_state"
 DAEMON_STATE_KEY = "daemon_state"
 SECRETS_KEY = "secrets"
 RUNTIME_DB_FILE = OUTPUT_DIR / "webui.db"
+
+
+def _log_tag(name: str, log_context: str = "") -> str:
+    ctx = str(log_context or "").strip()
+    return f"[{name} {ctx}]" if ctx else f"[{name}]"
+
+
+def _thread_log_context(kind: str, idx: int | None = None, email: str = "") -> str:
+    parts = [f"tid={threading.get_ident()}"]
+    if kind:
+        parts.append(f"kind={kind}")
+    if idx is not None:
+        parts.append(f"idx={idx}")
+    if email:
+        parts.append(f"email={email}")
+    return " ".join(parts)
 
 
 # ──────────────────────────────────────────────
@@ -641,7 +658,8 @@ def _register_method_from_config(path: str) -> str:
 
 
 def register(cardw_config_path, proxy=None, python="python3", timeout=600,
-             browser: bool | None = None, register_method: str | None = None):
+             browser: bool | None = None, register_method: str | None = None,
+             log_context: str = ""):
     """注册一个新 ChatGPT 账号。
 
     注册路径优先级：显式 register_method > WEBUI_REG_METHOD/WEBUI_REG_MODE >
@@ -760,8 +778,10 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 
         pass
 
+    register_tag = _log_tag("register", log_context)
+    reg_tag = _log_tag("reg", log_context)
     cmd = [python, "-c", script, auth_bundle_dir, cardw_config_path]
-    print(f"[register] 注册新账号 (method={method}, config={os.path.basename(cardw_config_path)}) ...")
+    print(f"{register_tag} 注册新账号 (method={method}, config={os.path.basename(cardw_config_path)}) ...")
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -775,7 +795,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         for line in proc.stdout:
             line = line.rstrip("\n")
             lines.append(line)
-            print(f"  [reg] {line}")
+            print(f"  {reg_tag} {line}")
             if line.startswith("LOCALAUTH_RESULT_JSON="):
                 payload = line.split("=", 1)[1]
                 result_json = json.loads(payload)
@@ -793,14 +813,14 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         raise RegistrationError("注册完成但未获取到凭证")
 
     email = result_json.get("email", "?")
-    print(f"[register] 注册成功: {email}")
+    print(f"{register_tag} 注册成功: {email}")
     try:
         entry = dict(result_json)
         entry.setdefault("register_method", method)
         entry["ts"] = datetime.now(timezone.utc).isoformat()
         get_db().add_registered_account(entry)
     except Exception as e:
-        print(f"[register] 保存凭证失败: {e}")
+        print(f"{register_tag} 保存凭证失败: {e}")
     return result_json
 
 
@@ -877,7 +897,7 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, account_email: str = "", use_paypal=False, use_gopay=False,
         gopay_otp_file=None, python="python3", timeout=600,
-        proxy_stage_plan=None):
+        proxy_stage_plan=None, log_context: str = ""):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -897,6 +917,7 @@ def pay(card_config_path, session_token=None, access_token=None,
     config_to_use = card_config_path
     tmp_config = None
     stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    pay_tag = _log_tag("pay", log_context)
     if session_token or access_token or stage_plan.has_any():
         with open(card_config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -921,7 +942,7 @@ def pay(card_config_path, session_token=None, access_token=None,
             auth["auto_register"] = auto
         if stage_plan.has_any():
             apply_payment_proxy_plan(cfg, stage_plan)
-            print(f"[pay] 阶段代理: {_describe_stage_plan(stage_plan)}")
+            print(f"{pay_tag} 阶段代理: {_describe_stage_plan(stage_plan)}")
 
         tmp_config = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="pipeline_pay_",
@@ -956,7 +977,7 @@ def pay(card_config_path, session_token=None, access_token=None,
         if client_id:
             env["OAUTH_CODEX_CLIENT_ID"] = client_id
 
-    print(f"[pay] 启动支付 (mode={mode_label}) ...")
+    print(f"{pay_tag} 启动支付 (mode={mode_label}) ...")
 
     result_json = None
     datadome_slider = False
@@ -970,7 +991,7 @@ def pay(card_config_path, session_token=None, access_token=None,
         for line in proc.stdout:
             line = line.rstrip("\n")
             lines.append(line)
-            print(f"  [pay] {line}")
+            print(f"  {pay_tag} {line}")
             if line.startswith(result_marker):
                 payload = line.split("=", 1)[1]
                 result_json = json.loads(payload)
@@ -989,7 +1010,7 @@ def pay(card_config_path, session_token=None, access_token=None,
 
     if result_json:
         status = result_json.get("state", "unknown")
-        print(f"[pay] 结果: state={status}")
+        print(f"{pay_tag} 结果: state={status}")
         return {"status": status, "raw": result_json}
 
     if proc.returncode != 0:
@@ -1008,7 +1029,8 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
              timeout_reg=300, timeout_pay=600,
              pool=None, team_client=None, card_cfg=None, proxy_pool=None,
              proxy_stage_allocator=None, proxy_stage_plan=None,
-             register_method: str | None = None):
+             register_method: str | None = None,
+             log_context: str = ""):
     """全链路: 注册 → 支付 → (可选) gpt-team 导入探测 → 更新域池
     proxy_pool 非空时从 pool 挑代理，同时覆盖 CTF-reg + CTF-pay 两个 config 的 proxy 字段"""
     card_config_path = str(Path(card_config_path).resolve())
@@ -1063,7 +1085,12 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
         print(f"[pipeline] Step 1/2: 注册 ChatGPT 账号")
         print(f"{'='*60}")
         try:
-            reg = register(effective_cardw, timeout=timeout_reg, register_method=register_method)
+            reg = register(
+                effective_cardw,
+                timeout=timeout_reg,
+                register_method=register_method,
+                log_context=log_context,
+            )
             record["registration"] = {"status": "ok", "email": reg.get("email", "")}
         except RegistrationError as e:
             record["registration"] = {"status": "error", "error": str(e)[:200]}
@@ -1093,6 +1120,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 gopay_otp_file=gopay_otp_file,
                 timeout=timeout_pay,
                 proxy_stage_plan=stage_plan,
+                log_context=log_context,
             )
             record["payment"] = {
                 "status": pay_result.get("status", "unknown"),
@@ -1141,36 +1169,35 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
 def _run_one(args_tuple):
     """单个 pipeline 任务（供并行调度）"""
     idx, card_config_path, kwargs = args_tuple
+    log_context = _thread_log_context("batch", idx=idx)
+    thread_tag = _log_tag("thread", log_context)
     local_kwargs = dict(kwargs or {})
     paypal_batch = bool(local_kwargs.pop("_paypal_new_user_batch_config", False))
-    phone_allocator = local_kwargs.pop("_paypal_phone_index_allocator", None)
+    phone_lease_dir = str(local_kwargs.pop("_paypal_phone_lease_dir", "") or "")
     temp_card = None
     effective_card = card_config_path
-    phone_index = None
     try:
+        print(f"{thread_tag} start")
         if paypal_batch:
-            if phone_allocator is not None:
-                phone_index = phone_allocator.get()
             temp_card = _rewrite_paypal_new_user_batch_config(
                 card_config_path,
                 idx,
-                phone_index=phone_index,
+                phone_lease_dir=phone_lease_dir,
             )
             effective_card = temp_card
             # Keep the config object aligned with the temp file so downstream
             # helpers such as CPA/team plan readers see the same per-run data.
             local_kwargs["card_cfg"] = _read_card_cfg(temp_card)
+        local_kwargs["log_context"] = log_context
         r = pipeline(effective_card, **local_kwargs)
         r["batch_index"] = idx
+        status = r.get("payment", {}).get("status", r.get("status", "?"))
+        print(f"{thread_tag} done status={status}")
         return r
     except Exception as e:
+        print(f"{thread_tag} error={str(e)[:300]}")
         return {"batch_index": idx, "status": "error", "error": str(e)[:200]}
     finally:
-        if phone_allocator is not None and phone_index is not None:
-            try:
-                phone_allocator.put(phone_index)
-            except Exception:
-                pass
         if temp_card and os.path.exists(temp_card):
             try:
                 os.unlink(temp_card)
@@ -1181,9 +1208,11 @@ def _run_one(args_tuple):
 def _run_one_pay_only(args_tuple):
     """单个 pay-only 任务。并发时必须传入 target_email，避免多个 worker 抢同一账号。"""
     idx, card_config_path, kwargs, target_email = args_tuple
+    log_context = _thread_log_context("pay-only", idx=idx, email=target_email)
+    thread_tag = _log_tag("thread", log_context)
     local_kwargs = dict(kwargs or {})
     paypal_batch = bool(local_kwargs.pop("_paypal_new_user_batch_config", False))
-    phone_allocator = local_kwargs.pop("_paypal_phone_index_allocator", None)
+    phone_lease_dir = str(local_kwargs.pop("_paypal_phone_lease_dir", "") or "")
     use_paypal = bool(local_kwargs.get("use_paypal", False))
     use_gopay = bool(local_kwargs.get("use_gopay", False))
     gopay_otp_file = str(local_kwargs.get("gopay_otp_file") or "")
@@ -1191,15 +1220,13 @@ def _run_one_pay_only(args_tuple):
     proxy_stage_plan = local_kwargs.get("proxy_stage_plan")
     temp_card = None
     effective_card = card_config_path
-    phone_index = None
     try:
+        print(f"{thread_tag} start")
         if paypal_batch:
-            if phone_allocator is not None:
-                phone_index = phone_allocator.get()
             temp_card = _rewrite_paypal_new_user_batch_config(
                 card_config_path,
                 idx,
-                phone_index=phone_index,
+                phone_lease_dir=phone_lease_dir,
             )
             effective_card = temp_card
         plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
@@ -1211,11 +1238,14 @@ def _run_one_pay_only(args_tuple):
             prefer_recent=False,
             target_email=target_email,
             proxy_stage_plan=plan,
+            log_context=log_context,
         )
         r["batch_index"] = idx
         r["target_email"] = target_email
+        print(f"{thread_tag} done status={r.get('status', '?')}")
         return r
     except Exception as e:
+        print(f"{thread_tag} error={str(e)[:300]}")
         return {
             "batch_index": idx,
             "target_email": target_email,
@@ -1223,11 +1253,6 @@ def _run_one_pay_only(args_tuple):
             "error": str(e)[:500],
         }
     finally:
-        if phone_allocator is not None and phone_index is not None:
-            try:
-                phone_allocator.put(phone_index)
-            except Exception:
-                pass
         if temp_card and os.path.exists(temp_card):
             try:
                 os.unlink(temp_card)
@@ -1282,12 +1307,278 @@ def _json_pool_count(path: str) -> int:
         return 0
 
 
+def _json_pool_rows(path: str) -> tuple[list[dict], str]:
+    resolved = _resolve_repo_path(path)
+    if not resolved.exists() or not resolved.is_file():
+        return [], str(resolved)
+    raw = resolved.read_text(encoding="utf-8", errors="ignore").strip()
+    if not raw:
+        return [], str(resolved)
+    rows: list[dict] = []
+    if raw.startswith("["):
+        data = json.loads(raw)
+        if isinstance(data, list):
+            rows = [item for item in data if isinstance(item, dict)]
+        return rows, str(resolved)
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows, str(resolved)
+
+
 def _paypal_cfg_pool_count(paypal_cfg: dict, *keys: str, default: str = "") -> int:
     for key in keys:
         value = paypal_cfg.get(key)
         if value:
             return _json_pool_count(str(value))
     return _json_pool_count(default) if default else 0
+
+
+_PAYPAL_HERO_SMS_PROVIDERS = {"hero", "hero_sms", "smshub", "sms_hub", "sms_activate", "smsactivate"}
+
+
+def _paypal_sms_provider_from_cfg(paypal_cfg: dict) -> str:
+    return str(
+        paypal_cfg.get("sms_provider")
+        or paypal_cfg.get("smsProvider")
+        or paypal_cfg.get("provider")
+        or ""
+    ).strip().lower().replace("-", "_")
+
+
+def _paypal_uses_hero_sms_cfg(paypal_cfg: dict) -> bool:
+    provider = _paypal_sms_provider_from_cfg(paypal_cfg)
+    return provider in _PAYPAL_HERO_SMS_PROVIDERS
+
+
+def _paypal_phone_pool_file_from_cfg(paypal_cfg: dict) -> str:
+    return str(
+        paypal_cfg.get("phones_file")
+        or paypal_cfg.get("new_user_phones_file")
+        or paypal_cfg.get("phone_pool_file")
+        or "output/paypal_test_phones.jsonl"
+    )
+
+
+def _paypal_hero_sms_cfg(paypal_cfg: dict) -> dict:
+    cfg = paypal_cfg.get("hero_sms") or paypal_cfg.get("hero") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _paypal_hero_sms_api_key(paypal_cfg: dict) -> str:
+    hero_cfg = _paypal_hero_sms_cfg(paypal_cfg)
+    raw = str(
+        hero_cfg.get("api_key")
+        or hero_cfg.get("token")
+        or paypal_cfg.get("hero_sms_api_key")
+        or paypal_cfg.get("hero_api_key")
+        or ""
+    ).strip()
+    if raw:
+        return raw
+    env_name = str(
+        hero_cfg.get("api_key_env")
+        or hero_cfg.get("token_env")
+        or paypal_cfg.get("hero_sms_api_key_env")
+        or paypal_cfg.get("hero_api_key_env")
+        or "HERO_SMS_API_KEY"
+    ).strip()
+    return str(os.environ.get(env_name) or "").strip()
+
+
+def _paypal_hero_sms_base_url(paypal_cfg: dict) -> str:
+    hero_cfg = _paypal_hero_sms_cfg(paypal_cfg)
+    return str(
+        hero_cfg.get("base_url")
+        or paypal_cfg.get("hero_sms_base_url")
+        or "https://hero-sms.com/stubs/handler_api.php"
+    ).strip()
+
+
+def _paypal_hero_activation_id(row: dict) -> str:
+    for key in ("hero_lease_id", "hero_activation_id", "activation_id", "activationId", "lease_id", "leaseId", "id"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+class _HeroSmsSetStatusHeartbeat:
+    def __init__(
+        self,
+        *,
+        activation_ids: list[str],
+        base_url: str,
+        api_key: str,
+        status: str = "3",
+        interval_s: float = 5.0,
+        timeout_s: float = 10.0,
+        source_path: str = "",
+    ) -> None:
+        self.activation_ids = activation_ids
+        self.base_url = base_url.rstrip("?&")
+        self.api_key = api_key
+        self.status = str(status or "3")
+        self.interval_s = max(1.0, float(interval_s or 5.0))
+        self.timeout_s = max(1.0, float(timeout_s or 10.0))
+        self.source_path = source_path
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "_HeroSmsSetStatusHeartbeat":
+        if self._thread and self._thread.is_alive():
+            return self
+        self._thread = threading.Thread(
+            target=self._run,
+            name="hero-sms-set-status-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+        print(
+            "[hero-sms] setStatus heartbeat started "
+            f"ids={len(self.activation_ids)} interval={self.interval_s:g}s status={self.status} "
+            f"source={self.source_path or '-'}"
+        )
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        print("[hero-sms] setStatus heartbeat stopped")
+
+    def _url_for(self, activation_id: str) -> str:
+        import urllib.parse
+
+        query = urllib.parse.urlencode(
+            {
+                "action": "setStatus",
+                "api_key": self.api_key,
+                "id": activation_id,
+                "status": self.status,
+            }
+        )
+        sep = "&" if "?" in self.base_url else "?"
+        return f"{self.base_url}{sep}{query}"
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36",
+            "Accept": "text/plain,application/json,*/*",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._tick()
+            self._stop.wait(self.interval_s)
+
+    def _tick(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        ok_count = 0
+        fail_count = 0
+        for activation_id in self.activation_ids:
+            if self._stop.is_set():
+                break
+            try:
+                req = urllib.request.Request(self._url_for(activation_id), headers=self._headers(), method="GET")
+                with opener.open(req, timeout=self.timeout_s) as resp:
+                    body = resp.read(512).decode("utf-8", errors="ignore").strip()
+                    ok_count += 1
+                    print(
+                        "[hero-sms] setStatus "
+                        f"status={self.status} activation_id={activation_id} http={getattr(resp, 'status', '?')} "
+                        f"body={body[:120]}"
+                    )
+            except urllib.error.HTTPError as e:
+                fail_count += 1
+                try:
+                    body = e.read(512).decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    body = ""
+                body = body.replace(self.api_key, "***") if self.api_key else body
+                print(
+                    "[hero-sms] setStatus error "
+                    f"status={self.status} activation_id={activation_id}: "
+                    f"http={getattr(e, 'code', '?')} reason={getattr(e, 'reason', '')} body={body[:160]}"
+                )
+            except Exception as e:
+                fail_count += 1
+                msg = str(e).replace(self.api_key, "***") if self.api_key else str(e)
+                print(f"[hero-sms] setStatus error status={self.status} activation_id={activation_id}: {msg[:220]}")
+        if self.activation_ids:
+            print(
+                "[hero-sms] setStatus heartbeat tick "
+                f"ids={len(self.activation_ids)} ok={ok_count} fail={fail_count}"
+            )
+
+
+def _paypal_start_hero_set_status_heartbeat(card_cfg: dict) -> _HeroSmsSetStatusHeartbeat | None:
+    paypal_cfg = (card_cfg or {}).get("paypal") or {}
+    if not isinstance(paypal_cfg, dict):
+        return None
+    if not _is_paypal_new_user_batch_cfg(card_cfg):
+        return None
+    if not _paypal_uses_hero_sms_cfg(paypal_cfg):
+        return None
+
+    rows, source_path = _json_pool_rows(_paypal_phone_pool_file_from_cfg(paypal_cfg))
+    activation_ids: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        activation_id = _paypal_hero_activation_id(row)
+        if activation_id and activation_id not in seen:
+            seen.add(activation_id)
+            activation_ids.append(activation_id)
+    if not activation_ids:
+        print(f"[hero-sms] setStatus heartbeat skipped: {source_path} 没有 activation_id")
+        return None
+
+    api_key = _paypal_hero_sms_api_key(paypal_cfg)
+    if not api_key:
+        print("[hero-sms] setStatus heartbeat skipped: Hero SMS api_key 未配置")
+        return None
+
+    hero_cfg = _paypal_hero_sms_cfg(paypal_cfg)
+    interval_s = float(
+        hero_cfg.get("set_status_interval_s")
+        or hero_cfg.get("status_heartbeat_interval_s")
+        or paypal_cfg.get("hero_sms_set_status_interval_s")
+        or 5
+    )
+    timeout_s = float(hero_cfg.get("request_timeout_s") or paypal_cfg.get("hero_sms_request_timeout_s") or 10)
+    return _HeroSmsSetStatusHeartbeat(
+        activation_ids=activation_ids,
+        base_url=_paypal_hero_sms_base_url(paypal_cfg),
+        api_key=api_key,
+        status="3",
+        interval_s=interval_s,
+        timeout_s=timeout_s,
+        source_path=source_path,
+    ).start()
+
+
+def _create_paypal_phone_lease_dir(phone_count: int) -> str:
+    lease_root = Path(tempfile.mkdtemp(prefix="paypal_phone_leases_"))
+    available = lease_root / "available"
+    leased = lease_root / "leased"
+    available.mkdir(parents=True, exist_ok=True)
+    leased.mkdir(parents=True, exist_ok=True)
+    for phone_idx in range(max(0, int(phone_count or 0))):
+        (available / str(phone_idx)).write_text("", encoding="utf-8")
+    return str(lease_root)
 
 
 def _indexed_path(path: str, index: int) -> str:
@@ -1304,7 +1595,13 @@ def _indexed_path(path: str, index: int) -> str:
     return str(p.with_name(name))
 
 
-def _rewrite_paypal_new_user_batch_config(src_path: str, batch_index: int, *, phone_index: int | None = None) -> str:
+def _rewrite_paypal_new_user_batch_config(
+    src_path: str,
+    batch_index: int,
+    *,
+    phone_index: int | None = None,
+    phone_lease_dir: str = "",
+) -> str:
     with open(src_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     paypal_cfg = data.setdefault("paypal", {})
@@ -1319,7 +1616,11 @@ def _rewrite_paypal_new_user_batch_config(src_path: str, batch_index: int, *, ph
         "phone_pool_file",
         default="output/paypal_test_phones.jsonl",
     )
-    if phone_index is not None:
+    if phone_lease_dir:
+        paypal_cfg.pop("phone_index", None)
+        paypal_cfg["_batch_phone_lease_dir"] = str(phone_lease_dir)
+        paypal_cfg["_batch_index"] = batch_index
+    elif phone_index is not None:
         paypal_cfg["phone_index"] = int(phone_index)
     elif phone_count:
         paypal_cfg["phone_index"] = batch_index % phone_count
@@ -1351,7 +1652,7 @@ def _rewrite_paypal_new_user_batch_config(src_path: str, batch_index: int, *, ph
     print(
         "[batch:paypal-new-user] "
         f"idx={batch_index} "
-        f"phone_index={paypal_cfg.get('phone_index', '-')}"
+        f"phone_index={paypal_cfg.get('phone_index', 'deferred')}"
     )
     return tmp.name
 
@@ -1360,6 +1661,8 @@ def _register_one(args_tuple):
     """单个注册任务。args_tuple = (idx, cardw_config_path, pool_or_None, proxy_allocator, proxy_plan)
     pool 非空时为每个 worker 独立 pick 域 + 改写临时 cardw config。"""
     idx = args_tuple[0]
+    log_context = _thread_log_context("register", idx=idx)
+    thread_tag = _log_tag("thread", log_context)
     cardw_config_path = args_tuple[1]
     pool = args_tuple[2] if len(args_tuple) >= 3 else None
     proxy_stage_allocator = args_tuple[3] if len(args_tuple) >= 4 else None
@@ -1370,13 +1673,15 @@ def _register_one(args_tuple):
     temp_cardw = None
     effective = cardw_config_path
     try:
+        print(f"{thread_tag} start")
         if pool and (pool.domains or pool.provisioner):
             picked_domain = pool.pick()
             pool.mark_used(picked_domain)
         if picked_domain or stage_plan.register:
             temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, stage_plan.register, stage_plan)
             effective = temp_cardw
-        r = register(effective, register_method=register_method)
+        r = register(effective, register_method=register_method, log_context=log_context)
+        print(f"{thread_tag} done status=ok email={r.get('email', '?')}")
         return {
             **r,
             "index": idx,
@@ -1386,6 +1691,7 @@ def _register_one(args_tuple):
             "proxy_stage_plan": stage_plan.to_dict() if stage_plan.has_any() else {},
         }
     except Exception as e:
+        print(f"{thread_tag} error={str(e)[:300]}")
         return {
             "index": idx,
             "status": "error",
@@ -1418,7 +1724,8 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     card_cfg = _read_card_cfg(card_config_path)
     cardw_path = _load_cardw_path_from_card_cfg(card_cfg, kwargs.get("cardw_config_path"))
     paypal_new_user_batch = bool(use_paypal and _is_paypal_new_user_batch_cfg(card_cfg))
-    phone_allocator = None
+    phone_lease_dir = ""
+    hero_status_heartbeat: _HeroSmsSetStatusHeartbeat | None = None
 
     def _batch_run_kwargs():
         run_kwargs = dict(kwargs)
@@ -1426,13 +1733,13 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         run_kwargs["gopay_otp_file"] = gopay_otp_file
         if paypal_new_user_batch:
             run_kwargs["_paypal_new_user_batch_config"] = True
-            if phone_allocator is not None:
-                run_kwargs["_paypal_phone_index_allocator"] = phone_allocator
+            if phone_lease_dir:
+                run_kwargs["_paypal_phone_lease_dir"] = phone_lease_dir
         return run_kwargs
 
     def _ensure_paypal_new_user_allocator() -> None:
-        nonlocal phone_allocator
-        if not paypal_new_user_batch or phone_allocator is not None:
+        nonlocal phone_lease_dir
+        if not paypal_new_user_batch or phone_lease_dir:
             return
         paypal_cfg = (card_cfg.get("paypal") or {})
         phone_count = _paypal_cfg_pool_count(
@@ -1443,15 +1750,26 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
             default="output/paypal_test_phones.jsonl",
         )
         if phone_count:
-            from queue import Queue
-
-            phone_allocator = Queue()
-            for phone_idx in range(phone_count):
-                phone_allocator.put(phone_idx)
+            phone_lease_dir = _create_paypal_phone_lease_dir(phone_count)
         print(
             "[batch:paypal-new-user] 启用新用户并发分配: "
-            f"runtime_identity=yes phones={phone_count or '?'}"
+            f"runtime_identity=yes phones={phone_count or '?'} lease_dir={phone_lease_dir or '-'}"
         )
+
+    def _start_paypal_hero_status_heartbeat() -> None:
+        nonlocal hero_status_heartbeat
+        if not paypal_new_user_batch:
+            return
+        if hero_status_heartbeat is not None:
+            return
+        hero_status_heartbeat = _paypal_start_hero_set_status_heartbeat(card_cfg)
+
+    def _stop_paypal_hero_status_heartbeat() -> None:
+        nonlocal hero_status_heartbeat
+        if hero_status_heartbeat is None:
+            return
+        hero_status_heartbeat.stop()
+        hero_status_heartbeat = None
 
     # ── register-only batch：每次 register；workers>1 时并发
     if is_register_only:
@@ -1544,65 +1862,73 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     # ── pay-only batch：复用未付账号；workers>1 时先领取不同账号再并发
     if is_pay_only:
         if workers > 1:
-            _ensure_paypal_new_user_allocator()
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             accounts = _select_recent_registered_accounts_for_pay_only(count)
             if not accounts:
                 print("[batch] pay-only 没有可并发领取的未支付账号，回退串行 config/pay-only")
             else:
+                _ensure_paypal_new_user_allocator()
+                _start_paypal_hero_status_heartbeat()
                 if len(accounts) < count:
                     print(f"[batch] pay-only 可用未支付账号不足: requested={count} available={len(accounts)}")
                 task_count = len(accounts)
                 print(f"\n[batch] === pay-only × {task_count} 并发 workers={workers} ===")
-                tasks = [
-                    (i, card_config_path, _batch_run_kwargs(), accounts[i]["email"])
-                    for i in range(task_count)
-                ]
-                results = [None] * task_count
-                ok_count = 0
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {executor.submit(_run_one_pay_only, task): task[0] for task in tasks}
-                    for future in as_completed(futures):
-                        idx = futures[future]
-                        r = future.result()
-                        results[idx] = r
-                        if r.get("status") == "succeeded":
-                            ok_count += 1
-                        mark = "✓" if r.get("status") == "succeeded" else "✗"
-                        email = r.get("target_email") or accounts[idx].get("email") or "?"
-                        err = f" error={r.get('error', '')}" if r.get("status") != "succeeded" else ""
-                        done = sum(1 for item in results if item)
-                        print(f"[batch] {mark} pay-only [{done}/{task_count}] idx={idx} email={email}{err}")
-                results = [r for r in results if r is not None]
-                print(f"\n[batch] pay-only 完成: {ok_count}/{task_count} 成功")
-                return results
+                try:
+                    tasks = [
+                        (i, card_config_path, _batch_run_kwargs(), accounts[i]["email"])
+                        for i in range(task_count)
+                    ]
+                    results = [None] * task_count
+                    ok_count = 0
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {executor.submit(_run_one_pay_only, task): task[0] for task in tasks}
+                        for future in as_completed(futures):
+                            idx = futures[future]
+                            r = future.result()
+                            results[idx] = r
+                            if r.get("status") == "succeeded":
+                                ok_count += 1
+                            mark = "✓" if r.get("status") == "succeeded" else "✗"
+                            email = r.get("target_email") or accounts[idx].get("email") or "?"
+                            err = f" error={r.get('error', '')}" if r.get("status") != "succeeded" else ""
+                            done = sum(1 for item in results if item)
+                            print(f"[batch] {mark} pay-only [{done}/{task_count}] idx={idx} email={email}{err}")
+                    results = [r for r in results if r is not None]
+                    print(f"\n[batch] pay-only 完成: {ok_count}/{task_count} 成功")
+                    return results
+                finally:
+                    _stop_paypal_hero_status_heartbeat()
 
         print(f"\n[batch] === pay-only × {count} 串行 ===")
-        results = []
-        ok_count = 0
-        for i in range(count):
-            print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
-            try:
-                plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
-                r = pay_only(
-                    card_config_path,
-                    use_paypal=use_paypal, use_gopay=use_gopay,
-                    gopay_otp_file=gopay_otp_file,
-                    proxy_stage_plan=plan,
-                )
-                r["batch_index"] = i
-                if r.get("status") == "succeeded":
-                    ok_count += 1
-            except Exception as e:
-                r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
-                print(f"[batch] ✗ 支付异常: {e}")
-            results.append(r)
-            print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
-            if i < count - 1 and delay > 0:
-                time.sleep(delay)
-        print(f"\n[batch] pay-only 完成: {ok_count}/{count} 成功")
-        return results
+        _start_paypal_hero_status_heartbeat()
+        try:
+            results = []
+            ok_count = 0
+            for i in range(count):
+                print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
+                try:
+                    plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+                    r = pay_only(
+                        card_config_path,
+                        use_paypal=use_paypal, use_gopay=use_gopay,
+                        gopay_otp_file=gopay_otp_file,
+                        proxy_stage_plan=plan,
+                    )
+                    r["batch_index"] = i
+                    if r.get("status") == "succeeded":
+                        ok_count += 1
+                except Exception as e:
+                    r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
+                    print(f"[batch] ✗ 支付异常: {e}")
+                results.append(r)
+                print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
+                if i < count - 1 and delay > 0:
+                    time.sleep(delay)
+            print(f"\n[batch] pay-only 完成: {ok_count}/{count} 成功")
+            return results
+        finally:
+            _stop_paypal_hero_status_heartbeat()
     ts_cfg = card_cfg.get("team_system") or {}
     cd_h = int(ts_cfg.get("domain_cooldown_hours", 24))
     pool = _build_domain_pool_from_cardw(cardw_path, cd_h)
@@ -1624,6 +1950,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     kwargs.setdefault("proxy_pool", proxy_pool)
 
     _ensure_paypal_new_user_allocator()
+    _start_paypal_hero_status_heartbeat()
 
     if workers > 1 and use_paypal and not paypal_new_user_batch:
         # PayPal 模式：并行注册 → 串行支付（共用 PayPal 账号不能并行 2FA）
@@ -1748,6 +2075,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         print(f"\n[DomainPool] 最终状态:")
         for d, st, lr in pool.summary():
             print(f"   - {d:40s} status={st:8s} last={lr}")
+    _stop_paypal_hero_status_heartbeat()
     return results
 
 
@@ -1774,6 +2102,25 @@ _COUPON_INELIGIBLE_RE = re.compile(
 
 def _is_coupon_ineligible_error(text: str) -> bool:
     return bool(_COUPON_INELIGIBLE_RE.search(str(text or "")))
+
+
+def _normalize_plan_type(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if "team" in raw:
+        return "team"
+    if "pro" in raw and "plus" not in raw:
+        return "pro"
+    if "plus" in raw:
+        return "plus"
+    if "free" in raw:
+        return "free"
+    return raw[:40]
+
+
+def _is_paid_plan(value: str) -> bool:
+    return _normalize_plan_type(value) in {"plus", "team", "pro"}
 
 
 def _mark_account_coupon_ineligible(email: str, message: str = "") -> bool:
@@ -1863,6 +2210,8 @@ def _select_recent_registered_accounts_for_pay_only(limit: int) -> list[dict]:
         seen.add(email)
         if str(acc.get("last_check_status") or "").strip().lower() == "coupon_ineligible":
             continue
+        if _is_paid_plan(str(acc.get("last_plan_type") or "")):
+            continue
         if email in consumed:
             continue
         if not (acc.get("session_token") or acc.get("access_token")):
@@ -1877,7 +2226,8 @@ def _select_recent_registered_accounts_for_pay_only(limit: int) -> list[dict]:
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
              gopay_otp_file=None, timeout_pay=600, prefer_recent=True,
-             target_email: str = "", proxy_stage_plan=None):
+             target_email: str = "", proxy_stage_plan=None,
+             log_context: str = ""):
     """Retry payment only.
 
     Default behavior is now:
@@ -1890,17 +2240,19 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
     registered-but-unpaid accounts from being wasted.
     """
     if target_email:
+        pay_only_tag = _log_tag("pay-only", log_context)
         # 显式指定账号——不走 consumed 过滤，让用户对选中行操作（即使曾经付费过
         # 也允许重试，便于测试）。读不到时回退正常逻辑。
         target_norm = _norm_email(target_email)
         row = get_db().find_latest_registered_account(target_norm) or None
         if row:
             account = row
-            print(f"[pay-only] 使用指定账号: {target_norm}")
+            print(f"{pay_only_tag} 使用指定账号: {target_norm}")
         else:
-            print(f"[pay-only] ⚠ 指定账号 {target_norm} 在 DB 没找到，回退默认逻辑")
+            print(f"{pay_only_tag} ⚠ 指定账号 {target_norm} 在 DB 没找到，回退默认逻辑")
             account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
     else:
+        pay_only_tag = _log_tag("pay-only", log_context)
         account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
     email = _norm_email(account.get("email")) if account else ""
     try:
@@ -1909,14 +2261,14 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         card_cfg = {}
     if account:
         print(
-            "[pay-only] 复用最近未支付注册账号: "
+            f"{pay_only_tag} 复用最近未支付注册账号: "
             f"{email} "
             f"session_token={'yes' if account.get('session_token') else 'no'} "
             f"access_token={'yes' if account.get('access_token') else 'no'} "
             f"device_id={'yes' if account.get('device_id') else 'no'}"
         )
     else:
-        print("[pay-only] 未找到可复用注册账号，回退使用 config 里的 session_token/access_token")
+        print(f"{pay_only_tag} 未找到可复用注册账号，回退使用 config 里的 session_token/access_token")
 
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1939,6 +2291,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             gopay_otp_file=gopay_otp_file,
             timeout=timeout_pay,
             proxy_stage_plan=proxy_stage_plan,
+            log_context=log_context,
         )
         status = result.get("status", "unknown")
         raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
@@ -1959,9 +2312,9 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         err_text = str(e)
         if email and _is_coupon_ineligible_error(err_text):
             if _mark_account_coupon_ineligible(email, err_text):
-                print(f"[pay-only] 标记账号 coupon_ineligible: {email}")
+                print(f"{pay_only_tag} 标记账号 coupon_ineligible: {email}")
             else:
-                print(f"[pay-only] ⚠ 标记 coupon_ineligible 失败: {email}")
+                print(f"{pay_only_tag} ⚠ 标记 coupon_ineligible 失败: {email}")
         record["payment"] = {"status": "error", "email": email, "error": err_text[:500]}
         _append_result(record)
         raise
@@ -1972,7 +2325,8 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
 # ──────────────────────────────────────────────
 
 
-def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan=None) -> dict:
+def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan=None,
+                      session_id: str = "") -> dict:
     """对单个 email 跑 RT 交换：用 DB 里现有 password/session 走 Codex OAuth
     拿 refresh_token，写回 registered_accounts。不会付款不会改账号 plan。
     """
@@ -1986,7 +2340,10 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         return {"status": "no_account", "email": target}
 
     if account.get("refresh_token"):
-        print(f"[rt-only] {target} 已有 refresh_token (len={len(account['refresh_token'])}), 跳过")
+        rt = str(account.get("refresh_token") or "")
+        if session_id:
+            _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
+        print(f"[rt-only] {target} 已有 refresh_token (len={len(rt)}), 跳过")
         return {"status": "already_has_rt", "email": target}
 
     # 借 card.py 的 RT 交换函数。card.py top-level 副作用较大但只需 import 一次。
@@ -2066,6 +2423,8 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         if updated < 1:
             print(f"[rt-only] UPDATE 0 行（id={row_id}），写库未生效")
             return {"status": "update_zero", "email": target, "id": row_id}
+        if session_id:
+            _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
         print(f"[rt-only] ✅ {target} refresh_token 已写库 (len={len(rt)} id={row_id})")
         return {"status": "succeeded", "email": target, "refresh_token_len": len(rt), "id": row_id}
     except Exception as e:
@@ -2074,7 +2433,8 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
 
 
 def rt_only_targets(card_config_path: str, target_emails: list[str],
-                    proxy_stage_allocator=None, proxy_stage_plan=None) -> dict:
+                    proxy_stage_allocator=None, proxy_stage_plan=None,
+                    session_id: str = "") -> dict:
     """批量 RT-only：串行跑每个 email，汇总结果。"""
     results = []
     ok = 0
@@ -2085,7 +2445,7 @@ def rt_only_targets(card_config_path: str, target_emails: list[str],
         if not em:
             continue
         plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
-        r = rt_only_for_email(card_config_path, em, proxy_stage_plan=plan)
+        r = rt_only_for_email(card_config_path, em, proxy_stage_plan=plan, session_id=session_id)
         results.append(r)
         st = r.get("status", "")
         if st == "succeeded":
@@ -4497,6 +4857,8 @@ def main():
     parser.add_argument("--rt-only", action="store_true",
                         help="只对 --target-emails 跑 RT 交换：用现有 password/session "
                              "走 Codex OAuth 拿 refresh_token 写回 DB（不付款）")
+    parser.add_argument("--rt-session-id", default="",
+                        help="--rt-only 后补本次支付记录时使用的 checkout session_id")
     parser.add_argument("--proxy-mode", default="config",
                         choices=("config", "manual", "trojan-pool"),
                         help="代理来源：config=沿用配置，manual=使用 --proxy，trojan-pool=从 Trojan 池分配")
@@ -4583,6 +4945,7 @@ def main():
                 target_emails_list,
                 proxy_stage_allocator=proxy_stage_allocator,
                 proxy_stage_plan=proxy_stage_plan,
+                session_id=args.rt_session_id,
             )
             print(f"\n结果: ok={r['ok']} skip={r['skip']} fail={r['fail']}")
             return

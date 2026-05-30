@@ -13,6 +13,7 @@ Stripe Checkout 自动化支付脚本
 """
 
 import argparse
+import atexit
 import base64
 import glob
 import hashlib
@@ -5461,6 +5462,172 @@ def _paypal_read_phone_rows(path: str) -> tuple[list[dict], str]:
     return _paypal_read_json_rows(path, "PayPal 手机号池")
 
 
+def _paypal_phone_pool_file(paypal_cfg: dict) -> str:
+    return str(
+        paypal_cfg.get("phones_file")
+        or paypal_cfg.get("new_user_phones_file")
+        or paypal_cfg.get("phone_pool_file")
+        or "output/paypal_test_phones.jsonl"
+    )
+
+
+def _paypal_should_defer_phone_to_node_rpa(paypal_cfg: dict) -> bool:
+    return bool(paypal_cfg.get("_defer_phone_lease_to_node_rpa") and _paypal_phone_lease_dir(paypal_cfg))
+
+
+def _paypal_node_delayed_phone_payload(paypal_cfg: dict) -> dict:
+    lease_dir = _paypal_phone_lease_dir(paypal_cfg)
+    if not lease_dir:
+        return {}
+    rows, phone_path = _paypal_read_phone_rows(_paypal_phone_pool_file(paypal_cfg))
+    hero_cfg = _hero_sms_cfg(paypal_cfg) if _paypal_uses_hero_sms(paypal_cfg) else {}
+    return {
+        "leaseDir": lease_dir,
+        "rows": rows,
+        "sourcePath": phone_path,
+        "phoneCountry": str(
+            paypal_cfg.get("dial_code")
+            or paypal_cfg.get("phone_country")
+            or paypal_cfg.get("country")
+            or paypal_cfg.get("locale_country")
+            or "US"
+        ),
+        "smsProvider": _paypal_sms_provider(paypal_cfg),
+        "smsApiEnabled": _paypal_bool_cfg(paypal_cfg, "sms_api_enabled", default=True),
+        "manualOtp": _paypal_bool_cfg(paypal_cfg, "manual_otp", default=False),
+        "smsApiUrlTemplate": str(
+            paypal_cfg.get("sms_api_url_template")
+            or paypal_cfg.get("sms_url_template")
+            or paypal_cfg.get("otp_api_url_template")
+            or paypal_cfg.get("sms_api_url")
+            or paypal_cfg.get("otp_api_url")
+            or ""
+        ),
+        "smsApiKey": str(paypal_cfg.get("sms_api_key") or paypal_cfg.get("sms_key") or ""),
+        "smsApiKeyEnv": str(paypal_cfg.get("sms_api_key_env") or ""),
+        "heroSms": {
+            "baseUrl": str(hero_cfg.get("base_url") or paypal_cfg.get("hero_sms_base_url") or "https://hero-sms.com/stubs/handler_api.php"),
+            "apiKey": _hero_sms_api_key(paypal_cfg) if hero_cfg else "",
+            "apiKeyEnv": str(hero_cfg.get("api_key_env") or hero_cfg.get("token_env") or paypal_cfg.get("hero_sms_api_key_env") or "HERO_SMS_API_KEY"),
+            "smsApiUrlTemplate": str(
+                hero_cfg.get("sms_api_url_template")
+                or hero_cfg.get("sms_url_template")
+                or hero_cfg.get("otp_api_url_template")
+                or hero_cfg.get("sms_api_url")
+                or hero_cfg.get("otp_api_url")
+                or ""
+            ),
+        },
+    }
+
+
+_PAYPAL_PHONE_LEASES: list[dict] = []
+_PAYPAL_PHONE_LEASE_ATEXIT_REGISTERED = False
+
+
+def _paypal_phone_lease_dir(paypal_cfg: dict) -> str:
+    return str(
+        paypal_cfg.get("_batch_phone_lease_dir")
+        or paypal_cfg.get("phone_lease_dir")
+        or os.environ.get("PAYPAL_PHONE_LEASE_DIR")
+        or ""
+    ).strip()
+
+
+def _paypal_phone_lease_owner(paypal_cfg: dict) -> str:
+    owner = str(paypal_cfg.get("_batch_index") or os.environ.get("NCPP_WORKER_ID") or "").strip()
+    if not owner:
+        owner = f"pid-{os.getpid()}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", owner)[:80] or f"pid-{os.getpid()}"
+
+
+def _paypal_release_phone_lease(lease: dict) -> None:
+    path = str(lease.get("path") or "")
+    available_dir = str(lease.get("available_dir") or "")
+    raw_index = lease.get("index")
+    index = "" if raw_index is None else str(raw_index)
+    if not path or not available_dir or index == "":
+        return
+    try:
+        os.makedirs(available_dir, exist_ok=True)
+        target = os.path.join(available_dir, index)
+        if os.path.exists(path):
+            try:
+                os.replace(path, target)
+            except Exception:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+            _log(f"      [B-new] 释放 PayPal 手机号租约 phone_index={index}")
+    except Exception:
+        pass
+
+
+def _paypal_release_all_phone_leases() -> None:
+    while _PAYPAL_PHONE_LEASES:
+        _paypal_release_phone_lease(_PAYPAL_PHONE_LEASES.pop())
+
+
+def _paypal_register_phone_lease_cleanup() -> None:
+    global _PAYPAL_PHONE_LEASE_ATEXIT_REGISTERED
+    if _PAYPAL_PHONE_LEASE_ATEXIT_REGISTERED:
+        return
+    atexit.register(_paypal_release_all_phone_leases)
+    _PAYPAL_PHONE_LEASE_ATEXIT_REGISTERED = True
+
+
+def _paypal_acquire_delayed_phone_index(paypal_cfg: dict) -> None:
+    if isinstance(paypal_cfg.get("_batch_phone_lease"), dict):
+        paypal_cfg["phone_index"] = int(paypal_cfg["_batch_phone_lease"]["index"])
+        return
+    lease_dir = _paypal_phone_lease_dir(paypal_cfg)
+    if not lease_dir:
+        return
+    raw_index = paypal_cfg.get("phone_index")
+    if raw_index not in (None, "", "round_robin"):
+        return
+
+    available_dir = os.path.join(lease_dir, "available")
+    leased_dir = os.path.join(lease_dir, "leased")
+    os.makedirs(available_dir, exist_ok=True)
+    os.makedirs(leased_dir, exist_ok=True)
+    timeout_s = int(paypal_cfg.get("phone_lease_timeout_s") or os.environ.get("PAYPAL_PHONE_LEASE_TIMEOUT_S") or 1800)
+    deadline = time.time() + max(1, timeout_s)
+    owner = _paypal_phone_lease_owner(paypal_cfg)
+
+    while True:
+        try:
+            names = os.listdir(available_dir)
+        except Exception as e:
+            raise RuntimeError(f"PayPal 手机号租约池不可用: {available_dir}: {e}") from e
+        names = [name for name in names if re.fullmatch(r"\d+", name)]
+        names.sort(key=lambda item: int(item))
+        for name in names:
+            src = os.path.join(available_dir, name)
+            dst = os.path.join(leased_dir, f"{name}.{owner}.{uuid.uuid4().hex[:8]}")
+            try:
+                os.replace(src, dst)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+            lease = {
+                "index": int(name),
+                "path": dst,
+                "available_dir": available_dir,
+            }
+            paypal_cfg["_batch_phone_lease"] = lease
+            paypal_cfg["phone_index"] = int(name)
+            _PAYPAL_PHONE_LEASES.append(lease)
+            _paypal_register_phone_lease_cleanup()
+            _log(f"      [B-new] 填表前领取 PayPal 手机号租约 phone_index={name}")
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(f"PayPal 手机号租约等待超时: lease_dir={lease_dir}")
+        time.sleep(0.75)
+
+
 def _paypal_resolve_new_user_account(paypal_cfg: dict) -> dict:
     cached = paypal_cfg.get("_resolved_new_user_account")
     if isinstance(cached, dict):
@@ -5821,13 +5988,15 @@ def _hero_sms_status_url(paypal_cfg: dict) -> str:
     return _hero_sms_query(paypal_cfg, "getStatusV2", id=str(lease.get("lease_id")))
 
 
+def _hero_sms_set_status_after_otp_url(paypal_cfg: dict) -> str:
+    lease = paypal_cfg.get("_hero_sms_lease")
+    if not isinstance(lease, dict) or not lease.get("lease_id"):
+        return ""
+    return _hero_sms_query(paypal_cfg, "setStatus", id=str(lease.get("lease_id")), status="3")
+
+
 def _paypal_phone_pool_row(paypal_cfg: dict) -> tuple[dict, str]:
-    phones_file = (
-        paypal_cfg.get("phones_file")
-        or paypal_cfg.get("new_user_phones_file")
-        or paypal_cfg.get("phone_pool_file")
-        or "output/paypal_test_phones.jsonl"
-    )
+    phones_file = _paypal_phone_pool_file(paypal_cfg)
     rows, phone_path = _paypal_read_phone_rows(phones_file)
     if not rows:
         raise RuntimeError(f"PayPal 手机号池没有可用行: {phones_file}")
@@ -6916,11 +7085,45 @@ def _paypal_complete_new_user_checkout(
     raise RuntimeError("PayPal 新用户表单提交后未进入授权/同意页面")
 
 
-def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
-    """从 CF KV 取 OpenAI 登录 OTP（worker 已替代 IMAP→QQ 转发链路）。
+def _fetch_openai_login_otp(
+    target_email: str,
+    mail_cfg: dict | None = None,
+    timeout: int = 180,
+    issued_after: float | None = None,
+) -> str:
+    """取 OpenAI 登录 OTP。
 
-    返回空串表示超时或 KV 路径配置缺失，调用方按需 fallback。
+    统一从 CF KV 读。自定义邮箱列表模式只负责启动本地 IMAP relay，
+    由 relay 把 Outlook/Gmail 邮件里的 OTP 写入 KV。
     """
+    mail_cfg = mail_cfg if isinstance(mail_cfg, dict) else {}
+    mark_seen = str(mail_cfg.get("mark_seen", "")).strip().lower() in ("1", "true", "yes", "y", "on")
+    mode = str(mail_cfg.get("mode") or "").strip().lower()
+    if mode == "imap_list":
+        try:
+            from mail_provider import MailProvider
+            provider = MailProvider(
+                str(mail_cfg.get("catch_all_domain") or ""),
+                mode="imap_list",
+                otp_timeout=timeout,
+                mark_seen=mark_seen,
+            )
+            _log(
+                f"      [RT-OTP] 启动 IMAP relay 写入 CF KV，主流程轮询 KV "
+                f"email={target_email} timeout={timeout}s"
+            )
+            return provider.wait_for_otp(
+                target_email,
+                timeout=timeout,
+                issued_after=issued_after,
+            )
+        except TimeoutError:
+            _log(f"      [RT-OTP] IMAP relay → CF KV 等 OTP 超时 {timeout}s email={target_email}")
+            return ""
+        except Exception as e:
+            _log(f"      [RT-OTP] IMAP relay/CF KV 取 OTP 失败: {e}")
+            return ""
+
     try:
         from cf_kv_otp_provider import CloudflareKVOtpProvider
     except ImportError as e:
@@ -6928,7 +7131,8 @@ def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
         return ""
     try:
         provider = CloudflareKVOtpProvider.from_env_or_secrets()
-        return provider.wait_for_otp(target_email, timeout=timeout)
+        _log(f"      [RT-OTP] 从 CF KV 读取邮箱验证码 email={target_email} timeout={timeout}s")
+        return provider.wait_for_otp(target_email, timeout=timeout, issued_after=issued_after)
     except TimeoutError:
         _log(f"      [RT-OTP] CF KV 等 OTP 超时 {timeout}s")
         return ""
@@ -6979,7 +7183,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
       1. Camoufox 打开 Codex authorize URL
       2. 重定向到 auth.openai.com/log-in
       3. 填邮箱 → 继续 → 填密码 → 继续
-      4. 可能触发 Turnstile (Camoufox 自动过) / OTP (IMAP 取)
+      4. 可能触发 Turnstile (Camoufox 自动过) / OTP (邮箱 IMAP 或 CF KV 取)
       5. workspace/select (选择默认 workspace)
       6. 自动 authorize Codex client → localhost callback
       7. POST /oauth/token 换 refresh_token
@@ -7071,6 +7275,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             _log(f"      [RT] 当前 URL: {page.url[:120]}")
 
             # [2] 填邮箱
+            otp_sent_ts = time.time()
             try:
                 page.wait_for_selector('input[type="email"], input[name="email"]',
                                        state="visible", timeout=20000)
@@ -7082,6 +7287,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 for sel in ['button[type="submit"]', 'button:has-text("Continue")', '#btnNext']:
                     b = page.query_selector(sel)
                     if b and b.is_visible():
+                        otp_sent_ts = time.time()
                         b.click()
                         _log("      [RT] 邮箱提交")
                         break
@@ -7113,7 +7319,6 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             _safe_screenshot(page, "/tmp/rt_after_pwd.png")
             # 最长等 4 分钟看能不能到 localhost callback
             end = time.time() + 240
-            otp_sent_ts = time.time()
             otp_fetched = False
             last_url = ""
             last_log_ts = 0.0
@@ -7135,8 +7340,14 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     page.query_selector('input[autocomplete="one-time-code"]') or
                     page.query_selector('input[inputmode="numeric"]')):
                     if not otp_fetched:
-                        _log("      [RT] 检测到 OTP 页面，从 IMAP 取验证码 ...")
-                        otp_code = _fetch_openai_login_otp(target_email=email, timeout=180)
+                        _log("      [RT] 检测到 OTP 页面，从邮箱/CF KV 取验证码 ...")
+                        otp_timeout = int((mail_cfg or {}).get("otp_timeout") or 180)
+                        otp_code = _fetch_openai_login_otp(
+                            target_email=email,
+                            mail_cfg=mail_cfg,
+                            timeout=otp_timeout,
+                            issued_after=otp_sent_ts,
+                        )
                         if not otp_code:
                             _log("      [RT] OTP 获取超时")
                             return ""
@@ -8579,15 +8790,18 @@ def _paypal_signup_payloads(paypal_cfg: dict, account: dict, payment_card: dict 
     address = _paypal_resolve_new_user_address(paypal_cfg, account, payment_card)
     if address.get("country"):
         country = str(address["country"]).upper()
-    phone_row = _paypal_resolve_new_user_phone(paypal_cfg, account)
-    phone_country = str(
-        phone_row.get("dial_code")
-        or phone_row.get("country")
-        or paypal_cfg.get("dial_code")
-        or paypal_cfg.get("phone_country")
-        or country
-    ).strip()
-    phone = _paypal_phone_e164(phone_row["phone"], phone_country)
+    phone = ""
+    if not _paypal_should_defer_phone_to_node_rpa(paypal_cfg):
+        _paypal_acquire_delayed_phone_index(paypal_cfg)
+        phone_row = _paypal_resolve_new_user_phone(paypal_cfg, account)
+        phone_country = str(
+            phone_row.get("dial_code")
+            or phone_row.get("country")
+            or paypal_cfg.get("dial_code")
+            or paypal_cfg.get("phone_country")
+            or country
+        ).strip()
+        phone = _paypal_phone_e164(phone_row["phone"], phone_country)
     card = _paypal_resolve_new_user_card(paypal_cfg, account, payment_card)
     signup_card = None
     if card.get("number"):
@@ -8760,6 +8974,7 @@ def _paypal_signup_node_rpa(
     profile_dir = tempfile.mkdtemp(prefix="paypal_node_rpa_")
     keep_profile = _paypal_bool_cfg(paypal_cfg, "keep_node_rpa_profile", default=False) or bool(os.environ.get("PPS_PAYPAL_KEEP_PROFILE"))
     five_sim_payload = _five_sim_payload(paypal_cfg)
+    delayed_phone_payload = _paypal_node_delayed_phone_payload(paypal_cfg)
     worker_id = (
         os.environ.get("NCPP_WORKER_ID")
         or str(paypal_cfg.get("node_rpa_worker_id") or "")
@@ -8794,7 +9009,9 @@ def _paypal_signup_node_rpa(
         "fiveSim": five_sim_payload,
         "deferFiveSimFinalize": bool(five_sim_payload),
         "smsApiUrl": sms_api_url or "",
+        "heroSmsSetStatusUrl": _hero_sms_set_status_after_otp_url(paypal_cfg) if _paypal_uses_hero_sms(paypal_cfg) else "",
         "manualOtpFile": "" if (sms_api_url or five_sim_payload) else (manual_otp_file or ""),
+        "delayedPhone": delayed_phone_payload,
         "networkCapture": _paypal_bool_cfg(paypal_cfg, "node_rpa_network_capture", default=False),
         "networkCapturePath": f"{tmp_base}_network_capture.jsonl",
         "expectedDueCents": int(expected_due_cents or 0),
@@ -8803,8 +9020,14 @@ def _paypal_signup_node_rpa(
         "otpResendAttempts": int(paypal_cfg.get("otp_resend_attempts") or paypal_cfg.get("sms_resend_attempts") or 0),
         "fallbackConsentDelayMs": int(
             paypal_cfg.get("fallback_consent_delay_ms")
-            or os.environ.get("PPS_PAYPAL_FALLBACK_CONSENT_DELAY_MS")
-            or 12000
+            if paypal_cfg.get("fallback_consent_delay_ms") is not None
+            else (os.environ.get("PPS_PAYPAL_FALLBACK_CONSENT_DELAY_MS") or 0)
+        ),
+        "consentClickTimeoutMs": int(
+            paypal_cfg.get("consent_click_timeout_ms")
+            or paypal_cfg.get("paypal_consent_click_timeout_ms")
+            or os.environ.get("PPS_PAYPAL_CONSENT_CLICK_TIMEOUT_MS")
+            or 30000
         ),
         "headless": bool(paypal_cfg.get("node_rpa_headless") or paypal_cfg.get("browser_rpa_headless")),
         "profileDir": profile_dir,
@@ -8868,7 +9091,7 @@ def _paypal_signup_node_rpa(
             if payload.get("fullCheckout")
             else "      [node-rpa] 启动 Node/Chromium PayPal RPA "
         )
-        + f"card=****{card_number[-4:]} phone={str(phone)[-4:].rjust(len(str(phone)), '*')} "
+        + f"card=****{card_number[-4:]} phone={str(phone)[-4:].rjust(len(str(phone)), '*') if phone else 'deferred'} "
         f"otp={'5sim' if five_sim_payload else ('sms_api' if sms_api_url else 'portal')} headless={payload['headless']}"
     )
     if payload.get("networkCapture"):
@@ -9144,8 +9367,16 @@ def _paypal_signup_no_card(
     account = account or _paypal_resolve_new_user_account(paypal_cfg)
     address = _paypal_resolve_new_user_address(paypal_cfg, account, payment_card)
     persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, payment_card)
+    defer_phone_to_node = (
+        (_paypal_bool_cfg(paypal_cfg, "node_rpa", default=False) or _paypal_bool_cfg(paypal_cfg, "browser_rpa", default=False))
+        and bool(_paypal_phone_lease_dir(paypal_cfg))
+    )
+    if defer_phone_to_node:
+        paypal_cfg["_defer_phone_lease_to_node_rpa"] = True
+    else:
+        paypal_cfg.pop("_defer_phone_lease_to_node_rpa", None)
     phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, payment_card)
-    if not phone:
+    if not phone and not defer_phone_to_node:
         _log("      [signup_no_card] 缺少手机号")
         paypal_cfg["_last_paypal_failure_reason"] = "signup_no_card 缺少手机号"
         return False
@@ -9291,6 +9522,9 @@ def _paypal_signup_no_card(
     else:
         env_updates["PPS_SMS_API_URL"] = ""
         env_updates["PPS_PAYPAL_MANUAL_OTP_FILE"] = manual_otp_file
+    hero_set_status_url = _hero_sms_set_status_after_otp_url(paypal_cfg) if _paypal_uses_hero_sms(paypal_cfg) else ""
+    if hero_set_status_url:
+        env_updates["PPS_PAYPAL_HERO_SET_STATUS_URL"] = hero_set_status_url
     if captcha_api_key:
         env_updates["PPS_PAYPAL_CAPTCHA_API_KEY"] = captcha_api_key
         env_updates["PPS_PAYPAL_CAPTCHA_CLIENT_KEY"] = captcha_api_key
@@ -11085,6 +11319,13 @@ def run(
         if not card.get("email"):
             card["email"] = _gen_email()
 
+    fresh_cfg = cfg.get("fresh_checkout") or {}
+    fresh_auth_cfg = fresh_cfg.get("auth") or {}
+    chatgpt_account_email = str(
+        fresh_cfg.get("_chatgpt_email") or fresh_auth_cfg.get("email") or ""
+    ).strip()
+    payment_contact_email = chatgpt_account_email or str(card.get("email") or "").strip()
+
     locale_key = cfg.get("locale", addr.get("country", "US")).upper()
     locale_profile = LOCALE_PROFILES.get(locale_key, LOCALE_PROFILES["US"])
     _log(f"  地域: {locale_key} (tz={locale_profile['browser_timezone']}, lang={locale_profile['browser_locale']})")
@@ -11097,10 +11338,14 @@ def run(
             _log(f"  PayPal 新用户邮箱: {_paypal_checkout_email(paypal_cfg, pp_account)}")
         else:
             _log(f"  PayPal 账号: {paypal_cfg['email']}")
+        if chatgpt_account_email:
+            _log(f"  ChatGPT 账号邮箱: {chatgpt_account_email}")
+        if payment_contact_email:
+            _log(f"  Stripe 联系邮箱: {payment_contact_email}")
     else:
         _log(f"  Stripe 自动化支付")
         _log(f"  使用卡: ****{card['number'][-4:]}  ({card['name']})")
-    _log(f"  邮箱: {card['email']}")
+        _log(f"  邮箱: {card['email']}")
     _log(f"  地址: {addr.get('line1', '')} ({addr.get('country', '')})")
     _log(f"  配置文件: {resolved_config_path}")
     _log(f"{'='*60}\n")
@@ -11155,11 +11400,14 @@ def run(
             reg_guid, reg_muid, reg_sid = register_fingerprint(http)
 
     effective_checkout_input = checkout_input
-    fresh_cfg = cfg.get("fresh_checkout") or {}
     fresh_info = None
     if _should_generate_fresh_checkout(checkout_input, force_fresh):
         fresh_info = generate_fresh_checkout(http, cfg, locale_profile=locale_profile)
         effective_checkout_input = fresh_info["url"]
+        fresh_generated_email = str(fresh_cfg.get("_chatgpt_email") or "").strip()
+        if fresh_generated_email:
+            chatgpt_account_email = chatgpt_account_email or fresh_generated_email
+            payment_contact_email = fresh_generated_email
         if fresh_only:
             _log(f"\n日志已保存到: {LOG_FILE}")
             print(fresh_info["url"])
@@ -11257,11 +11505,6 @@ def run(
 
         retryable_same_phone_pattern = re.compile(
             r"paypal_datadome_blocked|PayPal OTP timeout|node_rpa_timeout|timeout|"
-            r"paypal_fallback_missing_agree_continue_retry_new_paypal_account|"
-            r"paypal_no_interaction_after_pay_with_card_retry_new_paypal_account|"
-            r"paypal_onboarding_email_stuck_retry_new_paypal_account|"
-            r"paypal_legacy_start_onboarding_stuck_retry_new_paypal_account|"
-            r"paypal_billing_missing_agree_continue_retry_new_paypal_account|"
             r"paypal_generic_error_after_agree_continue|"
             r"smsApiUrl/manualOtpFile/fiveSim missing|"
             r"PayPal Node full-checkout 授权失败或超时",
@@ -11273,15 +11516,35 @@ def run(
         )
 
         last_node_result = {}
+        used_paypal_new_user_emails: set[str] = set()
         for node_attempt in range(1, max_node_attempts + 1):
             if node_attempt > 1:
                 _log(f"      [node-rpa-full] 重试 PayPal 新用户流程 ({node_attempt}/{max_node_attempts})")
-            account = _paypal_resolve_new_user_account(paypal_cfg)
-            address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
-            persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
+            for identity_guard_attempt in range(3):
+                account = _paypal_resolve_new_user_account(paypal_cfg)
+                address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
+                persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
+                attempt_email = str(getattr(persona, "email", "") or "").strip().lower()
+                if not attempt_email or attempt_email not in used_paypal_new_user_emails:
+                    break
+                _log(
+                    "      [node-rpa-full] 检测到 PayPal 新用户邮箱重复，强制重建身份 "
+                    f"email={attempt_email} guard={identity_guard_attempt + 1}/3"
+                )
+                _clear_paypal_new_user_runtime()
+            else:
+                raise RuntimeError("PayPal 新用户邮箱重复生成，拒绝继续复用同一邮箱")
+            if attempt_email:
+                used_paypal_new_user_emails.add(attempt_email)
+            defer_phone_to_node = bool(_paypal_phone_lease_dir(paypal_cfg))
+            if defer_phone_to_node:
+                paypal_cfg["_defer_phone_lease_to_node_rpa"] = True
+            else:
+                paypal_cfg.pop("_defer_phone_lease_to_node_rpa", None)
             phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, card)
-            if not phone:
+            if not phone and not defer_phone_to_node:
                 raise RuntimeError("PayPal Node full-checkout 缺少手机号")
+            _log(f"      [node-rpa-full] PayPal 新用户尝试身份 email={getattr(persona, 'email', '')}")
             sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
             manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
             otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
@@ -11292,7 +11555,7 @@ def run(
                     checkout_url=browser_checkout_url or stripe_checkout_url,
                     full_checkout=True,
                     expected_due_cents=expected_due_cents,
-                    stripe_email=str(card.get("email") or ""),
+                    stripe_email=payment_contact_email,
                     paypal_cfg=paypal_cfg,
                     proxy_url=proxy_url or "",
                     phone=phone,
@@ -11330,13 +11593,14 @@ def run(
                 result_hay,
                 re.I,
             )
-            is_same_phone_retryable = bool(retryable_same_phone_pattern.search(result_hay)) or (
-                retry_on_any_failure
-                and bool(result_hay.strip())
-                and not address_failed
-                and not funding_rejected
-                and not reroll_new_account
-                and not bool(hard_non_retry_pattern.search(result_hay))
+            is_same_phone_retryable = (not reroll_new_account) and (
+                bool(retryable_same_phone_pattern.search(result_hay)) or (
+                    retry_on_any_failure
+                    and bool(result_hay.strip())
+                    and not address_failed
+                    and not funding_rejected
+                    and not bool(hard_non_retry_pattern.search(result_hay))
+                )
             )
             if is_same_phone_retryable:
                 if node_attempt < max_node_attempts:
@@ -11419,6 +11683,98 @@ def run(
             )
         raise RuntimeError("PayPal Node full-checkout 授权失败或超时")
 
+    def _collect_post_payment_extra(result: dict, result_state: str, chatgpt_email: str) -> dict:
+        extra_info = {}
+        try:
+            ru = ""
+            if isinstance(result, dict):
+                ru = str(result.get("return_url") or result.get("returnUrl") or "")
+            if ru:
+                import urllib.parse as _up
+                qs = _up.parse_qs(_up.urlparse(ru).query)
+                aid = (qs.get("account_id") or [""])[0]
+                if aid:
+                    extra_info["team_account_id"] = aid
+        except Exception:
+            pass
+
+        if (
+            result_state == "succeeded"
+            and _is_probable_email(chatgpt_email)
+            and str(os.environ.get("SKIP_PAY_RT_EXCHANGE", "")).strip().lower() not in ("1", "true", "yes", "on")
+        ):
+            try:
+                import os as _os
+                _account = {}
+                try:
+                    _account = get_db().find_latest_registered_account(chatgpt_email) or {}
+                except Exception:
+                    _account = {}
+
+                existing_rt = str(_account.get("refresh_token") or "").strip()
+                if existing_rt:
+                    extra_info["refresh_token"] = existing_rt
+                    _log(f"      [RT] 复用数据库已有 refresh_token 长度={len(existing_rt)}，跳过重新登录")
+                    return extra_info
+
+                _mail_cfg = {}
+                reg_cfg_path = _os.path.join(
+                    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                    "CTF-reg", "config.paypal-proxy.json",
+                )
+                if _os.path.exists(reg_cfg_path):
+                    try:
+                        with open(reg_cfg_path, "r", encoding="utf-8") as rf:
+                            _reg_cfg = json.load(rf)
+                        _mail_cfg = _reg_cfg.get("mail", {}) or {}
+                    except Exception as e:
+                        _log(f"      [RT] 读取 mail 配置失败: {e}")
+
+                if not _mail_cfg:
+                    _log("      [RT] 缺少 mail_cfg，跳过（无邮件渠道接 OTP）")
+                    return extra_info
+
+                pipeline_py = _os.path.join(_REPO_DIR, "pipeline.py")
+                rt_log = _os.path.join(_OUTPUT_DIR, "logs", "rt_backfill.log")
+                cmd = [
+                    sys.executable,
+                    pipeline_py,
+                    "--config",
+                    resolved_config_path,
+                    "--rt-only",
+                    "--target-emails",
+                    chatgpt_email,
+                    "--rt-session-id",
+                    session_id,
+                ]
+                if proxy_url:
+                    cmd.extend(["--proxy-mode", "manual", "--proxy", proxy_url])
+                try:
+                    log_fd = open(rt_log, "a", encoding="utf-8")
+                    log_fd.write(
+                        f"\n[{datetime.now().isoformat()}] post-payment RT backfill "
+                        f"email={chatgpt_email} session_id={session_id}\n"
+                    )
+                    log_fd.flush()
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=_REPO_DIR,
+                        stdout=log_fd,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    log_fd.close()
+                    _log(f"      [RT] 已启动后台 refresh_token 补全 pid={proc.pid} log={rt_log}")
+                except Exception as e:
+                    _log(f"      [RT] 启动后台补全失败: {e}")
+            except Exception as e:
+                _log(f"      [RT] 获取异常: {e}")
+        elif result_state == "succeeded" and chatgpt_email and not _is_probable_email(chatgpt_email):
+            _log(f"      [RT] 跳过: ChatGPT 邮箱无效 ({chatgpt_email!r})")
+
+        return extra_info
+
     while True:
         init_attempt += 1
         _log("[1/6] 解析 checkout session ID ...")
@@ -11446,26 +11802,51 @@ def run(
                 browser_checkout_url=browser_checkout_url,
             )
             chatgpt_email = fresh_cfg.get("_chatgpt_email", card.get("email", ""))
-            extra_info = {}
-            try:
-                ru = result.get("return_url", "") if isinstance(result, dict) else ""
-                if ru:
-                    import urllib.parse as _up
-                    qs = _up.parse_qs(_up.urlparse(ru).query)
-                    aid = (qs.get("account_id") or [""])[0]
-                    if aid:
-                        extra_info["team_account_id"] = aid
-            except Exception:
-                pass
-            _record_result(
-                status=result.get("state", "unknown"),
-                chatgpt_email=chatgpt_email,
-                session_id=session_id,
-                payment_channel="paypal",
-                processor_entity=str((fresh_info or {}).get("processor_entity") or ""),
-                config_path=resolved_config_path,
-                extra=extra_info if extra_info else None,
-            )
+            if result.get("state") == "succeeded" and _paypal_bool_cfg(paypal_cfg, "node_rpa_poll_after_success", default=True):
+                try:
+                    _log("      PayPal Node full-checkout 完成，继续 poll Stripe 结果 ...")
+                    poll_pk = str((fresh_info or {}).get("publishable_key") or "").strip()
+                    if not poll_pk:
+                        with _http_session_stage_proxy(http, stage_proxy_cfg, "fetch_publishable_key"):
+                            poll_pk = fetch_publishable_key(http, session_id, stripe_checkout_url)
+                    with _http_session_stage_proxy(http, stage_proxy_cfg, "poll"):
+                        polled = poll_result(http, poll_pk, session_id, STRIPE_VERSION_BASE)
+                    if isinstance(polled, dict):
+                        polled.setdefault("paypal_node_result", result.get("paypal_node_result") or {})
+                        result = polled
+                except Exception as e:
+                    _log(f"      [node-rpa-full] poll Stripe 结果失败，保留浏览器成功结果: {e}")
+            result_state = result.get("state", "unknown")
+            processor_entity = str((fresh_info or {}).get("processor_entity") or "")
+            success_recorded_before_rt = False
+            if result_state == "succeeded":
+                _record_result(
+                    status=result_state,
+                    chatgpt_email=chatgpt_email,
+                    session_id=session_id,
+                    payment_channel="paypal",
+                    processor_entity=processor_entity,
+                    config_path=resolved_config_path,
+                )
+                success_recorded_before_rt = True
+
+            extra_info = _collect_post_payment_extra(result, result_state, chatgpt_email)
+            if success_recorded_before_rt:
+                if extra_info:
+                    try:
+                        get_db().augment_card_result_last_match(chatgpt_email, session_id, extra_info)
+                    except Exception:
+                        pass
+            else:
+                _record_result(
+                    status=result_state,
+                    chatgpt_email=chatgpt_email,
+                    session_id=session_id,
+                    payment_channel="paypal",
+                    processor_entity=processor_entity,
+                    config_path=resolved_config_path,
+                    extra=extra_info if extra_info else None,
+                )
             _log(f"\n日志已保存到: {LOG_FILE}")
             return result
 
@@ -11995,11 +12376,6 @@ def run(
         max_node_attempts = max(1, same_phone_attempts if retry_on_any_failure else base_node_attempts)
         retryable_same_phone_pattern = re.compile(
             r"paypal_datadome_blocked|PayPal OTP timeout|node_rpa_timeout|timeout|"
-            r"paypal_fallback_missing_agree_continue_retry_new_paypal_account|"
-            r"paypal_no_interaction_after_pay_with_card_retry_new_paypal_account|"
-            r"paypal_onboarding_email_stuck_retry_new_paypal_account|"
-            r"paypal_legacy_start_onboarding_stuck_retry_new_paypal_account|"
-            r"paypal_billing_missing_agree_continue_retry_new_paypal_account|"
             r"paypal_generic_error_after_agree_continue|"
             r"smsApiUrl/manualOtpFile/fiveSim missing|"
             r"PayPal Node full-checkout 授权失败或超时",
@@ -12009,8 +12385,19 @@ def run(
             r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号",
             re.I,
         )
+
+        def _clear_paypal_new_user_runtime_direct() -> None:
+            for key in (
+                "_resolved_new_user_account",
+                "_generated_new_user_email",
+                "_generated_new_user_password",
+                "_resolved_meiguodizhi_address",
+            ):
+                paypal_cfg.pop(key, None)
+
         last_node_result = {}
         reroll_address_next = False
+        used_paypal_new_user_emails: set[str] = set()
         for node_attempt in range(1, max_node_attempts + 1):
             if node_attempt > 1:
                 if reroll_address_next:
@@ -12025,12 +12412,31 @@ def run(
                         "      [node-rpa-full] 重试 PayPal 新用户流程，保留当前手机号并重新拉取验证码 "
                         f"({node_attempt}/{max_node_attempts})"
                     )
-            account = _paypal_resolve_new_user_account(paypal_cfg)
-            address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
-            persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
+            for identity_guard_attempt in range(3):
+                account = _paypal_resolve_new_user_account(paypal_cfg)
+                address = _paypal_resolve_new_user_address(paypal_cfg, account, card)
+                persona = _paypal_protocol_persona(pps, paypal_cfg, account, address, card)
+                attempt_email = str(getattr(persona, "email", "") or "").strip().lower()
+                if not attempt_email or attempt_email not in used_paypal_new_user_emails:
+                    break
+                _log(
+                    "      [node-rpa-full] 检测到 PayPal 新用户邮箱重复，强制重建身份 "
+                    f"email={attempt_email} guard={identity_guard_attempt + 1}/3"
+                )
+                _clear_paypal_new_user_runtime_direct()
+            else:
+                raise RuntimeError("PayPal 新用户邮箱重复生成，拒绝继续复用同一邮箱")
+            if attempt_email:
+                used_paypal_new_user_emails.add(attempt_email)
+            defer_phone_to_node = bool(_paypal_phone_lease_dir(paypal_cfg))
+            if defer_phone_to_node:
+                paypal_cfg["_defer_phone_lease_to_node_rpa"] = True
+            else:
+                paypal_cfg.pop("_defer_phone_lease_to_node_rpa", None)
             phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, card)
-            if not phone:
+            if not phone and not defer_phone_to_node:
                 raise RuntimeError("PayPal Node full-checkout 缺少手机号")
+            _log(f"      [node-rpa-full] PayPal 新用户尝试身份 email={getattr(persona, 'email', '')}")
             sms_api_url = _paypal_sms_api_url(paypal_cfg, phone)
             manual_otp_file = _paypal_project_path(str(paypal_cfg.get("manual_otp_file") or "output/paypal_new_user_otp.txt"))
             otp_timeout = int(paypal_cfg.get("manual_otp_timeout_s") or paypal_cfg.get("sms_otp_timeout_s") or paypal_cfg.get("otp_timeout_s") or 600)
@@ -12041,7 +12447,7 @@ def run(
                     checkout_url=str(init_ctx.get("checkout_url") or ""),
                     full_checkout=True,
                     expected_due_cents=int(init_ctx.get("expected_due_cents") or 0),
-                    stripe_email=str(card.get("email") or ""),
+                    stripe_email=payment_contact_email,
                     paypal_cfg=paypal_cfg,
                     proxy_url=init_ctx.get("proxy_url") or "",
                     phone=phone,
@@ -12062,11 +12468,18 @@ def run(
                 break
             result_hay = json.dumps(last_node_result or {}, ensure_ascii=False)
             address_failed = bool(re.search(r"paypal_address_validation_error|ADDRESS_VALIDATION_ERROR", result_hay, re.I))
-            is_same_phone_retryable = bool(retryable_same_phone_pattern.search(result_hay)) or (
-                retry_on_any_failure
-                and bool(result_hay.strip())
-                and not address_failed
-                and not bool(hard_non_retry_pattern.search(result_hay))
+            reroll_new_account = re.search(
+                r"retry_new_paypal_account|paypal_create_card_account_validation_error|CREATE_CARD_ACCOUNT_CANDIDATE_VALIDATION_ERROR",
+                result_hay,
+                re.I,
+            )
+            is_same_phone_retryable = (not reroll_new_account) and (
+                bool(retryable_same_phone_pattern.search(result_hay)) or (
+                    retry_on_any_failure
+                    and bool(result_hay.strip())
+                    and not address_failed
+                    and not bool(hard_non_retry_pattern.search(result_hay))
+                )
             )
             if is_same_phone_retryable:
                 if node_attempt < max_node_attempts:
@@ -12101,6 +12514,36 @@ def run(
                 raise RuntimeError(
                     "PayPal Node full-checkout 地址校验失败，已重试 "
                     f"{max_node_attempts} 次: {str(last_node_result.get('error') or '')[:200]}"
+                )
+            if reroll_new_account:
+                if node_attempt < max_node_attempts:
+                    if _paypal_uses_five_sim(paypal_cfg):
+                        _five_sim_finalize_order(
+                            paypal_cfg,
+                            str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                            str(last_node_result.get("error") or "reroll_new_account")[:120],
+                        )
+                    for key in (
+                        "_resolved_new_user_account",
+                        "_generated_new_user_email",
+                        "_generated_new_user_password",
+                        "_resolved_meiguodizhi_address",
+                    ):
+                        paypal_cfg.pop(key, None)
+                    _log(
+                        "      [node-rpa-full] PayPal 新用户流程要求重建身份，"
+                        "重新生成 PayPal 邮箱/密码/地址后重试"
+                    )
+                    continue
+                if _paypal_uses_five_sim(paypal_cfg):
+                    _five_sim_finalize_order(
+                        paypal_cfg,
+                        str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                        str(last_node_result.get("error") or "reroll_exhausted")[:120],
+                    )
+                raise RuntimeError(
+                    "PayPal Node full-checkout 新用户身份重建重试耗尽: "
+                    f"{str(last_node_result.get('error') or '')[:200]}"
                 )
             if _paypal_uses_five_sim(paypal_cfg):
                 _five_sim_finalize_order(
@@ -12188,87 +12631,38 @@ def run(
     chatgpt_email = fresh_cfg.get("_chatgpt_email", card.get("email", ""))
     payment_channel = "gopay" if use_gopay else ("paypal" if use_paypal else "card")
     result_state = result.get("state", "unknown")
+    processor_entity = init_resp.get("account_settings", {}).get("display_name", "")
 
-    # 从数据库查最近一条匹配 email 的账号凭证。
-    extra_info = {}
-    # 支付成功时记录 Team workspace account_id
-    try:
-        ru = result.get("return_url", "") if isinstance(result, dict) else ""
-        if ru:
-            import urllib.parse as _up
-            qs = _up.parse_qs(_up.urlparse(ru).query)
-            aid = (qs.get("account_id") or [""])[0]
-            if aid:
-                extra_info["team_account_id"] = aid
-    except Exception:
-        pass
+    success_recorded_before_rt = False
+    if result_state == "succeeded":
+        _record_result(
+            status=result_state,
+            chatgpt_email=chatgpt_email,
+            session_id=session_id,
+            payment_channel=payment_channel,
+            processor_entity=processor_entity,
+            config_path=resolved_config_path,
+        )
+        success_recorded_before_rt = True
 
-    # 支付成功才拿 refresh_token（失败不拿）
-    # auto-loop 不需要 RT，可设 SKIP_PAY_RT_EXCHANGE=1 跳过整段。
-    if (
-        result_state == "succeeded"
-        and _is_probable_email(chatgpt_email)
-        and str(os.environ.get("SKIP_PAY_RT_EXCHANGE", "")).strip().lower() not in ("1", "true", "yes", "on")
-    ):
-        try:
-            # 从 SQLite 主存储取本账号的 password。
-            import os as _os
-            _password = ""
+    extra_info = _collect_post_payment_extra(result, result_state, chatgpt_email)
+
+    if success_recorded_before_rt:
+        if extra_info:
             try:
-                _password = (get_db().find_latest_registered_account(chatgpt_email) or {}).get("password", "") or ""
+                get_db().augment_card_result_last_match(chatgpt_email, session_id, extra_info)
             except Exception:
-                _password = ""
-
-            # 加载 CTF-reg/config.paypal-proxy.json 里的 mail 配置（供 IMAP 取 OTP）
-            _mail_cfg = {}
-            reg_cfg_path = _os.path.join(
-                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                "CTF-reg", "config.paypal-proxy.json",
-            )
-            if _os.path.exists(reg_cfg_path):
-                try:
-                    with open(reg_cfg_path, "r", encoding="utf-8") as rf:
-                        _reg_cfg = json.load(rf)
-                    _mail_cfg = _reg_cfg.get("mail", {}) or {}
-                except Exception as e:
-                    _log(f"      [RT] 读取 mail 配置失败: {e}")
-
-            # passwordless_signup 账号 DB 里 password=""——但浏览器流程在
-            # card.py:5240 已有 passwordless 分支（找不到密码框就跳到 OTP 等
-            # 邮件再 callback）。所以 password 不再是硬条件，mail_cfg 够就启动。
-            if _mail_cfg:
-                if _password:
-                    _log("      [RT] 支付成功，重新登录拿 refresh_token ...")
-                else:
-                    _log("      [RT] 支付成功，账号无 password (passwordless_signup)，走 OTP 登录路径...")
-                rt_value = _exchange_refresh_token_with_session(
-	                    email=chatgpt_email,
-	                    password=_password,
-	                    mail_cfg=_mail_cfg,
-	                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
-	                    oauth_client_id=_codex_oauth_client_id_from_config(cfg),
-	                )
-                if rt_value:
-                    extra_info["refresh_token"] = rt_value
-                    _log(f"      [RT] ✅ 获得 refresh_token 长度={len(rt_value)}")
-                else:
-                    _log("      [RT] ❌ refresh_token 获取失败（不影响支付结果）")
-            else:
-                _log(f"      [RT] 缺少 mail_cfg，跳过（无邮件渠道接 OTP）")
-        except Exception as e:
-            _log(f"      [RT] 获取异常: {e}")
-    elif result_state == "succeeded" and chatgpt_email and not _is_probable_email(chatgpt_email):
-        _log(f"      [RT] 跳过: ChatGPT 邮箱无效 ({chatgpt_email!r})")
-
-    _record_result(
-        status=result_state,
-        chatgpt_email=chatgpt_email,
-        session_id=session_id,
-        payment_channel=payment_channel,
-        processor_entity=init_resp.get("account_settings", {}).get("display_name", ""),
-        config_path=resolved_config_path,
-        extra=extra_info if extra_info else None,
-    )
+                pass
+    else:
+        _record_result(
+            status=result_state,
+            chatgpt_email=chatgpt_email,
+            session_id=session_id,
+            payment_channel=payment_channel,
+            processor_entity=processor_entity,
+            config_path=resolved_config_path,
+            extra=extra_info if extra_info else None,
+        )
     _log(f"\n日志已保存到: {LOG_FILE}")
     return result
 

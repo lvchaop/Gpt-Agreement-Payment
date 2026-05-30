@@ -67,6 +67,35 @@ def test_paypal_hero_sms_can_use_activation_id_for_status_url(tmp_path, monkeypa
     assert "id=hero-123" in url
 
 
+def test_paypal_hero_sms_builds_set_status_after_otp_url(tmp_path, monkeypatch):
+    card = _load_module("ctf_pay_card_hero_set_status_test", "CTF-pay/card.py")
+    monkeypatch.setattr(card, "_log", lambda *_args, **_kwargs: None)
+    phones = tmp_path / "phones.jsonl"
+    phones.write_text(
+        '{"phone":"+817012345678","country":"JP","activation_id":"hero-123"}\n',
+        encoding="utf-8",
+    )
+
+    cfg = {
+        "sms_provider": "hero_sms",
+        "sms_api_enabled": True,
+        "phones_file": str(phones),
+        "phone_country": "JP",
+        "hero_sms": {
+            "base_url": "https://hero-sms.com/stubs/handler_api.php",
+            "api_key": "hero-key",
+        },
+    }
+
+    card._paypal_resolve_new_user_phone(cfg, {})
+    url = card._hero_sms_set_status_after_otp_url(cfg)
+
+    assert "action=setStatus" in url
+    assert "api_key=hero-key" in url
+    assert "id=hero-123" in url
+    assert "status=3" in url
+
+
 def test_paypal_hero_sms_template_uses_activation_id(tmp_path, monkeypatch):
     card = _load_module("ctf_pay_card_hero_template_test", "CTF-pay/card.py")
     monkeypatch.setattr(card, "_log", lambda *_args, **_kwargs: None)
@@ -93,6 +122,57 @@ def test_paypal_hero_sms_template_uses_activation_id(tmp_path, monkeypatch):
 
     assert phone["phone"] == "+817012345678"
     assert url == "https://hero.example/sms?key=hero-key&id=hero-123"
+
+
+def test_paypal_delayed_phone_lease_is_not_acquired_until_node_form_fill(tmp_path, monkeypatch):
+    card = _load_module("ctf_pay_card_delayed_phone_lease_test", "CTF-pay/card.py")
+    monkeypatch.setattr(card, "_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        card,
+        "_paypal_resolve_new_user_address",
+        lambda *_args, **_kwargs: {
+            "country": "US",
+            "line1": "1 Example St",
+            "city": "New York",
+            "state": "NY",
+            "postal_code": "10001",
+            "first_name": "Ann",
+            "last_name": "Lee",
+            "full_name": "Ann Lee",
+        },
+    )
+    phones = tmp_path / "phones.jsonl"
+    phones.write_text(
+        '{"phone":"2015550101","country":"US"}\n'
+        '{"phone":"2015550102","country":"US"}\n',
+        encoding="utf-8",
+    )
+    lease_dir = tmp_path / "leases"
+    available = lease_dir / "available"
+    leased = lease_dir / "leased"
+    available.mkdir(parents=True)
+    leased.mkdir()
+    (available / "0").write_text("", encoding="utf-8")
+    (available / "1").write_text("", encoding="utf-8")
+
+    cfg = {
+        "flow": "new_user",
+        "phones_file": str(phones),
+        "phone_country": "US",
+        "_batch_phone_lease_dir": str(lease_dir),
+        "_defer_phone_lease_to_node_rpa": True,
+    }
+
+    phone, _signup_card, _address = card._paypal_signup_payloads(
+        cfg,
+        {},
+        {"number": "4111111111111111", "expiry": "12/30", "cvc": "123"},
+    )
+
+    assert phone == ""
+    assert "phone_index" not in cfg
+    assert (available / "0").exists()
+    assert not list(leased.iterdir())
 
 
 def test_paypal_sms_extracts_hero_status_json():

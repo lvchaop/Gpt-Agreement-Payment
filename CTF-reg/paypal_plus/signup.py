@@ -344,6 +344,18 @@ def _sms_gateway_text(proxy: Optional[str] = None) -> str:
         return ""
 
 
+def _hero_sms_set_status_after_otp(proxy: Optional[str] = None) -> None:
+    url = (os.environ.get("PPS_PAYPAL_HERO_SET_STATUS_URL") or "").strip()
+    if not url:
+        return
+    s = _make_session(proxy)
+    try:
+        r = s.get(url, timeout=10)
+        logger.info("hero-sms setStatus after OTP: http=%s body=%s", r.status_code, (r.text or "").strip()[:160])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("hero-sms setStatus after OTP error: %s", e)
+
+
 def _extract_sms_code_from_text(text: str, *, after_ts: float = 0.0) -> str:
     raw = (text or "").strip()
     if not raw:
@@ -5276,6 +5288,7 @@ def signup_no_card(
             ],
             timeout=request_timeout,
         )
+        _hero_sms_set_status_after_otp(proxy=proxy)
 
     # 6) Sign up — no card
     content_identifier = _extract_content_identifier(signup_html, locale_country, locale_lang)

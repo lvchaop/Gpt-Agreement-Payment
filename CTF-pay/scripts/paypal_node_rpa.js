@@ -67,7 +67,41 @@ function readLocalPhoneLockOwner(lockPath) {
   }
 }
 
+function readLocalPhoneLockOwnerData(lockPath) {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function pidAlive(pid) {
+  const value = Number(pid);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch (e) {
+    if (e && e.code === 'ESRCH') return false;
+    return true;
+  }
+}
+
+function pidFromWorkerId(worker) {
+  const raw = String(worker || '');
+  let m = raw.match(/(?:^|[^0-9])pay_(\d+)(?:_|$)/);
+  if (m) return Number(m[1]);
+  m = raw.match(/(?:^|[^0-9])pid[-_](\d+)(?:[^0-9]|$)/);
+  if (m) return Number(m[1]);
+  return 0;
+}
+
 function localPhoneLockStale(lockPath) {
+  const owner = readLocalPhoneLockOwnerData(lockPath);
+  const ownerPid = Number(owner.pid || 0) || pidFromWorkerId(owner.owner);
+  const alive = pidAlive(ownerPid);
+  if (alive === false) return true;
   try {
     const stat = fs.statSync(path.join(lockPath, 'owner.json'));
     return Date.now() - stat.mtimeMs > PHONE_LOCK_STALE_MS;
@@ -174,6 +208,22 @@ async function releasePhoneLock(phone, workerId) {
     log('phone-lock released', phoneLockLabel(phone), `worker=${worker}`);
   } catch (e) {
     log('phone-lock release error', e && e.message ? e.message : e);
+  }
+}
+
+async function callHeroSmsSetStatusAfterOtp(url) {
+  const target = String(url || '').trim();
+  if (!target) return false;
+  try {
+    const r = await fetch(target, { method: 'GET', signal: AbortSignal.timeout(10000) });
+    const text = (await r.text()).trim();
+    log('hero-sms setStatus after OTP',
+      `http=${r.status}`,
+      redactSensitiveText(text).slice(0, 160));
+    return r.ok;
+  } catch (e) {
+    log('hero-sms setStatus after OTP error', e && e.message ? e.message : e);
+    return false;
   }
 }
 
@@ -350,7 +400,7 @@ async function closeBrowserSafe(browser, timeoutMs = 5000) {
 
 function redactSensitiveText(value) {
   return String(value || '')
-    .replace(/([?&]key=)[^&\s"']+/gi, '$1<redacted>')
+    .replace(/([?&](?:api_)?key=)[^&\s"']+/gi, '$1<redacted>')
     .replace(/\b(?:\d[ -]?){12,19}\b/g, '<card-redacted>')
     .replace(/\b\d{6}\b/g, '<otp-redacted>')
     .replace(/\bEC-[A-Z0-9-]+\b/g, 'EC-<redacted>')
@@ -557,6 +607,205 @@ function phoneForUi(phone, country = 'US') {
   if (c === 'US' && p.length === 11 && p.startsWith('1')) p = p.slice(1);
   if (c === 'JP' && p.startsWith('81') && p.length >= 11) p = p.slice(2);
   return p;
+}
+
+const DIAL_CODES = {
+  US: '1',
+  CA: '1',
+  JP: '81',
+  GB: '44',
+  FR: '33',
+  DE: '49',
+  AU: '61',
+  SG: '65',
+  ID: '62',
+};
+
+function phoneE164(rawPhone, country = 'US') {
+  const raw = String(rawPhone || '').trim();
+  const digits = raw.replace(/\D+/g, '');
+  if (!digits) return '';
+  const c = String(country || 'US').trim().toUpperCase();
+  const dial = /^\+?\d{1,4}$/.test(c) ? c.replace(/\D+/g, '') : (DIAL_CODES[c] || '');
+  if (!dial) return raw.startsWith('+') ? `+${digits}` : `+${digits}`;
+  if (digits.startsWith(dial) && digits.length > dial.length) return `+${digits}`;
+  let national = digits;
+  if (dial !== '1' && national.startsWith('0')) national = national.slice(1);
+  return `+${dial}${national}`;
+}
+
+function delayedPhoneActivationId(row) {
+  if (!row || typeof row !== 'object') return '';
+  for (const key of ['hero_lease_id', 'hero_activation_id', 'activation_id', 'activationId', 'lease_id', 'leaseId', 'id']) {
+    const value = String(row[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function formatSmsTemplate(template, values) {
+  return String(template || '').replace(/\{([A-Za-z0-9_]+)\}/g, (_, key) => (
+    Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : ''
+  ));
+}
+
+function buildDelayedSmsUrls(delayed, row, e164) {
+  const provider = String(delayed.smsProvider || '').trim().toLowerCase().replace(/-/g, '_');
+  const enabled = delayed.smsApiEnabled !== false && delayed.manualOtp !== true;
+  if (!enabled) return { smsApiUrl: '', heroSmsSetStatusUrl: '' };
+  const digits = String(e164 || '').replace(/\D+/g, '');
+  const activationId = delayedPhoneActivationId(row);
+  const hero = delayed.heroSms || {};
+  const isHero = ['hero', 'hero_sms', 'smshub', 'sms_hub', 'sms_activate', 'smsactivate'].includes(provider);
+  const apiKeyRaw = String((isHero ? hero.apiKey : delayed.smsApiKey) || '').trim();
+  const values = {
+    phone: digits,
+    phone_number: digits,
+    phone_e164: e164,
+    phone_e164_url: encodeURIComponent(e164),
+    activation_id: activationId,
+    lease_id: activationId,
+    id: activationId,
+    api_key: encodeURIComponent(apiKeyRaw),
+    api_key_raw: apiKeyRaw,
+  };
+  if (isHero) {
+    const tmpl = String(hero.smsApiUrlTemplate || '').trim();
+    const base = String(hero.baseUrl || 'https://hero-sms.com/stubs/handler_api.php').replace(/\?+$/, '');
+    const smsApiUrl = tmpl
+      ? formatSmsTemplate(tmpl, values)
+      : (activationId && apiKeyRaw ? `${base}?action=getStatusV2&api_key=${encodeURIComponent(apiKeyRaw)}&id=${encodeURIComponent(activationId)}` : '');
+    const heroSmsSetStatusUrl = activationId && apiKeyRaw
+      ? `${base}?action=setStatus&api_key=${encodeURIComponent(apiKeyRaw)}&id=${encodeURIComponent(activationId)}&status=3`
+      : '';
+    return { smsApiUrl, heroSmsSetStatusUrl };
+  }
+  return {
+    smsApiUrl: formatSmsTemplate(delayed.smsApiUrlTemplate || '', values),
+    heroSmsSetStatusUrl: '',
+  };
+}
+
+function delayedLeaseIndex(name) {
+  const m = String(name || '').match(/^(\d+)(?:\.|$)/);
+  return m ? m[1] : '';
+}
+
+function readDelayedLeaseMeta(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8').trim();
+    if (!raw) return {};
+    const data = JSON.parse(raw);
+    return data && typeof data === 'object' ? data : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function delayedLeaseStale(filePath, staleMs) {
+  const meta = readDelayedLeaseMeta(filePath);
+  const ownerPid = Number(meta.pid || 0)
+    || pidFromWorkerId(meta.owner)
+    || pidFromWorkerId(path.basename(filePath));
+  const alive = pidAlive(ownerPid);
+  if (alive === false) return true;
+  try {
+    const stat = fs.statSync(filePath);
+    return Date.now() - stat.mtimeMs > staleMs;
+  } catch (_) {
+    return false;
+  }
+}
+
+function reclaimStaleDelayedPhoneLeases(availableDir, leasedDir, staleMs) {
+  let reclaimed = 0;
+  let leasedCount = 0;
+  let names = [];
+  try {
+    names = fs.readdirSync(leasedDir).filter((name) => delayedLeaseIndex(name));
+  } catch (_) {
+    return { reclaimed, leasedCount };
+  }
+  leasedCount = names.length;
+  for (const name of names) {
+    const src = path.join(leasedDir, name);
+    if (!delayedLeaseStale(src, staleMs)) continue;
+    const index = delayedLeaseIndex(name);
+    const dst = path.join(availableDir, index);
+    try {
+      if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+      else fs.unlinkSync(src);
+      reclaimed++;
+      log('delayed phone lease stale; reclaimed', `phone_index=${index}`, `holder=${name}`);
+    } catch (e) {
+      log('delayed phone lease reclaim error', `phone_index=${index}`, e && e.message ? e.message : e);
+    }
+  }
+  return { reclaimed, leasedCount };
+}
+
+function acquireDelayedPhoneLease(delayed, worker) {
+  const leaseDir = String(delayed && delayed.leaseDir || '').trim();
+  const rows = Array.isArray(delayed && delayed.rows) ? delayed.rows : [];
+  if (!leaseDir || !rows.length) return null;
+  const availableDir = path.join(leaseDir, 'available');
+  const leasedDir = path.join(leaseDir, 'leased');
+  fs.mkdirSync(availableDir, { recursive: true });
+  fs.mkdirSync(leasedDir, { recursive: true });
+  const deadline = Date.now() + Math.max(1000, Number(delayed.timeoutMs || 1800000) || 1800000);
+  const staleMs = Math.max(60000, Number(delayed.staleMs || delayed.timeoutMs || 1800000) || 1800000);
+  let lastWaitLog = 0;
+  while (Date.now() < deadline) {
+    const leaseState = reclaimStaleDelayedPhoneLeases(availableDir, leasedDir, staleMs);
+    const names = fs.readdirSync(availableDir)
+      .filter((name) => /^\d+$/.test(name))
+      .sort((a, b) => Number(a) - Number(b));
+    for (const name of names) {
+      const src = path.join(availableDir, name);
+      const dst = path.join(leasedDir, `${name}.${String(worker || process.pid).replace(/[^A-Za-z0-9_.-]/g, '_')}.${crypto.randomBytes(4).toString('hex')}`);
+      try {
+        fs.renameSync(src, dst);
+      } catch (_) {
+        continue;
+      }
+      const index = Number(name);
+      try {
+        fs.writeFileSync(dst, JSON.stringify({
+          owner: String(worker || process.pid),
+          pid: process.pid,
+          index,
+          acquiredAt: new Date().toISOString(),
+        }, null, 2));
+      } catch (_) {}
+      return {
+        index,
+        row: rows[index] || {},
+        path: dst,
+        availableDir,
+      };
+    }
+    if (Date.now() - lastWaitLog > 10000) {
+      lastWaitLog = Date.now();
+      log('delayed phone lease busy, waiting',
+        `available=0`,
+        `leased=${leaseState.leasedCount}`,
+        `leaseDir=${leaseDir}`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+  }
+  throw new Error(`PayPal phone lease timeout leaseDir=${leaseDir}`);
+}
+
+function releaseDelayedPhoneLease(lease) {
+  if (!lease || !lease.path || lease.index === undefined || !lease.availableDir) return;
+  const target = path.join(lease.availableDir, String(lease.index));
+  try {
+    fs.mkdirSync(lease.availableDir, { recursive: true });
+    if (fs.existsSync(lease.path)) fs.renameSync(lease.path, target);
+    log('delayed phone lease released', `phone_index=${lease.index}`);
+  } catch (e) {
+    log('delayed phone lease release error', e && e.message ? e.message : e);
+  }
 }
 
 function dateOfBirthForUi(value) {
@@ -779,6 +1028,159 @@ async function fillSelectorAny(page, sel, val) {
   return ok;
 }
 
+const fillPaypalPhoneScript = ({ phone, country }) => {
+  const rawDigits = String(phone || '').replace(/\D+/g, '');
+  if (!rawDigits) return null;
+  const c = String(country || '').trim().toUpperCase();
+  const variants = [];
+  const addVariant = (value) => {
+    const v = String(value || '').replace(/\D+/g, '');
+    if (v && !variants.includes(v)) variants.push(v);
+  };
+  addVariant(rawDigits);
+  if (c === 'JP') {
+    if (!rawDigits.startsWith('0')) addVariant(`0${rawDigits}`);
+    if (rawDigits.startsWith('81') && rawDigits.length > 2) {
+      const national = rawDigits.slice(2);
+      addVariant(national);
+      addVariant(`0${national}`);
+    }
+  }
+
+  const isVisible = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    return el.offsetParent !== null
+      && r.width > 0
+      && r.height > 0
+      && s.visibility !== 'hidden'
+      && s.display !== 'none';
+  };
+  const meta = (el) => [
+    el.id,
+    el.name,
+    el.autocomplete,
+    el.placeholder,
+    el.getAttribute('aria-label'),
+    el.getAttribute('data-testid'),
+    el.getAttribute('data-field-name'),
+    el.closest('label') && el.closest('label').innerText,
+  ].filter(Boolean).join(' ').toLowerCase();
+  const bad = /(card|cvv|cvc|security|expiry|expir|postal|zip|email|password|birth|date|city|address|name|kana|カナ|氏名|郵便|住所|市区|都道府県)/i;
+  const good = /(phone|mobile|tel|telephone|number|msisdn|電話|携帯|携帶|携帯電話|電話番号|ケータイ)/i;
+  const setValue = (el, value) => {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    try { el.focus(); } catch (_) {}
+    if (desc && desc.set) desc.set.call(el, String(value)); else el.value = String(value);
+    for (const ev of ['keydown', 'input', 'keyup', 'change', 'blur']) {
+      try { el.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
+    }
+  };
+
+  const directSelectors = [
+    '#phone',
+    '#phoneNumber',
+    '#mobile',
+    '#telephone',
+    'input[name="phone"]',
+    'input[name="phoneNumber"]',
+    'input[name="mobile"]',
+    'input[name="telephone"]',
+    'input[name="tel"]',
+    'input[type="tel"]',
+    'input[autocomplete="tel"]',
+    'input[autocomplete="tel-national"]',
+    'input[autocomplete="tel-local"]',
+    'input[id*="phone" i]',
+    'input[name*="phone" i]',
+    'input[id*="mobile" i]',
+    'input[name*="mobile" i]',
+    'input[id*="tel" i]',
+    'input[name*="tel" i]',
+    'input[aria-label*="phone" i]',
+    'input[placeholder*="phone" i]',
+    'input[aria-label*="電話" i]',
+    'input[placeholder*="電話" i]',
+    'input[aria-label*="携帯" i]',
+    'input[placeholder*="携帯" i]',
+  ];
+  const candidates = [];
+  const seen = new Set();
+  for (const sel of directSelectors) {
+    for (const el of Array.from(document.querySelectorAll(sel))) {
+      if (seen.has(el) || !isVisible(el)) continue;
+      seen.add(el);
+      const text = meta(el);
+      if (bad.test(text)) continue;
+      candidates.push({ el, score: 100 + (good.test(text) ? 50 : 0), text });
+    }
+  }
+  for (const el of Array.from(document.querySelectorAll('input'))) {
+    if (seen.has(el) || !isVisible(el)) continue;
+    const type = String(el.type || '').toLowerCase();
+    if (!['', 'text', 'tel', 'number'].includes(type)) continue;
+    const text = meta(el);
+    if (bad.test(text) || !good.test(text)) continue;
+    seen.add(el);
+    candidates.push({ el, score: type === 'tel' ? 90 : 70, text });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  const hit = candidates[0];
+  if (!hit) return null;
+  const value = variants[0];
+  setValue(hit.el, value);
+  return {
+    id: hit.el.id || '',
+    name: hit.el.name || '',
+    type: hit.el.type || '',
+    autocomplete: hit.el.autocomplete || '',
+    placeholder: hit.el.placeholder || '',
+    valueLen: String(value).length,
+  };
+};
+
+let paypalPhoneFieldDiagLogged = false;
+
+async function fillPaypalPhoneAny(page, phone, country) {
+  const res = await evalAllFrames(page, fillPaypalPhoneScript, { phone, country });
+  const hit = res.find(Boolean);
+  if (hit) {
+    log('fill phone ok', JSON.stringify(hit));
+    return true;
+  }
+  return false;
+}
+
+async function logPaypalPhoneFieldDiag(page) {
+  if (paypalPhoneFieldDiagLogged) return;
+  paypalPhoneFieldDiagLogged = true;
+  try {
+    const rows = await evalAllFrames(page, () => Array.from(document.querySelectorAll('input, select, textarea'))
+      .filter((el) => {
+        const r = el.getBoundingClientRect();
+        return el.offsetParent !== null && r.width > 0 && r.height > 0;
+      })
+      .map((el) => ({
+        tag: el.tagName,
+        id: el.id || '',
+        name: el.name || '',
+        type: el.type || '',
+        autocomplete: el.autocomplete || '',
+        placeholder: el.placeholder || '',
+        aria: el.getAttribute('aria-label') || '',
+        testid: el.getAttribute('data-testid') || '',
+        valueLen: String(el.value || '').length,
+      }))
+      .slice(0, 60), null);
+    const useful = rows.filter(Boolean).flat().slice(0, 80);
+    log('paypal phone field diag', JSON.stringify(useful).slice(0, 3000));
+  } catch (e) {
+    log('paypal phone field diag error', e && e.message ? e.message : e);
+  }
+}
+
 const fillVisibleEmailScript = ({ selectors, val }) => {
   const isVisible = (el) => {
     const rect = el.getBoundingClientRect();
@@ -850,9 +1252,29 @@ async function waitForPaypalSignupFields(page, timeoutMs = 10000) {
         const r = el.getBoundingClientRect();
         return el.offsetParent !== null && r.width > 0 && r.height > 0;
       };
+      const phoneVisible = Array.from(document.querySelectorAll([
+        '#phone',
+        '#phoneNumber',
+        '#mobile',
+        'input[name="phone"]',
+        'input[name="phoneNumber"]',
+        'input[type="tel"]',
+        'input[autocomplete="tel"]',
+        'input[autocomplete="tel-national"]',
+        'input[id*="phone" i]',
+        'input[name*="phone" i]',
+        'input[id*="mobile" i]',
+        'input[name*="mobile" i]',
+        'input[id*="tel" i]',
+        'input[name*="tel" i]',
+        'input[aria-label*="電話" i]',
+        'input[placeholder*="電話" i]',
+        'input[aria-label*="携帯" i]',
+        'input[placeholder*="携帯" i]',
+      ].join(','))).some(visible);
       return Boolean(
         visible(document.getElementById('email') || document.querySelector('input[name="email"]'))
-        && visible(document.getElementById('phone') || document.querySelector('input[name="phone"]'))
+        && phoneVisible
         && visible(document.getElementById('cardNumber') || document.querySelector('input[name="cardNumber"], input[name="cardnumber"]'))
         && visible(document.getElementById('billingLine1') || document.querySelector('input[name="billingLine1"]'))
       );
@@ -883,7 +1305,7 @@ async function fillPaypalSignupForm(page, addr, profile) {
   ).trim();
   result.email = await fillAny(page, 'email', profile.email)
     || await fillSelectorAny(page, 'input[type="email"]', profile.email);
-  result.phone = await fillAny(page, 'phone', profile.phone);
+  result.phone = await fillPaypalPhoneAny(page, profile.phone, country);
   result.cardNumber = await fillAny(page, 'cardNumber', profile.cardNumber);
   result.cardExpiry = await fillAny(page, 'cardExpiry', profile.cardExpiry);
   result.cardCvv = await fillAny(page, 'cardCvv', profile.cardCvv);
@@ -917,7 +1339,10 @@ async function fillPaypalSignupForm(page, addr, profile) {
     required.push('countrySpecificFirstName', 'countrySpecificLastName', 'dateOfBirth');
   }
   const missing = required.filter((key) => !result[key]);
-  if (missing.length) log('paypal signup fill missing', missing.join(','));
+  if (missing.length) {
+    log('paypal signup fill missing', missing.join(','));
+    if (missing.includes('phone')) await logPaypalPhoneFieldDiag(page);
+  }
   return { ok: missing.length === 0, result, missing };
 }
 
@@ -1007,10 +1432,31 @@ async function paypalBillingDiag(page, label = 'paypal-billing') {
   } catch (_) {}
 }
 
-async function clickPaypalConsentButton(page, label = 'paypal-consent', timeoutMs = 8000, preDelayMs = 0) {
+function isStripeReturnSuccessUrl(url) {
+  return /pm-redirects\.stripe\.com\/return\/.*status=success/i.test(String(url || ''));
+}
+
+function isCheckoutRedirectSuccess(url, capturedReturnUrl = '') {
+  const current = String(url || '');
+  return isStripeReturnSuccessUrl(current)
+    || isStripeReturnSuccessUrl(capturedReturnUrl)
+    || /pay\.openai\.com\/.*redirect_status=(?:success|succeeded)/i.test(current)
+    || /chatgpt\.com\/payments\/success/i.test(current);
+}
+
+async function clickPaypalConsentButton(page, label = 'paypal-consent', timeoutMs = 8000, preDelayMs = 0, successReturnUrl = null) {
+  const consentTextRe = /agree\s*(and|&)\s*continue|continue|confirm|pay|同意|続行|同意して続行|確認|支払|次へ/i;
+  const successReached = () => isCheckoutRedirectSuccess(
+    page.url(),
+    typeof successReturnUrl === 'function' ? successReturnUrl() : successReturnUrl,
+  );
   if (preDelayMs > 0) {
     log('paypal consent wait before click', `${preDelayMs}ms`);
     await sleep(preDelayMs);
+  }
+  if (successReached()) {
+    log(label, 'success return observed while waiting for consent click');
+    return true;
   }
   await paypalBillingDiag(page, `${label}-before-click`);
   const selectors = [
@@ -1022,6 +1468,10 @@ async function clickPaypalConsentButton(page, label = 'paypal-consent', timeoutM
   ];
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (successReached()) {
+      log(label, 'success return observed while polling consent button');
+      return true;
+    }
     for (const frame of page.frames()) {
       for (const sel of selectors) {
         try {
@@ -1032,7 +1482,7 @@ async function clickPaypalConsentButton(page, label = 'paypal-consent', timeoutM
             disabled: !!x.disabled || x.getAttribute('aria-disabled') === 'true',
           })).catch(() => ({ text: '', disabled: false }));
           if (info.disabled) continue;
-          if (!/agree\s*(and|&)\s*continue|continue|confirm|pay/i.test(info.text || '') && !/consentButton/i.test(sel)) {
+          if (!consentTextRe.test(info.text || '') && !/consentButton/i.test(sel)) {
             continue;
           }
           try {
@@ -1058,7 +1508,13 @@ async function clickPaypalConsentButton(page, label = 'paypal-consent', timeoutM
     }
     await sleep(300);
   }
-  return clickByText(page, /^(agree[\s&]+continue|agree and continue|continue|agree|confirm|next|pay)$/i, label, 2000);
+  const clicked = await clickByText(page, /^(agree[\s&]+continue|agree and continue|continue|agree|confirm|next|pay|同意|同意して続行|続行|確認|支払う|次へ)$/i, label, 2000);
+  if (clicked) return true;
+  if (successReached()) {
+    log(label, 'success return observed after text fallback');
+    return true;
+  }
+  return false;
 }
 
 async function clickSelectorAny(page, selectors, label) {
@@ -1313,20 +1769,53 @@ function extractOtpFromSmsResponse(text, opts = {}) {
   const afterMs = Number(opts.afterMs || opts.afterTimeMs || 0);
   const minMsWithSkew = afterMs > 0 ? Math.max(0, afterMs - 15000) : 0;
 
+  const parseRecordTimeValueMs = (key, value) => {
+    if (value === null || value === undefined || value === '') return 0;
+    if (typeof value === 'number') return value > 100000000000 ? value : value * 1000;
+    const s = String(value).trim();
+    if (!s) return 0;
+    if (/^\d+(?:\.\d+)?$/.test(s)) {
+      const n = Number(s);
+      return n > 100000000000 ? n : n * 1000;
+    }
+    // Hero/SMS-Activate style dateTime is timezone-less. Their API returns it
+    // in UTC+3, so parsing it as local time can turn a fresh code into "old".
+    if (/^(?:dateTime|date_time|datetime)$/i.test(String(key || ''))) {
+      const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+      if (m) {
+        return Date.UTC(
+          Number(m[1]),
+          Number(m[2]) - 1,
+          Number(m[3]),
+          Number(m[4]) - 3,
+          Number(m[5]),
+          Number(m[6] || 0),
+        );
+      }
+    }
+    const parsed = Date.parse(s);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
   const recordTimeMs = (record) => {
     if (!record || typeof record !== 'object') return 0;
-    for (const key of ['smsTime', 'expiresTime', 'time', 'createdAt', 'created_at', 'receivedAt', 'receiveTime', 'timestamp']) {
-      const value = record[key];
-      if (value === null || value === undefined || value === '') continue;
-      if (typeof value === 'number') return value > 100000000000 ? value : value * 1000;
-      const s = String(value).trim();
-      if (!s) continue;
-      if (/^\d+(?:\.\d+)?$/.test(s)) {
-        const n = Number(s);
-        return n > 100000000000 ? n : n * 1000;
-      }
-      const parsed = Date.parse(s);
-      if (Number.isFinite(parsed)) return parsed;
+    for (const key of [
+      'smsTime',
+      'expiresTime',
+      'dateTime',
+      'date_time',
+      'datetime',
+      'time',
+      'date',
+      'createdAt',
+      'created_at',
+      'receivedAt',
+      'receiveTime',
+      'receive_time',
+      'timestamp',
+    ]) {
+      const ts = parseRecordTimeValueMs(key, record[key]);
+      if (ts) return ts;
     }
     return 0;
   };
@@ -1339,8 +1828,11 @@ function extractOtpFromSmsResponse(text, opts = {}) {
       if (digits.length >= 4 && digits.length <= 8) return digits;
     }
     const patterns = [
+      /PayPal[^\d]{0,120}(\d{4,8})(?!\d)/i,
       /(?:code|verification|security|one[-\s]*time|passcode|pin|验证码|驗證碼)[^\d]{0,80}(\d{4,8})(?!\d)/i,
       /(?<!\d)(\d{4,8})(?!\d)[^\n\r]{0,80}(?:code|verification|security|one[-\s]*time|passcode|pin|验证码|驗證碼)/i,
+      /(?:コード|セキュリティコード|認証コード|確認コード|ワンタイム|パスコード)[^\d]{0,80}(\d{4,8})(?!\d)/i,
+      /(?<!\d)(\d{4,8})(?!\d)[^\n\r]{0,80}(?:です|コード|セキュリティコード|認証コード|確認コード)/i,
     ];
     for (const pat of patterns) {
       const m = s.match(pat);
@@ -1362,7 +1854,7 @@ function extractOtpFromSmsResponse(text, opts = {}) {
       }
     }
     for (const key of ['code', 'otp', 'pin']) {
-      const code = codeFromValue(record[key], true);
+      const code = codeFromValue(record[key], true) || codeFromValue(record[key], false);
       if (code) return code;
     }
     for (const key of ['sms', 'text', 'message', 'content', 'body']) {
@@ -1598,6 +2090,20 @@ async function pageSnapshot(page, outPrefix) {
     const html = await withTimeout(page.content(), 8000, "");
     if (html) fs.writeFileSync(`${outPrefix}.html`, html);
   } catch (_) {}
+}
+
+async function paypalExistingAccountPrompt(page, email) {
+  const hits = await evalAllFrames(page, ({ email }) => {
+    const body = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!body) return '';
+    const lower = body.toLowerCase();
+    const emailHit = email && lower.includes(String(email).toLowerCase());
+    const promptHit = /PayPalアカウントをすでにお持ち|すでにPayPalアカウント|already have (?:a )?PayPal account|already.*PayPal account|已有.*PayPal.*[账帳]户|已经.*PayPal.*[账帳]户/i.test(body);
+    if (!promptHit) return '';
+    if (!emailHit && body.length > 1200) return '';
+    return body.slice(0, 500);
+  }, { email }).catch(() => []);
+  return hits.find(Boolean) || '';
 }
 
 function isSuccessUrl(url) {
@@ -1906,21 +2412,48 @@ async function main() {
   const country = String(payload.country || addr.country || 'US').toUpperCase();
   const email = payload.email || randEmail();
   const password = payload.password || randPass();
-  const phone = phoneForUi(payload.phone || process.env.PPS_PAYPAL_PHONE || '', country);
+  let phone = phoneForUi(payload.phone || process.env.PPS_PAYPAL_PHONE || '', country);
   // 并发 worker 共享同一 phone 时, OTP 阶段排队避免短信串.
   // 有 PHONE_LOCK_URL 时用 HTTP 锁; 否则用本机目录锁兜底.
   const _LOCK_WID = (process.env.NCPP_WORKER_ID || `pid-${process.pid}`).trim();
   let phoneLockHeld = false;
+  let otpAcceptedBeforeRelease = false;
+  let heroSmsSetStatusSent = false;
+  let heroSmsSetStatusUrl = String(payload.heroSmsSetStatusUrl || process.env.PPS_PAYPAL_HERO_SET_STATUS_URL || '').trim();
+  let delayedPhoneLease = null;
+  let phoneLockSkipLogged = false;
   const ensurePhoneLock = async () => {
     if (phoneLockHeld || !phoneLockToken(phone) || !_LOCK_WID) return;
+    if (delayedPhoneLease) {
+      if (!phoneLockSkipLogged) {
+        phoneLockSkipLogged = true;
+        log('phone-lock skipped: delayed phone lease owns phone in current batch', phoneLockLabel(phone));
+      }
+      return;
+    }
     log('phone-lock acquiring (form filled; next submit triggers SMS)', phoneLockLabel(phone));
     const got = await waitAcquirePhoneLock(phone, _LOCK_WID, 900000);
     phoneLockHeld = !!got;
   };
-  const releaseIfHeld = async () => {
-    if (!phoneLockHeld) return;
-    phoneLockHeld = false;
-    await releasePhoneLock(phone, _LOCK_WID);
+  const notifyHeroSmsBeforeRelease = async () => {
+    if (!otpAcceptedBeforeRelease || heroSmsSetStatusSent || !heroSmsSetStatusUrl) return;
+    heroSmsSetStatusSent = true;
+    await callHeroSmsSetStatusAfterOtp(heroSmsSetStatusUrl);
+  };
+  const releaseIfHeld = async (opts = {}) => {
+    const releaseDelayed = opts.releaseDelayed !== false;
+    if (otpAcceptedBeforeRelease && (phoneLockHeld || delayedPhoneLease)) {
+      await notifyHeroSmsBeforeRelease();
+    }
+    if (phoneLockHeld) {
+      phoneLockHeld = false;
+      await releasePhoneLock(phone, _LOCK_WID);
+    }
+    if (releaseDelayed && delayedPhoneLease) {
+      releaseDelayedPhoneLease(delayedPhoneLease);
+      delayedPhoneLease = null;
+      phoneLockSkipLogged = false;
+    }
   };
   const cardNumber = String(payload.cardNumber || '').replace(/\s+/g, '');
   const cardExpiry = normalizeExpiry(payload.cardExpiry || '03/30');
@@ -1947,13 +2480,18 @@ async function main() {
   };
   log('signup profile name', `${signupProfile.firstName}/${signupProfile.lastName}`);
   const fiveSim = fiveSimFromPayload(payload);
-  const smsApiUrl = fiveSim ? '' : (payload.smsApiUrl || process.env.PPS_SMS_API_URL || '');
+  let smsApiUrl = fiveSim ? '' : (payload.smsApiUrl || process.env.PPS_SMS_API_URL || '');
   const fallbackConsentDelayMs = Math.max(0, Number(
     payload.fallbackConsentDelayMs
     ?? process.env.PPS_PAYPAL_FALLBACK_CONSENT_DELAY_MS
     ?? process.env.PPS_PAYPAL_FALLBACK_DELAY_MS
-    ?? 12000,
+    ?? 0,
   ) || 0);
+  const consentClickTimeoutMs = Math.max(1000, Number(
+    payload.consentClickTimeoutMs
+    ?? process.env.PPS_PAYPAL_CONSENT_CLICK_TIMEOUT_MS
+    ?? 30000,
+  ) || 30000);
   let smsBaselineText = '';
   let smsBaselinePrepared = false;
   const prepareSmsBaseline = async () => {
@@ -1968,10 +2506,35 @@ async function main() {
       log('sms baseline error', e.message || e);
     }
   };
+  const ensureDelayedPhoneForForm = async () => {
+    if (phoneLockToken(signupProfile.phone)) return;
+    const delayed = payload.delayedPhone || {};
+    if (!delayed.leaseDir) return;
+    delayedPhoneLease = acquireDelayedPhoneLease(delayed, _LOCK_WID);
+    const row = delayedPhoneLease.row || {};
+    const countryHint = row.dial_code || row.calling_code || row.country_calling_code
+      || row.country || row.country_code || delayed.phoneCountry || country;
+    const rawPhone = row.phone || row.phone_number || row.number || '';
+    const e164 = phoneE164(rawPhone, countryHint);
+    if (!e164) throw new Error(`delayed phone row missing phone phone_index=${delayedPhoneLease.index}`);
+    phone = phoneForUi(e164, country);
+    signupProfile.phone = phone;
+    const urls = buildDelayedSmsUrls(delayed, row, e164);
+    smsApiUrl = urls.smsApiUrl || smsApiUrl || '';
+    heroSmsSetStatusUrl = urls.heroSmsSetStatusUrl || heroSmsSetStatusUrl || '';
+    smsBaselinePrepared = false;
+    smsBaselineText = '';
+    log('delayed phone lease acquired before form fill',
+      `phone_index=${delayedPhoneLease.index}`,
+      `phone=${phoneLockLabel(e164)}`,
+      smsApiUrl ? 'otp=sms_api' : 'otp=manual');
+  };
   if (fiveSim) {
     log('5sim otp enabled', `order=${fiveSim.orderId}`);
   } else if (smsApiUrl) {
     log('sms api enabled; baseline delayed until form-filled phone-lock');
+  } else if (payload.delayedPhone && payload.delayedPhone.leaseDir) {
+    log('sms api delayed until PayPal form fill');
   }
   const { browser } = await launchProjectChromium(payload);
   const page = browser.pages()[0] || await browser.newPage();
@@ -2138,6 +2701,40 @@ async function main() {
       log('url', url.slice(0, 220));
       lastUrl = url;
     }
+    const host = (() => { try { return new URL(url).hostname; } catch (_) { return ''; } })();
+    const pathname = (() => { try { return new URL(url).pathname; } catch (_) { return ''; } })();
+    const isHermesBillingReview = (
+      /paypal\.com/i.test(host)
+      && /\/webapps\/hermes/i.test(pathname)
+      && (
+        /(?:fallback=1|fromSignupLite=true|billingLite=1)/i.test(url)
+        || /#\/billingweb\/review/i.test(url)
+      )
+    );
+    const openaiRedirectSucceeded = /pay\.openai\.com\/.*redirect_status=(?:success|succeeded)/i.test(url);
+    const pmRedirectSuccess = /pm-redirects\.stripe\.com\/return\/.*status=success/i.test(url);
+    const capturedReturnSuccess = /pm-redirects\.stripe\.com\/return\/.*status=success/i.test(capturedReturnUrl || '');
+    const chatgptSuccess = /chatgpt\.com\/payments\/success/i.test(url);
+    const chatgptLandingAfterReturn = /chatgpt\.com\/?/i.test(host) && !!capturedReturnUrl;
+    const payOpenaiLandingAfterReturn = (
+      /pay\.openai\.com/i.test(host)
+      && capturedReturnSuccess
+      && /(?:redirect_pm_type=paypal|redirect_status=(?:success|succeeded))/i.test(url)
+    );
+    if (chatgptSuccess || chatgptLandingAfterReturn || pmRedirectSuccess || capturedReturnSuccess || payOpenaiLandingAfterReturn) {
+      log('success url reached');
+      const finalUrl = page.url();
+      const result = { success: true, finalUrl, returnUrl: capturedReturnUrl };
+      persistResult(result);
+      log('success result persisted; closing browser');
+      await closeBrowserSafe(browser);
+      return result;
+    }
+    if (openaiRedirectSucceeded) {
+      log('openai redirect_status=succeeded seen; waiting for chatgpt success landing');
+      await sleep(2000);
+      continue;
+    }
     if (ccLinkedToFullAccount) {
       log('decisive PayPal error CC_LINKED_TO_FULL_ACCOUNT; persona/card is poisoned, bailing for re-roll');
       await pageSnapshot(page, T('cc_linked')).catch(() => {});
@@ -2190,7 +2787,7 @@ async function main() {
         returnUrl: capturedReturnUrl,
       };
     }
-    if (decisiveError || /\/pay\/generic-error|\/checkoutweb\/genericError/i.test(url)) {
+    if (decisiveError || isHermesBillingReview || /\/pay\/generic-error|\/checkoutweb\/genericError/i.test(url)) {
       const errHost = (() => { try { return new URL(url).hostname; } catch (_) { return ''; } })();
       const errPath = (() => { try { return new URL(url).pathname; } catch (_) { return ''; } })();
       const cardFundingError = /INSTRUMENT_SHARING_LIMIT_EXCEEDED|CARD_GENERIC_ERROR|ISSUER_DECLINE/i.test(decisiveError || '');
@@ -2199,8 +2796,11 @@ async function main() {
       // only the newer /pay/billing shell.  That Hermes page contains the
       // final "Agree and Continue" button which issues billing.authorize.
       const hermesBillingFallback = (
-        /\/webapps\/hermes/i.test(errPath)
-        && /(?:fallback=1|fromSignupLite=true|billingLite=1|reason=Q0FSRF9HRU5FUklDX0VSUk9S)/i.test(url)
+        isHermesBillingReview
+        || (
+          /\/webapps\/hermes/i.test(errPath)
+          && /(?:fallback=1|fromSignupLite=true|billingLite=1|reason=Q0FSRF9HRU5FUklDX0VSUk9S)/i.test(url)
+        )
       );
       if (
         cardFundingError
@@ -2218,7 +2818,7 @@ async function main() {
       const recoverablePaypalFallback = (
         /paypal\.com/i.test(errHost)
         && (/\/pay\/billing/i.test(errPath) || hermesBillingFallback)
-        && cardFundingError
+        && (cardFundingError || hermesBillingFallback)
       );
       if (recoverablePaypalFallback && paypalFallbackContinueClicks < 3) {
         if (!paypalFallbackSeenAt) paypalFallbackSeenAt = Date.now();
@@ -2236,8 +2836,9 @@ async function main() {
         const clicked = await clickPaypalConsentButton(
           page,
           'paypal-fallback-agree-continue',
-          4000,
-          paypalFallbackContinueClicks === 0 ? Math.max(0, fallbackConsentDelayMs - waitedMs) : 3000,
+          consentClickTimeoutMs,
+          paypalFallbackContinueClicks === 0 ? Math.max(0, fallbackConsentDelayMs - waitedMs) : 500,
+          () => capturedReturnUrl,
         );
         if (clicked) {
           paypalFallbackContinueClicks++;
@@ -2248,6 +2849,12 @@ async function main() {
           log('paypal fallback billing accepted after error; waiting for redirect');
           decisiveError = '';
           await sleep(6000);
+          continue;
+        }
+        if (isCheckoutRedirectSuccess(page.url(), capturedReturnUrl)) {
+          log('paypal fallback success return observed; skip missing Agree and Continue');
+          decisiveError = '';
+          await sleep(1000);
           continue;
         }
         log('paypal fallback billing missing Agree and Continue; retry with a fresh PayPal signup');
@@ -2279,28 +2886,6 @@ async function main() {
         paypalFallbackAgreed,
       };
     }
-    const host = (() => { try { return new URL(url).hostname; } catch (_) { return ''; } })();
-    const pathname = (() => { try { return new URL(url).pathname; } catch (_) { return ''; } })();
-
-    const openaiRedirectSucceeded = /pay\.openai\.com\/.*redirect_status=succeeded/i.test(url);
-    const pmRedirectSuccess = /pm-redirects\.stripe\.com\/return\/.*status=success/i.test(url);
-    const chatgptSuccess = /chatgpt\.com\/payments\/success/i.test(url);
-    const chatgptLandingAfterReturn = /chatgpt\.com\/?/i.test(host) && !!capturedReturnUrl;
-    if (chatgptSuccess || chatgptLandingAfterReturn || pmRedirectSuccess) {
-      log('success url reached');
-      const finalUrl = page.url();
-      const result = { success: true, finalUrl, returnUrl: capturedReturnUrl };
-      persistResult(result);
-      log('success result persisted; closing browser');
-      await closeBrowserSafe(browser);
-      return result;
-    }
-    if (openaiRedirectSucceeded) {
-      log('openai redirect_status=succeeded seen; waiting for chatgpt success landing');
-      await sleep(2000);
-      continue;
-    }
-
     await addUserscriptStyle(page);
     await maybeDismiss(page);
 
@@ -2345,6 +2930,20 @@ async function main() {
     // before checkoutweb/signup.  The legacy unified-login
     // #startOnboardingFlow path is only a last-resort fallback.
     if (/paypal\.com$/i.test(host) || /paypal\.com/i.test(host)) {
+      const existingAccountPrompt = await paypalExistingAccountPrompt(page, email);
+      if (existingAccountPrompt) {
+        log('paypal email already exists prompt; retry with a fresh PayPal signup', existingAccountPrompt.slice(0, 220));
+        await pageSnapshot(page, T('paypal_email_already_exists')).catch(() => {});
+        const finalUrl = page.url();
+        await releaseIfHeld();
+        await closeBrowserSafe(browser);
+        return {
+          success: false,
+          error: 'paypal_email_already_exists_retry_new_paypal_account',
+          finalUrl,
+          returnUrl: capturedReturnUrl,
+        };
+      }
       const isAgreementsApprove = /\/agreements\/approve/i.test(pathname);
       const isUlOnboardRedirectApprove = isAgreementsApprove && /ulOnboardRedirect=true/i.test(url);
       const isPaypalPayRoute = /\/pay\/?$/i.test(pathname);
@@ -2567,7 +3166,7 @@ async function main() {
         }
       }
 
-      if (/\/pay\/billing/i.test(pathname) && paypalFallbackContinueClicks < 3) {
+      if ((/\/pay\/billing/i.test(pathname) || isHermesBillingReview) && paypalFallbackContinueClicks < 3) {
         const billingState = await evalAllFrames(page, () => {
           const btn = document.getElementById('consentButton')
             || document.querySelector('[data-id="consentButton"]')
@@ -2603,14 +3202,21 @@ async function main() {
           const clicked = await clickPaypalConsentButton(
             page,
             'paypal-billing-agree-continue',
-            4000,
-            paypalFallbackContinueClicks === 0 ? Math.max(0, fallbackConsentDelayMs - waitedMs) : 3000,
+            consentClickTimeoutMs,
+            paypalFallbackContinueClicks === 0 ? Math.max(0, fallbackConsentDelayMs - waitedMs) : 500,
+            () => capturedReturnUrl,
           );
           if (clicked) {
             paypalFallbackContinueClicks++;
             paypalFallbackAgreed = true;
             decisiveError = '';
             await sleep(6000);
+            continue;
+          }
+          if (isCheckoutRedirectSuccess(page.url(), capturedReturnUrl)) {
+            log('paypal billing success return observed after consent wait');
+            decisiveError = '';
+            await sleep(1000);
             continue;
           }
         } else if (billingState && (billingState.hasAddCard || billingState.looksLikeBilling)) {
@@ -2682,6 +3288,7 @@ async function main() {
           await sleep(3000);
           await waitForPaypalSignupFields(page, 10000);
         }
+        await ensureDelayedPhoneForForm();
         let fillState = await fillPaypalSignupForm(page, addr, signupProfile);
         if (!fillState.ok) {
           await sleep(1200);
@@ -2766,8 +3373,14 @@ async function main() {
         if (otpAccepted) {
           otpHandled = true;
           // PayPal 已接受验证码并离开 OTP modal 后再释放手机号锁。
-          await releaseIfHeld();
-          log('OTP submit accepted; phone-lock released');
+          otpAcceptedBeforeRelease = true;
+          const hadPhoneLock = phoneLockHeld;
+          await releaseIfHeld({ releaseDelayed: false });
+          if (hadPhoneLock) {
+            log('OTP submit accepted; phone-lock released');
+          } else {
+            log('OTP submit accepted; delayed phone lease kept until flow ends');
+          }
         } else {
           log('OTP still visible after submit; keep phone-lock held for retry');
         }
@@ -2794,6 +3407,7 @@ async function main() {
           return { visible, errors };
         }, null).catch(() => []);
         log('form still present; retry submit diag=', JSON.stringify(diag).slice(0, 1000));
+        await ensureDelayedPhoneForForm();
         const refillState = await fillPaypalSignupForm(page, addr, signupProfile);
         if (!refillState.ok) {
           log('paypal signup retry fill still missing', refillState.missing.join(','));

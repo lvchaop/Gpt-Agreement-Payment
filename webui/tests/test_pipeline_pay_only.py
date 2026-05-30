@@ -104,6 +104,41 @@ def test_register_only_batch_uses_workers(tmp_path, monkeypatch):
     assert peak > 1
 
 
+def test_paypal_new_user_batch_rewrite_defers_phone_index(tmp_path):
+    phones = tmp_path / "phones.jsonl"
+    phones.write_text('{"phone":"+817012345678","country":"JP","activation_id":"a1"}\n', encoding="utf-8")
+    cfg_path = tmp_path / "pay.json"
+    cfg_path.write_text(json.dumps({
+        "paypal": {
+            "flow": "new_user",
+            "phones_file": str(phones),
+            "phone_index": 0,
+            "manual_otp_file": "output/paypal_new_user_otp.txt",
+        },
+    }), encoding="utf-8")
+
+    lease_dir = tmp_path / "leases"
+    temp_path = pipeline._rewrite_paypal_new_user_batch_config(
+        str(cfg_path),
+        4,
+        phone_lease_dir=str(lease_dir),
+    )
+
+    try:
+        rewritten = json.loads(open(temp_path, encoding="utf-8").read())
+    finally:
+        try:
+            import os
+            os.unlink(temp_path)
+        except Exception:
+            pass
+
+    paypal = rewritten["paypal"]
+    assert "phone_index" not in paypal
+    assert paypal["_batch_phone_lease_dir"] == str(lease_dir)
+    assert paypal["_batch_index"] == 4
+
+
 def test_pay_only_treats_already_paid_error_as_consumed(tmp_path, monkeypatch):
     db = _reset_db(tmp_path, monkeypatch)
 
@@ -121,6 +156,27 @@ def test_pay_only_treats_already_paid_error_as_consumed(tmp_path, monkeypatch):
     selected = pipeline._select_recent_registered_account_for_pay_only()
     assert selected is not None
     assert selected["email"] == "older@example.com"
+
+
+def test_pay_only_skips_accounts_already_verified_as_paid_plan(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+
+    for email, plan in [
+        ("free@example.com", "free"),
+        ("plus@example.com", "plus"),
+        ("team@example.com", "team"),
+    ]:
+        db.add_registered_account({
+            "email": email,
+            "session_token": f"sess-{plan}",
+            "access_token": f"at-{plan}",
+        })
+        row = next(row for row in db.iter_registered_accounts() if row["email"] == email)
+        db.update_account_check(row["id"], "valid", plan_type=plan)
+
+    selected = pipeline._select_recent_registered_accounts_for_pay_only(3)
+
+    assert [row["email"] for row in selected] == ["free@example.com"]
 
 
 def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
