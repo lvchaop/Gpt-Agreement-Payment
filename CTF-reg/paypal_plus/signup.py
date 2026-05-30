@@ -22,6 +22,7 @@ original GraphQL mutation.  No PayPal page automation is used on this path.
 from __future__ import annotations
 
 import base64
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -31,6 +32,7 @@ import re
 import shutil
 import string
 import subprocess
+import tempfile
 import time
 import urllib.parse
 from datetime import datetime
@@ -395,6 +397,12 @@ def _extract_sms_code_from_text(text: str, *, after_ts: float = 0.0) -> str:
             ts = _record_time(record)
             if ts and ts < min_ts_with_skew:
                 return ""
+        for key in ("sms", "call"):
+            nested = record.get(key)
+            if isinstance(nested, dict):
+                code = _code_from_record(nested)
+                if code:
+                    return code
         for key in ("code", "otp", "pin"):
             code = _code_from_value(record.get(key), plain_digits=True)
             if code:
@@ -1118,6 +1126,141 @@ def _paypal_pay_pre_onboard_warmup(
         logger.debug("BA fraudnet warmup soft-failed: %s", e)
 
 
+def _locale_from_signup_url(signup_url: str) -> tuple[str, str]:
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(signup_url or "").query)
+    except Exception:
+        return "", ""
+    country = str((qs.get("country.x") or [""])[0] or "").strip().upper()
+    raw_locale = str((qs.get("locale.x") or [""])[0] or "").strip()
+    lang = ""
+    if raw_locale:
+        parts = re.split(r"[_-]", raw_locale, maxsplit=1)
+        lang = (parts[0] if parts else "").strip().lower()
+        if not country and len(parts) > 1:
+            country = parts[1].strip().upper()
+    return country, lang
+
+
+def _gql_locale_parts(variables: dict[str, Any], signup_url: str) -> tuple[str, str]:
+    locale_vars = variables.get("locale") if isinstance(variables.get("locale"), dict) else {}
+    url_country, url_lang = _locale_from_signup_url(signup_url)
+    country = (
+        variables.get("country")
+        or variables.get("countryCode")
+        or variables.get("countryCodeAsString")
+        or locale_vars.get("country")
+        or url_country
+        or "US"
+    )
+    lang = (
+        locale_vars.get("lang")
+        or variables.get("languageCode")
+        or url_lang
+        or ("ja" if str(country).upper() == "JP" else "en")
+    )
+    return str(country).upper(), str(lang).lower()
+
+
+def _accept_language_header(locale_country: str, locale_lang: str) -> str:
+    country = (locale_country or "US").upper()
+    lang = (locale_lang or ("ja" if country == "JP" else "en")).lower()
+    return f"{lang}-{country},{lang};q=0.9,en;q=0.8"
+
+
+def _phone_lock_label(phone: str) -> str:
+    digits = re.sub(r"\D+", "", str(phone or ""))
+    return f"****{digits[-4:]}" if digits else "unknown"
+
+
+def _phone_lock_key(phone: str) -> str:
+    token = re.sub(r"\D+", "", str(phone or "")) or str(phone or "").strip()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def _phone_lock_root() -> Path:
+    raw = str(os.environ.get("PPS_PAYPAL_PHONE_LOCK_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(tempfile.gettempdir()) / "pps_paypal_phone_locks"
+
+
+class _PhoneOtpLock:
+    def __init__(self, phone: str, *, timeout: int = 900, stale_after: int = 3600):
+        self.phone = str(phone or "").strip()
+        self.timeout = max(1, int(timeout or 900))
+        self.stale_after = max(60, int(stale_after or 3600))
+        self.lock_dir = _phone_lock_root() / f"{_phone_lock_key(self.phone)}.lock"
+        self.acquired = False
+        self.owner = str(os.environ.get("NCPP_WORKER_ID") or f"pid-{os.getpid()}").strip()
+
+    def acquire(self) -> None:
+        if not self.phone:
+            return
+        root = self.lock_dir.parent
+        root.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + self.timeout
+        last_holder = ""
+        while time.time() < deadline:
+            try:
+                self.lock_dir.mkdir(mode=0o700)
+                owner = {
+                    "owner": self.owner,
+                    "pid": os.getpid(),
+                    "phone": _phone_lock_label(self.phone),
+                    "created_at": time.time(),
+                }
+                try:
+                    (self.lock_dir / "owner.json").write_text(json.dumps(owner, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                self.acquired = True
+                logger.info("phone-lock acquired phone=%s owner=%s", _phone_lock_label(self.phone), self.owner)
+                return
+            except FileExistsError:
+                holder = self._holder()
+                if holder and holder != last_holder:
+                    last_holder = holder
+                    logger.info("phone-lock busy phone=%s holder=%s", _phone_lock_label(self.phone), holder)
+                if self._is_stale():
+                    logger.warning("phone-lock stale; clearing phone=%s holder=%s", _phone_lock_label(self.phone), holder)
+                    shutil.rmtree(self.lock_dir, ignore_errors=True)
+                    continue
+                time.sleep(0.75)
+        raise TimeoutError(f"phone-lock acquire timeout phone={_phone_lock_label(self.phone)}")
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        self.acquired = False
+        shutil.rmtree(self.lock_dir, ignore_errors=True)
+        logger.info("phone-lock released phone=%s owner=%s", _phone_lock_label(self.phone), self.owner)
+
+    def _holder(self) -> str:
+        try:
+            data = json.loads((self.lock_dir / "owner.json").read_text(encoding="utf-8"))
+            return str(data.get("owner") or data.get("pid") or "").strip()
+        except Exception:
+            return ""
+
+    def _is_stale(self) -> bool:
+        try:
+            mtime = (self.lock_dir / "owner.json").stat().st_mtime
+        except Exception:
+            try:
+                mtime = self.lock_dir.stat().st_mtime
+            except Exception:
+                return False
+        return time.time() - mtime > self.stale_after
+
+    def __enter__(self) -> "_PhoneOtpLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
 def _gql(
     s: Any,
     op_name: str,
@@ -1134,17 +1277,12 @@ def _gql(
         body.update(extra_body)
     url = f"{PP_ORIGIN}{path}?{op_name}" if path == "/graphql" else f"{PP_ORIGIN}{path}"
     token = str(variables.get("token") or variables.get("billingAgreementId") or "")
-    country = (
-        variables.get("country")
-        or variables.get("countryCodeAsString")
-        or (variables.get("locale") or {}).get("country")
-        or "US"
-    )
+    country, lang = _gql_locale_parts(variables, signup_url)
     headers = {
         "User-Agent": USER_AGENT,
         "Content-Type": "application/json",
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": _accept_language_header(country, lang),
         "Origin": PP_ORIGIN,
         "Referer": signup_url,
         "X-Requested-With": "fetch",
@@ -1154,8 +1292,8 @@ def _gql(
         "X-App-Name": "checkoutuinodeweb_weasley",
         "PayPal-Client-Context": token,
         "PayPal-Client-Metadata-Id": token,
-        "X-Country": str(country),
-        "X-Locale": "en_US" if str(country).upper() == "US" else f"en_{str(country).upper()}",
+        "X-Country": country,
+        "X-Locale": f"{lang}_{country}",
         "Sec-CH-UA": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
         "Sec-CH-UA-Full-Version-List": '"Chromium";v="146.0.7680.154", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="146.0.7680.154"',
         "Sec-CH-UA-Platform": '"Windows"',
@@ -1586,6 +1724,8 @@ def _extract_content_identifier(html: str, locale_country: str, locale_lang: str
     # syntactically accepted by GraphQL but can fail later inside OAS.
     if locale_country.upper() == "US" and locale_lang.lower() == "en":
         return "US:en:f411614ea3eaac38abc54763fcfca00e:compliance.signupTerms"
+    if locale_country.upper() == "JP" and locale_lang.lower() == "ja":
+        return "JP:ja:d75a1bdbc6baa8ebe00aed449566be84:compliance.signupTerms"
     return f"{locale_country}:{locale_lang}:compliance.signupTerms"
 
 
@@ -3178,6 +3318,8 @@ def _validate_paypal_recaptcha(
     timeout: int,
 ) -> bool:
     """Replay /auth/validatecaptcha using protocol-supplied grcV3 token."""
+    logger.info("validatecaptcha: PayPal reCAPTCHA ignored; continuing without token")
+    return True
     csrf = _html_input_value(challenge_html, "_csrf")
     request_id = _html_input_value(challenge_html, "_requestId")
     hsh = _html_input_value(challenge_html, "_hash")
@@ -3721,14 +3863,8 @@ def _validate_paypal_authchallenge(
             timeout=timeout,
         )
     if "recaptcha" in captcha_type or _extract_recaptcha_iframe_src(challenge_html):
-        return _validate_paypal_recaptcha(
-            s,
-            challenge_html=challenge_html,
-            signup_url=signup_url,
-            proxy=proxy,
-            user_data_dir=user_data_dir,
-            timeout=timeout,
-        )
+        logger.info("authchallenge: PayPal reCAPTCHA ignored; continuing without validatecaptcha")
+        return True
     logger.warning("authchallenge: unsupported captcha type=%r", captcha_type)
     return False
 
@@ -3817,6 +3953,60 @@ def _is_retryable_create_member_account_error(parts: dict[str, Any]) -> bool:
     return False
 
 
+def _date_of_birth_from_source(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    day = str(value.get("day") or "").strip()
+    month = str(value.get("month") or "").strip()
+    year = str(value.get("year") or "").strip()
+    if day and month and year:
+        return {"day": day.zfill(2), "month": month.zfill(2), "year": year}
+    return {}
+
+
+def _address_input_from_source(
+    src: dict[str, Any],
+    *,
+    country: str,
+    family_name: str,
+    given_name: str,
+    default_state: str = "",
+    default_city: str = "",
+    default_line1: str = "",
+    default_postal: str = "",
+    include_state: bool = True,
+) -> dict[str, Any]:
+    out = {
+        "line1": src.get("line1") if src.get("line1") is not None else default_line1,
+        "city": src.get("city") if src.get("city") is not None else default_city,
+        "postalCode": (
+            src.get("postalCode")
+            if src.get("postalCode") is not None
+            else src.get("postal_code")
+            if src.get("postal_code") is not None
+            else default_postal
+        ),
+        "accountQuality": {
+            "autoCompleteType": src.get("autoCompleteType") or "MANUAL",
+            "isUserModified": bool(src.get("isUserModified", False)),
+        },
+        "country": country,
+        "familyName": src.get("familyName") or src.get("last_name") or family_name,
+        "givenName": src.get("givenName") or src.get("first_name") or given_name,
+    }
+    state_value = src.get("state") if src.get("state") is not None else default_state
+    if include_state:
+        out["state"] = state_value
+    return out
+
+
+def _card_issuer_type(value: Any) -> str:
+    token = str(value or "VISA").strip().upper().replace("-", "_").replace(" ", "_")
+    if token in {"MASTERCARD", "MASTER"}:
+        return "MASTER_CARD"
+    return token or "VISA"
+
+
 def _signup_variables(
     *,
     persona: Persona,
@@ -3829,12 +4019,29 @@ def _signup_variables(
     signup_billing_address: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     cc, num = _phone_split(phone_e164)
+    src_addr = signup_billing_address or {}
+    addr_country = (src_addr.get("country") or persona.country or locale_country).upper()
+    is_jp = addr_country == "JP" or str(locale_country or "").upper() == "JP"
+
     # The random identity provider sometimes emits synthetic-looking family
     # names (for example consonant-heavy strings) that PayPal's OAS rejects as
     # INVALID_LAST_NAME even though they are alphabetic.  The browser userscript
     # we are replicating used stable common US names; do the same for the PayPal
     # member profile while keeping the random email/password.
-    if signup_card:
+    if signup_card and is_jp:
+        given_name = (
+            src_addr.get("first_name")
+            or src_addr.get("first_name_kanji")
+            or persona.first_name
+            or "太郎"
+        )
+        family_name = (
+            src_addr.get("last_name")
+            or src_addr.get("last_name_kanji")
+            or persona.last_name
+            or "山田"
+        )
+    elif signup_card:
         # Keep the userscript-compatible stable name by default, but allow
         # targeted replay experiments against captured traces without editing
         # the module again.
@@ -3849,31 +4056,39 @@ def _signup_variables(
             or "Smith"
         )
     else:
-        given_name = persona.first_name
-        family_name = persona.last_name
+        given_name = src_addr.get("first_name") or persona.first_name
+        family_name = src_addr.get("last_name") or persona.last_name
 
-    src_addr = signup_billing_address or {}
-    addr_country = (src_addr.get("country") or persona.country or locale_country).upper()
-    addr = {
-        "line1": src_addr.get("line1") or persona.line1,
-        "city": src_addr.get("city") or persona.city,
-        "postalCode": src_addr.get("postalCode") or src_addr.get("postal_code") or persona.postal_code,
-        "accountQuality": {
-            # v32 userscript fills billingLine1/city/postal/state manually and
-            # hides/escapes address autocomplete, so signup should present as
-            # MANUAL unless a caller explicitly overrides it.
-            "autoCompleteType": src_addr.get("autoCompleteType") or "MANUAL",
-            "isUserModified": bool(src_addr.get("isUserModified", False)),
-        },
-        "country": addr_country,
-        "familyName": family_name,
-        "givenName": given_name,
-    }
+    given_name = str(given_name or "").strip()
+    family_name = str(family_name or "").strip()
+    include_state = addr_country == "US" or src_addr.get("state") is not None
+    addr = _address_input_from_source(
+        src_addr,
+        country=addr_country,
+        family_name=family_name,
+        given_name=given_name,
+        default_line1=persona.line1,
+        default_city=persona.city,
+        default_state=persona.state,
+        default_postal=persona.postal_code,
+        include_state=include_state,
+    )
     # PayPal's state field is country-specific: US uses 2-letter codes from
     # the locale metadata (e.g. "CA"); FR/GB/most-of-EU don't take it at all.
-    state = _us_state_code(src_addr.get("state") or persona.state)
-    if addr_country == "US" and state:
-        addr["state"] = state
+    if addr_country == "US":
+        state = _us_state_code(src_addr.get("state") or persona.state)
+        if state:
+            addr["state"] = state
+
+    shipping_src = src_addr.get("shipping_address") if isinstance(src_addr.get("shipping_address"), dict) else {}
+    shipping_country = (shipping_src.get("country") or addr_country).upper()
+    shipping = _address_input_from_source(
+        shipping_src,
+        country=shipping_country,
+        family_name=family_name,
+        given_name=given_name,
+        include_state=True,
+    )
 
     variables = {
         "country": locale_country,
@@ -3884,28 +4099,36 @@ def _signup_variables(
         "supportedThreeDsExperiences": ["IFRAME"],
         "token": ec_token,
         "billingAddress": addr,
-        "shippingAddress": {
-            "line1": "",
-            "city": "",
-            "state": "",
-            "postalCode": "",
-            "accountQuality": {"autoCompleteType": "MANUAL", "isUserModified": False},
-            "country": addr_country,
-            "familyName": family_name,
-            "givenName": given_name,
-        },
+        "shippingAddress": shipping,
         "contentIdentifier": content_identifier or f"{locale_country}:{locale_lang}:compliance.signupTerms",
         "marketingOptOut": False,
         "password": persona.password,
         "crsData": None,
         "legalAgreements": {},
     }
+    if is_jp:
+        variables["nationality"] = src_addr.get("nationality") or "JP"
+        variables["countrySpecificFirstName"] = (
+            src_addr.get("country_specific_first_name")
+            or src_addr.get("first_name_katakana")
+            or src_addr.get("first_name_hiragana")
+            or given_name
+        )
+        variables["countrySpecificLastName"] = (
+            src_addr.get("country_specific_last_name")
+            or src_addr.get("last_name_katakana")
+            or src_addr.get("last_name_hiragana")
+            or family_name
+        )
+        dob = _date_of_birth_from_source(src_addr.get("date_of_birth") or src_addr.get("dateOfBirth"))
+        if dob:
+            variables["dateOfBirth"] = dob
     if signup_card:
         variables["card"] = {
             "cardNumber": str(signup_card.get("cardNumber") or signup_card.get("number") or "").replace(" ", ""),
             "expirationDate": str(signup_card.get("expirationDate") or ""),
             "securityCode": str(signup_card.get("securityCode") or signup_card.get("cvc") or ""),
-            "type": str(signup_card.get("type") or "VISA").upper(),
+            "type": _card_issuer_type(signup_card.get("type")),
         }
     return variables
 
@@ -4898,125 +5121,161 @@ def signup_no_card(
             timeout=request_timeout,
         )
 
-    # 3) Send SMS OTP
-    _paypal_weasley_log(
-        s,
-        ec_token=ec_token,
-        signup_url=signup_url,
-        locale_country=locale_country,
-        locale_lang=locale_lang,
-        event_names=[
-            "weasley_risk_based_phone_confirmation_modal_component_mounted",
-            "weasley_initiate_phone_confirmation_start",
-            "weasley_api_request_initiate_risk_based_two_factor_phone_confirmation_mutation",
-        ],
-        timeout=request_timeout,
-    )
-    sms_baseline = _sms_gateway_text(proxy=proxy)
-    if sms_baseline:
-        logger.info("sms baseline before init: %s", sms_baseline)
-    sms_t0 = time.time()
-    cc, num = _phone_split(phone_e164)
-    phone_country = {"1": "US", "33": "FR", "44": "GB"}.get(cc, locale_country)
-    init_resp = _gql(
-        s,
-        "InitiateRiskBasedTwoFactorPhoneConfirmationMutation",
-        {
-            "locale": {"country": locale_country, "lang": locale_lang},
-            "phoneCountry": phone_country,
-            "phoneNumber": num,
-            "token": ec_token,
-        },
-        Q_INIT_OTP,
-        signup_url=signup_url,
-        timeout=request_timeout,
-    )
-    init_data = (init_resp.get("data") or {}).get("initiateRiskBasedTwoFactorPhoneConfirmation") or {}
-    auth_id = init_data.get("authId")
-    challenge_id = init_data.get("challengeId")
-    if not auth_id or not challenge_id:
-        return SignupResult(
-            success=False,
-            error="OTP init failed",
-            error_code="OTP_INIT",
+    # 3) Send and confirm SMS OTP.  This is the critical section for a shared
+    # phone number: only the lock holder is allowed to trigger PayPal's SMS and
+    # poll the provider.  The lock is released immediately after PayPal accepts
+    # the code, before the final SignUpNewMemberMutation.
+    lock_timeout = int(os.environ.get("PPS_PAYPAL_PHONE_LOCK_TIMEOUT_S") or max(otp_timeout + 300, 900))
+    lock_stale = int(os.environ.get("PPS_PAYPAL_PHONE_LOCK_STALE_S") or max(lock_timeout * 2, 3600))
+    with _PhoneOtpLock(phone_e164, timeout=lock_timeout, stale_after=lock_stale):
+        _paypal_weasley_log(
+            s,
             ec_token=ec_token,
-            ba_token=ba_token,
-            persona=persona,
+            signup_url=signup_url,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            event_names=[
+                "weasley_risk_based_phone_confirmation_modal_component_mounted",
+                "weasley_initiate_phone_confirmation_start",
+                "weasley_api_request_initiate_risk_based_two_factor_phone_confirmation_mutation",
+            ],
+            timeout=request_timeout,
         )
-    _paypal_weasley_log(
-        s,
-        ec_token=ec_token,
-        signup_url=signup_url,
-        locale_country=locale_country,
-        locale_lang=locale_lang,
-        event_names=[
-            "weasley_api_response_status_200_initiate_risk_based_two_factor_phone_confirmation_mutation",
-            "weasley_initiate_phone_confirmation_success",
-            "weasley_phone_confirmation_interstitial_component_mounted",
-        ],
-        timeout=request_timeout,
-    )
-    logger.info("otp init authId=%s challengeId=%s state=%s",
-                auth_id, challenge_id, init_data.get("state"))
-
-    # 4) Poll SMS gateway
-    pin = wait_for_sms_otp(
-        after_ts=sms_t0,
-        timeout=otp_timeout,
-        proxy=proxy,
-        baseline_text=sms_baseline,
-    )
-    logger.info("otp received: %s", pin)
-
-    # 5) Confirm OTP
-    _paypal_weasley_log(
-        s,
-        ec_token=ec_token,
-        signup_url=signup_url,
-        locale_country=locale_country,
-        locale_lang=locale_lang,
-        event_names=[
-            "weasley_confirm_phone_confirmation_start",
-            "weasley_api_request_confirm_risk_based_two_factor_phone_confirmation_mutation",
-        ],
-        timeout=request_timeout,
-    )
-    conf_resp = _gql(
-        s,
-        "ConfirmRiskBasedTwoFactorPhoneConfirmationMutation",
-        {
-            "authId": auth_id,
-            "challengeId": challenge_id,
-            "pin": pin,
-            "token": ec_token,
-        },
-        Q_CONFIRM_OTP,
-        signup_url=signup_url,
-        timeout=request_timeout,
-    )
-    conf_state = ((conf_resp.get("data") or {})
-                  .get("confirmRiskBasedTwoFactorPhoneConfirmation") or {}).get("state")
-    if conf_state != "CONFIRMED":
-        return SignupResult(
-            success=False,
-            error=f"OTP confirm rejected: state={conf_state}",
-            error_code="OTP_CONFIRM",
+        sms_baseline = _sms_gateway_text(proxy=proxy)
+        if sms_baseline:
+            logger.info("sms baseline before init: %s", sms_baseline)
+        sms_t0 = time.time()
+        cc, num = _phone_split(phone_e164)
+        phone_country = {"1": "US", "33": "FR", "44": "GB"}.get(cc, locale_country)
+        init_resp = _gql(
+            s,
+            "InitiateRiskBasedTwoFactorPhoneConfirmationMutation",
+            {
+                "locale": {"country": locale_country, "lang": locale_lang},
+                "phoneCountry": phone_country,
+                "phoneNumber": num,
+                "token": ec_token,
+            },
+            Q_INIT_OTP,
+            signup_url=signup_url,
+            timeout=request_timeout,
+        )
+        init_data = (init_resp.get("data") or {}).get("initiateRiskBasedTwoFactorPhoneConfirmation") or {}
+        auth_id = init_data.get("authId")
+        challenge_id = init_data.get("challengeId")
+        if not auth_id or not challenge_id:
+            return SignupResult(
+                success=False,
+                error="OTP init failed",
+                error_code="OTP_INIT",
+                ec_token=ec_token,
+                ba_token=ba_token,
+                persona=persona,
+            )
+        _paypal_weasley_log(
+            s,
             ec_token=ec_token,
-            ba_token=ba_token,
-            persona=persona,
+            signup_url=signup_url,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            event_names=[
+                "weasley_api_response_status_200_initiate_risk_based_two_factor_phone_confirmation_mutation",
+                "weasley_initiate_phone_confirmation_success",
+                "weasley_phone_confirmation_interstitial_component_mounted",
+            ],
+            timeout=request_timeout,
         )
-    _paypal_weasley_log(
-        s,
-        ec_token=ec_token,
-        signup_url=signup_url,
-        locale_country=locale_country,
-        locale_lang=locale_lang,
-        event_names=[
-            "weasley_api_response_status_200_confirm_risk_based_two_factor_phone_confirmation_mutation",
-            "weasley_confirm_phone_confirmation_success",
-        ],
-        timeout=request_timeout,
-    )
+        logger.info("otp init authId=%s challengeId=%s state=%s",
+                    auth_id, challenge_id, init_data.get("state"))
+
+        # 4) Poll SMS gateway.  Some providers keep a lease open while PayPal
+        # needs the user-visible "resend SMS" action; re-issue the same init
+        # mutation on timeout so Hero/NexSMS-style polling can catch the new code.
+        resend_attempts = max(0, int(os.environ.get("PPS_PAYPAL_OTP_RESEND_ATTEMPTS") or 0))
+        pin = ""
+        for otp_attempt in range(0, resend_attempts + 1):
+            try:
+                pin = wait_for_sms_otp(
+                    after_ts=sms_t0,
+                    timeout=otp_timeout,
+                    proxy=proxy,
+                    baseline_text=sms_baseline,
+                )
+                break
+            except TimeoutError:
+                if otp_attempt >= resend_attempts:
+                    raise
+                logger.info("sms otp timeout; resend attempt %s/%s", otp_attempt + 1, resend_attempts)
+                sms_baseline = _sms_gateway_text(proxy=proxy)
+                sms_t0 = time.time()
+                init_resp = _gql(
+                    s,
+                    "InitiateRiskBasedTwoFactorPhoneConfirmationMutation",
+                    {
+                        "locale": {"country": locale_country, "lang": locale_lang},
+                        "phoneCountry": phone_country,
+                        "phoneNumber": num,
+                        "token": ec_token,
+                    },
+                    Q_INIT_OTP,
+                    signup_url=signup_url,
+                    timeout=request_timeout,
+                )
+                init_data = (init_resp.get("data") or {}).get("initiateRiskBasedTwoFactorPhoneConfirmation") or {}
+                auth_id = init_data.get("authId") or auth_id
+                challenge_id = init_data.get("challengeId") or challenge_id
+                logger.info("otp resend authId=%s challengeId=%s state=%s", auth_id, challenge_id, init_data.get("state"))
+        logger.info("otp received: %s", pin)
+
+        # 5) Confirm OTP
+        _paypal_weasley_log(
+            s,
+            ec_token=ec_token,
+            signup_url=signup_url,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            event_names=[
+                "weasley_confirm_phone_confirmation_start",
+                "weasley_api_request_confirm_risk_based_two_factor_phone_confirmation_mutation",
+            ],
+            timeout=request_timeout,
+        )
+        conf_resp = _gql(
+            s,
+            "ConfirmRiskBasedTwoFactorPhoneConfirmationMutation",
+            {
+                "authId": auth_id,
+                "challengeId": challenge_id,
+                "pin": pin,
+                "token": ec_token,
+            },
+            Q_CONFIRM_OTP,
+            signup_url=signup_url,
+            timeout=request_timeout,
+        )
+        conf_state = ((conf_resp.get("data") or {})
+                      .get("confirmRiskBasedTwoFactorPhoneConfirmation") or {}).get("state")
+        if conf_state != "CONFIRMED":
+            return SignupResult(
+                success=False,
+                error=f"OTP confirm rejected: state={conf_state}",
+                error_code="OTP_CONFIRM",
+                ec_token=ec_token,
+                ba_token=ba_token,
+                persona=persona,
+            )
+        _paypal_weasley_log(
+            s,
+            ec_token=ec_token,
+            signup_url=signup_url,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            event_names=[
+                "weasley_api_response_status_200_confirm_risk_based_two_factor_phone_confirmation_mutation",
+                "weasley_confirm_phone_confirmation_success",
+            ],
+            timeout=request_timeout,
+        )
 
     # 6) Sign up — no card
     content_identifier = _extract_content_identifier(signup_html, locale_country, locale_lang)

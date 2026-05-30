@@ -15,6 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const Module = require('module');
 
 const _EXTRA_NODE_PATHS = [
@@ -36,13 +37,84 @@ const T = (suffix) => `${T_BASE}_${suffix}`;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Phone OTP 临界区协调 (并发 worker 用同一 phone). 通过 webui parallel_runner
-// 的 HTTP 锁; 缺 env (单 worker / CLI) 时整体 no-op 保持向后兼容.
+// Phone OTP 临界区协调 (并发 worker 用同一 phone). 优先用 webui
+// parallel_runner 的 HTTP 锁; 没有 HTTP 锁时退回本机目录锁, 让 CLI/单机多进程
+// 也不会同时触发同一个手机号的 PayPal SMS.
 const PHONE_LOCK_URL = (process.env.NCPP_PHONE_LOCK_URL || '').trim();
+const PHONE_LOCK_DIR = (process.env.PPS_PAYPAL_PHONE_LOCK_DIR || path.join(os.tmpdir(), 'pps_paypal_phone_locks')).trim();
+const PHONE_LOCK_STALE_MS = Math.max(60000, Number(process.env.PPS_PAYPAL_PHONE_LOCK_STALE_S || 3600) * 1000);
+
+function phoneLockToken(phone) {
+  return String(phone || '').replace(/\D+/g, '') || String(phone || '').trim();
+}
+
+function phoneLockLabel(phone) {
+  const digits = phoneLockToken(phone);
+  return digits ? `****${digits.slice(-4)}` : 'unknown';
+}
+
+function phoneLockPath(phone) {
+  const key = crypto.createHash('sha256').update(phoneLockToken(phone)).digest('hex').slice(0, 24);
+  return path.join(PHONE_LOCK_DIR, `${key}.lock`);
+}
+
+function readLocalPhoneLockOwner(lockPath) {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+    return String(data.owner || data.pid || '').trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+function localPhoneLockStale(lockPath) {
+  try {
+    const stat = fs.statSync(path.join(lockPath, 'owner.json'));
+    return Date.now() - stat.mtimeMs > PHONE_LOCK_STALE_MS;
+  } catch (_) {
+    try {
+      const stat = fs.statSync(lockPath);
+      return Date.now() - stat.mtimeMs > PHONE_LOCK_STALE_MS;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+function tryAcquireLocalPhoneLock(phone, workerId) {
+  if (!phoneLockToken(phone)) return { ok: true, noop: true };
+  const lockPath = phoneLockPath(phone);
+  try { fs.mkdirSync(PHONE_LOCK_DIR, { recursive: true, mode: 0o700 }); } catch (_) {}
+  try {
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    try {
+      fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+        owner: workerId,
+        pid: process.pid,
+        phone: phoneLockLabel(phone),
+        createdAt: new Date().toISOString(),
+      }, null, 2));
+    } catch (_) {}
+    return { ok: true, local: true, lockPath };
+  } catch (e) {
+    if (e && e.code === 'EEXIST') {
+      const holder = readLocalPhoneLockOwner(lockPath);
+      if (localPhoneLockStale(lockPath)) {
+        log('phone-lock stale; clearing', phoneLockLabel(phone), holder ? `holder=${holder}` : '');
+        try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch (_) {}
+        return { ok: false, staleCleared: true, body: { holder } };
+      }
+      return { ok: false, body: { holder } };
+    }
+    return { ok: false, error: e && e.message ? e.message : String(e) };
+  }
+}
 
 async function tryAcquirePhoneLock(phone, workerId) {
-  if (!PHONE_LOCK_URL || !phone || !workerId) return { ok: true, noop: true };
-  const url = `${PHONE_LOCK_URL}/acquire?phone=${encodeURIComponent(phone)}&worker=${encodeURIComponent(workerId)}`;
+  const worker = String(workerId || process.pid || '').trim();
+  if (!phoneLockToken(phone)) return { ok: true, noop: true };
+  if (!PHONE_LOCK_URL) return tryAcquireLocalPhoneLock(phone, worker);
+  const url = `${PHONE_LOCK_URL}/acquire?phone=${encodeURIComponent(phone)}&worker=${encodeURIComponent(worker)}`;
   try {
     const r = await fetch(url, { method: 'POST', signal: AbortSignal.timeout(5000) });
     if (r.status === 200) return { ok: true };
@@ -55,40 +127,51 @@ async function tryAcquirePhoneLock(phone, workerId) {
 }
 
 async function waitAcquirePhoneLock(phone, workerId, timeoutMs = 600000) {
-  if (!PHONE_LOCK_URL || !phone || !workerId) return true;
+  if (!phoneLockToken(phone)) return true;
+  const worker = String(workerId || process.pid || '').trim();
   const deadline = Date.now() + timeoutMs;
   let lastHolder = '';
   let attempts = 0;
   while (Date.now() < deadline) {
     attempts++;
-    const r = await tryAcquirePhoneLock(phone, workerId);
+    const r = await tryAcquirePhoneLock(phone, worker);
     if (r.ok) {
       if (!r.noop && attempts > 1) {
-        log('phone-lock acquired after wait', phone, `worker=${workerId}`, `attempts=${attempts}`);
+        log('phone-lock acquired after wait', phoneLockLabel(phone), `worker=${worker}`, `attempts=${attempts}`);
       } else if (!r.noop) {
-        log('phone-lock acquired', phone, `worker=${workerId}`);
+        log('phone-lock acquired', phoneLockLabel(phone), `worker=${worker}`);
       }
       return true;
     }
     const holder = (r.body && r.body.detail && r.body.detail.holder) || (r.body && r.body.holder) || '';
     if (holder && holder !== lastHolder) {
       lastHolder = holder;
-      log('phone-lock busy, waiting', phone, `holder=${holder}`);
+      log('phone-lock busy, waiting', phoneLockLabel(phone), `holder=${holder}`);
     }
     await sleep(750);
   }
-  log('phone-lock acquire TIMEOUT', phone, `worker=${workerId}`);
+  log('phone-lock acquire TIMEOUT', phoneLockLabel(phone), `worker=${worker}`);
   return false;
 }
 
 async function releasePhoneLock(phone, workerId) {
-  if (!PHONE_LOCK_URL || !phone || !workerId) return;
+  const worker = String(workerId || process.pid || '').trim();
+  if (!phoneLockToken(phone)) return;
+  if (!PHONE_LOCK_URL) {
+    try {
+      fs.rmSync(phoneLockPath(phone), { recursive: true, force: true });
+      log('phone-lock released', phoneLockLabel(phone), `worker=${worker}`);
+    } catch (e) {
+      log('phone-lock release error', e && e.message ? e.message : e);
+    }
+    return;
+  }
   try {
     await fetch(
-      `${PHONE_LOCK_URL}/release?phone=${encodeURIComponent(phone)}&worker=${encodeURIComponent(workerId)}`,
+      `${PHONE_LOCK_URL}/release?phone=${encodeURIComponent(phone)}&worker=${encodeURIComponent(worker)}`,
       { method: 'POST', signal: AbortSignal.timeout(3000) },
     );
-    log('phone-lock released', phone, `worker=${workerId}`);
+    log('phone-lock released', phoneLockLabel(phone), `worker=${worker}`);
   } catch (e) {
     log('phone-lock release error', e && e.message ? e.message : e);
   }
@@ -364,14 +447,18 @@ function proxyForPlaywright(raw) {
 }
 
 function chromiumLaunchOptions(executablePath, headless, proxy, payload = {}) {
+  const localeCountry = String(payload.localeCountry || payload.country || 'US').toUpperCase();
+  const localeLang = String(payload.localeLang || (localeCountry === 'JP' ? 'ja' : 'en')).toLowerCase();
+  const browserLocale = `${localeLang}-${localeCountry}`;
+  const timezoneId = localeCountry === 'JP' ? 'Asia/Tokyo' : 'America/Chicago';
   return {
     executablePath,
     headless,
     proxy,
     ignoreDefaultArgs: ['--enable-automation'],
     viewport: { width: 1440, height: 900 },
-    locale: 'en-US',
-    timezoneId: 'America/Chicago',
+    locale: browserLocale,
+    timezoneId,
     userAgent: payload.userAgent || undefined,
     args: [
       '--disable-blink-features=AutomationControlled',
@@ -435,6 +522,25 @@ function shortNameToken(value, fallback) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+function isJpCountry(country) {
+  return String(country || '').trim().toUpperCase() === 'JP';
+}
+
+function nameTokenForCountry(value, fallback, country) {
+  if (isJpCountry(country)) {
+    const raw = String(value || '').trim();
+    return raw || fallback;
+  }
+  return shortNameToken(value, fallback);
+}
+
+function cleanInputName(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/[^\x00-\x7F]/.test(raw)) return raw.slice(0, 32);
+  return raw.replace(/[^A-Za-z]/g, '').slice(0, 6);
+}
+
 function normalizeExpiry(expiry) {
   const parts = String(expiry || '').replace(/\//g, ' ').split(/\s+/).filter(Boolean);
   if (parts.length >= 2) {
@@ -445,20 +551,35 @@ function normalizeExpiry(expiry) {
   return String(expiry || '03 / 30');
 }
 
-function phoneForUi(phone) {
+function phoneForUi(phone, country = 'US') {
   let p = String(phone || '').replace(/[^\d]/g, '');
-  if (p.length === 11 && p.startsWith('1')) p = p.slice(1);
+  const c = String(country || '').toUpperCase();
+  if (c === 'US' && p.length === 11 && p.startsWith('1')) p = p.slice(1);
+  if (c === 'JP' && p.startsWith('81') && p.length >= 11) p = p.slice(2);
   return p;
+}
+
+function dateOfBirthForUi(value) {
+  const d = value && typeof value === 'object' ? value : {};
+  const year = String(d.year || '').trim();
+  const month = String(d.month || '').trim().padStart(2, '0');
+  const day = String(d.day || '').trim().padStart(2, '0');
+  if (year && month && day) return `${year}/${month}/${day}`;
+  return '';
 }
 
 async function getAddress(payload) {
   const a = payload.address || {};
   if (a.line1 || a.street) {
+    const country = String(a.country || payload.country || 'US').toUpperCase();
     return {
       street: a.line1 || a.street,
       city: a.city || 'New York',
       state: a.state || 'New York',
-      zip: String(a.postalCode || a.postal_code || a.zip || '10001').slice(0, 5),
+      zip: country === 'US'
+        ? String(a.postalCode || a.postal_code || a.zip || '10001').slice(0, 5)
+        : String(a.postalCode || a.postal_code || a.zip || ''),
+      country,
     };
   }
   try {
@@ -474,10 +595,11 @@ async function getAddress(payload) {
       city: x.City || x.city || 'New York',
       state: x.State_Full || x.State || x.state || 'New York',
       zip: String(x.Zip_Code || x.zip || '10001').slice(0, 5),
+      country: 'US',
     };
   } catch (e) {
     log('addr fallback', e.message || e);
-    return { street: '123 Main St', city: 'New York', state: 'New York', zip: '10001' };
+    return { street: '123 Main St', city: 'New York', state: 'New York', zip: '10001', country: 'US' };
   }
 }
 
@@ -525,7 +647,10 @@ const fillByIdScript = ({ id, val }) => {
 };
 
 const fillNameScript = ({ id, val }) => {
-  const clean = String(val || '').replace(/[^A-Za-z]/g, '').slice(0, 6);
+  const raw = String(val || '').trim();
+  const clean = /[^\x00-\x7F]/.test(raw)
+    ? raw.slice(0, 32)
+    : raw.replace(/[^A-Za-z]/g, '').slice(0, 6);
   if (!clean) return false;
   const selectorMap = {
     firstName: [
@@ -639,7 +764,7 @@ async function fillAny(page, id, val) {
 }
 
 async function fillNameAny(page, id, val) {
-  const clean = String(val || '').replace(/[^A-Za-z]/g, '').slice(0, 5);
+  const clean = cleanInputName(val);
   const res = await evalAllFrames(page, fillNameScript, { id, val: clean });
   const hit = res.filter((x) => x && x.count > 0)[0];
   if (hit) log('fill', id, `ok value=${hit.value}`);
@@ -741,8 +866,21 @@ async function waitForPaypalSignupFields(page, timeoutMs = 10000) {
 
 async function fillPaypalSignupForm(page, addr, profile) {
   const result = {};
-  const firstName = shortNameToken(profile.firstName, 'James');
-  const lastName = shortNameToken(profile.lastName, 'Smith');
+  const country = String(profile.country || addr.country || 'US').toUpperCase();
+  const firstName = nameTokenForCountry(profile.firstName, country === 'JP' ? '太郎' : 'James', country);
+  const lastName = nameTokenForCountry(profile.lastName, country === 'JP' ? '山田' : 'Smith', country);
+  const countrySpecificFirstName = String(
+    profile.countrySpecificFirstName
+    || profile.firstNameKatakana
+    || profile.firstNameHiragana
+    || firstName
+  ).trim();
+  const countrySpecificLastName = String(
+    profile.countrySpecificLastName
+    || profile.lastNameKatakana
+    || profile.lastNameHiragana
+    || lastName
+  ).trim();
   result.email = await fillAny(page, 'email', profile.email)
     || await fillSelectorAny(page, 'input[type="email"]', profile.email);
   result.phone = await fillAny(page, 'phone', profile.phone);
@@ -752,6 +890,11 @@ async function fillPaypalSignupForm(page, addr, profile) {
   result.password = await fillAny(page, 'password', profile.password);
   result.firstName = await fillNameAny(page, 'firstName', firstName);
   result.lastName = await fillNameAny(page, 'lastName', lastName);
+  if (country === 'JP') {
+    result.countrySpecificFirstName = await fillNameAny(page, 'countrySpecificFirstName', countrySpecificFirstName);
+    result.countrySpecificLastName = await fillNameAny(page, 'countrySpecificLastName', countrySpecificLastName);
+    result.dateOfBirth = await fillAny(page, 'dateOfBirth', profile.dateOfBirthUi);
+  }
   result.billingLine1 = await fillAny(page, 'billingLine1', addr.street);
   result.billingCity = await fillAny(page, 'billingCity', addr.city);
   result.billingPostalCode = await fillAny(page, 'billingPostalCode', addr.zip);
@@ -770,6 +913,9 @@ async function fillPaypalSignupForm(page, addr, profile) {
     'billingCity',
     'billingPostalCode',
   ];
+  if (country === 'JP') {
+    required.push('countrySpecificFirstName', 'countrySpecificLastName', 'dateOfBirth');
+  }
   const missing = required.filter((key) => !result[key]);
   if (missing.length) log('paypal signup fill missing', missing.join(','));
   return { ok: missing.length === 0, result, missing };
@@ -1208,6 +1354,12 @@ function extractOtpFromSmsResponse(text, opts = {}) {
     if (minMsWithSkew) {
       const ts = recordTimeMs(record);
       if (ts && ts < minMsWithSkew) return '';
+    }
+    for (const key of ['sms', 'call']) {
+      if (record[key] && typeof record[key] === 'object') {
+        const code = codeFromRecord(record[key]);
+        if (code) return code;
+      }
     }
     for (const key of ['code', 'otp', 'pin']) {
       const code = codeFromValue(record[key], true);
@@ -1747,16 +1899,21 @@ async function main() {
   try { fs.writeFileSync(T('live.log'), ''); } catch (_) {}
   const timeoutMs = Number(payload.timeoutMs || 600000);
   const addr = await getAddress(payload);
+  const stripeAddr = await getAddress({
+    ...payload,
+    address: payload.stripeAddress || payload.stripeBillingAddress || {},
+  });
+  const country = String(payload.country || addr.country || 'US').toUpperCase();
   const email = payload.email || randEmail();
   const password = payload.password || randPass();
-  const phone = phoneForUi(payload.phone || process.env.PPS_PAYPAL_PHONE || '');
-  // 并发 worker 共享同一 phone 时, OTP 阶段用 PHONE_LOCK_URL 排队避免短信串.
-  // 单 worker / 无 PHONE_LOCK_URL 时, ensure/release 都是 no-op.
-  const _LOCK_WID = (process.env.NCPP_WORKER_ID || '').trim();
+  const phone = phoneForUi(payload.phone || process.env.PPS_PAYPAL_PHONE || '', country);
+  // 并发 worker 共享同一 phone 时, OTP 阶段排队避免短信串.
+  // 有 PHONE_LOCK_URL 时用 HTTP 锁; 否则用本机目录锁兜底.
+  const _LOCK_WID = (process.env.NCPP_WORKER_ID || `pid-${process.pid}`).trim();
   let phoneLockHeld = false;
   const ensurePhoneLock = async () => {
-    if (phoneLockHeld || !PHONE_LOCK_URL || !_LOCK_WID) return;
-    log('phone-lock acquiring (about to submit form, will trigger SMS)', phone);
+    if (phoneLockHeld || !phoneLockToken(phone) || !_LOCK_WID) return;
+    log('phone-lock acquiring (form filled; next submit triggers SMS)', phoneLockLabel(phone));
     const got = await waitAcquirePhoneLock(phone, _LOCK_WID, 900000);
     phoneLockHeld = !!got;
   };
@@ -1777,8 +1934,16 @@ async function main() {
     cardExpiry,
     cardCvv,
     password,
-    firstName: shortNameToken(payload.firstName, 'James'),
-    lastName: shortNameToken(payload.lastName, 'Smith'),
+    country,
+    firstName: nameTokenForCountry(payload.firstName, country === 'JP' ? '太郎' : 'James', country),
+    lastName: nameTokenForCountry(payload.lastName, country === 'JP' ? '山田' : 'Smith', country),
+    countrySpecificFirstName: payload.countrySpecificFirstName || '',
+    countrySpecificLastName: payload.countrySpecificLastName || '',
+    firstNameHiragana: payload.firstNameHiragana || '',
+    lastNameHiragana: payload.lastNameHiragana || '',
+    firstNameKatakana: payload.firstNameKatakana || '',
+    lastNameKatakana: payload.lastNameKatakana || '',
+    dateOfBirthUi: dateOfBirthForUi(payload.dateOfBirth),
   };
   log('signup profile name', `${signupProfile.firstName}/${signupProfile.lastName}`);
   const fiveSim = fiveSimFromPayload(payload);
@@ -1790,16 +1955,23 @@ async function main() {
     ?? 12000,
   ) || 0);
   let smsBaselineText = '';
-  if (fiveSim) {
-    log('5sim otp enabled', `order=${fiveSim.orderId}`);
-  } else if (smsApiUrl) {
+  let smsBaselinePrepared = false;
+  const prepareSmsBaseline = async () => {
+    if (smsBaselinePrepared) return;
+    smsBaselinePrepared = true;
+    if (!smsApiUrl) return;
     try {
-      const r = await fetch(smsApiUrl, { method: 'GET' });
+      const r = await fetch(smsApiUrl, { method: 'GET', signal: AbortSignal.timeout(10000) });
       smsBaselineText = (await r.text()).trim();
-      if (smsBaselineText) log('sms baseline', smsBaselineText.slice(0, 80).replace(/[0-9]{6}/g, '******'));
+      if (smsBaselineText) log('sms baseline before submit', smsBaselineText.slice(0, 80).replace(/[0-9]{6}/g, '******'));
     } catch (e) {
       log('sms baseline error', e.message || e);
     }
+  };
+  if (fiveSim) {
+    log('5sim otp enabled', `order=${fiveSim.orderId}`);
+  } else if (smsApiUrl) {
+    log('sms api enabled; baseline delayed until form-filled phone-lock');
   }
   const { browser } = await launchProjectChromium(payload);
   const page = browser.pages()[0] || await browser.newPage();
@@ -1936,6 +2108,7 @@ async function main() {
       initialReferer = 'https://checkout.stripe.com/';
     }
   } catch (_) {}
+  try {
   try {
     await page.goto(startUrl, {
       // Do not wait for PayPal's full DOM lifecycle here.  Challenge /
@@ -2147,7 +2320,7 @@ async function main() {
         }
       }
       if (visible && !stripeFilled) {
-        const ok = await fillStripeCheckoutLikeUserscript(page, addr, expectedDueCents, stripeEmail);
+        const ok = await fillStripeCheckoutLikeUserscript(page, stripeAddr, expectedDueCents, stripeEmail);
         if (ok) {
           stripeFilled = true;
           lastStripeSubmitClick = Date.now();
@@ -2503,9 +2676,9 @@ async function main() {
 
       if (hasForm && !formFilled) {
         log('checkout form detected; filling userscript v32 fields');
-        const countryChanged = await selectAny(page, 'country', 'US');
+        const countryChanged = await selectAny(page, 'country', country);
         if (countryChanged) {
-          log('country -> US, wait for PayPal form rerender');
+          log(`country -> ${country}, wait for PayPal form rerender`);
           await sleep(3000);
           await waitForPaypalSignupFields(page, 10000);
         }
@@ -2524,6 +2697,7 @@ async function main() {
         // 并发 worker 抢同 phone 时, 在这里阻塞排队拿锁;
         // 拿到锁后再 click submit 让 PayPal 发 SMS, 避免两 worker 同时触发短信串码.
         await ensurePhoneLock();
+        await prepareSmsBaseline();
         await clickSubmitLike(page);
         lastSubmitClick = Date.now();
         await sleep(3500);
@@ -2534,17 +2708,28 @@ async function main() {
       if (otpInfo && !otpHandled) {
         log('OTP modal detected', JSON.stringify(otpInfo));
         if (!fiveSim && !smsApiUrl && !payload.manualOtpFile) throw new Error('smsApiUrl/manualOtpFile/fiveSim missing for PayPal OTP');
-        const code = await getOtp(
-          smsApiUrl,
-          Number(payload.otpTimeoutMs || 180000),
-          smsBaselineText,
-          {
-            shouldAbort: () => dataDomeBlocked,
-            manualOtpFile: payload.manualOtpFile || '',
-            fiveSim,
-            afterMs: lastSubmitClick || 0,
-          },
-        );
+        let code = '';
+        const otpResendAttempts = Math.max(0, Number(payload.otpResendAttempts || 0) || 0);
+        for (let otpAttempt = 0; otpAttempt <= otpResendAttempts; otpAttempt++) {
+          code = await getOtp(
+            smsApiUrl,
+            Number(payload.otpTimeoutMs || 180000),
+            smsBaselineText,
+            {
+              shouldAbort: () => dataDomeBlocked,
+              manualOtpFile: payload.manualOtpFile || '',
+              fiveSim,
+              afterMs: lastSubmitClick || 0,
+            },
+          );
+          if (code || otpAttempt >= otpResendAttempts) break;
+          const resent = await clickByText(page, /(resend|send again|重新发送|再送)/i, 'otp-resend', 3000);
+          log('OTP resend', resent ? 'clicked' : 'not-found', `attempt=${otpAttempt + 1}/${otpResendAttempts}`);
+          if (!resent) break;
+          lastSubmitClick = Date.now();
+          smsBaselineText = '';
+          await sleep(3000);
+        }
         if (code === '__ABORTED__') {
           log('decisive PayPal error paypal_datadome_blocked; SMS never dispatched, bailing');
           await pageSnapshot(page, T('datadome')).catch(() => {});
@@ -2565,13 +2750,28 @@ async function main() {
         }
         const ok = await fillOtp(page, code);
         log('OTP fill', ok ? 'ok' : 'miss');
-        otpHandled = true;
-        // OTP 填完 → 释放 phone 锁让下一个 worker 进入临界区.
-        // post-OTP 阶段 (Hermes / Stripe return) 不再需要短信, 可与其它 worker 并行.
-        await releaseIfHeld();
-        await sleep(1200);
+        if (!ok) throw new Error('PayPal OTP input not found');
+        await sleep(800);
         await clickSubmitLike(page);
-        await sleep(4000);
+        lastSubmitClick = Date.now();
+        let otpAccepted = false;
+        for (let i = 0; i < 10; i++) {
+          await sleep(1000);
+          const stillOtp = await hasOtp(page);
+          if (!stillOtp) {
+            otpAccepted = true;
+            break;
+          }
+        }
+        if (otpAccepted) {
+          otpHandled = true;
+          // PayPal 已接受验证码并离开 OTP modal 后再释放手机号锁。
+          await releaseIfHeld();
+          log('OTP submit accepted; phone-lock released');
+        } else {
+          log('OTP still visible after submit; keep phone-lock held for retry');
+        }
+        await sleep(2500);
         continue;
       }
 
@@ -2601,6 +2801,8 @@ async function main() {
           lastSubmitClick = Date.now();
           continue;
         }
+        await ensurePhoneLock();
+        await prepareSmsBaseline();
         await clickSubmitLike(page);
         lastSubmitClick = Date.now();
         await sleep(3500);
@@ -2624,13 +2826,13 @@ async function main() {
       }
     }
 
-    // Save breadcrumbs if a real visible captcha page appears and does not
-    // auto-resolve. We keep waiting a bit because PayPal sometimes swaps a
-    // passive challenge out after its own scripts finish.
+    // Save breadcrumbs for hCaptcha-like pages. PayPal reCAPTCHA is ignored by
+    // this flow so we keep moving through the normal waits instead of treating
+    // it as a blocking challenge.
     const captchaVisible = await evalAllFrames(page, () => {
       const t = (document.body && document.body.innerText || '').slice(0, 1200);
-      const textLooksLikeChallenge = /Security Challenge|security check|unusual activity|reCAPTCHA|hCaptcha|请验证|請驗證|人机验证|人機驗證/i.test(t);
-      const visibleChallenge = Array.from(document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], #captcha-standalone, .captcha-overlay, .captcha-container')).some((el) => {
+      const textLooksLikeChallenge = /hCaptcha|请验证|請驗證|人机验证|人機驗證/i.test(t);
+      const visibleChallenge = Array.from(document.querySelectorAll('iframe[src*="hcaptcha"], #captcha-standalone, .captcha-overlay, .captcha-container')).some((el) => {
         const r = el.getBoundingClientRect();
         return el.offsetParent !== null && r.width > 10 && r.height > 10;
       });
@@ -2661,6 +2863,9 @@ async function main() {
   const finalUrl = page.url();
   await closeBrowserSafe(browser);
   return { success: false, error: 'timeout', finalUrl, returnUrl: capturedReturnUrl };
+  } finally {
+    await releaseIfHeld();
+  }
 }
 
 if (require.main === module) {

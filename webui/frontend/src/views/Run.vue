@@ -1324,18 +1324,25 @@ function _selectedEmails(): string[] {
 }
 
 async function payOnlySelected() {
-  const emails = _selectedEmails();
-  if (!emails.length) { message.warning("没有选中账号"); return; }
+  const selectedEmails = _selectedEmails();
+  if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
+  const requestedBatch = form.value.mode === "batch"
+    ? Math.max(1, Number(form.value.batch || 0))
+    : selectedEmails.length;
+  const emails = selectedEmails.slice(0, Math.min(selectedEmails.length, requestedBatch));
   const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
-  if (!confirm(`对 ${emails.length} 个选中账号跑 pay-only？\n${preview}\n\n模式：${form.value.gopay ? "GoPay" : (form.value.paypal ? "PayPal" : "Card")}`)) return;
+  const batchNote = selectedEmails.length > emails.length ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）` : "";
+  if (!confirm(`对 ${emails.length} 个选中账号跑 pay-only？${batchNote}\n${preview}\n\nworkers=${Math.max(1, Number(form.value.workers || 1))}\n模式：${form.value.gopay ? "GoPay" : (form.value.paypal ? "PayPal" : "Card")}`)) return;
   starting.value = true;
   try {
     await api.post("/run/start", {
-      mode: "single",
+      mode: emails.length > 1 ? "batch" : "single",
       paypal: form.value.paypal,
       gopay: form.value.gopay,
       pay_only: true,
       register_only: false,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers: Math.max(1, Number(form.value.workers || 1)),
       register_mode: form.value.register_mode || "browser",
       target_emails: emails,
     });

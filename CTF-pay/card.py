@@ -5543,6 +5543,23 @@ def _paypal_uses_five_sim(paypal_cfg: dict) -> bool:
     return _paypal_sms_provider(paypal_cfg) in {"5sim", "five_sim", "fivesim"}
 
 
+def _paypal_uses_hero_sms(paypal_cfg: dict) -> bool:
+    if _paypal_bool_cfg(paypal_cfg, "manual_otp", default=False):
+        return False
+    if not _paypal_bool_cfg(paypal_cfg, "sms_api_enabled", default=True):
+        return False
+    return _paypal_sms_provider(paypal_cfg) in {
+        "hero",
+        "hero_sms",
+        "hero-sms",
+        "sms_hub",
+        "smshub",
+        "sms-activate",
+        "sms_activate",
+        "smsactivate",
+    }
+
+
 def _five_sim_cfg(paypal_cfg: dict) -> dict:
     cfg = paypal_cfg.get("five_sim") or paypal_cfg.get("fivesim") or {}
     return cfg if isinstance(cfg, dict) else {}
@@ -5698,21 +5715,160 @@ def _five_sim_keep_for_retry(paypal_cfg: dict) -> None:
         order["_keep_for_retry"] = True
 
 
+def _hero_sms_cfg(paypal_cfg: dict) -> dict:
+    cfg = paypal_cfg.get("hero_sms") or paypal_cfg.get("hero") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _hero_sms_api_key(paypal_cfg: dict) -> str:
+    cfg = _hero_sms_cfg(paypal_cfg)
+    api_key = str(
+        cfg.get("api_key")
+        or cfg.get("token")
+        or paypal_cfg.get("hero_sms_api_key")
+        or paypal_cfg.get("hero_api_key")
+        or ""
+    ).strip()
+    if api_key:
+        return api_key
+    env_name = str(
+        cfg.get("api_key_env")
+        or cfg.get("token_env")
+        or paypal_cfg.get("hero_sms_api_key_env")
+        or paypal_cfg.get("hero_api_key_env")
+        or "HERO_SMS_API_KEY"
+    ).strip()
+    return str(os.environ.get(env_name) or "").strip()
+
+
+def _hero_sms_base_url(paypal_cfg: dict) -> str:
+    cfg = _hero_sms_cfg(paypal_cfg)
+    return str(
+        cfg.get("base_url")
+        or paypal_cfg.get("hero_sms_base_url")
+        or "https://hero-sms.com/stubs/handler_api.php"
+    ).strip().rstrip("/")
+
+
+def _hero_sms_query(paypal_cfg: dict, action: str, **params) -> str:
+    api_key = _hero_sms_api_key(paypal_cfg)
+    if not api_key:
+        env_name = str(_hero_sms_cfg(paypal_cfg).get("api_key_env") or "HERO_SMS_API_KEY")
+        raise RuntimeError(f"Hero SMS api_key 未配置：设置 paypal.hero_sms.api_key 或环境变量 {env_name}")
+    query = {"action": action, "api_key": api_key}
+    for key, val in params.items():
+        if val in (None, ""):
+            continue
+        query[key] = str(val)
+    return f"{_hero_sms_base_url(paypal_cfg)}?{urllib.parse.urlencode(query)}"
+
+
+def _hero_sms_lease_id_from_source(source: dict) -> str:
+    for key in (
+        "hero_lease_id",
+        "hero_activation_id",
+        "activation_id",
+        "activationId",
+        "lease_id",
+        "leaseId",
+        "id",
+    ):
+        value = str(source.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _hero_sms_cache_lease(paypal_cfg: dict, lease: dict) -> dict:
+    paypal_cfg["_hero_sms_lease"] = dict(lease)
+    return paypal_cfg["_hero_sms_lease"]
+
+
+def _hero_sms_static_phone(paypal_cfg: dict, source: dict, source_name: str) -> dict:
+    phone = _paypal_phone_from_source(source)
+    country_hint = phone.get("dial_code") or phone.get("country") or paypal_cfg.get("phone_country") or paypal_cfg.get("country") or "JP"
+    phone_e164 = _paypal_phone_e164(phone["phone"], country_hint)
+    activation_id = _hero_sms_lease_id_from_source(source)
+    if not activation_id:
+        paypal_cfg.pop("_hero_sms_lease", None)
+        raise RuntimeError(
+            "Hero SMS 需要在手机号文件/账号配置里提供 activation_id/activationId/id；"
+            "支付链路只用该 activation_id 调 getStatusV2 取验证码，不会买号或取消号码"
+        )
+    _hero_sms_cache_lease(
+        paypal_cfg,
+        {
+            "lease_id": activation_id,
+            "phone_e164": phone_e164,
+            "source": source_name,
+            "provider_country": str(source.get("provider_country") or source.get("hero_country") or ""),
+        },
+    )
+    _log(f"      [hero-sms] 使用配置手机号 phone=****{phone_e164[-4:]} activation_id={activation_id}")
+    return {
+        "phone": phone_e164,
+        "country": phone.get("country") or paypal_cfg.get("phone_country") or paypal_cfg.get("country") or "JP",
+        "dial_code": phone.get("dial_code") or "",
+        "_source": source_name,
+        "_hero_sms_activation_id": activation_id,
+    }
+
+
+def _hero_sms_status_url(paypal_cfg: dict) -> str:
+    lease = paypal_cfg.get("_hero_sms_lease")
+    if not isinstance(lease, dict) or not lease.get("lease_id"):
+        return ""
+    return _hero_sms_query(paypal_cfg, "getStatusV2", id=str(lease.get("lease_id")))
+
+
+def _paypal_phone_pool_row(paypal_cfg: dict) -> tuple[dict, str]:
+    phones_file = (
+        paypal_cfg.get("phones_file")
+        or paypal_cfg.get("new_user_phones_file")
+        or paypal_cfg.get("phone_pool_file")
+        or "output/paypal_test_phones.jsonl"
+    )
+    rows, phone_path = _paypal_read_phone_rows(phones_file)
+    if not rows:
+        raise RuntimeError(f"PayPal 手机号池没有可用行: {phones_file}")
+    raw_index = paypal_cfg.get("phone_index")
+    if raw_index in (None, "", "round_robin"):
+        raw_index = 0
+    index = int(raw_index)
+    if index < 0 or index >= len(rows):
+        raise RuntimeError(f"PayPal 手机号 phone_index={index} 越界，手机号池共 {len(rows)} 条")
+    row = dict(rows[index])
+    row["_source_index"] = index
+    row["_source_path"] = phone_path
+    return row, phone_path
+
+
 def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
     account_phone = _paypal_account_value(account, "phone", "phone_number")
     if account_phone:
+        if _paypal_uses_hero_sms(paypal_cfg):
+            return _hero_sms_static_phone(paypal_cfg, account, "account.phone")
         phone = _paypal_phone_from_source(account)
         phone["_source"] = "account.phone"
         return phone
 
     inline_phone = str(paypal_cfg.get("phone") or paypal_cfg.get("phone_number") or "").strip()
     if inline_phone:
+        if _paypal_uses_hero_sms(paypal_cfg):
+            return _hero_sms_static_phone(paypal_cfg, paypal_cfg, "paypal.phone")
         return {
             "phone": inline_phone,
             "country": _paypal_account_value(paypal_cfg, "phone_country", "country", "country_code", "region"),
             "dial_code": _paypal_account_value(paypal_cfg, "dial_code", "calling_code", "country_calling_code"),
             "_source": "paypal.phone",
         }
+
+    if _paypal_uses_hero_sms(paypal_cfg):
+        row, _phone_path = _paypal_phone_pool_row(paypal_cfg)
+        phone = _hero_sms_static_phone(paypal_cfg, row, "phones_file")
+        if not phone["phone"]:
+            raise RuntimeError(f"PayPal 手机号池第 {row.get('_source_index')} 行缺少 phone/phone_number/number")
+        return phone
 
     if _paypal_uses_five_sim(paypal_cfg):
         order = _five_sim_buy_activation(paypal_cfg)
@@ -5724,28 +5880,10 @@ def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
             "_five_sim_order_id": order.get("id"),
         }
 
-    phones_file = (
-        paypal_cfg.get("phones_file")
-        or paypal_cfg.get("new_user_phones_file")
-        or paypal_cfg.get("phone_pool_file")
-        or "output/paypal_test_phones.jsonl"
-    )
-    rows, phone_path = _paypal_read_phone_rows(phones_file)
-    if not rows:
-        raise RuntimeError(f"PayPal 手机号池没有可用行: {phones_file}")
-
-    raw_index = paypal_cfg.get("phone_index")
-    if raw_index in (None, "", "round_robin"):
-        raw_index = 0
-    index = int(raw_index)
-    if index < 0 or index >= len(rows):
-        raise RuntimeError(f"PayPal 手机号 phone_index={index} 越界，手机号池共 {len(rows)} 条")
-    row = dict(rows[index])
-    row["_source_index"] = index
-    row["_source_path"] = phone_path
+    row, _phone_path = _paypal_phone_pool_row(paypal_cfg)
     phone = _paypal_phone_from_source(row)
     if not phone["phone"]:
-        raise RuntimeError(f"PayPal 手机号池第 {index} 行缺少 phone/phone_number/number")
+        raise RuntimeError(f"PayPal 手机号池第 {row.get('_source_index')} 行缺少 phone/phone_number/number")
     return phone
 
 
@@ -5955,7 +6093,137 @@ def _paypal_fetch_meiguodizhi_address(paypal_cfg: dict) -> dict:
     raise RuntimeError(f"PayPal meiguodizhi 地址获取失败: {last_err}")
 
 
+def _paypal_split_jp_name(value: str) -> tuple[str, str]:
+    parts = [p for p in re.split(r"[\s\u3000]+", str(value or "").strip()) if p]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    if parts:
+        return parts[0], parts[0]
+    return "", ""
+
+
+def _paypal_jp_city_line(full_address: str, prefecture: str, city: str) -> tuple[str, str]:
+    rest = str(full_address or "").strip()
+    pref = str(prefecture or "").strip()
+    base_city = str(city or "").strip()
+    if pref and rest.startswith(pref):
+        rest = rest[len(pref):]
+    if base_city and rest.startswith(base_city):
+        rest = rest[len(base_city):]
+    rest = rest.strip()
+    if not rest:
+        return base_city, ""
+    m = re.match(r"^([^\d０-９]+)([\d０-９].*)$", rest)
+    if m:
+        return f"{base_city}{m.group(1).strip()}".strip(), m.group(2).strip()
+    return base_city, rest
+
+
+def _paypal_fetch_ratenn_jp_address(paypal_cfg: dict) -> dict:
+    cached = paypal_cfg.get("_resolved_ratenn_jp_address")
+    if isinstance(cached, dict):
+        return cached
+
+    url = "https://hant.ratenn.com/jp-address/generate-address"
+    timeout_s = 20
+    attempts = 3
+    last_err = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "User-Agent": USER_AGENT,
+                    "Referer": "https://hant.ratenn.com/jp-address/",
+                },
+                timeout=timeout_s,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            addr_raw = data.get("address") if isinstance(data, dict) else None
+            if not isinstance(addr_raw, dict):
+                raise RuntimeError(f"unexpected response: {str(data)[:160]}")
+            prefecture = str(addr_raw.get("prefecture") or "").strip()
+            base_city = str(addr_raw.get("city") or "").strip()
+            postal_code = str(addr_raw.get("postal_code") or "").strip()
+            full_address = str(addr_raw.get("full_address") or "").strip()
+            city, line1 = _paypal_jp_city_line(full_address, prefecture, base_city)
+            if not all([prefecture, city, postal_code, line1]):
+                raise RuntimeError(f"incomplete JP address: {addr_raw}")
+
+            first_hira, last_hira = _paypal_split_jp_name(str(data.get("name_hiragana") or ""))
+            first_kata, last_kata = _paypal_split_jp_name(str(data.get("name_katakana") or ""))
+            first_kanji, last_kanji = _paypal_split_jp_name(str(data.get("name") or ""))
+            first = first_kanji or first_hira or first_kata or "太郎"
+            last = last_kanji or last_hira or last_kata or "山田"
+            first_kana = first_kata or first_hira or first
+            last_kana = last_kata or last_hira or last
+            birth = str(data.get("birth") or "").strip()
+            dob = {}
+            m_birth = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", birth)
+            if m_birth:
+                dob = {"year": m_birth.group(1), "month": m_birth.group(2), "day": m_birth.group(3)}
+
+            address = {
+                "country": "JP",
+                "line1": line1,
+                "line2": "",
+                "city": city,
+                "state": prefecture,
+                "postal_code": postal_code,
+                "first_name": first,
+                "last_name": last,
+                "full_name": f"{first} {last}".strip(),
+                "first_name_hiragana": first_hira,
+                "last_name_hiragana": last_hira,
+                "first_name_katakana": first_kata,
+                "last_name_katakana": last_kata,
+                "first_name_kanji": first_kanji,
+                "last_name_kanji": last_kanji,
+                "country_specific_first_name": first_kana,
+                "country_specific_last_name": last_kana,
+                "nationality": "JP",
+                "date_of_birth": dob,
+                "autoCompleteType": "MANUAL",
+                "isUserModified": True,
+                "shipping_address": {
+                    "country": "JP",
+                    "line1": "",
+                    "city": "",
+                    "state": "",
+                    "postal_code": "",
+                    "autoCompleteType": "MANUAL",
+                    "isUserModified": False,
+                },
+                "_source": "ratenn_jp",
+                "_raw": {
+                    "full_address": full_address,
+                    "name": str(data.get("name") or ""),
+                    "name_hiragana": str(data.get("name_hiragana") or ""),
+                    "name_katakana": str(data.get("name_katakana") or ""),
+                    "birth": birth,
+                },
+            }
+            paypal_cfg["_resolved_ratenn_jp_address"] = address
+            _log(
+                "      [B-new] Ratenn JP 地址: "
+                f"{address['state']} {address['city']} {address['line1']} "
+                f"{address['postal_code']} name={address['first_name']}/{address['last_name']}"
+            )
+            return address
+        except Exception as e:
+            last_err = str(e)
+            _log(f"      [B-new] Ratenn JP 地址获取失败 ({attempt}/{attempts}): {last_err}")
+            if attempt < attempts:
+                time.sleep(1.0)
+    raise RuntimeError(f"PayPal Ratenn JP 地址获取失败: {last_err}")
+
+
 def _paypal_resolve_new_user_address(paypal_cfg: dict, account: dict, payment_card: dict | None = None) -> dict:
+    country = _paypal_target_country(paypal_cfg).upper()
+    if country == "JP":
+        return _paypal_fetch_ratenn_jp_address(paypal_cfg)
     return _paypal_fetch_meiguodizhi_address(paypal_cfg)
 
 
@@ -6117,25 +6385,8 @@ def _paypal_manual_browser_visible(paypal_cfg: dict) -> bool:
 
 
 def _paypal_recaptcha_visible(page) -> bool:
-    if _paypal_visible_any(page, [
-        '#captchaComponent',
-        '#captchaComponent iframe[src*="recaptcha"]',
-        '#captchaComponent #captcha-standalone',
-        '#captcha-standalone',
-        '.captcha-overlay',
-        '.captcha-container',
-        '.ngrl-anomalydetection-div',
-        'iframe[name="recaptcha"]',
-        'iframe[src*="/recaptcha/"]',
-        'iframe[src*="google.com/recaptcha"]',
-    ]):
-        return True
-    try:
-        body_text = (page.locator("body").inner_text(timeout=1000) or "").lower()
-        if "security challenge" in body_text and ("not a robot" in body_text or "recaptcha" in body_text):
-            return True
-    except Exception:
-        pass
+    # PayPal reCAPTCHA is intentionally ignored in this flow.  Call sites keep
+    # moving through their normal waits/clicks instead of solving or waiting for it.
     return False
 
 
@@ -8166,19 +8417,60 @@ def _paypal_sms_api_url(paypal_cfg: dict, phone_e164: str) -> str:
     ):
         return ""
 
-    template = str(
-        paypal_cfg.get("sms_api_url_template")
-        or paypal_cfg.get("sms_url_template")
-        or paypal_cfg.get("otp_api_url_template")
-        or paypal_cfg.get("sms_api_url")
-        or paypal_cfg.get("otp_api_url")
-        or ""
-    ).strip()
+    if _paypal_uses_hero_sms(paypal_cfg):
+        hero_cfg = _hero_sms_cfg(paypal_cfg)
+        hero_template = str(
+            hero_cfg.get("sms_api_url_template")
+            or hero_cfg.get("sms_url_template")
+            or hero_cfg.get("otp_api_url_template")
+            or hero_cfg.get("sms_api_url")
+            or hero_cfg.get("otp_api_url")
+            or ""
+        ).strip()
+        top_template = str(
+            paypal_cfg.get("sms_api_url_template")
+            or paypal_cfg.get("sms_url_template")
+            or paypal_cfg.get("otp_api_url_template")
+            or paypal_cfg.get("sms_api_url")
+            or paypal_cfg.get("otp_api_url")
+            or ""
+        ).strip()
+        if hero_template:
+            template = hero_template
+        elif "nexsms" in top_template.lower():
+            _log("      [signup_no_card] 当前顶层短信模板仍是 NexSMS；Hero 请配置 paypal.hero_sms.sms_api_url_template")
+            template = ""
+        else:
+            template = top_template
+    else:
+        template = str(
+            paypal_cfg.get("sms_api_url_template")
+            or paypal_cfg.get("sms_url_template")
+            or paypal_cfg.get("otp_api_url_template")
+            or paypal_cfg.get("sms_api_url")
+            or paypal_cfg.get("otp_api_url")
+            or ""
+        ).strip()
     if not template:
+        if _paypal_uses_hero_sms(paypal_cfg):
+            url = _hero_sms_status_url(paypal_cfg)
+            if not url:
+                _log("      [signup_no_card] Hero SMS 未配置 sms_api_url_template，且当前手机号没有 activation_id，无法自动查码")
+            return url
         return ""
 
-    api_key_env = str(paypal_cfg.get("sms_api_key_env") or "NEXSMS_API_KEY").strip()
-    api_key = str(paypal_cfg.get("sms_api_key") or paypal_cfg.get("sms_key") or "").strip()
+    if _paypal_uses_hero_sms(paypal_cfg):
+        hero_cfg = _hero_sms_cfg(paypal_cfg)
+        api_key_env = str(paypal_cfg.get("sms_api_key_env") or hero_cfg.get("api_key_env") or "HERO_SMS_API_KEY").strip()
+        api_key = str(
+            _hero_sms_api_key(paypal_cfg)
+            or paypal_cfg.get("sms_api_key")
+            or paypal_cfg.get("sms_key")
+            or ""
+        ).strip()
+    else:
+        api_key_env = str(paypal_cfg.get("sms_api_key_env") or "NEXSMS_API_KEY").strip()
+        api_key = str(paypal_cfg.get("sms_api_key") or paypal_cfg.get("sms_key") or "").strip()
     if not api_key and api_key_env:
         api_key = str(os.environ.get(api_key_env) or "").strip()
     if "{api_key" in template and not api_key:
@@ -8197,11 +8489,18 @@ def _paypal_sms_api_url(paypal_cfg: dict, phone_e164: str) -> str:
         phone_value = _paypal_phone_e164(phone_value, phone_country)
 
     digits = re.sub(r"\D+", "", phone_value)
+    hero_lease = paypal_cfg.get("_hero_sms_lease")
+    activation_id = ""
+    if isinstance(hero_lease, dict):
+        activation_id = str(hero_lease.get("lease_id") or "").strip()
     values = {
         "phone": digits,
         "phone_number": digits,
         "phone_e164": phone_value,
         "phone_e164_url": urllib.parse.quote(phone_value, safe=""),
+        "activation_id": activation_id,
+        "lease_id": activation_id,
+        "id": activation_id,
         "api_key": urllib.parse.quote(api_key, safe=""),
         "api_key_raw": api_key,
     }
@@ -8217,7 +8516,7 @@ def _paypal_card_type(number: str) -> str:
     if digits.startswith("4"):
         return "VISA"
     if re.match(r"^(5[1-5]|2[2-7])", digits):
-        return "MASTERCARD"
+        return "MASTER_CARD"
     if re.match(r"^3[47]", digits):
         return "AMEX"
     if digits.startswith("6"):
@@ -8238,16 +8537,20 @@ def _paypal_signup_expiry(expiry: str) -> str:
 
 
 def _paypal_protocol_persona(pps, paypal_cfg: dict, account: dict, address: dict, payment_card: dict | None):
+    is_jp = str(address.get("country") or _paypal_target_country(paypal_cfg)).upper() == "JP"
     first_name = str(address.get("first_name") or "").strip()
     last_name = str(address.get("last_name") or "").strip()
     full_name = str(address.get("full_name") or "").strip()
     if not first_name or not last_name:
         first_name, last_name, full_name = _paypal_name_parts(account, payment_card)
     if not first_name:
-        first_name = "James"
+        first_name = "太郎" if is_jp else "James"
     if not last_name:
-        last_name = "Smith"
-    first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
+        last_name = "山田" if is_jp else "Smith"
+    if not is_jp:
+        first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
+    elif not full_name:
+        full_name = f"{first_name} {last_name}".strip()
     email = _paypal_checkout_email(paypal_cfg, account)
     password = _paypal_generated_new_user_password(paypal_cfg)
     return pps.Persona(
@@ -8260,7 +8563,14 @@ def _paypal_protocol_persona(pps, paypal_cfg: dict, account: dict, address: dict
         state=address.get("state") or "NY",
         postal_code=address.get("postal_code") or "10001",
         country=(address.get("country") or _paypal_target_country(paypal_cfg) or "US").upper(),
-        raw={"source": "CTF-pay.runtime", "full_name": full_name},
+        raw={
+            "source": "CTF-pay.runtime",
+            "full_name": full_name,
+            "first_name_hiragana": address.get("first_name_hiragana", ""),
+            "last_name_hiragana": address.get("last_name_hiragana", ""),
+            "first_name_katakana": address.get("first_name_katakana", ""),
+            "last_name_katakana": address.get("last_name_katakana", ""),
+        },
     )
 
 
@@ -8294,20 +8604,56 @@ def _paypal_signup_payloads(paypal_cfg: dict, account: dict, payment_card: dict 
         "city": address.get("city") or "New York",
         "state": address.get("state") or "NY",
         "postal_code": address.get("postal_code") or "10001",
-        "autoCompleteType": "MANUAL",
-        "isUserModified": False,
+        "autoCompleteType": address.get("autoCompleteType") or "MANUAL",
+        "isUserModified": bool(address.get("isUserModified", False)),
     }
     first_name = str(address.get("first_name") or "").strip()
     last_name = str(address.get("last_name") or "").strip()
     if not first_name or not last_name:
         first_name, last_name, _full = _paypal_name_parts(account, payment_card)
-    first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
+    if country == "JP":
+        full_name = str(address.get("full_name") or f"{first_name} {last_name}").strip()
+    else:
+        first_name, last_name, full_name = _paypal_short_name_pair(first_name, last_name)
     if first_name:
         signup_address["first_name"] = first_name
     if last_name:
         signup_address["last_name"] = last_name
     signup_address["full_name"] = full_name
+    for key in (
+        "first_name_hiragana",
+        "last_name_hiragana",
+        "first_name_katakana",
+        "last_name_katakana",
+        "country_specific_first_name",
+        "country_specific_last_name",
+        "nationality",
+        "date_of_birth",
+        "shipping_address",
+    ):
+        if address.get(key) not in (None, "", {}):
+            signup_address[key] = address.get(key)
     return phone, signup_card, signup_address
+
+
+def _paypal_stripe_billing_address(payment_card: dict | None) -> dict:
+    card = payment_card if isinstance(payment_card, dict) else {}
+    addr = card.get("address") if isinstance(card.get("address"), dict) else {}
+    country = str(addr.get("country") or card.get("country") or "US").upper()
+    return {
+        "country": country,
+        "line1": addr.get("line1") or card.get("line1") or "1 Example Street",
+        "line2": addr.get("line2") or card.get("line2") or "",
+        "city": addr.get("city") or card.get("city") or "San Francisco",
+        "state": addr.get("state") or card.get("state") or "CA",
+        "postal_code": (
+            addr.get("postal_code")
+            or addr.get("postalCode")
+            or card.get("postal_code")
+            or card.get("postalCode")
+            or "94105"
+        ),
+    }
 
 
 def _paypal_install_pps_log_bridge(pps) -> None:
@@ -8345,6 +8691,7 @@ def _paypal_signup_node_rpa(
     phone: str,
     signup_card: dict | None,
     signup_billing_address: dict | None,
+    stripe_billing_address: dict | None = None,
     persona=None,
     sms_api_url: str = "",
     manual_otp_file: str = "",
@@ -8378,21 +8725,33 @@ def _paypal_signup_node_rpa(
         return False
 
     signup_billing_address = signup_billing_address or {}
+    signup_country = str(
+        signup_billing_address.get("country")
+        or paypal_cfg.get("locale_country")
+        or paypal_cfg.get("country")
+        or "US"
+    ).upper()
+    signup_is_jp = signup_country == "JP"
     first_name = (
         paypal_cfg.get("signup_first_name")
         or signup_billing_address.get("first_name")
         or getattr(persona, "first_name", "")
         or os.environ.get("PPS_PAYPAL_SIGNUP_FIRST_NAME")
-        or "James"
+        or ("太郎" if signup_is_jp else "James")
     )
     last_name = (
         paypal_cfg.get("signup_last_name")
         or signup_billing_address.get("last_name")
         or getattr(persona, "last_name", "")
         or os.environ.get("PPS_PAYPAL_SIGNUP_LAST_NAME")
-        or "Smith"
+        or ("山田" if signup_is_jp else "Smith")
     )
-    first_name, last_name, _full_name = _paypal_short_name_pair(first_name, last_name)
+    if signup_is_jp:
+        first_name = str(first_name or "").strip()
+        last_name = str(last_name or "").strip()
+        _full_name = str(signup_billing_address.get("full_name") or f"{first_name} {last_name}").strip()
+    else:
+        first_name, last_name, _full_name = _paypal_short_name_pair(first_name, last_name)
     signup_billing_address["first_name"] = first_name
     signup_billing_address["last_name"] = last_name
     signup_billing_address["full_name"] = _full_name
@@ -8418,8 +8777,19 @@ def _paypal_signup_node_rpa(
         "cardExpiry": signup_card.get("expirationDate") or paypal_cfg.get("card_expiry") or "03/30",
         "cardCvv": signup_card.get("securityCode") or signup_card.get("cvc") or signup_card.get("cvv") or "",
         "address": signup_billing_address,
+        "stripeAddress": stripe_billing_address or _paypal_stripe_billing_address(None),
         "firstName": first_name,
         "lastName": last_name,
+        "country": signup_country,
+        "localeCountry": (paypal_cfg.get("locale_country") or signup_country).upper(),
+        "localeLang": str(paypal_cfg.get("locale_lang") or ("ja" if signup_is_jp else "en")).lower(),
+        "countrySpecificFirstName": signup_billing_address.get("country_specific_first_name") or "",
+        "countrySpecificLastName": signup_billing_address.get("country_specific_last_name") or "",
+        "firstNameHiragana": signup_billing_address.get("first_name_hiragana") or "",
+        "lastNameHiragana": signup_billing_address.get("last_name_hiragana") or "",
+        "firstNameKatakana": signup_billing_address.get("first_name_katakana") or "",
+        "lastNameKatakana": signup_billing_address.get("last_name_katakana") or "",
+        "dateOfBirth": signup_billing_address.get("date_of_birth") or signup_billing_address.get("dateOfBirth") or {},
         "smsProvider": "5sim" if five_sim_payload else _paypal_sms_provider(paypal_cfg),
         "fiveSim": five_sim_payload,
         "deferFiveSimFinalize": bool(five_sim_payload),
@@ -8430,6 +8800,7 @@ def _paypal_signup_node_rpa(
         "expectedDueCents": int(expected_due_cents or 0),
         "timeoutMs": int(paypal_cfg.get("node_rpa_timeout_s") or paypal_cfg.get("browser_rpa_timeout_s") or 720) * 1000,
         "otpTimeoutMs": int(otp_timeout or paypal_cfg.get("otp_timeout_s") or 600) * 1000,
+        "otpResendAttempts": int(paypal_cfg.get("otp_resend_attempts") or paypal_cfg.get("sms_resend_attempts") or 0),
         "fallbackConsentDelayMs": int(
             paypal_cfg.get("fallback_consent_delay_ms")
             or os.environ.get("PPS_PAYPAL_FALLBACK_CONSENT_DELAY_MS")
@@ -8516,6 +8887,15 @@ def _paypal_signup_node_rpa(
         env.setdefault("HTTP_PROXY", proxy_url)
         env.setdefault("ALL_PROXY", proxy_url)
     env["NCPP_WORKER_ID"] = worker_id
+    phone_lock_dir = str(
+        paypal_cfg.get("phone_lock_dir")
+        or paypal_cfg.get("sms_phone_lock_dir")
+        or paypal_cfg.get("otp_lock_dir")
+        or os.environ.get("PPS_PAYPAL_PHONE_LOCK_DIR")
+        or ""
+    ).strip()
+    if phone_lock_dir:
+        env["PPS_PAYPAL_PHONE_LOCK_DIR"] = phone_lock_dir
 
     cmd = [node_bin, helper]
     use_xvfb = (
@@ -8641,7 +9021,6 @@ def _paypal_signup_node_rpa(
                 str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
                 str((result or {}).get("error") or "node_rpa_failed")[:120],
             )
-
     try:
         with open(f"{tmp_base}_last.json", "w", encoding="utf-8") as f:
             json.dump(
@@ -8693,10 +9072,12 @@ def _paypal_signup_no_card(
     for optional Camoufox DataDome/EC seeding; account creation itself uses the
     captured PayPal GraphQL flow.
     """
+    paypal_cfg.pop("_last_paypal_failure_reason", None)
     try:
         from paypal_plus import signup as pps  # type: ignore
     except Exception as e:
         _log(f"      [signup_no_card] paypal_plus 模块不可用: {e!r}")
+        paypal_cfg["_last_paypal_failure_reason"] = f"paypal_plus 模块不可用: {e!r}"
         return False
     _paypal_install_pps_log_bridge(pps)
 
@@ -8766,12 +9147,14 @@ def _paypal_signup_no_card(
     phone, signup_card, signup_billing_address = _paypal_signup_payloads(paypal_cfg, account, payment_card)
     if not phone:
         _log("      [signup_no_card] 缺少手机号")
+        paypal_cfg["_last_paypal_failure_reason"] = "signup_no_card 缺少手机号"
         return False
 
     original_redirect_url = (redirect_url or "").strip()
     approve_url, ba_token = _resolve_paypal_approve_url(original_redirect_url)
     if not ba_token:
         _log(f"      [signup_no_card] redirect_url 缺 ba_token: {approve_url[:120]}")
+        paypal_cfg["_last_paypal_failure_reason"] = "signup_no_card redirect_url 缺 ba_token"
         return False
 
     locale_country = (paypal_cfg.get("locale_country") or paypal_cfg.get("country") or "US").upper()
@@ -8816,6 +9199,7 @@ def _paypal_signup_no_card(
             phone=phone,
             signup_card=signup_card,
             signup_billing_address=signup_billing_address,
+            stripe_billing_address=_paypal_stripe_billing_address(payment_card),
             persona=persona,
             sms_api_url=sms_api_url,
             manual_otp_file=manual_otp_file,
@@ -8872,6 +9256,7 @@ def _paypal_signup_no_card(
                     "      [signup_no_card] seed 失败，按配置不回退纯 HTTP，"
                     "避免触发 hcaptchapassive"
                 )
+                paypal_cfg["_last_paypal_failure_reason"] = "signup_no_card seed 失败且禁用 HTTP fallback"
                 return False
             _log("      [signup_no_card] seed 失败，继续纯 HTTP fallback: " + ("; ".join(seed_errors[-2:]) or "unknown"))
 
@@ -8883,13 +9268,21 @@ def _paypal_signup_no_card(
         "PPS_PAYPAL_CAPTCHA_PROXY": proxy_url or "",
         "PPS_PAYPAL_SIGNUP_FIRST_NAME": persona.first_name,
         "PPS_PAYPAL_SIGNUP_LAST_NAME": persona.last_name,
+        "PPS_PAYPAL_OTP_RESEND_ATTEMPTS": str(paypal_cfg.get("otp_resend_attempts") or paypal_cfg.get("sms_resend_attempts") or 0),
     }
+    phone_lock_dir = str(
+        paypal_cfg.get("phone_lock_dir")
+        or paypal_cfg.get("sms_phone_lock_dir")
+        or paypal_cfg.get("otp_lock_dir")
+        or os.environ.get("PPS_PAYPAL_PHONE_LOCK_DIR")
+        or ""
+    ).strip()
+    if phone_lock_dir:
+        env_updates["PPS_PAYPAL_PHONE_LOCK_DIR"] = phone_lock_dir
     if _paypal_bool_cfg(paypal_cfg, "disable_idapps", default=False):
         env_updates["PPS_DISABLE_IDAPPS"] = "1"
     if _paypal_bool_cfg(paypal_cfg, "browser_form_warmup", default=False):
         env_updates["PPS_ENABLE_BROWSER_FORM_WARMUP"] = "1"
-    if _paypal_bool_cfg(paypal_cfg, "allow_browser_recaptcha", default=False):
-        env_updates["PPS_ALLOW_BROWSER_RECAPTCHA"] = "1"
     if _paypal_bool_cfg(paypal_cfg, "signup_address_autocomplete", default=False):
         env_updates["PPS_ENABLE_GOOGLE_ADDRESS"] = "1"
     if sms_api_url:
@@ -8923,9 +9316,11 @@ def _paypal_signup_no_card(
         )
     except pps.CaptchaRequired as e:
         _log(f"      [signup_no_card] 卡 captcha: {e}")
+        paypal_cfg["_last_paypal_failure_reason"] = f"signup_no_card captcha: {e}"
         return False
     except Exception as e:
         _log(f"      [signup_no_card] 异常: {e!r}")
+        paypal_cfg["_last_paypal_failure_reason"] = f"signup_no_card 异常: {e!r}"
         return False
     finally:
         for k, old in old_env.items():
@@ -8946,6 +9341,7 @@ def _paypal_signup_no_card(
 
     if not result.success:
         _log(f"      [signup_no_card] 失败: {result.error_code} {result.error}")
+        paypal_cfg["_last_paypal_failure_reason"] = f"signup_no_card 失败: {result.error_code} {result.error}"
         return False
 
     _log(
@@ -8960,6 +9356,13 @@ def _paypal_signup_no_card(
         except Exception as e:
             _log(f"      [signup_no_card] callback 异常(仍按成功处理): {e!r}")
     return True
+
+
+def _paypal_authorize_failure_message(paypal_cfg: dict, default: str = "PayPal 授权失败或超时") -> str:
+    reason = str(paypal_cfg.get("_last_paypal_failure_reason") or "").strip()
+    if reason:
+        return f"PayPal 授权失败: {reason}"
+    return default
 
 
 def _handle_paypal_redirect(
@@ -10895,6 +11298,7 @@ def run(
                     phone=phone,
                     signup_card=signup_card,
                     signup_billing_address=signup_billing_address,
+                    stripe_billing_address=_paypal_stripe_billing_address(card),
                     persona=persona,
                     sms_api_url=sms_api_url,
                     manual_otp_file=manual_otp_file,
@@ -10956,6 +11360,7 @@ def run(
             if address_failed:
                 if node_attempt < max_node_attempts:
                     paypal_cfg.pop("_resolved_meiguodizhi_address", None)
+                    _five_sim_keep_for_retry(paypal_cfg)
                     _log(
                         "      [node-rpa-full] PayPal 地址校验失败，重新取 meiguodizhi 地址后重试 "
                         f"({node_attempt + 1}/{max_node_attempts})"
@@ -10973,6 +11378,12 @@ def run(
                 )
             if reroll_new_account or funding_rejected:
                 if node_attempt < max_node_attempts:
+                    if _paypal_uses_five_sim(paypal_cfg):
+                        _five_sim_finalize_order(
+                            paypal_cfg,
+                            str((_five_sim_cfg(paypal_cfg).get("fail_action") or "cancel")),
+                            str(last_node_result.get("error") or "reroll_new_account")[:120],
+                        )
                     _clear_paypal_new_user_runtime()
                     reason = "PayPal 卡/账号组合被拒" if funding_rejected else "PayPal 新用户流程要求重建身份"
                     if funding_rejected and not _advance_paypal_card_index(reason):
@@ -11363,7 +11774,7 @@ def run(
                             ctx=init_ctx,
                         )
                         if not success:
-                            raise RuntimeError("PayPal 授权失败或超时")
+                            raise RuntimeError(_paypal_authorize_failure_message(paypal_cfg))
                         _log("      PayPal 授权完成，继续 poll 结果 ...")
                 else:
                     raise RuntimeError("PayPal confirm 返回了 redirect_to_url 但缺少 url 字段")
@@ -11489,7 +11900,7 @@ def run(
                                     locale_profile=locale_profile, ctx=init_ctx,
                                 )
                                 if not success:
-                                    raise RuntimeError("PayPal 授权失败或超时")
+                                    raise RuntimeError(_paypal_authorize_failure_message(paypal_cfg))
                                 got_redirect = True
                                 break
                         sa2 = (gj.get("submission_attempt") or {}).get("state")
@@ -11636,6 +12047,7 @@ def run(
                     phone=phone,
                     signup_card=signup_card,
                     signup_billing_address=signup_billing_address,
+                    stripe_billing_address=_paypal_stripe_billing_address(card),
                     persona=persona,
                     sms_api_url=sms_api_url,
                     manual_otp_file=manual_otp_file,

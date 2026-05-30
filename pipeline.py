@@ -2100,15 +2100,45 @@ def rt_only_targets(card_config_path: str, target_emails: list[str],
 
 def pay_only_targets(card_config_path: str, target_emails: list[str], *,
                      use_paypal=False, use_gopay=False, gopay_otp_file=None,
-                     proxy_stage_allocator=None, proxy_stage_plan=None) -> dict:
+                     proxy_stage_allocator=None, proxy_stage_plan=None,
+                     workers: int = 1) -> dict:
     """批量 pay-only：对指定 email 列表逐个跑支付。"""
+    target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
     results = []
     ok = 0
     fail = 0
+    workers = max(1, int(workers or 1))
+    if workers > 1 and len(target_emails) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(f"[pay-only-targets] 并发: {len(target_emails)} accounts workers={workers}")
+        run_kwargs = {
+            "use_paypal": use_paypal,
+            "use_gopay": use_gopay,
+            "gopay_otp_file": gopay_otp_file or "",
+            "proxy_stage_allocator": proxy_stage_allocator,
+            "proxy_stage_plan": proxy_stage_plan,
+        }
+        tasks = [(i, card_config_path, run_kwargs, em) for i, em in enumerate(target_emails)]
+        ordered = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_run_one_pay_only, task): task[0] for task in tasks}
+            for future in as_completed(futures):
+                idx = futures[future]
+                item = future.result()
+                ordered[idx] = item
+                if item.get("status") == "succeeded":
+                    ok += 1
+                else:
+                    fail += 1
+                mark = "✓" if item.get("status") == "succeeded" else "✗"
+                err = f" error={item.get('error', '')}" if item.get("status") != "succeeded" else ""
+                print(f"[pay-only-targets] {mark} [{sum(1 for x in ordered if x)}/{len(tasks)}] {item.get('target_email') or target_emails[idx]}{err}")
+        results = [r for r in ordered if r is not None]
+        print(f"\n[pay-only-targets] 完成: ok={ok} fail={fail} 共 {len(results)}")
+        return {"results": results, "ok": ok, "fail": fail}
+
     for em in target_emails:
-        em = (em or "").strip()
-        if not em:
-            continue
         try:
             plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
             r = pay_only(
@@ -4558,12 +4588,16 @@ def main():
             return
 
         if args.pay_only and target_emails_list:
+            if args.batch > 0 and len(target_emails_list) > args.batch:
+                print(f"[pay-only-targets] batch={args.batch}，从 {len(target_emails_list)} 个 target_emails 中截取前 {args.batch} 个")
+                target_emails_list = target_emails_list[:args.batch]
             r = pay_only_targets(
                 args.config, target_emails_list,
                 use_paypal=args.paypal, use_gopay=args.gopay,
                 gopay_otp_file=args.gopay_otp_file,
                 proxy_stage_allocator=proxy_stage_allocator,
                 proxy_stage_plan=proxy_stage_plan,
+                workers=args.workers,
             )
             print(f"\n结果: ok={r['ok']} fail={r['fail']}")
             return

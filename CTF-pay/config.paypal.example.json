@@ -74,6 +74,16 @@
     "sms_api_url_template": "https://api.nexsms.net/api/premium/sms-records?apiKey={api_key}&page=1&pageSize=3&tel={phone}",
     "sms_api_key_env": "NEXSMS_API_KEY",
     "sms_api_key": "",
+    "otp_resend_attempts": 0,
+    "phone_lock_dir": "",
+    "hero_sms": {
+      "base_url": "https://hero-sms.com/stubs/handler_api.php",
+      "sms_api_url_template": "",
+      "api_key_env": "HERO_SMS_API_KEY",
+      "api_key": "",
+      "otp_poll_interval_s": 3,
+      "request_timeout_s": 20
+    },
     "five_sim": {
       "token_env": "FIVESIM_TOKEN",
       "token": "",
