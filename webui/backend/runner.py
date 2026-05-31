@@ -39,6 +39,199 @@ _active_gopay_phone: str = ""          # digits-only phone for the running gopay
 _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls across iterations
 
 
+def _state_path() -> Path:
+    return s.get_data_dir() / "webui_runner_state.json"
+
+
+def _read_state() -> dict:
+    try:
+        return json.loads(_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_state(proc: subprocess.Popen, cmd: list[str], mode: str) -> None:
+    path = _state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = proc.pid
+    payload = {
+        "pid": proc.pid,
+        "pgid": pgid,
+        "cmd": cmd,
+        "mode": mode,
+        "started_at": time.time(),
+    }
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_state(expected_pid: Optional[int] = None) -> None:
+    state = _read_state()
+    if expected_pid is not None:
+        try:
+            if int(state.get("pid") or 0) != int(expected_pid):
+                return
+        except Exception:
+            return
+    try:
+        _state_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        if int(pid) <= 0:
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_pgid(pid: int) -> int:
+    try:
+        return os.getpgid(int(pid))
+    except Exception:
+        return int(pid)
+
+
+def _kill_pgid_or_pid(pid: int, pgid: Optional[int] = None, *, sig: int = signal.SIGTERM) -> None:
+    pid = int(pid)
+    pgid = int(pgid or _safe_pgid(pid))
+    try:
+        os.killpg(pgid, sig)
+    except Exception:
+        try:
+            os.kill(pid, sig)
+        except Exception:
+            pass
+
+
+def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_alive(pid)
+
+
+def _terminate_process_group(pid: int, pgid: Optional[int] = None, *, wait_proc: Optional[subprocess.Popen] = None) -> None:
+    pid = int(pid)
+    pgid = int(pgid or _safe_pgid(pid))
+    _kill_pgid_or_pid(pid, pgid, sig=signal.SIGTERM)
+    try:
+        if wait_proc is not None:
+            wait_proc.wait(timeout=5)
+            return
+    except subprocess.TimeoutExpired:
+        pass
+    if not _wait_pid_gone(pid, 5):
+        _kill_pgid_or_pid(pid, pgid, sig=signal.SIGKILL)
+        if wait_proc is not None:
+            try:
+                wait_proc.wait(timeout=2)
+            except Exception:
+                pass
+        else:
+            _wait_pid_gone(pid, 2)
+
+
+def _pid_command(pid: int) -> str:
+    try:
+        return subprocess.check_output(["ps", "-p", str(int(pid)), "-o", "command="], text=True).strip()
+    except Exception:
+        return ""
+
+
+def _is_managed_run_command(cmd: str) -> bool:
+    root = str(s.ROOT)
+    if "pipeline.py" in cmd and root in cmd and "--config" in cmd:
+        return True
+    if "CTF-pay/card.py" in cmd and root in cmd and "--json-result" in cmd:
+        return True
+    if "CTF-pay/scripts/paypal_node_rpa.js" in cmd and root in cmd:
+        return True
+    if "/Google Chrome" in cmd and "paypal_node_rpa_" in cmd and "--user-data-dir=" in cmd:
+        return True
+    return False
+
+
+def _managed_orphan_rows() -> list[tuple[int, int, str]]:
+    """Find project-owned runner descendants that may outlive WebUI state.
+
+    This is intentionally narrow: only this repo's pipeline/card/node commands
+    and Chrome instances with Playwright's paypal_node_rpa temp profile match.
+    """
+    try:
+        out = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True)
+    except Exception:
+        return []
+    rows: list[tuple[int, int, str]] = []
+    self_pid = os.getpid()
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except Exception:
+            continue
+        if pid == self_pid:
+            continue
+        cmd = parts[2]
+        if _is_managed_run_command(cmd):
+            rows.append((pid, ppid, cmd))
+    return rows
+
+
+def _cleanup_persisted_and_orphan_runs(*, include_scan: bool = True) -> int:
+    """Best-effort cleanup for runs whose Popen object is no longer in memory."""
+    killed = 0
+    state = _read_state()
+    try:
+        pid = int(state.get("pid") or 0)
+        pgid = int(state.get("pgid") or 0) or None
+    except Exception:
+        pid = 0
+        pgid = None
+    if pid:
+        if _pid_alive(pid):
+            if _is_managed_run_command(_pid_command(pid)):
+                _terminate_process_group(pid, pgid)
+                killed += 1
+            else:
+                _clear_state(pid)
+        else:
+            _clear_state(pid)
+
+    if include_scan:
+        rows = _managed_orphan_rows()
+        # Kill parent-ish processes first; Chrome children are handled by pgid
+        # but remain as an explicit fallback when a child escaped the group.
+        rows.sort(key=lambda item: (0 if "pipeline.py" in item[2] else 1 if "card.py" in item[2] else 2))
+        seen_groups: set[int] = set()
+        for pid, ppid, _cmd in rows:
+            if ppid != 1:
+                continue
+            if not _pid_alive(pid):
+                continue
+            pgid = _safe_pgid(pid)
+            if pgid in seen_groups:
+                continue
+            seen_groups.add(pgid)
+            _terminate_process_group(pid, pgid)
+            killed += 1
+    return killed
+
+
 _PHONE_CONFIG_KEYS = {
     "enabled", "provider", "base_url", "api_key_env", "country", "countries", "service",
     "maxPrice", "max_price", "country_max_prices", "lease_ttl_s", "max_number_attempts", "request_timeout_s", "allocate_path", "otp_path",
@@ -222,14 +415,29 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
 def status() -> dict:
     global _proc
     is_running = _proc is not None and _proc.poll() is None
+    orphan_state: dict = {}
+    orphan_running = False
+    if not is_running:
+        state = _read_state()
+        try:
+            state_pid = int(state.get("pid") or 0)
+        except Exception:
+            state_pid = 0
+        if state_pid and _pid_alive(state_pid):
+            orphan_state = state
+            orphan_running = True
+            is_running = True
+        elif state_pid:
+            _clear_state(state_pid)
     return {
         "running": is_running,
-        "started_at": _started_at,
+        "started_at": orphan_state.get("started_at") if orphan_running else _started_at,
         "ended_at": _ended_at,
         "exit_code": _exit_code if not is_running else None,
-        "cmd": _cmd,
-        "mode": _mode,
-        "pid": _proc.pid if is_running and _proc else None,
+        "cmd": orphan_state.get("cmd") if orphan_running else _cmd,
+        "mode": orphan_state.get("mode") if orphan_running else _mode,
+        "pid": orphan_state.get("pid") if orphan_running else (_proc.pid if is_running and _proc else None),
+        "orphan": orphan_running,
         "log_count": _seq_counter,
         "otp_pending": _otp_pending,
     }
@@ -247,6 +455,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
     with _lock:
         if _proc is not None and _proc.poll() is None:
             raise RuntimeError("a pipeline is already running")
+        _cleanup_persisted_and_orphan_runs(include_scan=True)
 
         # OTP 默认走 WebUI SQLite endpoint；不再创建临时 FIFO 文件。
         otp_p: Optional[Path] = None
@@ -338,6 +547,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
             _exit_code = -1
             raise RuntimeError(f"failed to spawn: {e}") from e
         _proc = proc
+        _write_state(proc, cmd, mode)
 
         threading.Thread(target=_drain, args=(proc,), daemon=True).start()
     return status()
@@ -429,6 +639,7 @@ def _drain(proc: subprocess.Popen) -> None:
                         pass
     finally:
         proc.wait()
+        _clear_state(proc.pid)
         with _lock:
             _ended_at = time.time()
             _exit_code = proc.returncode
@@ -447,31 +658,12 @@ def stop() -> dict:
     global _proc
     with _lock:
         proc = _proc
-        if proc is None or proc.poll() is not None:
-            return status()
-    # subprocess 是独立 session leader（start_new_session=True），用 killpg
-    # 终止整组，否则只 SIGTERM 父进程会留下 xvfb-run/python pipeline 孤儿。
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
+    if proc is not None and proc.poll() is None:
+        # subprocess 是独立 session leader（start_new_session=True），用 killpg
+        # 终止整组，否则只 SIGTERM 父进程会留下 xvfb-run/python pipeline 孤儿。
+        _terminate_process_group(proc.pid, wait_proc=proc)
+        _clear_state(proc.pid)
+    _cleanup_persisted_and_orphan_runs(include_scan=True)
     return status()
 
 

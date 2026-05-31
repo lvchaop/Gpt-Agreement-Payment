@@ -375,10 +375,16 @@
         </div>
 
         <div v-if="inventory.accounts.length" class="inventory-toolbar">
-          <label class="inventory-toolbar-check">
-            <input type="checkbox" :checked="allFilteredSelected" @change="toggleSelectAllFiltered" />
-            <span>全选筛选结果 ({{ selectedFilteredCount }} / {{ filteredAccounts.length }})</span>
-          </label>
+          <div class="inventory-toolbar-selects">
+            <label class="inventory-toolbar-check">
+              <input type="checkbox" :checked="allPagedSelected" @change="toggleSelectAllPaged" />
+              <span>全选当前页 ({{ selectedPagedCount }} / {{ pagedAccounts.length }})</span>
+            </label>
+            <label class="inventory-toolbar-check">
+              <input type="checkbox" :checked="allFilteredSelected" @change="toggleSelectAllFiltered" />
+              <span>全选筛选结果 ({{ selectedFilteredCount }} / {{ filteredAccounts.length }})</span>
+            </label>
+          </div>
           <div class="inventory-toolbar-actions">
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="verifySelected">验证选中</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unknownOrUncheckedIds.length === 0" @click="verifyAllUnknown">验证全部未检 ({{ unknownOrUncheckedIds.length }})</TermBtn>
@@ -1206,6 +1212,7 @@ function setInventoryPage(page: number) {
 
 watch(() => ({ ...invFilters.value }), () => {
   inventoryPage.value = 1;
+  selectedIds.value = new Set();
 });
 
 watch(inventoryPageSize, (size) => {
@@ -1228,6 +1235,30 @@ watch([() => filteredAccounts.value.length, inventoryTotalPages], () => {
 
 function resetInvFilters() {
   invFilters.value = { search: "", plan: "", check: "", pay: "", sale: "", rt: "", cpa: "" };
+}
+
+const allPagedSelected = computed(() => {
+  const ids = pagedAccounts.value.map(a => a.id).filter(Boolean);
+  return ids.length > 0 && ids.every(id => selectedIds.value.has(id));
+});
+
+const selectedPagedCount = computed(() => {
+  let n = 0;
+  for (const acc of pagedAccounts.value) {
+    if (selectedIds.value.has(acc.id)) n++;
+  }
+  return n;
+});
+
+function toggleSelectAllPaged() {
+  const ids = pagedAccounts.value.map(a => a.id).filter(Boolean);
+  const next = new Set(selectedIds.value);
+  if (allPagedSelected.value) {
+    for (const id of ids) next.delete(id);
+  } else {
+    for (const id of ids) next.add(id);
+  }
+  selectedIds.value = next;
 }
 
 const allFilteredSelected = computed(() => {
@@ -2095,6 +2126,12 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   border: 1px solid var(--border);
   background: var(--bg-panel);
+  flex-wrap: wrap;
+}
+.inventory-toolbar-selects {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
   flex-wrap: wrap;
 }
 .inventory-toolbar-check {
