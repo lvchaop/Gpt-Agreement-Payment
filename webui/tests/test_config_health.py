@@ -148,6 +148,47 @@ def test_config_health_phone_register_hero_sms_ok(client, tmp_path, monkeypatch,
     assert "service=tg" in phone_check["details"]
 
 
+def test_config_health_portal_protocol_register_only_skips_mail_otp(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed_configs(tmp_path, monkeypatch)
+
+    db = get_db()
+    db.clear_runtime_data()
+
+    r = client.post("/api/config/health", json={
+        "mode": "single",
+        "paypal": True,
+        "register_only": True,
+        "register_mode": "portal_protocol",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["requires_email_otp"] is False
+    names = {c["name"] for c in body["checks"]}
+    assert "portal_protocol" in names
+    assert "cloudflare_kv_secrets" in names
+
+
+def test_config_health_portal_protocol_blocks_payment_chain(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed_configs(tmp_path, monkeypatch)
+
+    db = get_db()
+    db.clear_runtime_data()
+
+    r = client.post("/api/config/health", json={
+        "mode": "single",
+        "paypal": True,
+        "register_mode": "portal_protocol",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    names = {c["name"] for c in body["blocking"]}
+    assert "portal_protocol_scope" in names
+
+
 def test_run_start_blocked_by_config_health(client, tmp_path, monkeypatch):
     _login(client)
     _seed_configs(tmp_path, monkeypatch)

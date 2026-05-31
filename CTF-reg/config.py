@@ -79,7 +79,7 @@ class CaptchaConfig:
 @dataclass
 class RegistrationConfig:
     """注册路径配置。method 为空时由 pipeline / WEBUI_REG_MODE 决定。"""
-    method: str = ""  # browser | protocol | phone_browser | phone_protocol
+    method: str = ""  # browser | protocol | phone_browser | phone_protocol | portal_protocol
 
 
 @dataclass
@@ -122,6 +122,32 @@ class PhoneConfig:
 
 
 @dataclass
+class PortalProtocolConfig:
+    """Microsoft/Live portal pure-protocol signup settings."""
+
+    enabled: bool = False
+    state_path: str = "output/portal_identity_state.json"
+    namespace: str = "portal-live"
+    account_domain: str = "outlook.com"
+    client_id: str = "00000000480728C5"
+    scope: str = "profile offline_access openid service::outlook.office.com::MBI_SSL"
+    redirect_uri: str = "https://login.live.com/oauth20_desktop.srf"
+    locale: str = "zh-CN"
+    user_agent: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) PKeyAuth/1.0"
+    accept_language: str = "zh-CN,zh-Hans;q=0.9"
+    country: str = "JP"
+    timeout_s: int = 30
+    max_name_retries: int = 5
+    first_name: str = ""
+    last_name: str = ""
+    birth_age_min: int = 20
+    birth_age_max: int = 40
+    birth_year_min: int = 1985
+    birth_year_max: int = 2000
+    passkey_mode: str = "skip"
+
+
+@dataclass
 class Config:
     """总配置"""
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
@@ -131,6 +157,7 @@ class Config:
     team_plan: TeamPlanConfig = field(default_factory=TeamPlanConfig)
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
     phone: PhoneConfig = field(default_factory=PhoneConfig)
+    portal_protocol: PortalProtocolConfig = field(default_factory=PortalProtocolConfig)
     proxy: Optional[str] = None
     proxy_meta: dict = field(default_factory=dict)
     # 已有凭证（可选，跳过注册直接支付时使用）
@@ -171,6 +198,8 @@ class Config:
             cfg.captcha = CaptchaConfig(**filtered_kwargs(CaptchaConfig, data["captcha"]))
         if "phone" in data:
             cfg.phone = PhoneConfig(**filtered_kwargs(PhoneConfig, data["phone"]))
+        if "portal_protocol" in data:
+            cfg.portal_protocol = PortalProtocolConfig(**filtered_kwargs(PortalProtocolConfig, data["portal_protocol"]))
         cfg.proxy = data.get("proxy")
         cfg.proxy_meta = data.get("proxy_meta") if isinstance(data.get("proxy_meta"), dict) else {}
         cfg.session_token = data.get("session_token")
@@ -188,6 +217,7 @@ class Config:
             "team_plan": self.team_plan.__dict__,
             "captcha": self.captcha.__dict__,
             "phone": self.phone.__dict__,
+            "portal_protocol": self.portal_protocol.__dict__,
             "proxy": self.proxy,
             "proxy_meta": self.proxy_meta,
             "session_token": self.session_token,

@@ -136,8 +136,14 @@ def _requires_registration(req: dict) -> bool:
     return not bool(req.get("pay_only"))
 
 
+def _requested_register_mode(req: dict) -> str:
+    return _text(req.get("register_mode")).lower().replace("-", "_")
+
+
 def _requires_email_otp(req: dict) -> bool:
     mode = _text(req.get("mode")) or "single"
+    if _requested_register_mode(req) == "portal_protocol":
+        return False
     # free_backfill_rt does not create a new mailbox, but OAuth login still
     # needs the OpenAI email OTP provider for existing accounts.
     return _requires_registration(req) or mode == "free_backfill_rt" or bool(req.get("register_only"))
@@ -155,7 +161,7 @@ def _payment_kind(req: dict) -> str:
 
 
 def _registration_method(req: dict, reg_cfg: dict | None = None) -> str:
-    requested = _text(req.get("register_mode")).lower().replace("-", "_")
+    requested = _requested_register_mode(req)
     if requested:
         return requested
     reg = (reg_cfg or {}).get("registration") if isinstance((reg_cfg or {}).get("registration"), dict) else {}
@@ -221,6 +227,15 @@ def _check_config_files(checks: list[dict], req: dict) -> tuple[dict, dict, Path
 
 
 def _check_cloudflare_kv(checks: list[dict], req: dict, reg_cfg: dict | None = None) -> None:
+    if _registration_method(req, reg_cfg) == "portal_protocol":
+        _check(
+            checks,
+            "cloudflare_kv_secrets",
+            "ok",
+            "portal_protocol 不需要 Cloudflare KV 邮箱 OTP",
+            blocking=False,
+        )
+        return
     mail = (reg_cfg or {}).get("mail") if isinstance((reg_cfg or {}).get("mail"), dict) else {}
     if _text(mail.get("mode")) == "imap_list":
         _check(
@@ -269,6 +284,27 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
     if not _requires_registration(req):
         return
     method = _registration_method(req, reg_cfg)
+    if method == "portal_protocol":
+        portal = reg_cfg.get("portal_protocol") if isinstance(reg_cfg.get("portal_protocol"), dict) else {}
+        state_path = _text(portal.get("state_path") or "output/portal_identity_state.json")
+        if _payment_kind(req) != "none":
+            _check(
+                checks,
+                "portal_protocol_scope",
+                "fail",
+                "portal_protocol 当前只产出 Live/portal 账号密码，不产出 ChatGPT session",
+                action="Run 页勾选 --register-only 后再启动；支付链路继续使用 browser/protocol/phone_* 注册方式",
+            )
+        else:
+            _check(
+                checks,
+                "portal_protocol",
+                "ok",
+                "portal_protocol 账号生成配置可用",
+                details=f"state_path={state_path}",
+                blocking=False,
+            )
+        return
     if method in {"phone_browser", "phone_protocol"}:
         phone = reg_cfg.get("phone") if isinstance(reg_cfg.get("phone"), dict) else {}
         phone_override = req.get("phone") if isinstance(req.get("phone"), dict) else {}

@@ -376,7 +376,7 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.append("--free-register")
             if count > 0:
                 cmd.extend(["--count", str(count)])
-            if rm in ("protocol", "phone_browser", "phone_protocol"):
+            if rm in ("protocol", "phone_browser", "phone_protocol", "portal_protocol"):
                 cmd.extend(["--register-method", rm])
         else:
             cmd.append("--free-backfill-rt")
@@ -387,7 +387,7 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.extend(["--gopay-otp-file", gopay_otp_file])
     elif paypal:
         cmd.append("--paypal")
-    if rm in ("protocol", "phone_browser", "phone_protocol"):
+    if rm in ("protocol", "phone_browser", "phone_protocol", "portal_protocol"):
         cmd.extend(["--register-method", rm])
     # mode 决定循环结构（daemon ∞ / self_dealer / batch N / 单次）
     if mode == "daemon":
@@ -517,11 +517,15 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         env["AUTH_HTTP_TRACE"] = "0"
         env["AUTH_TRACE_INCLUDE_COOKIE"] = "0"
         env.setdefault("PHONE_TRACE_DUMP", "1")
-        # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_*=手机号入口/协议
+        # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_*=手机号入口/协议；portal_protocol=Live/portal 纯协议
         env["WEBUI_REG_MODE"] = (
-            "phone_protocol"
-            if rm == "phone_protocol"
-            else ("phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser"))
+            "portal_protocol"
+            if rm == "portal_protocol"
+            else (
+                "phone_protocol"
+                if rm == "phone_protocol"
+                else ("phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser"))
+            )
         )
         if runtime_env_overrides:
             for k, v in runtime_env_overrides.items():

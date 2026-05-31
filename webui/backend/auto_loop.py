@@ -424,6 +424,8 @@ def start(
         raise ValueError("target_success must be >= 1")
     if max_consec_fail < 1:
         raise ValueError("max_consec_fail must be >= 1")
+    if (register_mode or "").strip().lower().replace("-", "_") == "portal_protocol":
+        raise ValueError("portal_protocol 只支持普通 Run 的 --register-only，不支持 auto-loop")
 
     with _lock:
         if _state["running"]:

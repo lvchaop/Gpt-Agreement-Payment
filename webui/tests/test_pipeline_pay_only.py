@@ -15,6 +15,44 @@ def _reset_db(tmp_path, monkeypatch):
     return db
 
 
+def test_portal_protocol_register_saves_mail_account_not_registered_account(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    cardw_config = tmp_path / "reg.json"
+    cardw_config.write_text(json.dumps({
+        "registration": {"method": "portal_protocol"},
+    }), encoding="utf-8")
+
+    payload = {
+        "email": "A1b2C3d4E5f6@outlook.com",
+        "password": "PwD123!abcX",
+        "register_method": "portal_protocol",
+    }
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = ["LOCALAUTH_RESULT_JSON=" + json.dumps(payload) + "\n"]
+            self.returncode = 0
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+
+    result = pipeline.register(str(cardw_config), register_method="portal_protocol")
+
+    assert result["email"] == payload["email"]
+    assert db.iter_registered_accounts() == []
+    mail_accounts = db.iter_mail_accounts()
+    assert len(mail_accounts) == 1
+    assert mail_accounts[0]["email"] == payload["email"].lower()
+    assert mail_accounts[0]["mail_password"] == payload["password"]
+    assert mail_accounts[0]["provider"] == "outlook"
+    assert mail_accounts[0]["status"] == "unused"
+
+
 def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch):
     db = _reset_db(tmp_path, monkeypatch)
 

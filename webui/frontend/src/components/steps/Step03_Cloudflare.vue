@@ -229,6 +229,7 @@ const registrationOptions = [
   { value: "protocol", label: "邮箱协议", desc: "auth_flow HTTP 链路" },
   { value: "phone_browser", label: "手机号浏览器", desc: "Phone 入口 + provider 拿号/取码" },
   { value: "phone_protocol", label: "手机号协议", desc: "手机号纯协议 + provider 拿号/取码" },
+  { value: "portal_protocol", label: "Portal 协议", desc: "Live/portal HAR 形态纯协议账号注册" },
 ];
 const phoneProviderOptions = [
   { value: "hero_sms", label: "Hero SMS", desc: "getNumberV2 + getStatusV2" },

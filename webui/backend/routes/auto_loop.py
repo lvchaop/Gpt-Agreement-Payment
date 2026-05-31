@@ -18,7 +18,7 @@ class StartRequest(BaseModel):
     gopay: bool = True
     pay_only: bool = False
     register_only: bool = False
-    register_mode: str = Field(default="browser", pattern="^(browser|protocol|phone_browser|phone_protocol)$")
+    register_mode: str = Field(default="browser", pattern="^(browser|protocol|phone_browser|phone_protocol|portal_protocol)$")
 
 
 @router.post("/start")

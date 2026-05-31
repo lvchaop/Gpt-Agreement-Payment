@@ -74,12 +74,17 @@
               <input type="radio" value="phone_protocol" v-model="form.register_mode" />
               手机号 (纯协议)
             </label>
+            <label class="reg-mode-opt" :class="{ active: form.register_mode === 'portal_protocol' }">
+              <input type="radio" value="portal_protocol" v-model="form.register_mode" />
+              Portal (纯协议)
+            </label>
           </div>
           <p v-if="!form.pay_only" class="ctl-hint">
             <code>browser</code> 走 Camoufox + Turnstile 真实执行（稳但慢，OpenAI 改 modal 后可能失败）；
             <code>protocol</code> 走 <code>auth_flow.AuthFlow</code> HTTP 直连（快，但可能被风控）。
             <code>phone_browser</code> 进入手机号入口后调用 <code>phone</code> provider 拿号/取码；
-            <code>phone_protocol</code> 复用同一 provider 走纯协议。
+            <code>phone_protocol</code> 复用同一 provider 走纯协议；
+            <code>portal_protocol</code> 走 Live/portal HAR 形态的纯协议注册，只产出账号密码。
             选择会自动持久化到 localStorage。
           </p>
           <div v-if="!form.pay_only && isPhoneRegisterMode" class="phone-runtime">
@@ -650,7 +655,7 @@ const form = ref({
   workers: 3,
   self_dealer: 4,
   count: 0, // free_register 模式：注册多少个后停（0 = 无限）
-  register_mode: (localStorage.getItem("webui.register_mode") || "browser") as "browser" | "protocol" | "phone_browser" | "phone_protocol",
+  register_mode: (localStorage.getItem("webui.register_mode") || "browser") as "browser" | "protocol" | "phone_browser" | "phone_protocol" | "portal_protocol",
 });
 const phoneRunForm = ref({
   provider: "hero_sms",

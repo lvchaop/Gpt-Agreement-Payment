@@ -59,6 +59,23 @@
     "fail_path": "/api/phones/{lease_id}/fail",
     "verified_path": "/api/phones/{lease_id}/verified"
   },
+  "portal_protocol": {
+    "enabled": false,
+    "state_path": "output/portal_identity_state.json",
+    "namespace": "portal-live",
+    "account_domain": "outlook.com",
+    "client_id": "00000000480728C5",
+    "scope": "profile offline_access openid service::outlook.office.com::MBI_SSL",
+    "redirect_uri": "https://login.live.com/oauth20_desktop.srf",
+    "locale": "zh-CN",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) PKeyAuth/1.0",
+    "accept_language": "zh-CN,zh-Hans;q=0.9",
+    "country": "JP",
+    "timeout_s": 30,
+    "max_name_retries": 5,
+    "birth_age_min": 20,
+    "birth_age_max": 40
+  },
   "proxy": null,
   "session_token": null,
   "access_token": null,

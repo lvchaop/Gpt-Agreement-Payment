@@ -642,6 +642,8 @@ def _normalize_register_method(value: str | None) -> str:
         return "phone_browser"
     if v in ("phone_protocol", "phone_http", "phone_api"):
         return "phone_protocol"
+    if v in ("portal", "portal_protocol", "live_protocol", "outlook_protocol", "microsoft_protocol"):
+        return "portal_protocol"
     raise RegistrationError(f"未知注册路径: {value}")
 
 
@@ -664,8 +666,8 @@ def register(cardw_config_path, proxy=None, python="python3", timeout=600,
 
     注册路径优先级：显式 register_method > WEBUI_REG_METHOD/WEBUI_REG_MODE >
     config.registration.method > 旧 browser 参数 > 默认 browser。
-    `phone_browser` 走手机号入口注册；`phone_protocol` 走手机号纯协议注册，
-    两者都返回兼容的 email/session/access_token 结构。
+    `phone_browser` 走手机号入口注册；`phone_protocol` 走手机号纯协议注册。
+    `portal_protocol` 走 Live/portal 纯协议注册，返回账号密码，不产出 ChatGPT session。
     WebUI 在 Run 页加了切换按钮，每次启动 pipeline 时把选择透传成环境变量。
 
     返回 dict: {email, session_token, access_token, device_id, ...}
@@ -747,6 +749,19 @@ except Exception:
     pass
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False), flush=True)
 """
+    elif method == "portal_protocol":
+        script = r"""
+import json, logging, os, sys
+auth_bundle_dir = sys.argv[1]
+config_path = sys.argv[2]
+sys.path.insert(0, auth_bundle_dir)
+from config import Config
+from portal_protocol import portal_protocol_register
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+cfg = Config.from_file(config_path)
+result = portal_protocol_register(cfg)
+print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
+"""
     else:
         script = r"""
 import json, logging, os, sys
@@ -818,7 +833,17 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         entry = dict(result_json)
         entry.setdefault("register_method", method)
         entry["ts"] = datetime.now(timezone.utc).isoformat()
-        get_db().add_registered_account(entry)
+        if method == "portal_protocol":
+            get_db().append_mail_accounts([{
+                "email": entry.get("email", ""),
+                "mail_password": entry.get("password", ""),
+                "provider": "outlook",
+                "status": "unused",
+                "first": entry.get("first") or entry.get("first_name") or "",
+                "last": entry.get("last") or entry.get("last_name") or "",
+            }])
+        else:
+            get_db().add_registered_account(entry)
     except Exception as e:
         print(f"{register_tag} 保存凭证失败: {e}")
     return result_json
@@ -4829,8 +4854,8 @@ def main():
     parser.add_argument("--register-only", action="store_true",
                         help="仅注册，不支付")
     parser.add_argument("--register-method", default="",
-                        choices=("", "browser", "protocol", "phone_browser", "phone_protocol"),
-                        help="注册路径：browser / protocol / phone_browser / phone_protocol；空则读 WEBUI_REG_MODE 或注册配置")
+                        choices=("", "browser", "protocol", "phone_browser", "phone_protocol", "portal_protocol"),
+                        help="注册路径：browser / protocol / phone_browser / phone_protocol / portal_protocol；空则读 WEBUI_REG_MODE 或注册配置")
     parser.add_argument("--pay-only", action="store_true",
                         help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,
