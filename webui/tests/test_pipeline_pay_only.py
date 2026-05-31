@@ -1,8 +1,10 @@
 import json
+import re
 import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pipeline
 from webui.backend.db import get_db
@@ -51,6 +53,50 @@ def test_portal_protocol_register_saves_mail_account_not_registered_account(tmp_
     assert mail_accounts[0]["mail_password"] == payload["password"]
     assert mail_accounts[0]["provider"] == "outlook"
     assert mail_accounts[0]["status"] == "unused"
+
+
+def test_portal_protocol_register_generates_runtime_device_config(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    cardw_config = tmp_path / "reg.json"
+    cardw_config.write_text(json.dumps({
+        "registration": {"method": "portal_protocol"},
+        "device_id": "static-device",
+    }), encoding="utf-8")
+
+    captured: dict[str, str] = {}
+
+    class FakeProc:
+        def __init__(self, payload):
+            self.stdout = ["LOCALAUTH_RESULT_JSON=" + json.dumps(payload) + "\n"]
+            self.returncode = 0
+
+        def wait(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_popen(cmd, *args, **kwargs):
+        cfg_path = cmd[4]
+        cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+        captured["cfg_path"] = cfg_path
+        captured["device_id"] = cfg.get("device_id", "")
+        payload = {
+            "email": "portal@example.com",
+            "password": "PwD123!abcX",
+            "register_method": "portal_protocol",
+            "device_id": captured["device_id"],
+        }
+        return FakeProc(payload)
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", fake_popen)
+
+    result = pipeline.register(str(cardw_config), register_method="portal_protocol")
+
+    assert re.fullmatch(r"[0-9a-f-]{36}", captured["device_id"])
+    assert captured["device_id"] != "static-device"
+    assert result["device_id"] == captured["device_id"]
+    assert not Path(captured["cfg_path"]).exists()
 
 
 def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch):

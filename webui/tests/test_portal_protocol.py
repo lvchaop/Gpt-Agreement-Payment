@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import sys
@@ -127,6 +128,39 @@ class _BirthdateRetrySession(_FakeSession):
         })
 
 
+class _CreateAccountBusinessErrorSession(_FakeSession):
+    def __init__(self, signup_html: str = "<html></html>"):
+        super().__init__(signup_html)
+        self.cookies = {"fptctx2": "1", "MUID": "1"}
+
+    def post(self, url, json=None, data=None, **kwargs):
+        self.posts.append((url, json or data or {}))
+        self.post_headers.append((url, kwargs.get("headers") or {}))
+        if "CreateAccount" in url:
+            return _FakeResponse(url=url, data={
+                "error": {
+                    "code": "1347",
+                    "data": "",
+                    "stackTrace": "",
+                    "telemetryContext": "ctx-1347",
+                }
+            })
+        return _FakeResponse(url=url, data={})
+
+
+class _CreateAccountHttpErrorSession(_FakeSession):
+    def __init__(self, signup_html: str = "<html></html>"):
+        super().__init__(signup_html)
+        self.cookies = {"fptctx2": "1", "MUID": "1", "_pxde": "1", "_px3": "1", "_pxvid": "1"}
+
+    def post(self, url, json=None, data=None, **kwargs):
+        self.posts.append((url, json or data or {}))
+        self.post_headers.append((url, kwargs.get("headers") or {}))
+        if "CreateAccount" in url:
+            return _FakeResponse(url=url, text="Too Many Requests", status_code=429)
+        return _FakeResponse(url=url, data={})
+
+
 def test_portal_protocol_uses_hmac_identity_and_live_api_shape(tmp_path):
     server_data = {
         "apiCanary": "initial-canary",
@@ -150,10 +184,12 @@ def test_portal_protocol_uses_hmac_identity_and_live_api_shape(tmp_path):
     cfg.portal_protocol.state_path = str(tmp_path / "identity.json")
     cfg.portal_protocol.namespace = "test-portal"
     cfg.portal_protocol.account_domain = "outlook.com"
+    cfg.device_id = "11111111-2222-3333-4444-555555555555"
 
     result = PortalProtocol(cfg, session=session).run().to_dict()
 
     assert result["register_method"] == "portal_protocol"
+    assert result["device_id"] == cfg.device_id
     assert re.fullmatch(r"[a-z][a-z0-9]{11}@outlook\.com", result["email"])
     assert result["email"] == result["email"].lower()
     assert result["portal_oauth_code_captured"] is True
@@ -172,12 +208,14 @@ def test_portal_protocol_uses_hmac_identity_and_live_api_shape(tmp_path):
     clear_url = next(url for url in session.gets if "fpt.live.com/Images/Clear.PNG" in url)
     clear_qs = parse_qs(urlparse(clear_url).query)
     esi = base64.b64decode(clear_qs["esi"][0]).decode("utf-8")
-    eci = base64.b64decode(clear_qs["eci"][0]).decode("utf-8")
-    assert "mth=27f51d3149e6bf209b66bd387b0af3c4" in esi
+    eci = json.loads(base64.b64decode(clear_qs["eci"][0]).decode("utf-8"))
+    assert f"mth={hashlib.sha256(f'{cfg.device_id}:mth'.encode('utf-8')).hexdigest()[:32]}" in esi
     assert "plugin_flash%3Dfalse" in esi
-    assert "fh=07d7339f27cd6608358c55b7fda0f9ec" in esi
-    assert "c=bdef6bc2985d5a701a6bf7d693ef085b" in esi
-    assert '"vdr":"WebKit"' in eci
+    assert f"fh={hashlib.sha256(f'{cfg.device_id}:fh'.encode('utf-8')).hexdigest()[:32]}" in esi
+    assert f"c={hashlib.sha256(f'{cfg.device_id}:c'.encode('utf-8')).hexdigest()[:32]}" in esi
+    assert re.search(r"sr=\d+x\d+", esi)
+    assert eci["vdr"] == "WebKit"
+    assert eci["iduh"] == hashlib.sha256(f"{cfg.device_id}:iduh".encode("utf-8")).hexdigest()[:32]
 
 
 def test_portal_protocol_retries_birthdate_error_with_same_account(tmp_path):
@@ -249,3 +287,38 @@ def test_portal_birth_date_formats_by_country_not_server_display_order():
     assert re.fullmatch(r"\d{2}:\d{2}:\d{4}", mdy)
     assert mdy_order == "MDY"
     assert mdy_source == "country:US"
+
+
+def test_portal_create_account_business_error_contains_cookie_context():
+    cfg = Config()
+    cfg.portal_protocol.country = "JP"
+    portal = PortalProtocol(cfg, session=_CreateAccountBusinessErrorSession())
+
+    try:
+        portal._create_account(_portal_state_with_order("YMD"), "demo@outlook.com", "Passw0rd!23")
+    except Exception as e:
+        message = str(e)
+    else:
+        raise AssertionError("expected create account business error")
+
+    assert "code': '1347'" in message
+    assert "ctx=email=demo@outlook.com" in message
+    assert "country=JP" in message
+    assert "cookies=fptctx2=1,muid=1,pxde=0,px3=0,pxvid=0" in message
+
+
+def test_portal_create_account_http_error_contains_cookie_context():
+    cfg = Config()
+    cfg.portal_protocol.country = "JP"
+    portal = PortalProtocol(cfg, session=_CreateAccountHttpErrorSession())
+
+    try:
+        portal._create_account(_portal_state_with_order("YMD"), "demo@outlook.com", "Passw0rd!23")
+    except Exception as e:
+        message = str(e)
+    else:
+        raise AssertionError("expected create account http error")
+
+    assert "CreateAccount HTTP 429" in message
+    assert "ctx=email=demo@outlook.com" in message
+    assert "cookies=fptctx2=1,muid=1,pxde=1,px3=1,pxvid=1" in message

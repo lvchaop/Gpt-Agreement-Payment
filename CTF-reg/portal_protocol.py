@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import html
 import base64
+import hashlib
 import json
 import logging
 import os
 import random
 import re
 import secrets
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +34,25 @@ _COUNTRY_DATE_ORDERS = {
     "UK": "DMY",
     "JP": "DMY",
 }
+
+_SCREEN_PRESETS = (
+    (1440, 900, 840, 2),
+    (1512, 982, 934, 2),
+    (1680, 1050, 1000, 2),
+    (1728, 1117, 1069, 2),
+    (1792, 1120, 1072, 2),
+    (1920, 1080, 1032, 2),
+    (2560, 1600, 1548, 2),
+    (3024, 1964, 1912, 2),
+)
+
+_GPU_PRESETS = (
+    ("Apple Inc.", "Apple GPU"),
+    ("Apple Inc.", "Apple M1"),
+    ("Apple Inc.", "Apple M2"),
+    ("Intel Inc.", "Intel Iris OpenGL Engine"),
+    ("AMD", "AMD Radeon Pro 560X OpenGL Engine"),
+)
 
 
 class PortalProtocolError(RuntimeError):
@@ -58,6 +79,7 @@ class PortalProtocolResult:
     email: str
     password: str
     username_seq: int
+    device_id: str = ""
     final_url: str = ""
     oauth_code_captured: bool = False
 
@@ -67,7 +89,7 @@ class PortalProtocolResult:
             "password": self.password,
             "session_token": "",
             "access_token": "",
-            "device_id": "",
+            "device_id": self.device_id,
             "csrf_token": "",
             "id_token": "",
             "refresh_token": "",
@@ -84,6 +106,26 @@ def _cfg_value(cfg: Config, key: str, default: Any = "") -> Any:
     if portal is None:
         return default
     return getattr(portal, key, default)
+
+
+@dataclass(frozen=True)
+class PortalDeviceProfile:
+    device_id: str
+    screen_width: int
+    screen_height: int
+    avail_width: int
+    avail_height: int
+    pixel_ratio: int
+    logical_processors: int
+    timezone_offset: int
+    browser_language: str
+    gpu_vendor: str
+    gpu_renderer: str
+    mth: str
+    ph: str
+    fh: str
+    cid_hash: str
+    iduh: str
 
 
 def _project_base_dir() -> Path:
@@ -196,6 +238,9 @@ class PortalProtocol:
         self.timeout = float(_cfg_value(cfg, "timeout_s", 30) or 30)
         self.user_agent = str(_cfg_value(cfg, "user_agent", PORTAL_USER_AGENT) or PORTAL_USER_AGENT)
         self.accept_language = str(_cfg_value(cfg, "accept_language", "zh-CN,zh-Hans;q=0.9") or "zh-CN,zh-Hans;q=0.9")
+        self.device_id = str(getattr(cfg, "device_id", "") or "").strip() or str(uuid.uuid4())
+        self.device_profile: PortalDeviceProfile | None = None
+        self._last_create_account_context: dict[str, Any] = {}
         self.session = session or create_http_session(proxy=cfg.proxy, impersonate="chrome136")
         self.session.headers.update({
             "User-Agent": self.user_agent,
@@ -229,6 +274,41 @@ class PortalProtocol:
         m = re.search(rf"\b{re.escape(name)}\s*=\s*'([^']*)'", text)
         return m.group(1) if m else ""
 
+    def _profile_hash(self, label: str, length: int = 32) -> str:
+        return hashlib.sha256(f"{self.device_id}:{label}".encode("utf-8")).hexdigest()[:length]
+
+    def _profile_rng(self, *parts: str) -> random.Random:
+        seed_parts = [self.device_id] + [str(part or "") for part in parts]
+        seed = hashlib.sha256("|".join(seed_parts).encode("utf-8")).digest()
+        return random.Random(int.from_bytes(seed[:8], "big"))
+
+    def _build_device_profile(self, country: str) -> PortalDeviceProfile:
+        country_code = self._normalise_country(country) or "US"
+        rng = self._profile_rng(country_code, self.user_agent, self.accept_language)
+        screen_width, screen_height, avail_height, pixel_ratio = rng.choice(_SCREEN_PRESETS)
+        gpu_vendor, gpu_renderer = rng.choice(_GPU_PRESETS)
+        browser_language = re.split(r"[;,]", self.accept_language, maxsplit=1)[0].strip() or "en-US"
+        timezone_offset = 480
+        logical_processors = rng.choice([8, 8, 10, 12])
+        return PortalDeviceProfile(
+            device_id=self.device_id,
+            screen_width=screen_width,
+            screen_height=screen_height,
+            avail_width=screen_width,
+            avail_height=avail_height,
+            pixel_ratio=pixel_ratio,
+            logical_processors=logical_processors,
+            timezone_offset=timezone_offset,
+            browser_language=browser_language,
+            gpu_vendor=gpu_vendor,
+            gpu_renderer=gpu_renderer,
+            mth=self._profile_hash("mth"),
+            ph=self._profile_hash("ph"),
+            fh=self._profile_hash("fh"),
+            cid_hash=self._profile_hash("c"),
+            iduh=self._profile_hash("iduh"),
+        )
+
     def _cookie_names(self) -> set[str]:
         cookies = getattr(self.session, "cookies", None)
         names: set[str] = set()
@@ -247,6 +327,70 @@ class PortalProtocol:
         except Exception:
             pass
         return names
+
+    def _cookie_presence(self) -> dict[str, bool]:
+        cookie_names = self._cookie_names()
+        return {
+            "fptctx2": "fptctx2" in cookie_names,
+            "MUID": "MUID" in cookie_names,
+            "_pxde": "_pxde" in cookie_names,
+            "_px3": "_px3" in cookie_names,
+            "_pxvid": "_pxvid" in cookie_names,
+        }
+
+    @staticmethod
+    def _bool01(value: Any) -> str:
+        return "1" if bool(value) else "0"
+
+    def _create_account_context(
+        self,
+        *,
+        email: str,
+        country: str,
+        birth_date: str,
+        birth_order: str,
+        birth_order_source: str,
+        birth_attempt: int,
+        birth_attempt_total: int,
+        birth_age_days: int,
+        server_date_order: str,
+        cookie_flags: dict[str, bool],
+    ) -> dict[str, Any]:
+        return {
+            "email": email,
+            "country": country,
+            "birth_date": birth_date,
+            "birth_order": birth_order,
+            "birth_order_source": birth_order_source,
+            "birth_attempt": birth_attempt,
+            "birth_attempt_total": birth_attempt_total,
+            "birth_age_days": birth_age_days,
+            "server_date_order": server_date_order,
+            "cookie_flags": dict(cookie_flags),
+        }
+
+    def _format_create_account_context(self, context: dict[str, Any] | None = None) -> str:
+        ctx = dict(context or self._last_create_account_context or {})
+        if not ctx:
+            return "ctx=<empty>"
+        cookie_flags = dict(ctx.get("cookie_flags") or {})
+        return (
+            "ctx="
+            f"email={ctx.get('email') or '<empty>'} "
+            f"country={ctx.get('country') or '<empty>'} "
+            f"birth_date={ctx.get('birth_date') or '<empty>'} "
+            f"birth_order={ctx.get('birth_order') or '<empty>'} "
+            f"order_source={ctx.get('birth_order_source') or '<empty>'} "
+            f"birth_attempt={ctx.get('birth_attempt') or 0}/{ctx.get('birth_attempt_total') or 0} "
+            f"age_days={ctx.get('birth_age_days') or 0} "
+            f"sDateOrder={ctx.get('server_date_order') or '<empty>'} "
+            "cookies="
+            f"fptctx2={self._bool01(cookie_flags.get('fptctx2'))},"
+            f"muid={self._bool01(cookie_flags.get('MUID'))},"
+            f"pxde={self._bool01(cookie_flags.get('_pxde'))},"
+            f"px3={self._bool01(cookie_flags.get('_px3'))},"
+            f"pxvid={self._bool01(cookie_flags.get('_pxvid'))}"
+        )
 
     def _navigation_headers(self, uaid: str = "") -> dict[str, str]:
         request_id = self._uuidish(uaid)
@@ -339,6 +483,7 @@ class PortalProtocol:
                 email=email,
                 password=password,
                 username_seq=seq,
+                device_id=self.device_id,
                 final_url=urlunparse(parsed_final._replace(query="")),
                 oauth_code_captured=code_captured,
             )
@@ -419,6 +564,22 @@ class PortalProtocol:
             state.server_data.get("iMinBirthYear") or "<empty>",
             state.server_data.get("iMaxBirthYear") or "<empty>",
         )
+        self.device_profile = self._build_device_profile(self._effective_country(state))
+        logger.info(
+            "[portal-protocol] device profile device_id=%s screen=%sx%s avail=%sx%s pr=%s cpu=%s "
+            "gpu=%s/%s lang=%s tz=%s",
+            self._short_id(self.device_id),
+            self.device_profile.screen_width,
+            self.device_profile.screen_height,
+            self.device_profile.avail_width,
+            self.device_profile.avail_height,
+            self.device_profile.pixel_ratio,
+            self.device_profile.logical_processors,
+            self.device_profile.gpu_vendor,
+            self.device_profile.gpu_renderer,
+            self.device_profile.browser_language,
+            self.device_profile.timezone_offset,
+        )
         self._evaluate_experiments(state)
         self._touch_fingerprint(state)
         return state
@@ -465,6 +626,7 @@ class PortalProtocol:
             logger.debug("[portal-protocol] experiment assignment skipped: %s", e)
 
     def _fingerprint_clear_url(self, html_text: str, fingerprint_url: str) -> str:
+        profile = self.device_profile or self._build_device_profile("")
         local_target = self._js_string(html_text, "localTarget") or "https://fpt.live.com/"
         txn_id = self._js_string(html_text, "txnId")
         cid = self._js_string(html_text, "cid")
@@ -486,7 +648,7 @@ class PortalProtocol:
         esi_pairs = [
             ("bua", self.user_agent),
             ("os", "MacIntel"),
-            ("lproc", "8"),
+            ("lproc", str(profile.logical_processors)),
             ("ol", "true"),
             ("prosub", "20030107"),
             ("eval", "37"),
@@ -494,35 +656,35 @@ class PortalProtocol:
             ("ls", "true"),
             ("mtp", "0"),
             ("nc", "39"),
-            ("pr", "2"),
-            ("sr", "3840x2160"),
+            ("pr", str(profile.pixel_ratio)),
+            ("sr", f"{profile.screen_width}x{profile.screen_height}"),
             ("scd", "24"),
-            ("asr", "3840x1968"),
-            ("tz", "480"),
+            ("asr", f"{profile.avail_width}x{profile.avail_height}"),
+            ("tz", str(profile.timezone_offset)),
             ("dst", "0"),
-            ("tzo", "480"),
-            ("bl", "zh-CN"),
-            ("mth", "27f51d3149e6bf209b66bd387b0af3c4"),
+            ("tzo", str(profile.timezone_offset)),
+            ("bl", profile.browser_language),
+            ("mth", profile.mth),
             ("mtn", "2"),
             ("pn", "5"),
-            ("ph", "f3ac22ac59c6dcb874109d093c5255e8"),
+            ("ph", profile.ph),
             ("p", plugin_info),
-            ("fh", "07d7339f27cd6608358c55b7fda0f9ec"),
+            ("fh", profile.fh),
             ("fn", "70"),
             ("lh", fingerprint_url[:255]),
             ("dr", "https://signup.live.com/"),
             ("w", ticks),
             (rid_key, rid),
             ("a", ""),
-            ("c", "bdef6bc2985d5a701a6bf7d693ef085b"),
+            ("c", profile.cid_hash),
         ]
         esi = base64.b64encode(urlencode(esi_pairs).encode("utf-8")).decode("ascii")
         eci = base64.b64encode(json.dumps({
-            "uvdr": "Apple Inc.",
-            "urdr": "Apple GPU",
+            "uvdr": profile.gpu_vendor,
+            "urdr": profile.gpu_renderer,
             "vdr": "WebKit",
             "rdr": "WebKit WebGL",
-            "iduh": "457739c9dd9799ea64bab73f2a27f40d",
+            "iduh": profile.iduh,
         }, separators=(",", ":")).encode("utf-8")).decode("ascii")
         params = [
             ("ctx", "jscb1.0"),
@@ -705,7 +867,20 @@ class PortalProtocol:
                 "hpgid": state.hpgid,
             }
             safe_keys = [k for k in sorted(body.keys()) if k != "Password"]
-            cookie_names = self._cookie_names()
+            cookie_flags = self._cookie_presence()
+            context = self._create_account_context(
+                email=email,
+                country=country,
+                birth_date=birth_date,
+                birth_order=birth_order,
+                birth_order_source=birth_order_source,
+                birth_attempt=birth_attempt,
+                birth_attempt_total=len(birth_candidates),
+                birth_age_days=birth_age_days,
+                server_date_order=str(state.server_data.get("sDateOrder") or "<empty>"),
+                cookie_flags=cookie_flags,
+            )
+            self._last_create_account_context = dict(context)
             logger.info(
                 "[portal-protocol] create account request email=%s country=%s birth_date=%s "
                 "birth_order=%s order_source=%s birth_attempt=%s/%s age_days=%s sDateOrder=%s first_empty=%s "
@@ -725,11 +900,11 @@ class PortalProtocol:
                 bool(body.get("SignupReturnUrl")),
                 bool(body.get("ReturnUrl")),
                 body.get("SiteId") == "",
-                "fptctx2" in cookie_names,
-                "MUID" in cookie_names,
-                "_pxde" in cookie_names,
-                "_px3" in cookie_names,
-                "_pxvid" in cookie_names,
+                cookie_flags["fptctx2"],
+                cookie_flags["MUID"],
+                cookie_flags["_pxde"],
+                cookie_flags["_px3"],
+                cookie_flags["_pxvid"],
                 ",".join(safe_keys),
             )
             resp = self.session.post(
@@ -738,8 +913,14 @@ class PortalProtocol:
                 headers=self._api_headers(state),
                 timeout=self.timeout,
             )
-            self._raise_for_status(resp, "CreateAccount")
-            data = _json_or_error(resp, "CreateAccount")
+            try:
+                self._raise_for_status(resp, "CreateAccount")
+            except PortalProtocolError as e:
+                raise PortalProtocolError(f"{e} [{self._format_create_account_context(context)}]") from e
+            try:
+                data = _json_or_error(resp, "CreateAccount")
+            except PortalProtocolError as e:
+                raise PortalProtocolError(f"{e} [{self._format_create_account_context(context)}]") from e
             if data.get("apiCanary"):
                 state.api_canary = str(data["apiCanary"])
             if data.get("error"):
@@ -778,7 +959,10 @@ class PortalProtocol:
                         len(birth_candidates),
                     )
                     continue
-                raise PortalProtocolError(f"CreateAccount error={data.get('error')} code={data.get('errorCode')}")
+                raise PortalProtocolError(
+                    f"CreateAccount error={data.get('error')} code={data.get('errorCode')} "
+                    f"[{self._format_create_account_context(context)}]"
+                )
             logger.info(
                 "[portal-protocol] create account response email=%s has_redirect=%s response_keys=%s",
                 email,

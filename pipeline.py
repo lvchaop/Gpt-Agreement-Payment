@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -795,17 +796,25 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 
     register_tag = _log_tag("register", log_context)
     reg_tag = _log_tag("reg", log_context)
-    cmd = [python, "-c", script, auth_bundle_dir, cardw_config_path]
-    print(f"{register_tag} 注册新账号 (method={method}, config={os.path.basename(cardw_config_path)}) ...")
+    config_to_use = cardw_config_path
+    runtime_cardw = None
+    runtime_device_id = ""
+    if method == "portal_protocol":
+        runtime_cardw, runtime_device_id = _rewrite_cardw_with_runtime_device(cardw_config_path)
+        config_to_use = runtime_cardw
+        print(f"{register_tag} portal 设备已重置: {runtime_device_id[:8]}...")
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=env, cwd=str(CARDW_DIR),
-    )
+    cmd = [python, "-c", script, auth_bundle_dir, config_to_use]
+    print(f"{register_tag} 注册新账号 (method={method}, config={os.path.basename(config_to_use)}) ...")
 
+    proc = None
     result_json = None
     lines = []
     try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, cwd=str(CARDW_DIR),
+        )
         deadline = time.time() + timeout
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -818,7 +827,13 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
                 proc.kill()
                 raise RegistrationError("注册超时")
     finally:
-        proc.wait()
+        if proc is not None:
+            proc.wait()
+        if runtime_cardw and os.path.exists(runtime_cardw):
+            try:
+                os.unlink(runtime_cardw)
+            except Exception:
+                pass
 
     if proc.returncode != 0 and result_json is None:
         last_lines = _register_failure_excerpt(lines)
@@ -847,6 +862,21 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
     except Exception as e:
         print(f"{register_tag} 保存凭证失败: {e}")
     return result_json
+
+
+def _rewrite_cardw_with_runtime_device(src_path):
+    """读 CTF-reg config，注入本次 register work 专用 device_id。"""
+    with open(src_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    device_id = str(uuid.uuid4())
+    data["device_id"] = device_id
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="pipeline_cardw_device_",
+        dir=str(CARDW_DIR), delete=False,
+    )
+    json.dump(data, tmp, ensure_ascii=False, indent=2)
+    tmp.close()
+    return tmp.name, device_id
 
 
 # ──────────────────────────────────────────────
