@@ -469,6 +469,33 @@ class ImapOtpProvider:
             except Exception:
                 pass
 
+    def _otp_mailboxes(self, imap: imaplib.IMAP4) -> list[str]:
+        mailboxes = ["INBOX"]
+        common = ("Junk", "Junk Email", "Spam")
+        discovered: list[str] = []
+        try:
+            typ, rows = imap.list()
+            if typ == "OK":
+                for row in rows or []:
+                    text = row.decode(errors="replace") if isinstance(row, bytes) else str(row)
+                    quoted = re.findall(r'"((?:[^"\\]|\\.)*)"', text)
+                    name = quoted[-1].replace(r'\"', '"') if quoted else text.rsplit(" ", 1)[-1]
+                    name = name.strip().strip('"')
+                    lower = name.lower()
+                    if name and (
+                        "junk" in lower
+                        or "spam" in lower
+                        or "垃圾" in lower
+                    ):
+                        discovered.append(name)
+        except Exception as e:
+            logger.info("IMAP list mailbox failed email=%s: %s", self.account.email, e)
+
+        for name in [*discovered, *common]:
+            if name and name not in mailboxes:
+                mailboxes.append(name)
+        return mailboxes
+
     def wait_for_otp(
         self,
         email_addr: str,
@@ -508,6 +535,13 @@ class ImapOtpProvider:
                         item.get("from", ""),
                     )
                     if otp:
+                        logger.info(
+                            "IMAP OTP found email=%s mailbox=%s uid=%s subject=%r",
+                            email_addr,
+                            item.get("mailbox", "?"),
+                            item.get("uid", ""),
+                            item.get("subject", "")[:80],
+                        )
                         return OtpMatch(
                             otp=otp,
                             uid=item.get("uid", ""),
@@ -524,39 +558,74 @@ class ImapOtpProvider:
     def _recent_openai_messages(self, limit: int = 20) -> list[dict]:
         imap = self._connect()
         try:
-            imap.select("INBOX", readonly=not self.mark_seen)
-            # Search broad, then filter in Python. Provider-specific FROM
-            # search syntax can vary with encoded display names.
-            typ, data = imap.search(None, "ALL")
-            if typ != "OK":
-                raise RuntimeError(f"IMAP search failed: {typ}")
-            ids = (data[0] or b"").split()
+            mailboxes = self._otp_mailboxes(imap)
+            logger.info(
+                "IMAP OTP scan email=%s mailboxes=%s",
+                self.account.email,
+                ",".join(mailboxes),
+            )
             out: list[dict] = []
-            for msg_id in reversed(ids[-max(1, limit * 4):]):
-                if len(out) >= limit:
-                    break
-                typ, fetched = imap.fetch(msg_id, "(RFC822)")
-                if typ != "OK" or not fetched:
+            for mailbox in mailboxes:
+                try:
+                    typ, _ = imap.select(mailbox, readonly=not self.mark_seen)
+                    if typ != "OK":
+                        logger.info(
+                            "IMAP select mailbox failed email=%s mailbox=%s status=%s",
+                            self.account.email,
+                            mailbox,
+                            typ,
+                        )
+                        continue
+                    # Search broad, then filter in Python. Provider-specific FROM
+                    # search syntax can vary with encoded display names.
+                    typ, data = imap.search(None, "ALL")
+                    if typ != "OK":
+                        logger.info(
+                            "IMAP search failed email=%s mailbox=%s status=%s",
+                            self.account.email,
+                            mailbox,
+                            typ,
+                        )
+                        continue
+                    ids = (data[0] or b"").split()
+                except Exception as e:
+                    logger.info(
+                        "IMAP scan mailbox failed email=%s mailbox=%s error=%s",
+                        self.account.email,
+                        mailbox,
+                        e,
+                    )
                     continue
-                raw = next((item[1] for item in fetched if isinstance(item, tuple)), b"")
-                if not raw:
-                    continue
-                msg = email.message_from_bytes(raw)
-                subject = _decode_header_value(msg.get("Subject", ""))
-                from_value = _decode_header_value(msg.get("From", ""))
-                body = _plain_text_from_msg(msg)
-                searchable = f"{from_value}\n{subject}\n{body[:1000]}".lower()
-                if "openai" not in searchable and "chatgpt" not in searchable:
-                    continue
-                out.append({
-                    "uid": msg_id.decode(errors="replace"),
-                    "datetime": (_message_datetime(msg).isoformat() if _message_datetime(msg) else ""),
-                    "_datetime": _message_datetime(msg),
-                    "from": from_value,
-                    "subject": subject,
-                    "body": body,
-                })
-            return out
+
+                for msg_id in reversed(ids[-max(1, limit * 4):]):
+                    typ, fetched = imap.fetch(msg_id, "(RFC822)")
+                    if typ != "OK" or not fetched:
+                        continue
+                    raw = next((item[1] for item in fetched if isinstance(item, tuple)), b"")
+                    if not raw:
+                        continue
+                    msg = email.message_from_bytes(raw)
+                    subject = _decode_header_value(msg.get("Subject", ""))
+                    from_value = _decode_header_value(msg.get("From", ""))
+                    body = _plain_text_from_msg(msg)
+                    searchable = f"{from_value}\n{subject}\n{body[:1000]}".lower()
+                    if "openai" not in searchable and "chatgpt" not in searchable:
+                        continue
+                    dt = _message_datetime(msg)
+                    out.append({
+                        "mailbox": mailbox,
+                        "uid": msg_id.decode(errors="replace"),
+                        "datetime": (dt.isoformat() if dt else ""),
+                        "_datetime": dt,
+                        "from": from_value,
+                        "subject": subject,
+                        "body": body,
+                    })
+            out.sort(
+                key=lambda item: item.get("_datetime") or datetime.fromtimestamp(0, timezone.utc),
+                reverse=True,
+            )
+            return out[:limit]
         finally:
             try:
                 imap.close()

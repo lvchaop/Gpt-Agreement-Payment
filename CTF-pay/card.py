@@ -1762,6 +1762,34 @@ def _select_fresh_checkout_url(
     return canonical_url or provider_url
 
 
+def _fresh_provider_url_from_checkout_url(value: str) -> str:
+    candidate = (value or "").strip()
+    if "chatgpt.com/checkout/" in candidate.lower():
+        return ""
+    return candidate
+
+
+def _fresh_checkout_requires_provider_url(fresh_cfg: dict, checkout_payload: dict) -> bool:
+    fresh_cfg = fresh_cfg or {}
+    checkout_payload = checkout_payload or {}
+    plan_cfg = fresh_cfg.get("plan") or {}
+    explicit_mode = str(
+        plan_cfg.get("output_url_mode")
+        or fresh_cfg.get("output_url_mode")
+        or ""
+    ).strip().lower()
+    checkout_ui_mode = str(
+        plan_cfg.get("checkout_ui_mode")
+        or checkout_payload.get("checkout_ui_mode")
+        or ""
+    ).strip().lower()
+    return explicit_mode in {"provider", "raw", "long", "hosted", "pay_openai", "pay.openai.com"} or checkout_ui_mode in {
+        "hosted",
+        "hosted_checkout",
+        "redirect",
+    }
+
+
 def _extract_checkout_totals(payload: dict | None) -> dict:
     payload = payload or {}
     total_summary = payload.get("total_summary") or {}
@@ -2529,11 +2557,16 @@ def generate_fresh_checkout(
                         else plan_cfg.get("billing_country", "US")
                     ).upper()
                     processor_entity = "openai_llc" if billing_country == "US" else "openai_ie"
-                provider_url = fresh_url
+                provider_url = _fresh_provider_url_from_checkout_url(fresh_url)
                 canonical_chatgpt_url = (
                     f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
                     if processor_entity else ""
                 )
+                if _fresh_checkout_requires_provider_url(fresh_cfg, payload) and not provider_url:
+                    raise RuntimeError(
+                        "provider_url_missing: hosted/provider checkout response 缺少 provider URL；"
+                        f"拒绝使用 canonical_url={canonical_chatgpt_url or '<empty>'}"
+                    )
                 fresh_url = _select_fresh_checkout_url(
                     provider_url=provider_url,
                     canonical_url=canonical_chatgpt_url,
@@ -2615,6 +2648,7 @@ def generate_fresh_checkout(
                     "processor_entity": processor_entity,
                     "provider_url": provider_url,
                     "canonical_url": canonical_chatgpt_url,
+                    "checkout_payload": payload,
                     "publishable_key": data.get("publishable_key", ""),
                     "client_secret": data.get("client_secret", ""),
                     "coupon_check": coupon_check,
@@ -5688,6 +5722,7 @@ def _paypal_phone_from_source(source: dict) -> dict:
         "phone": _paypal_account_value(source, "phone", "phone_number", "number"),
         "country": _paypal_account_value(source, "phone_country", "country", "country_code", "region"),
         "dial_code": _paypal_account_value(source, "dial_code", "calling_code", "country_calling_code"),
+        "order_no": _paypal_account_value(source, "order_no", "orderNo", "phone_order_no", "sms_order_no"),
         "_source_path": str(source.get("_source_path") or ""),
         "_source_index": source.get("_source_index"),
     }
@@ -5725,6 +5760,16 @@ def _paypal_uses_hero_sms(paypal_cfg: dict) -> bool:
         "sms_activate",
         "smsactivate",
     }
+
+
+def _paypal_selected_phone_order_no(paypal_cfg: dict) -> str:
+    selected = paypal_cfg.get("_selected_phone_row")
+    sources = [selected if isinstance(selected, dict) else {}, paypal_cfg]
+    for source in sources:
+        value = _paypal_account_value(source, "order_no", "orderNo", "phone_order_no", "sms_order_no")
+        if value:
+            return value
+    return ""
 
 
 def _five_sim_cfg(paypal_cfg: dict) -> dict:
@@ -6053,6 +6098,7 @@ def _paypal_resolve_new_user_phone(paypal_cfg: dict, account: dict) -> dict:
     phone = _paypal_phone_from_source(row)
     if not phone["phone"]:
         raise RuntimeError(f"PayPal 手机号池第 {row.get('_source_index')} 行缺少 phone/phone_number/number")
+    paypal_cfg["_selected_phone_row"] = dict(row)
     return phone
 
 
@@ -7202,6 +7248,14 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
 
     codex_client_id = _resolve_codex_oauth_client_id(oauth_client_id)
     codex_redirect = "http://localhost:1455/auth/callback"
+    codex_scope = (
+        os.getenv("OAUTH_CODEX_SCOPE", "").strip()
+        or "openid profile email offline_access api.connectors.read api.connectors.invoke"
+    )
+    codex_origin_stable_id = (
+        os.getenv("CODEX_ORIGIN_STABLE_ID", "").strip()
+        or "132279e4-b3af-46f6-bc3f-5340c1033222"
+    )
     codex_state = _b64url_nopad(_secrets.token_bytes(24))
     verifier = _b64url_nopad(_secrets.token_bytes(64))
     challenge = _b64url_nopad(_hashlib.sha256(verifier.encode()).digest())
@@ -7209,12 +7263,14 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
         "client_id": codex_client_id,
         "response_type": "code",
         "redirect_uri": codex_redirect,
-        "scope": "openid email profile offline_access",
+        "scope": codex_scope,
         "state": codex_state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
+        "originator": "Codex Desktop",
+        "codex_origin_stable_id": codex_origin_stable_id,
     })
 
     # Camoufox proxy
@@ -8704,11 +8760,20 @@ def _paypal_sms_api_url(paypal_cfg: dict, phone_e164: str) -> str:
     activation_id = ""
     if isinstance(hero_lease, dict):
         activation_id = str(hero_lease.get("lease_id") or "").strip()
+    order_no = _paypal_selected_phone_order_no(paypal_cfg)
+    provider = _paypal_sms_provider(paypal_cfg)
+    if provider == "yamasaki_sms" and "{order_no" in template and not order_no:
+        _log("      [signup_no_card] yamasaki_sms 模板需要 {order_no}，但当前手机号池行缺 order_no/orderNo/phone_order_no")
+        return ""
     values = {
         "phone": digits,
         "phone_number": digits,
         "phone_e164": phone_value,
         "phone_e164_url": urllib.parse.quote(phone_value, safe=""),
+        "order_no": order_no,
+        "orderNo": order_no,
+        "phone_order_no": order_no,
+        "sms_order_no": order_no,
         "activation_id": activation_id,
         "lease_id": activation_id,
         "id": activation_id,
@@ -11750,6 +11815,7 @@ def run(
                 if proxy_url:
                     cmd.extend(["--proxy-mode", "manual", "--proxy", proxy_url])
                 try:
+                    _os.makedirs(_os.path.dirname(rt_log), exist_ok=True)
                     log_fd = open(rt_log, "a", encoding="utf-8")
                     log_fd.write(
                         f"\n[{datetime.now().isoformat()}] post-payment RT backfill "
@@ -11794,6 +11860,18 @@ def run(
         _log(f"      stripe_url: {stripe_checkout_url}")
         if browser_checkout_url != stripe_checkout_url:
             _log(f"      browser_checkout_url: {browser_checkout_url[:160]}")
+        if (
+            isinstance(fresh_info, dict)
+            and _fresh_checkout_requires_provider_url(
+                fresh_cfg,
+                fresh_info.get("checkout_payload") if isinstance(fresh_info.get("checkout_payload"), dict) else {},
+            )
+            and "chatgpt.com/checkout/" in browser_checkout_url.lower()
+        ):
+            raise RuntimeError(
+                "provider_url_missing: hosted/provider checkout 缺少真实 provider URL；"
+                f"拒绝跳转 browser_checkout_url={browser_checkout_url[:180]}"
+            )
 
         if node_full_checkout_requested:
             result = _run_paypal_node_full_checkout_only(

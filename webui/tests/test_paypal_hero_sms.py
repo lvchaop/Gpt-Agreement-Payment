@@ -124,6 +124,54 @@ def test_paypal_hero_sms_template_uses_activation_id(tmp_path, monkeypatch):
     assert url == "https://hero.example/sms?key=hero-key&id=hero-123"
 
 
+def test_paypal_yamasaki_sms_template_uses_phone_pool_order_no(tmp_path, monkeypatch):
+    card = _load_module("ctf_pay_card_yamasaki_order_no_test", "CTF-pay/card.py")
+    monkeypatch.setattr(card, "_log", lambda *_args, **_kwargs: None)
+    phones = tmp_path / "phones.jsonl"
+    phones.write_text(
+        '{"phone":"+8108018395381","country":"JP","order_no":"452463628772274176"}\n'
+        '{"phone":"+8109070400534","country":"JP","order_no":"452463628772274177"}\n',
+        encoding="utf-8",
+    )
+
+    cfg = {
+        "sms_provider": "yamasaki_sms",
+        "sms_api_enabled": True,
+        "phones_file": str(phones),
+        "phone_index": 1,
+        "phone_country": "JP",
+        "sms_api_url_template": "https://api.yamasakisms.com/api/private/getphonecode?order_no={order_no}",
+    }
+
+    phone = card._paypal_resolve_new_user_phone(cfg, {})
+    url = card._paypal_sms_api_url(cfg, phone["phone"])
+
+    assert phone["phone"] == "+8109070400534"
+    assert url == "https://api.yamasakisms.com/api/private/getphonecode?order_no=452463628772274177"
+
+
+def test_paypal_yamasaki_sms_requires_order_no_when_template_uses_it(tmp_path, monkeypatch):
+    card = _load_module("ctf_pay_card_yamasaki_missing_order_no_test", "CTF-pay/card.py")
+    logs = []
+    monkeypatch.setattr(card, "_log", lambda msg, *_args, **_kwargs: logs.append(str(msg)))
+    phones = tmp_path / "phones.jsonl"
+    phones.write_text('{"phone":"+8108018395381","country":"JP"}\n', encoding="utf-8")
+
+    cfg = {
+        "sms_provider": "yamasaki_sms",
+        "sms_api_enabled": True,
+        "phones_file": str(phones),
+        "phone_country": "JP",
+        "sms_api_url_template": "https://api.yamasakisms.com/api/private/getphonecode?order_no={order_no}",
+    }
+
+    phone = card._paypal_resolve_new_user_phone(cfg, {})
+    url = card._paypal_sms_api_url(cfg, phone["phone"])
+
+    assert url == ""
+    assert any("order_no" in line for line in logs)
+
+
 def test_paypal_delayed_phone_lease_is_not_acquired_until_node_form_fill(tmp_path, monkeypatch):
     card = _load_module("ctf_pay_card_delayed_phone_lease_test", "CTF-pay/card.py")
     monkeypatch.setattr(card, "_log", lambda *_args, **_kwargs: None)

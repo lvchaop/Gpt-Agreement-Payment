@@ -1406,6 +1406,7 @@ async function rtOnlySelected() {
       pay_only: false,
       register_only: false,
       rt_only: true,
+      rt_force: true,
       register_mode: form.value.register_mode || "browser",
       target_emails: emails,
     });

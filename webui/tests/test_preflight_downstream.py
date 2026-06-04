@@ -46,3 +46,19 @@ def test_cpa_ok(client):
         "admin_key": "k",
     })
     assert r.json()["status"] == "ok"
+
+
+@respx.mock
+def test_sub2api_cpa_ok(client):
+    _login(client)
+    respx.get("https://sub2api.example.com/api/v1/admin/accounts").mock(
+        return_value=Response(200, json={"data": {"total": 2, "items": []}})
+    )
+    r = client.post("/api/preflight/cpa", json={
+        "target": "sub2api",
+        "base_url": "https://sub2api.example.com/api/v1",
+        "admin_key": "Bearer jwt",
+    })
+    body = r.json()
+    assert body["status"] == "ok"
+    assert "sub2api" in body["checks"][0]["message"]

@@ -13,7 +13,7 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
   # 仅注册
   python pipeline.py --register-only --cardw-config CTF-reg/config.paypal-proxy.json
 
-  # 仅支付 (优先复用 SQLite 数据库里最近未支付账号)
+  # 仅支付 (按注册顺序优先复用 SQLite 数据库里未支付账号)
   python pipeline.py --pay-only --config CTF-pay/config.paypal.json --paypal
 
   # 批量
@@ -922,7 +922,8 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, account_email: str = "", use_paypal=False, use_gopay=False,
         gopay_otp_file=None, python="python3", timeout=600,
-        proxy_stage_plan=None, log_context: str = ""):
+        proxy_stage_plan=None, log_context: str = "",
+        skip_pay_rt_exchange: bool = False):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -1001,6 +1002,9 @@ def pay(card_config_path, session_token=None, access_token=None,
         client_id = _codex_oauth_client_id_from_card_cfg(cfg_for_env)
         if client_id:
             env["OAUTH_CODEX_CLIENT_ID"] = client_id
+    if skip_pay_rt_exchange:
+        env["SKIP_PAY_RT_EXCHANGE"] = "1"
+        print(f"{pay_tag} CPA 接管补 RT：支付子进程禁用异步 RT")
 
     print(f"{pay_tag} 启动支付 (mode={mode_label}) ...")
 
@@ -1103,6 +1107,8 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
     ts = datetime.now(timezone.utc).isoformat()
     record = {"ts": ts, "registration": {}, "payment": {},
               "domain": picked_domain, "proxy": stage_plan.to_dict() if stage_plan.has_any() else picked_proxy}
+    cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+    cpa_enabled = bool(cpa_cfg.get("enabled"))
 
     try:
         # Step 1: 注册
@@ -1146,6 +1152,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 timeout=timeout_pay,
                 proxy_stage_plan=stage_plan,
                 log_context=log_context,
+                skip_pay_rt_exchange=cpa_enabled,
             )
             record["payment"] = {
                 "status": pay_result.get("status", "unknown"),
@@ -1158,6 +1165,16 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
 
         # Step 3: 支付成功 → gpt-team 导入 + invite 探测
         pay_status = pay_result.get("status", "unknown")
+        rt_ok = True
+        sid = (pay_result.get("raw") or {}).get("session_id", "") if isinstance(pay_result.get("raw"), dict) else ""
+        if pay_status == "succeeded" and cpa_enabled:
+            rt_ok, rt_result = _sync_rt_before_cpa(
+                card_config_path,
+                reg.get("email", ""),
+                sid,
+                proxy_stage_plan=stage_plan,
+            )
+            record["rt_backfill"] = rt_result
         if pay_status == "succeeded" and team_client:
             try:
                 probe_status = _team_probe_after_payment(
@@ -1170,11 +1187,13 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 record["invite_permission"] = "error"
 
         # Step 4: 支付成功 → 额外导入到 CPA（CLIProxyAPI）
-        cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
-        if pay_status == "succeeded" and cpa_cfg.get("enabled"):
+        if pay_status == "succeeded" and cpa_enabled:
             try:
-                sid = (pay_result.get("raw") or {}).get("session_id", "") if isinstance(pay_result.get("raw"), dict) else ""
-                cpa_status = _cpa_import_after_team(reg.get("email", ""), sid, cpa_cfg)
+                if not rt_ok:
+                    cpa_status = "skip_no_rt"
+                    print(f"[CPA] skip because post-payment RT backfill failed email={reg.get('email', '')}")
+                else:
+                    cpa_status = _cpa_import_after_team(reg.get("email", ""), sid, cpa_cfg)
                 record["cpa_import"] = cpa_status
             except Exception as e:
                 print(f"[CPA] 导入异常: {e}")
@@ -2120,13 +2139,17 @@ def _norm_email(value: str) -> str:
 
 
 _COUPON_INELIGIBLE_RE = re.compile(
-    r"promo coupon.*state=not_eligible|coupon.*not_eligible|state=not_eligible.*promo",
+    r"provider_url_missing|缺少 provider URL|promo coupon.*state=not_eligible|coupon.*not_eligible|state=not_eligible.*promo",
     re.I,
 )
 
 
 def _is_coupon_ineligible_error(text: str) -> bool:
     return bool(_COUPON_INELIGIBLE_RE.search(str(text or "")))
+
+
+def _is_provider_url_missing_error(text: str) -> bool:
+    return bool(re.search(r"provider_url_missing|缺少 provider URL", str(text or ""), re.I))
 
 
 def _normalize_plan_type(value: str) -> str:
@@ -2207,7 +2230,7 @@ def _paid_or_consumed_emails() -> set[str]:
 
 
 def _select_recent_registered_account_for_pay_only() -> dict | None:
-    """Pick the newest registered account that has not already succeeded.
+    """Pick the earliest registered account that has not already succeeded.
 
     This makes `--pay-only` useful for the common case where registration
     completed but payment was blocked by captcha/OTP/DataDome/etc.  The selected
@@ -2226,7 +2249,7 @@ def _select_recent_registered_accounts_for_pay_only(limit: int) -> list[dict]:
     consumed = _paid_or_consumed_emails()
     selected_accounts: list[dict] = []
     seen: set[str] = set()
-    for acc in reversed(accounts):
+    for acc in accounts:
         if not isinstance(acc, dict):
             continue
         email = _norm_email(acc.get("email"))
@@ -2256,7 +2279,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
     """Retry payment only.
 
     Default behavior is now:
-      1. use the newest account in SQLite storage that has not
+      1. use the earliest account in SQLite storage that has not
          already succeeded/been consumed;
       2. fall back to credentials embedded in the payment config if no reusable
          account exists.
@@ -2264,85 +2287,121 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
     This preserves the old config-token path while preventing freshly
     registered-but-unpaid accounts from being wasted.
     """
-    if target_email:
-        pay_only_tag = _log_tag("pay-only", log_context)
-        # 显式指定账号——不走 consumed 过滤，让用户对选中行操作（即使曾经付费过
-        # 也允许重试，便于测试）。读不到时回退正常逻辑。
-        target_norm = _norm_email(target_email)
-        row = get_db().find_latest_registered_account(target_norm) or None
-        if row:
-            account = row
-            print(f"{pay_only_tag} 使用指定账号: {target_norm}")
-        else:
-            print(f"{pay_only_tag} ⚠ 指定账号 {target_norm} 在 DB 没找到，回退默认逻辑")
-            account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
-    else:
-        pay_only_tag = _log_tag("pay-only", log_context)
-        account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
-    email = _norm_email(account.get("email")) if account else ""
     try:
         card_cfg = _read_card_cfg(card_config_path)
     except Exception:
         card_cfg = {}
-    if account:
-        print(
-            f"{pay_only_tag} 复用最近未支付注册账号: "
-            f"{email} "
-            f"session_token={'yes' if account.get('session_token') else 'no'} "
-            f"access_token={'yes' if account.get('access_token') else 'no'} "
-            f"device_id={'yes' if account.get('device_id') else 'no'}"
-        )
-    else:
-        print(f"{pay_only_tag} 未找到可复用注册账号，回退使用 config 里的 session_token/access_token")
+    cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+    cpa_enabled = bool(cpa_cfg.get("enabled"))
+    pay_only_tag = _log_tag("pay-only", log_context)
+    target_norm = _norm_email(target_email)
+    tried: set[str] = set()
+    target_checked = False
 
-    record = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "mode": "pay_only",
-        "registration": {"status": "reused" if account else "config", "email": email},
-        "payment": {},
-        "domain": email.split("@", 1)[1] if "@" in email else "",
-        "proxy": ProxyStagePlan.from_obj(proxy_stage_plan).to_dict()
-        if ProxyStagePlan.from_obj(proxy_stage_plan).has_any() else "",
-    }
-    try:
-        result = pay(
-            card_config_path,
-            session_token=account.get("session_token") if account else None,
-            access_token=account.get("access_token") if account else None,
-            device_id=account.get("device_id", "") if account else None,
-            account_email=email,
-            use_paypal=use_paypal,
-            use_gopay=use_gopay,
-            gopay_otp_file=gopay_otp_file,
-            timeout=timeout_pay,
-            proxy_stage_plan=proxy_stage_plan,
-            log_context=log_context,
-        )
-        status = result.get("status", "unknown")
-        raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
-        pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
-        record["payment"] = {"status": status, "email": pay_email}
-        cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
-        if status == "succeeded" and cpa_cfg.get("enabled"):
-            try:
+    def _next_account() -> dict | None:
+        nonlocal target_checked
+        if target_norm and not target_checked:
+            target_checked = True
+            row = get_db().find_latest_registered_account(target_norm) or None
+            if row:
+                print(f"{pay_only_tag} 使用指定账号: {target_norm}")
+                selected = dict(row)
+                selected["email"] = target_norm
+                return selected
+            print(f"{pay_only_tag} ⚠ 指定账号 {target_norm} 在 DB 没找到，回退默认逻辑")
+        if not prefer_recent:
+            return None
+        for selected in _select_recent_registered_accounts_for_pay_only(10000):
+            selected_email = _norm_email(selected.get("email"))
+            if selected_email and selected_email not in tried:
+                return selected
+        return None
+
+    while True:
+        account = _next_account()
+        email = _norm_email(account.get("email")) if account else ""
+        if email:
+            tried.add(email)
+        if account:
+            print(
+                f"{pay_only_tag} 按顺序复用未支付注册账号: "
+                f"{email} "
+                f"session_token={'yes' if account.get('session_token') else 'no'} "
+                f"access_token={'yes' if account.get('access_token') else 'no'} "
+                f"device_id={'yes' if account.get('device_id') else 'no'}"
+            )
+        else:
+            print(f"{pay_only_tag} 未找到可复用注册账号，回退使用 config 里的 session_token/access_token")
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "mode": "pay_only",
+            "registration": {"status": "reused" if account else "config", "email": email},
+            "payment": {},
+            "domain": email.split("@", 1)[1] if "@" in email else "",
+            "proxy": ProxyStagePlan.from_obj(proxy_stage_plan).to_dict()
+            if ProxyStagePlan.from_obj(proxy_stage_plan).has_any() else "",
+        }
+        try:
+            result = pay(
+                card_config_path,
+                session_token=account.get("session_token") if account else None,
+                access_token=account.get("access_token") if account else None,
+                device_id=account.get("device_id", "") if account else None,
+                account_email=email,
+                use_paypal=use_paypal,
+                use_gopay=use_gopay,
+                gopay_otp_file=gopay_otp_file,
+                timeout=timeout_pay,
+                proxy_stage_plan=proxy_stage_plan,
+                log_context=log_context,
+                skip_pay_rt_exchange=cpa_enabled,
+            )
+            status = result.get("status", "unknown")
+            raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+            pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
+            record["payment"] = {"status": status, "email": pay_email}
+            rt_ok = True
+            if status == "succeeded" and cpa_enabled:
                 sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
-                cpa_status = _cpa_import_after_team(pay_email, sid, cpa_cfg)
-                record["cpa_import"] = cpa_status
-            except Exception as e:
-                print(f"[CPA] 导入异常: {e}")
-                record["cpa_import"] = "error"
-        _append_result(record)
-        return result
-    except PaymentError as e:
-        err_text = str(e)
-        if email and _is_coupon_ineligible_error(err_text):
+                rt_ok, rt_result = _sync_rt_before_cpa(
+                    card_config_path,
+                    pay_email,
+                    sid,
+                    proxy_stage_plan=proxy_stage_plan,
+                )
+                record["rt_backfill"] = rt_result
+            if status == "succeeded" and cpa_enabled:
+                try:
+                    sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
+                    if not rt_ok:
+                        cpa_status = "skip_no_rt"
+                        print(f"[CPA] skip because post-payment RT backfill failed email={pay_email}")
+                    else:
+                        cpa_status = _cpa_import_after_team(pay_email, sid, cpa_cfg)
+                    record["cpa_import"] = cpa_status
+                except Exception as e:
+                    print(f"[CPA] 导入异常: {e}")
+                    record["cpa_import"] = "error"
+            _append_result(record)
+            return result
+        except PaymentError as e:
+            err_text = str(e)
+            record["payment"] = {"status": "error", "email": email, "error": err_text[:500]}
+            _append_result(record)
+            if not (email and _is_coupon_ineligible_error(err_text)):
+                raise
             if _mark_account_coupon_ineligible(email, err_text):
                 print(f"{pay_only_tag} 标记账号 coupon_ineligible: {email}")
             else:
                 print(f"{pay_only_tag} ⚠ 标记 coupon_ineligible 失败: {email}")
-        record["payment"] = {"status": "error", "email": email, "error": err_text[:500]}
-        _append_result(record)
-        raise
+            if _is_provider_url_missing_error(err_text):
+                print(f"{pay_only_tag} provider_url_missing，结束当前 pay-only，等待外层重新分配代理")
+                raise
+            if _next_account() is None:
+                print(f"{pay_only_tag} 没有下一个可用账号，失败")
+                raise
+            print(f"{pay_only_tag} 当前账号优惠不适用，自动切换下一个账号继续")
 
 
 # ──────────────────────────────────────────────
@@ -2351,7 +2410,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
 
 
 def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan=None,
-                      session_id: str = "") -> dict:
+                      session_id: str = "", force: bool = False) -> dict:
     """对单个 email 跑 RT 交换：用 DB 里现有 password/session 走 Codex OAuth
     拿 refresh_token，写回 registered_accounts。不会付款不会改账号 plan。
     """
@@ -2364,12 +2423,15 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         print(f"[rt-only] ⚠ DB 找不到账号: {target}")
         return {"status": "no_account", "email": target}
 
-    if account.get("refresh_token"):
+    if account.get("refresh_token") and not force:
         rt = str(account.get("refresh_token") or "")
         if session_id:
             _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
         print(f"[rt-only] {target} 已有 refresh_token (len={len(rt)}), 跳过")
         return {"status": "already_has_rt", "email": target}
+    if account.get("refresh_token") and force:
+        rt_len = len(str(account.get("refresh_token") or ""))
+        print(f"[rt-only] force=True，忽略已有 refresh_token (len={rt_len})，重新补 RT")
 
     # 借 card.py 的 RT 交换函数。card.py top-level 副作用较大但只需 import 一次。
     sys.path.insert(0, str(CARD_DIR))
@@ -2409,14 +2471,19 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
     proxy_url = stage_plan.payment or _build_proxy_url_from_cfg(card_cfg.get("proxy"))
     if stage_plan.has_any():
         print(f"[ProxyStage] rt-only 阶段代理: {_describe_stage_plan(stage_plan)}")
-    print(f"[rt-only] 启动 Codex OAuth → email={target} password={'有' if account.get('password') else '无(passwordless)'}")
+    oauth_client_id = _codex_oauth_client_id_from_config(card_cfg)
+    print(
+        f"[rt-only] 启动 Codex OAuth → email={target} "
+        f"password={'有' if account.get('password') else '无(passwordless)'} "
+        f"force={bool(force)} oauth_client_id={oauth_client_id}"
+    )
     try:
         rt = _exchange_refresh_token_with_session(
             email=target,
             password=account.get("password", "") or "",
             mail_cfg=mail_cfg,
             proxy_url=proxy_url,
-            oauth_client_id=_codex_oauth_client_id_from_config(card_cfg),
+            oauth_client_id=oauth_client_id,
         )
     except Exception as e:
         print(f"[rt-only] 异常: {type(e).__name__}: {str(e)[:200]}")
@@ -2457,9 +2524,31 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         return {"status": "write_failed", "email": target, "error": str(e)[:200]}
 
 
+def _sync_rt_before_cpa(card_config_path: str, email: str, sid: str,
+                        proxy_stage_plan=None) -> tuple[bool, dict]:
+    """Force backfill RT before CPA/Sub2API import so downstream does not race."""
+    target = _norm_email(email)
+    if not target:
+        result = {"status": "no_email", "email": target}
+        print("[RT] post-payment sync backfill skip: no email")
+        return False, result
+    print(f"[RT] post-payment sync backfill start force=True email={target} session_id={sid or '-'}")
+    result = rt_only_for_email(
+        card_config_path,
+        target,
+        proxy_stage_plan=proxy_stage_plan,
+        session_id=sid,
+        force=True,
+    )
+    status = str(result.get("status") or "")
+    ok = status == "succeeded"
+    print(f"[RT] post-payment sync backfill result={status} ok={ok} email={target}")
+    return ok, result
+
+
 def rt_only_targets(card_config_path: str, target_emails: list[str],
                     proxy_stage_allocator=None, proxy_stage_plan=None,
-                    session_id: str = "") -> dict:
+                    session_id: str = "", force: bool = False) -> dict:
     """批量 RT-only：串行跑每个 email，汇总结果。"""
     results = []
     ok = 0
@@ -2470,7 +2559,13 @@ def rt_only_targets(card_config_path: str, target_emails: list[str],
         if not em:
             continue
         plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
-        r = rt_only_for_email(card_config_path, em, proxy_stage_plan=plan, session_id=session_id)
+        r = rt_only_for_email(
+            card_config_path,
+            em,
+            proxy_stage_plan=plan,
+            session_id=session_id,
+            force=force,
+        )
         results.append(r)
         st = r.get("status", "")
         if st == "succeeded":
@@ -4090,6 +4185,235 @@ def _cpa_import_after_team(
     admin_key = (cpa_cfg.get("admin_key") or "").strip()
     if not base_url or not admin_key or not email:
         return "skipped"
+    target = str(cpa_cfg.get("target") or cpa_cfg.get("provider") or "cpa").strip().lower()
+
+    def _auth_header_value(token: str) -> str:
+        if token.lower().startswith("bearer "):
+            return token
+        return f"Bearer {token}"
+
+    def _auth_header_debug(token: str) -> str:
+        value = _auth_header_value(token)
+        scheme = value.split(" ", 1)[0] if value else "?"
+        return f"{scheme} *** len={len(value)}"
+
+    def _response_preview(text: str, limit: int = 500) -> str:
+        text = (text or "").replace("\n", "\\n")
+        return text[:limit]
+
+    def _auth_body_debug(body: dict) -> str:
+        return (
+            f"email={body.get('email') or '?'} "
+            f"account_id={(body.get('account_id') or '?')} "
+            f"has_access_token={bool(body.get('access_token'))} "
+            f"has_refresh_token={bool(body.get('refresh_token'))} "
+            f"has_id_token={bool(body.get('id_token'))}"
+        )
+
+    def _sub2api_import_failed(resp_text: str) -> str:
+        try:
+            data = json.loads(resp_text or "{}")
+        except Exception:
+            return ""
+        if isinstance(data, dict) and data.get("code") not in (None, 0):
+            return str(data.get("message") or data.get("error") or f"code={data.get('code')}")
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return ""
+        if int(payload.get("failed") or 0) > 0:
+            errors = payload.get("errors") or []
+            items = payload.get("items") or []
+            for seq in (errors, items):
+                if isinstance(seq, list) and seq:
+                    msg = seq[0].get("message") if isinstance(seq[0], dict) else str(seq[0])
+                    if msg:
+                        return msg
+            return f"failed={payload.get('failed')}"
+        for item in payload.get("items") or []:
+            if isinstance(item, dict) and item.get("action") == "failed":
+                return str(item.get("message") or "item failed")
+        return ""
+
+    def _plan_tag() -> str:
+        tag_value = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
+        if is_free:
+            tag_value = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
+        return tag_value
+
+    def _auth_file_name(plan_tag: str) -> str:
+        tag = hashlib.md5(email.encode()).hexdigest()[:8]
+        return f"codex-{tag}-{email}-{plan_tag}.json"
+
+    def _sub2api_endpoint() -> str:
+        if base_url.endswith("/api/v1"):
+            return f"{base_url}/admin/accounts/import/codex-session"
+        if base_url.endswith("/api"):
+            return f"{base_url}/v1/admin/accounts/import/codex-session"
+        return f"{base_url}/api/v1/admin/accounts/import/codex-session"
+
+    def _int_or_none(value):
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _float_or_none(value):
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _group_ids() -> list[int]:
+        raw = cpa_cfg.get("group_ids") or cpa_cfg.get("sub2api_group_ids") or []
+        if isinstance(raw, str):
+            raw = [p.strip() for p in raw.split(",") if p.strip()]
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            try:
+                out.append(int(item))
+            except Exception:
+                pass
+        return out
+
+    def _upload_auth_file(body: dict, name: str, account_id: str) -> str:
+        print(
+            f"[CPA] prepare target={target or 'cpa'} base_url={base_url} "
+            f"name={name} auth={_auth_header_debug(admin_key)} {_auth_body_debug(body)}"
+        )
+        if target == "sub2api":
+            payload = {
+                "content": json.dumps(body, ensure_ascii=False),
+                "name": name,
+                "update_existing": bool(cpa_cfg.get("update_existing", True)),
+            }
+            gids = _group_ids()
+            if gids:
+                payload["group_ids"] = gids
+            for key in ("concurrency", "priority", "load_factor", "expires_at"):
+                value = _int_or_none(cpa_cfg.get(key))
+                if value is not None:
+                    payload[key] = value
+            rate_multiplier = _float_or_none(cpa_cfg.get("rate_multiplier"))
+            if rate_multiplier is not None:
+                payload["rate_multiplier"] = rate_multiplier
+            proxy_id = _int_or_none(cpa_cfg.get("proxy_id"))
+            if proxy_id is not None:
+                payload["proxy_id"] = proxy_id
+            if "auto_pause_on_expired" in cpa_cfg:
+                payload["auto_pause_on_expired"] = bool(cpa_cfg.get("auto_pause_on_expired"))
+            if "skip_default_group_bind" in cpa_cfg:
+                payload["skip_default_group_bind"] = bool(cpa_cfg.get("skip_default_group_bind"))
+            if "confirm_mixed_channel_risk" in cpa_cfg:
+                payload["confirm_mixed_channel_risk"] = bool(cpa_cfg.get("confirm_mixed_channel_risk"))
+
+            endpoint = _sub2api_endpoint()
+            print(
+                f"[Sub2API] request url={endpoint} method=POST "
+                f"payload_keys={','.join(sorted(payload.keys()))} "
+                f"group_ids={payload.get('group_ids', [])} proxy_id={payload.get('proxy_id')}"
+            )
+            try:
+                try:
+                    import curl_cffi.requests as cr
+                    sess = cr.Session(impersonate="chrome136")
+                    sess.proxies = {}
+                    sess.trust_env = False
+                    r = sess.post(
+                        endpoint,
+                        json=payload,
+                        headers={"Authorization": _auth_header_value(admin_key),
+                                 "Content-Type": "application/json"},
+                        timeout=int(cpa_cfg.get("timeout_s", 20)),
+                    )
+                    print(f"[Sub2API] response status={r.status_code} body={_response_preview(r.text)}")
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"http={r.status_code} body={r.text[:200]}")
+                    rejected = _sub2api_import_failed(r.text)
+                    if rejected:
+                        print(f"[Sub2API] ✗ import rejected url={endpoint} reason={rejected}")
+                        return "fail_upload"
+                    print(f"[Sub2API] ✓ import ok url={endpoint} email={email} account_id={account_id[:8] or '?'}")
+                    return "ok"
+                except ImportError:
+                    pass
+                req = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(payload).encode(),
+                    headers={"Authorization": _auth_header_value(admin_key),
+                             "Content-Type": "application/json",
+                             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"},
+                    method="POST",
+                )
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=int(cpa_cfg.get("timeout_s", 20))) as r:
+                    resp = r.read().decode(errors="replace")
+                    print(f"[Sub2API] response status={getattr(r, 'status', '?')} body={_response_preview(resp)}")
+                rejected = _sub2api_import_failed(resp)
+                if rejected:
+                    print(f"[Sub2API] ✗ import rejected url={endpoint} reason={rejected}")
+                    return "fail_upload"
+                print(f"[Sub2API] ✓ import ok url={endpoint} email={email} account_id={account_id[:8] or '?'}")
+                return "ok"
+            except urllib.error.HTTPError as e:
+                try: eb = e.read().decode(errors="replace")
+                except Exception: eb = ""
+                print(f"[Sub2API] ✗ import failed url={endpoint} http={e.code} body={_response_preview(eb)}")
+                return "fail_upload"
+            except Exception as e:
+                print(f"[Sub2API] ✗ import exception url={endpoint} type={type(e).__name__}: {e}")
+                return "fail_upload"
+
+        endpoint = f"{base_url}/v0/management/auth-files"
+        print(f"[CPA] request url={endpoint} method=POST params.name={name}")
+        try:
+            try:
+                import curl_cffi.requests as cr
+                sess = cr.Session(impersonate="chrome136")
+                sess.proxies = {}
+                sess.trust_env = False
+                r = sess.post(
+                    f"{base_url}/v0/management/auth-files",
+                    params={"name": name},
+                    json=body,
+                    headers={"Authorization": _auth_header_value(admin_key),
+                             "Content-Type": "application/json"},
+                    timeout=int(cpa_cfg.get("timeout_s", 20)),
+                )
+                print(f"[CPA] response status={r.status_code} body={_response_preview(r.text)}")
+                if r.status_code >= 400:
+                    raise RuntimeError(f"http={r.status_code} body={r.text[:200]}")
+                print(f"[CPA] ✓ import ok url={endpoint} email={email} account_id={account_id[:8] or '?'}")
+                return "ok"
+            except ImportError:
+                pass
+            req = urllib.request.Request(
+                f"{base_url}/v0/management/auth-files?name={urllib.parse.quote(name)}",
+                data=json.dumps(body).encode(),
+                headers={"Authorization": _auth_header_value(admin_key),
+                         "Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"},
+                method="POST",
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走本地 proxy
+            with opener.open(req, timeout=int(cpa_cfg.get("timeout_s", 20))) as r:
+                resp = r.read().decode(errors="replace")
+                print(f"[CPA] response status={getattr(r, 'status', '?')} body={_response_preview(resp)}")
+            print(f"[CPA] ✓ import ok url={endpoint} email={email} account_id={account_id[:8] or '?'}")
+            return "ok"
+        except urllib.error.HTTPError as e:
+            try: eb = e.read().decode(errors="replace")
+            except Exception: eb = ""
+            print(f"[CPA] ✗ import failed url={endpoint} http={e.code} body={_response_preview(eb)}")
+            return "fail_upload"
+        except Exception as e:
+            print(f"[CPA] ✗ import exception url={endpoint} type={type(e).__name__}: {e}")
+            return "fail_upload"
 
     rt = (refresh_token or "").strip() or _find_latest_refresh_token_for_email(email, sid)
     reg_acc = _find_latest_registered_account_for_email(email)
@@ -4124,52 +4448,8 @@ def _cpa_import_after_team(
             "type": "codex",
         }
         print(f"[CPA] {email} 无 refresh_token，回退使用现有 access_token 裸导入")
-        tag = hashlib.md5(email.encode()).hexdigest()[:8]
-        plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
-        if is_free:
-            plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
-        name = f"codex-{tag}-{email}-{plan_tag}.json"
-        try:
-            try:
-                import curl_cffi.requests as cr
-                sess = cr.Session(impersonate="chrome136")
-                sess.proxies = {}
-                sess.trust_env = False
-                r = sess.post(
-                    f"{base_url}/v0/management/auth-files",
-                    params={"name": name},
-                    json=body,
-                    headers={"Authorization": f"Bearer {admin_key}",
-                             "Content-Type": "application/json"},
-                    timeout=int(cpa_cfg.get("timeout_s", 20)),
-                )
-                if r.status_code >= 400:
-                    raise RuntimeError(f"http={r.status_code} body={r.text[:200]}")
-                print(f"[CPA] ✓ {email} 已导入 → {base_url}  account_id={account_id[:8] or '?'}")
-                return "ok"
-            except ImportError:
-                pass
-            req = urllib.request.Request(
-                f"{base_url}/v0/management/auth-files?name={urllib.parse.quote(name)}",
-                data=json.dumps(body).encode(),
-                headers={"Authorization": f"Bearer {admin_key}",
-                         "Content-Type": "application/json",
-                         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"},
-                method="POST",
-            )
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走本地 proxy
-            with opener.open(req, timeout=int(cpa_cfg.get("timeout_s", 20))) as r:
-                resp = r.read().decode()
-            print(f"[CPA] ✓ {email} 已导入 → {base_url}  account_id={account_id[:8] or '?'}")
-            return "ok"
-        except urllib.error.HTTPError as e:
-            try: eb = e.read().decode()[:200]
-            except Exception: eb = ""
-            print(f"[CPA] ✗ {email} 上传失败 http={e.code} {eb}")
-            return "fail_upload"
-        except Exception as e:
-            print(f"[CPA] ✗ {email} 上传异常: {e}")
-            return "fail_upload"
+        plan_tag = _plan_tag()
+        return _upload_auth_file(body, _auth_file_name(plan_tag), account_id)
 
     # 刷一次 refresh_token → 拿绑了 team 的 access_token + id_token
     client_id = cpa_cfg.get("oauth_client_id") or "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -4204,6 +4484,18 @@ def _cpa_import_after_team(
     except Exception as e:
         print(f"[CPA] {email} refresh_token 交换失败（仍尝试裸导入）: {e}")
 
+    if not at:
+        fallback_at = (reg_acc.get("access_token") or "").strip()
+        fallback_id_tok = (reg_acc.get("id_token") or "").strip() or fallback_at
+        if fallback_at:
+            at = fallback_at
+            id_tok = fallback_id_tok
+            account_id = account_id or _oai_team_id_from_access_token(at)
+            print(
+                f"[CPA] {email} refresh_token 未换出 access_token，"
+                f"回退本地 access_token 裸导入 len={len(at)}"
+            )
+
     # 构造 codex 文件
     expired_iso = ""
     if at:
@@ -4221,52 +4513,8 @@ def _cpa_import_after_team(
         "account_id": account_id, "email": email,
         "last_refresh": now_iso, "expired": expired_iso, "type": "codex",
     }
-    tag = hashlib.md5(email.encode()).hexdigest()[:8]
-    plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
-    if is_free:
-        plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
-    name = f"codex-{tag}-{email}-{plan_tag}.json"
-    try:
-        # 走 curl_cffi（chrome TLS+UA 指纹）规避 CF WAF；不可用则降级 urllib
-        try:
-            import curl_cffi.requests as cr
-            sess = cr.Session(impersonate="chrome136")
-            sess.proxies = {}
-            sess.trust_env = False
-            r = sess.post(
-                f"{base_url}/v0/management/auth-files",
-                params={"name": name},
-                json=body,
-                headers={"Authorization": f"Bearer {admin_key}",
-                         "Content-Type": "application/json"},
-                timeout=int(cpa_cfg.get("timeout_s", 20)),
-            )
-            if r.status_code >= 400:
-                raise RuntimeError(f"http={r.status_code} body={r.text[:200]}")
-            print(f"[CPA] ✓ {email} 已导入 → {base_url}  account_id={account_id[:8] or '?'}")
-            return "ok"
-        except ImportError:
-            pass
-        req = urllib.request.Request(
-            f"{base_url}/v0/management/auth-files?name={urllib.parse.quote(name)}",
-            data=json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {admin_key}",
-                     "Content-Type": "application/json",
-                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"},
-            method="POST",
-        )
-        with opener.open(req, timeout=int(cpa_cfg.get("timeout_s", 20))) as r:
-            resp = r.read().decode()
-        print(f"[CPA] ✓ {email} 已导入 → {base_url}  account_id={account_id[:8] or '?'}")
-        return "ok"
-    except urllib.error.HTTPError as e:
-        try: eb = e.read().decode()[:200]
-        except Exception: eb = ""
-        print(f"[CPA] ✗ {email} 上传失败 http={e.code} {eb}")
-        return "fail_upload"
-    except Exception as e:
-        print(f"[CPA] ✗ {email} 上传异常: {e}")
-        return "fail_upload"
+    plan_tag = _plan_tag()
+    return _upload_auth_file(body, _auth_file_name(plan_tag), account_id)
 
 
 def _team_probe_after_payment(pay_record, team_client, pool, domain):
@@ -4857,7 +5105,7 @@ def main():
                         choices=("", "browser", "protocol", "phone_browser", "phone_protocol", "portal_protocol"),
                         help="注册路径：browser / protocol / phone_browser / phone_protocol / portal_protocol；空则读 WEBUI_REG_MODE 或注册配置")
     parser.add_argument("--pay-only", action="store_true",
-                        help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
+                        help="仅支付（按注册顺序优先复用未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,
                         help="批量运行 N 次")
     parser.add_argument("--delay", type=float, default=30,
@@ -4882,6 +5130,8 @@ def main():
     parser.add_argument("--rt-only", action="store_true",
                         help="只对 --target-emails 跑 RT 交换：用现有 password/session "
                              "走 Codex OAuth 拿 refresh_token 写回 DB（不付款）")
+    parser.add_argument("--rt-force", action="store_true",
+                        help="配合 --rt-only 使用：即使账号已有 refresh_token 也强制重新补 RT 并覆盖写回")
     parser.add_argument("--rt-session-id", default="",
                         help="--rt-only 后补本次支付记录时使用的 checkout session_id")
     parser.add_argument("--proxy-mode", default="config",
@@ -4971,6 +5221,7 @@ def main():
                 proxy_stage_allocator=proxy_stage_allocator,
                 proxy_stage_plan=proxy_stage_plan,
                 session_id=args.rt_session_id,
+                force=args.rt_force,
             )
             print(f"\n结果: ok={r['ok']} skip={r['skip']} fail={r['fail']}")
             return

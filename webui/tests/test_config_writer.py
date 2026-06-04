@@ -195,6 +195,38 @@ def test_export_preserves_cpa_config(client, tmp_path, monkeypatch):
     assert pay["cpa"]["free_plan_tag"] == "free"
 
 
+def test_export_preserves_sub2api_cpa_config(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed(tmp_path, monkeypatch)
+
+    answers = {
+        "cpa": {
+            "enabled": True,
+            "target": "sub2api",
+            "base_url": "https://sub2api.example.com/api/v1",
+            "admin_key": "sub2api-admin-jwt",
+            "group_ids": "1,2",
+            "proxy_id": "3",
+            "concurrency": 2,
+            "priority": 10,
+            "update_existing": True,
+        },
+    }
+    r = client.post("/api/config/export", json={"answers": answers})
+    assert r.status_code == 200
+
+    pay = json.loads((tmp_path / "CTF-pay" / "config.paypal.json").read_text())
+    assert pay["cpa"]["enabled"] is True
+    assert pay["cpa"]["target"] == "sub2api"
+    assert pay["cpa"]["base_url"] == "https://sub2api.example.com/api/v1"
+    assert pay["cpa"]["admin_key"] == "sub2api-admin-jwt"
+    assert pay["cpa"]["group_ids"] == "1,2"
+    assert pay["cpa"]["proxy_id"] == "3"
+    assert pay["cpa"]["concurrency"] == 2
+    assert pay["cpa"]["priority"] == 10
+    assert pay["cpa"]["update_existing"] is True
+
+
 def test_exported_reg_config_accepts_checkout_link_fields(client, tmp_path, monkeypatch):
     _login(client)
     _seed(tmp_path, monkeypatch)

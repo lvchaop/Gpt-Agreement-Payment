@@ -129,6 +129,8 @@ def _missing_paths(obj: dict, paths: list[str]) -> list[str]:
 
 def _requires_registration(req: dict) -> bool:
     mode = _text(req.get("mode")) or "single"
+    if bool(req.get("rt_only")):
+        return False
     if mode == "free_register":
         return True
     if mode == "free_backfill_rt":
@@ -142,6 +144,8 @@ def _requested_register_mode(req: dict) -> str:
 
 def _requires_email_otp(req: dict) -> bool:
     mode = _text(req.get("mode")) or "single"
+    if bool(req.get("rt_only")):
+        return True
     if _requested_register_mode(req) == "portal_protocol":
         return False
     # free_backfill_rt does not create a new mailbox, but OAuth login still
@@ -151,7 +155,7 @@ def _requires_email_otp(req: dict) -> bool:
 
 def _payment_kind(req: dict) -> str:
     mode = _text(req.get("mode")) or "single"
-    if mode in {"free_register", "free_backfill_rt"} or bool(req.get("register_only")):
+    if mode in {"free_register", "free_backfill_rt"} or bool(req.get("register_only")) or bool(req.get("rt_only")):
         return "none"
     if bool(req.get("gopay")):
         return "gopay"

@@ -35,6 +35,26 @@ def test_run_preview_batch(client):
     assert "--workers" in body["cmd_str"]
 
 
+def test_run_preview_rt_force(client):
+    _login(client)
+    r = client.post(
+        "/api/run/preview",
+        json={
+            "mode": "single",
+            "paypal": False,
+            "rt_only": True,
+            "rt_force": True,
+            "target_emails": ["a@example.com"],
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "--rt-only" in body["cmd_str"]
+    assert "--rt-force" in body["cmd_str"]
+    assert "--target-emails" in body["cmd_str"]
+    assert "a@example.com" in body["cmd_str"]
+
+
 @pytest.mark.parametrize("register_mode", ["phone_browser", "phone_protocol", "portal_protocol"])
 def test_run_preview_phone_register_mode(client, register_mode):
     _login(client)

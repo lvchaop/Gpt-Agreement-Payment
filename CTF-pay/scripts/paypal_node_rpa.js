@@ -643,6 +643,15 @@ function delayedPhoneActivationId(row) {
   return '';
 }
 
+function delayedPhoneOrderNo(row) {
+  if (!row || typeof row !== 'object') return '';
+  for (const key of ['order_no', 'orderNo', 'phone_order_no', 'sms_order_no']) {
+    const value = String(row[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
 function formatSmsTemplate(template, values) {
   return String(template || '').replace(/\{([A-Za-z0-9_]+)\}/g, (_, key) => (
     Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : ''
@@ -655,6 +664,7 @@ function buildDelayedSmsUrls(delayed, row, e164) {
   if (!enabled) return { smsApiUrl: '', heroSmsSetStatusUrl: '' };
   const digits = String(e164 || '').replace(/\D+/g, '');
   const activationId = delayedPhoneActivationId(row);
+  const orderNo = delayedPhoneOrderNo(row);
   const hero = delayed.heroSms || {};
   const isHero = ['hero', 'hero_sms', 'smshub', 'sms_hub', 'sms_activate', 'smsactivate'].includes(provider);
   const apiKeyRaw = String((isHero ? hero.apiKey : delayed.smsApiKey) || '').trim();
@@ -663,6 +673,10 @@ function buildDelayedSmsUrls(delayed, row, e164) {
     phone_number: digits,
     phone_e164: e164,
     phone_e164_url: encodeURIComponent(e164),
+    order_no: orderNo,
+    orderNo,
+    phone_order_no: orderNo,
+    sms_order_no: orderNo,
     activation_id: activationId,
     lease_id: activationId,
     id: activationId,
@@ -1812,6 +1826,8 @@ function extractOtpFromSmsResponse(text, opts = {}) {
       'receivedAt',
       'receiveTime',
       'receive_time',
+      'recvTime',
+      'recv_time',
       'timestamp',
     ]) {
       const ts = parseRecordTimeValueMs(key, record[key]);
@@ -1853,11 +1869,11 @@ function extractOtpFromSmsResponse(text, opts = {}) {
         if (code) return code;
       }
     }
-    for (const key of ['code', 'otp', 'pin']) {
+    for (const key of ['code', 'otp', 'pin', 'phone_code', 'phoneCode', 'phonecode', 'verify_code', 'verifyCode', 'verification_code', 'verificationCode']) {
       const code = codeFromValue(record[key], true) || codeFromValue(record[key], false);
       if (code) return code;
     }
-    for (const key of ['sms', 'text', 'message', 'content', 'body']) {
+    for (const key of ['sms', 'text', 'message', 'content', 'body', 'phone_code_result', 'phoneCodeResult', 'result']) {
       const code = codeFromValue(record[key], false);
       if (code) return code;
     }
@@ -1872,7 +1888,7 @@ function extractOtpFromSmsResponse(text, opts = {}) {
   };
 
   const codeFromRecords = (records) => {
-    for (const record of records || []) {
+    for (const record of (records || []).slice().reverse()) {
       const code = codeFromRecord(record);
       if (code) return code;
     }
@@ -1885,7 +1901,7 @@ function extractOtpFromSmsResponse(text, opts = {}) {
       if (Array.isArray(data)) return codeFromRecords(data);
       const payload = data && typeof data === 'object' ? data.data : null;
       if (payload && typeof payload === 'object') {
-        for (const key of ['list', 'records', 'rows', 'items']) {
+        for (const key of ['sms_content', 'smsContent', 'sms_records', 'smsRecords', 'smsRecordsList', 'list', 'records', 'rows', 'items']) {
           if (Array.isArray(payload[key])) {
             return codeFromRecords(payload[key]);
           }

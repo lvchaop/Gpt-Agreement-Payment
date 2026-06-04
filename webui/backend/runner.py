@@ -338,6 +338,7 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
               register_only: bool, pay_only: bool, gopay: bool = False,
               gopay_otp_file: str = "", count: int = 0,
               target_emails: Optional[list] = None, rt_only: bool = False,
+              rt_force: bool = False,
               register_mode: str = "browser", cardw_config_path: str = "") -> list[str]:
     """根据参数拼出最终命令行。"""
     cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
@@ -405,6 +406,8 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
         cmd.append("--pay-only")
     if rt_only:
         cmd.append("--rt-only")
+        if rt_force:
+            cmd.append("--rt-force")
     if target_emails:
         joined = ",".join(e.strip() for e in target_emails if e and e.strip())
         if joined:
@@ -448,6 +451,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
           gopay: bool = False, count: int = 0, register_mode: str = "browser",
           env_overrides: Optional[dict] = None,
           target_emails: Optional[list] = None, rt_only: bool = False,
+          rt_force: bool = False,
           phone: Optional[dict] = None) -> dict:
     global _proc, _started_at, _ended_at, _exit_code, _cmd, _mode
     global _log_lines, _seq_counter, _otp_file, _otp_to_db, _otp_pending, _otp_file_is_temp
@@ -473,7 +477,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         cmd = build_cmd(mode, paypal, batch, workers, self_dealer,
                         register_only, pay_only, gopay=gopay,
                         gopay_otp_file="", count=count,
-                        target_emails=target_emails, rt_only=rt_only,
+                        target_emails=target_emails, rt_only=rt_only, rt_force=rt_force,
                         register_mode=register_mode,
                         cardw_config_path=cardw_config_path)
 

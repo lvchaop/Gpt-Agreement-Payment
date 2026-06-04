@@ -38,3 +38,12 @@ def test_explicit_output_url_mode_overrides_checkout_ui_mode():
         checkout_payload={"checkout_ui_mode": "custom"},
     )
     assert selected == "https://pay.openai.com/c/pay/cs_live_forced#frag"
+
+
+def test_chatgpt_checkout_url_is_not_treated_as_provider_url():
+    assert card._fresh_provider_url_from_checkout_url(
+        "https://chatgpt.com/checkout/openai_llc/cs_live_synthetic"
+    ) == ""
+    assert card._fresh_provider_url_from_checkout_url(
+        "https://pay.openai.com/c/pay/cs_live_real#frag"
+    ) == "https://pay.openai.com/c/pay/cs_live_real#frag"

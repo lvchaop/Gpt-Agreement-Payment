@@ -23,8 +23,23 @@
     <div class="term-divider" style="margin-top:20px">CPA</div>
     <TermToggle v-model="cpa.enabled">启用 CPA</TermToggle>
     <div v-if="cpa.enabled" class="form-stack" style="margin-top:12px">
+      <TermSelect
+        v-model="cpa.target"
+        label="目标 · target"
+        :options="[
+          { value: 'cpa', label: 'CPA 兼容接口', desc: 'POST /v0/management/auth-files' },
+          { value: 'sub2api', label: 'Sub2API', desc: 'POST /api/v1/admin/accounts/import/codex-session' },
+        ]"
+      />
       <TermField v-model="cpa.base_url" label="Base URL · base_url" />
       <TermField v-model="cpa.admin_key" label="Admin Key · admin_key" type="password" />
+      <template v-if="cpa.target === 'sub2api'">
+        <TermField v-model="cpa.group_ids" label="分组 IDs · group_ids" placeholder="1,2" />
+        <TermField v-model="cpa.proxy_id" label="代理 ID · proxy_id" placeholder="可选" />
+        <TermField v-model.number="cpa.concurrency" label="并发 · concurrency" type="number" />
+        <TermField v-model.number="cpa.priority" label="优先级 · priority" type="number" />
+        <TermToggle v-model="cpa.update_existing">重复账号更新</TermToggle>
+      </template>
       <div class="step-actions">
         <TermBtn :loading="cpaLoading" @click="testCpa">健康检查</TermBtn>
       </div>
@@ -45,6 +60,7 @@ import type { PreflightResult } from "../../api/client";
 import TermField from "../term/TermField.vue";
 import TermBtn from "../term/TermBtn.vue";
 import TermToggle from "../term/TermToggle.vue";
+import TermSelect from "../term/TermSelect.vue";
 
 const store = useWizardStore();
 const tsInit = store.answers.team_system ?? {};
@@ -60,8 +76,14 @@ const ts = ref({
 });
 const cpa = ref({
   enabled: false,
+  target: cpaInit.target ?? "cpa",
   base_url: cpaInit.base_url ?? "",
   admin_key: cpaInit.admin_key ?? "",
+  group_ids: Array.isArray(cpaInit.group_ids) ? cpaInit.group_ids.join(",") : (cpaInit.group_ids ?? ""),
+  proxy_id: cpaInit.proxy_id ?? "",
+  concurrency: cpaInit.concurrency ?? 1,
+  priority: cpaInit.priority ?? 0,
+  update_existing: cpaInit.update_existing ?? true,
 });
 
 // 立即同步到 store 覆盖可能从 source 同步过来的 enabled=true，
@@ -90,6 +112,7 @@ async function testCpa() {
   cpaLoading.value = true;
   try {
     cpaResult.value = await store.runPreflight("cpa", {
+      target: cpa.value.target,
       base_url: cpa.value.base_url,
       admin_key: cpa.value.admin_key,
     });

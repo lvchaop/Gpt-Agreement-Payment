@@ -25,6 +25,7 @@ class StartRequest(BaseModel):
     # 选中账号定向操作：配合 pay_only 或 rt_only
     target_emails: list[str] = []
     rt_only: bool = False
+    rt_force: bool = False
 
 
 class OTPRequest(BaseModel):
@@ -116,5 +117,8 @@ def preview(req: StartRequest, user: str = CurrentUser):
         req.mode, req.paypal, req.batch, req.workers, req.self_dealer,
         req.register_only, req.pay_only, gopay=req.gopay, count=req.count,
         register_mode=req.register_mode,
+        target_emails=req.target_emails,
+        rt_only=req.rt_only,
+        rt_force=req.rt_force,
     )
     return {"cmd": cmd, "cmd_str": " ".join(cmd)}
