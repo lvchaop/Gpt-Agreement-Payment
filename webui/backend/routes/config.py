@@ -23,6 +23,10 @@ class HealthRequest(BaseModel):
     count: int = 0
     register_mode: str = "browser"
     phone: dict = Field(default_factory=dict)
+    target_emails: list[str] = Field(default_factory=list)
+    rt_only: bool = False
+    rt_force: bool = False
+    session_only: bool = False
 
 
 @router.post("/export")

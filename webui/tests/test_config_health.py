@@ -81,6 +81,32 @@ def test_config_health_ok_with_cloudflare_secrets(client, tmp_path, monkeypatch)
     assert not body["blocking"]
 
 
+def test_config_health_session_only_skips_registration_and_payment(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed_configs(tmp_path, monkeypatch)
+
+    db = get_db()
+    db.clear_runtime_data()
+
+    r = client.post("/api/config/health", json={
+        "mode": "single",
+        "paypal": False,
+        "session_only": True,
+        "target_emails": ["a@example.com"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["requires_registration"] is False
+    assert body["requires_email_otp"] is True
+    assert body["payment_kind"] == "none"
+    names = {c["name"] for c in body["checks"]}
+    assert "mail_domains" not in names
+    payment_check = next(c for c in body["checks"] if c["name"] == "payment_config")
+    assert payment_check["status"] == "ok"
+    blocking = {c["name"] for c in body["blocking"]}
+    assert blocking == {"cloudflare_kv_secrets"}
+
+
 @pytest.mark.parametrize("register_mode", ["phone_browser", "phone_protocol"])
 def test_config_health_phone_register_requires_provider(client, tmp_path, monkeypatch, register_mode):
     _login(client)

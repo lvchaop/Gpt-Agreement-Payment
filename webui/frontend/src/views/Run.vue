@@ -335,6 +335,12 @@
             class="inv-filter-input"
             placeholder="🔍 邮箱关键字"
           />
+          <textarea
+            v-model="invFilters.emails"
+            class="inv-filter-textarea"
+            placeholder="批量邮箱筛选，一行一个"
+            rows="3"
+          ></textarea>
           <select v-model="invFilters.plan" class="inv-filter-sel">
             <option value="">所有 plan</option>
             <option value="plus">plus</option>
@@ -1153,6 +1159,7 @@ function toggleSelectAll() {
 // ── 账号库存筛选 ───────────────────────────────────────────────
 const invFilters = ref({
   search: "",
+  emails: "",
   plan: "",
   check: "",
   pay: "",
@@ -1171,11 +1178,29 @@ const hasActiveFilter = computed(() =>
   Object.values(invFilters.value).some(v => v !== "")
 );
 
+function parseEmailFilter(text: string): Set<string> {
+  const items = (text || "")
+    .split(/[\s,;，；]+/)
+    .map(v => v.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(items);
+}
+
+function matchesEmailFilter(email: string, filters: Set<string>): boolean {
+  if (!filters.size) return true;
+  const full = (email || "").trim().toLowerCase();
+  const local = full.split("@", 1)[0];
+  return filters.has(full) || filters.has(local);
+}
+
 const filteredAccounts = computed<InventoryAccount[]>(() => {
   const f = invFilters.value;
   const s = (f.search || "").trim().toLowerCase();
+  const emailFilters = parseEmailFilter(f.emails || "");
   return inventory.value.accounts.filter(acc => {
-    if (s && !(acc.email || "").toLowerCase().includes(s)) return false;
+    const email = acc.email || "";
+    if (s && !email.toLowerCase().includes(s)) return false;
+    if (!matchesEmailFilter(email, emailFilters)) return false;
     if (f.plan && acc.plan_tag !== f.plan) return false;
     if (f.check) {
       if (f.check === "unchecked") {
@@ -1240,7 +1265,7 @@ watch([() => filteredAccounts.value.length, inventoryTotalPages], () => {
 });
 
 function resetInvFilters() {
-  invFilters.value = { search: "", plan: "", check: "", pay: "", sale: "", rt: "", cpa: "" };
+  invFilters.value = { search: "", emails: "", plan: "", check: "", pay: "", sale: "", rt: "", cpa: "" };
 }
 
 const allPagedSelected = computed(() => {
@@ -1360,15 +1385,22 @@ function _selectedEmails(): string[] {
   return emailsForIds(Array.from(selectedIds.value)).filter(e => e && !e.startsWith("id="));
 }
 
-async function payOnlySelected() {
+function _selectedEmailsForBatch(): { emails: string[]; selectedCount: number; batchNote: string } {
   const selectedEmails = _selectedEmails();
-  if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
   const requestedBatch = form.value.mode === "batch"
     ? Math.max(1, Number(form.value.batch || 0))
     : selectedEmails.length;
   const emails = selectedEmails.slice(0, Math.min(selectedEmails.length, requestedBatch));
+  const batchNote = selectedEmails.length > emails.length
+    ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）`
+    : "";
+  return { emails, selectedCount: selectedEmails.length, batchNote };
+}
+
+async function payOnlySelected() {
+  const { emails, batchNote } = _selectedEmailsForBatch();
+  if (!emails.length) { message.warning("没有选中账号"); return; }
   const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
-  const batchNote = selectedEmails.length > emails.length ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）` : "";
   if (!confirm(`对 ${emails.length} 个选中账号跑 pay-only？${batchNote}\n${preview}\n\nworkers=${Math.max(1, Number(form.value.workers || 1))}\n模式：${form.value.gopay ? "GoPay" : (form.value.paypal ? "PayPal" : "Card")}`)) return;
   starting.value = true;
   try {
@@ -1394,20 +1426,23 @@ async function payOnlySelected() {
 }
 
 async function rtOnlySelected() {
-  const emails = _selectedEmails();
+  const { emails, batchNote } = _selectedEmailsForBatch();
   if (!emails.length) { message.warning("没有选中账号"); return; }
   const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
-  if (!confirm(`对 ${emails.length} 个选中账号跑 rt-only（只补 refresh_token，不付款）？\n${preview}`)) return;
+  const workers = Math.max(1, Number(form.value.workers || 1));
+  if (!confirm(`对 ${emails.length} 个选中账号跑 rt-only（补 refresh_token；CPA 开启时成功后自动推送）？${batchNote}\n${preview}\n\nworkers=${workers}`)) return;
   starting.value = true;
   try {
     await api.post("/run/start", {
-      mode: "single",
+      mode: emails.length > 1 ? "batch" : "single",
       paypal: false,
       gopay: false,
       pay_only: false,
       register_only: false,
       rt_only: true,
       rt_force: true,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers,
       register_mode: form.value.register_mode || "browser",
       target_emails: emails,
     });
@@ -1422,10 +1457,10 @@ async function rtOnlySelected() {
 }
 
 async function sessionOnlySelected() {
-  const emails = _selectedEmails();
+  const { emails, batchNote } = _selectedEmailsForBatch();
   if (!emails.length) { message.warning("没有选中账号"); return; }
   const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
-  if (!confirm(`对 ${emails.length} 个选中账号跑 session-only（补 session_token/access_token/cookie，不注册不付款）？\n${preview}`)) return;
+  if (!confirm(`对 ${emails.length} 个选中账号跑 session-only（补 session_token/access_token/cookie，不注册不付款）？${batchNote}\n${preview}`)) return;
   starting.value = true;
   try {
     await api.post("/run/start", {
@@ -2137,6 +2172,21 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 .inv-filter-input:focus { border-color: var(--accent); outline: none; }
+.inv-filter-textarea {
+  flex: 1 1 260px;
+  min-width: 220px;
+  max-width: 420px;
+  min-height: 58px;
+  resize: vertical;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--fg-primary);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.inv-filter-textarea:focus { border-color: var(--accent); outline: none; }
 .inv-filter-sel {
   background: var(--bg-panel);
   border: 1px solid var(--border);

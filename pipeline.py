@@ -1305,6 +1305,38 @@ def _run_one_pay_only(args_tuple):
                 pass
 
 
+def _run_one_rt_only(args_tuple):
+    """单个 rt-only 任务。并发时每个 worker 处理固定 target_email。"""
+    idx, card_config_path, target_email, kwargs = args_tuple
+    log_context = _thread_log_context("rt-only", idx=idx, email=target_email)
+    thread_tag = _log_tag("thread", log_context)
+    local_kwargs = dict(kwargs or {})
+    proxy_stage_allocator = local_kwargs.get("proxy_stage_allocator")
+    proxy_stage_plan = local_kwargs.get("proxy_stage_plan")
+    try:
+        print(f"{thread_tag} start")
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = rt_only_for_email(
+            card_config_path,
+            target_email,
+            proxy_stage_plan=plan,
+            session_id=str(local_kwargs.get("session_id") or ""),
+            force=bool(local_kwargs.get("force", False)),
+        )
+        r["batch_index"] = idx
+        r["target_email"] = target_email
+        print(f"{thread_tag} done status={r.get('status', '?')}")
+        return r
+    except Exception as e:
+        print(f"{thread_tag} error={str(e)[:300]}")
+        return {
+            "batch_index": idx,
+            "target_email": target_email,
+            "status": "error",
+            "error": str(e)[:500],
+        }
+
+
 _PAYPAL_NEW_USER_BATCH_FLOWS = {"new_user", "sandbox_new_user", "guest", "guest_checkout"}
 
 
@@ -2419,6 +2451,14 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
     if not target:
         return {"status": "no_email"}
 
+    try:
+        with open(card_config_path, "r", encoding="utf-8") as f:
+            card_cfg = json.load(f)
+    except Exception as e:
+        return {"status": "read_card_cfg_failed", "error": str(e)[:200], "email": target}
+    cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+    cpa_enabled = bool(cpa_cfg.get("enabled"))
+
     account = get_db().find_latest_registered_account(target) or {}
     if not account:
         print(f"[rt-only] ⚠ DB 找不到账号: {target}")
@@ -2429,7 +2469,16 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         if session_id:
             _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
         print(f"[rt-only] {target} 已有 refresh_token (len={len(rt)}), 跳过")
-        return {"status": "already_has_rt", "email": target}
+        result = {"status": "already_has_rt", "email": target, "refresh_token_len": len(rt)}
+        if cpa_enabled:
+            try:
+                cpa_status = _cpa_import_after_team(target, session_id, cpa_cfg, refresh_token=rt)
+            except Exception as e:
+                print(f"[rt-only] CPA 导入异常: {e}")
+                cpa_status = "error"
+            result["cpa_import"] = cpa_status
+            print(f"[rt-only] CPA({target}) → {cpa_status}")
+        return result
     if account.get("refresh_token") and force:
         rt_len = len(str(account.get("refresh_token") or ""))
         print(f"[rt-only] force=True，忽略已有 refresh_token (len={rt_len})，重新补 RT")
@@ -2448,12 +2497,6 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
     finally:
         try: sys.path.remove(str(CARD_DIR))
         except ValueError: pass
-
-    try:
-        with open(card_config_path, "r", encoding="utf-8") as f:
-            card_cfg = json.load(f)
-    except Exception as e:
-        return {"status": "read_card_cfg_failed", "error": str(e)[:200]}
 
     mail_cfg = {}
     reg_cfg_path = ROOT / "CTF-reg" / "config.paypal-proxy.json"
@@ -2519,7 +2562,16 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         if session_id:
             _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
         print(f"[rt-only] ✅ {target} refresh_token 已写库 (len={len(rt)} id={row_id})")
-        return {"status": "succeeded", "email": target, "refresh_token_len": len(rt), "id": row_id}
+        result = {"status": "succeeded", "email": target, "refresh_token_len": len(rt), "id": row_id}
+        if cpa_enabled:
+            try:
+                cpa_status = _cpa_import_after_team(target, session_id, cpa_cfg, refresh_token=rt)
+            except Exception as e:
+                print(f"[rt-only] CPA 导入异常: {e}")
+                cpa_status = "error"
+            result["cpa_import"] = cpa_status
+            print(f"[rt-only] CPA({target}) → {cpa_status}")
+        return result
     except Exception as e:
         print(f"[rt-only] 拿到 RT 但写库失败: {e}")
         return {"status": "write_failed", "email": target, "error": str(e)[:200]}
@@ -2549,16 +2601,63 @@ def _sync_rt_before_cpa(card_config_path: str, email: str, sid: str,
 
 def rt_only_targets(card_config_path: str, target_emails: list[str],
                     proxy_stage_allocator=None, proxy_stage_plan=None,
-                    session_id: str = "", force: bool = False) -> dict:
-    """批量 RT-only：串行跑每个 email，汇总结果。"""
+                    session_id: str = "", force: bool = False,
+                    workers: int = 1) -> dict:
+    """批量 RT-only：对指定 email 列表补 RT，workers>1 时并发处理。"""
+    target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
     results = []
     ok = 0
     skip = 0
     fail = 0
+
+    def _count_result(r: dict) -> None:
+        nonlocal ok, skip, fail
+        st = r.get("status", "")
+        if st == "succeeded":
+            ok += 1
+        elif st in ("already_has_rt",):
+            skip += 1
+        else:
+            fail += 1
+
+    if workers > 1 and len(target_emails) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = max(1, min(int(workers), len(target_emails)))
+        print(f"[rt-only-targets] 并发: {len(target_emails)} accounts workers={workers}")
+        tasks = [
+            (
+                idx,
+                card_config_path,
+                em,
+                {
+                    "proxy_stage_allocator": proxy_stage_allocator,
+                    "proxy_stage_plan": proxy_stage_plan,
+                    "session_id": session_id,
+                    "force": force,
+                },
+            )
+            for idx, em in enumerate(target_emails)
+        ]
+        ordered: list[dict | None] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_run_one_rt_only, task): task[0] for task in tasks}
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                item = future.result()
+                ordered[idx] = item
+                _count_result(item)
+                mark = "✓" if item.get("status") == "succeeded" else ("-" if item.get("status") == "already_has_rt" else "✗")
+                err = f" err={item.get('error')}" if item.get("error") else ""
+                print(
+                    f"[rt-only-targets] {mark} "
+                    f"[{sum(1 for x in ordered if x)}/{len(tasks)}] "
+                    f"{item.get('target_email') or target_emails[idx]} status={item.get('status')}{err}"
+                )
+        results = [item for item in ordered if item]
+        print(f"\n[rt-only] 完成: ok={ok} skip={skip} fail={fail} 共 {len(results)}")
+        return {"results": results, "ok": ok, "skip": skip, "fail": fail}
+
     for em in target_emails:
-        em = (em or "").strip()
-        if not em:
-            continue
         plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
         r = rt_only_for_email(
             card_config_path,
@@ -2568,13 +2667,7 @@ def rt_only_targets(card_config_path: str, target_emails: list[str],
             force=force,
         )
         results.append(r)
-        st = r.get("status", "")
-        if st == "succeeded":
-            ok += 1
-        elif st in ("already_has_rt",):
-            skip += 1
-        else:
-            fail += 1
+        _count_result(r)
     print(f"\n[rt-only] 完成: ok={ok} skip={skip} fail={fail} 共 {len(results)}")
     return {"results": results, "ok": ok, "skip": skip, "fail": fail}
 
@@ -5508,6 +5601,7 @@ def main():
                 proxy_stage_plan=proxy_stage_plan,
                 session_id=args.rt_session_id,
                 force=args.rt_force,
+                workers=args.workers,
             )
             print(f"\n结果: ok={r['ok']} skip={r['skip']} fail={r['fail']}")
             return
