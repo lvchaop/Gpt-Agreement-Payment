@@ -481,7 +481,7 @@ class TrojanBridgeManager:
 
     def ensure_started(self) -> None:
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        config_path = self.work_dir / "sing-box.trojan-pool.json"
+        config_path = (self.work_dir / "sing-box.trojan-pool.json").resolve()
         pid_path = self.work_dir / "sing-box.pid"
         log_path = self.work_dir / "sing-box.log"
 

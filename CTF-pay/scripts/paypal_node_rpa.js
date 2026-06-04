@@ -420,6 +420,63 @@ function redactHeaders(headers) {
   return out;
 }
 
+function cookiesFromHeader(cookieHeader, url = 'https://chatgpt.com/') {
+  const raw = String(cookieHeader || '').trim();
+  if (!raw) return [];
+  let cookieUrl = String(url || 'https://chatgpt.com/').trim() || 'https://chatgpt.com/';
+  try {
+    cookieUrl = new URL(cookieUrl).origin + '/';
+  } catch (_) {
+    cookieUrl = 'https://chatgpt.com/';
+  }
+  const out = [];
+  const seen = new Set();
+  const pushCookie = (name, value) => {
+    out.push({
+      name,
+      value,
+      url: cookieUrl,
+      secure: true,
+      httpOnly: name.includes('next-auth') || name.includes('session'),
+      sameSite: 'Lax',
+    });
+  };
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const name = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (!name || !value || seen.has(name)) continue;
+    seen.add(name);
+    if (name === '__Secure-next-auth.session-token' && value.length > 3800) {
+      const chunkSize = 3800;
+      for (let offset = 0, chunkIndex = 0; offset < value.length; offset += chunkSize, chunkIndex += 1) {
+        pushCookie(`${name}.${chunkIndex}`, value.slice(offset, offset + chunkSize));
+      }
+      continue;
+    }
+    pushCookie(name, value);
+  }
+  return out;
+}
+
+async function seedChatgptCookies(context, payload = {}) {
+  const header = String(payload.chatgptCookieHeader || '').trim();
+  if (!header || !context || typeof context.addCookies !== 'function') return 0;
+  const url = String(payload.chatgptCookieUrl || 'https://chatgpt.com/').trim() || 'https://chatgpt.com/';
+  const cookies = cookiesFromHeader(header, url);
+  if (!cookies.length) return 0;
+  try {
+    await context.addCookies(cookies);
+  } catch (e) {
+    const sample = cookies[0] ? { ...cookies[0], value: `<redacted:${String(cookies[0].value || '').length}>` } : null;
+    log('seed chatgpt cookies failed', e && e.message ? e.message : e, sample ? `sample=${JSON.stringify(sample)}` : '');
+    throw e;
+  }
+  log('seed chatgpt cookies', `count=${cookies.length}`, `session=${cookies.some((c) => c.name === '__Secure-next-auth.session-token' || c.name.startsWith('__Secure-next-auth.session-token.')) ? 'yes' : 'no'}`);
+  return cookies.length;
+}
+
 function readStdin() {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -1754,6 +1811,407 @@ async function clickSubmitLike(page) {
   return clickByText(page, /^(下一页|next|subscribe|pay|continue|agree|agree and continue|verify|confirm|create account|agree\s*&\s*continue)$/i, 'submit-text', 3000);
 }
 
+async function chatgptCustomCheckoutVisible(page) {
+  return evalAllFrames(page, () => {
+    const body = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+    const html = document.documentElement ? document.documentElement.innerHTML : '';
+    const submit = document.querySelector('button[form][type="submit"], button[type="submit"]');
+    const submitText = submit ? (submit.innerText || submit.textContent || submit.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim() : '';
+    return /checkout_ui_mode(?:\\\\?")?,(?:\\\\?")?custom|custom_checkout_session|elementsInitSource=custom_checkout/i.test(html)
+      || /サブスクリプションを登録する|subscribe|start.*trial/i.test(`${body} ${submitText}`);
+  }, null).then((xs) => xs.some(Boolean)).catch(() => false);
+}
+
+const fillChatgptCustomFieldScript = ({ selectors, val, metaReSource }) => {
+  const value = String(val || '').trim();
+  if (!value) return null;
+  const metaRe = metaReSource ? new RegExp(metaReSource, 'i') : null;
+  const visible = (el) => {
+    if (!el || el.disabled || el.readOnly) return false;
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const meta = (el) => [
+    el.id,
+    el.name,
+    el.autocomplete,
+    el.placeholder,
+    el.getAttribute('aria-label'),
+    el.getAttribute('data-testid'),
+    el.getAttribute('data-field-name'),
+    el.closest('label') && el.closest('label').innerText,
+    el.parentElement && el.parentElement.innerText,
+  ].filter(Boolean).join(' ');
+  const setValue = (el) => {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    try { el.focus(); } catch (_) {}
+    if (desc && desc.set) desc.set.call(el, ''); else el.value = '';
+    try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+    if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    for (const ev of ['keydown', 'input', 'keyup', 'change', 'blur']) {
+      try { el.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
+    }
+  };
+  const seen = new Set();
+  for (const sel of selectors || []) {
+    for (const el of Array.from(document.querySelectorAll(sel))) {
+      if (seen.has(el) || !visible(el)) continue;
+      seen.add(el);
+      setValue(el);
+      return {
+        id: el.id || '',
+        name: el.name || '',
+        autocomplete: el.autocomplete || '',
+        placeholder: el.placeholder || '',
+        frameHref: location.href.slice(0, 120),
+      };
+    }
+  }
+  if (metaRe) {
+    for (const el of Array.from(document.querySelectorAll('input, textarea'))) {
+      if (seen.has(el) || !visible(el)) continue;
+      if (!metaRe.test(meta(el))) continue;
+      setValue(el);
+      return {
+        id: el.id || '',
+        name: el.name || '',
+        autocomplete: el.autocomplete || '',
+        placeholder: el.placeholder || '',
+        frameHref: location.href.slice(0, 120),
+      };
+    }
+  }
+  return null;
+};
+
+async function fillChatgptCustomField(page, label, selectors, val, metaReSource = '') {
+  if (!val) return false;
+  const res = await evalAllFrames(page, fillChatgptCustomFieldScript, { selectors, val, metaReSource });
+  const hit = res.find(Boolean);
+  if (hit) {
+    log('chatgpt custom fill', label, JSON.stringify(hit));
+    return true;
+  }
+  return false;
+}
+
+async function selectChatgptCustomCountry(page, country) {
+  const res = await evalAllFrames(page, ({ country: desired }) => {
+    const value = String(desired || '').toUpperCase();
+    if (!value) return null;
+    const visible = (el) => {
+      if (!el || el.disabled) return false;
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    for (const el of Array.from(document.querySelectorAll('select'))) {
+      if (!visible(el)) continue;
+      const meta = [el.id, el.name, el.autocomplete, el.getAttribute('aria-label'), el.closest('label') && el.closest('label').innerText].filter(Boolean).join(' ');
+      if (!/(country|billingCountry|国|国\/地域|country or region)/i.test(meta)) continue;
+      const opt = Array.from(el.options || []).find((x) => String(x.value || '').toUpperCase() === value)
+        || Array.from(el.options || []).find((x) => String(x.text || '').toUpperCase().includes(value));
+      if (!opt) continue;
+      const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+      try { el.focus(); } catch (_) {}
+      if (desc && desc.set) desc.set.call(el, opt.value); else el.value = opt.value;
+      for (const ev of ['input', 'change', 'blur']) {
+        try { el.dispatchEvent(new Event(ev, { bubbles: true })); } catch (_) {}
+      }
+      return { id: el.id || '', name: el.name || '', value: opt.value || '', text: opt.text || '' };
+    }
+    return null;
+  }, { country });
+  const hit = res.find(Boolean);
+  if (hit) log('chatgpt custom select country', JSON.stringify(hit));
+  return Boolean(hit);
+}
+
+async function chatgptCustomCheckoutDiag(page, label) {
+  try {
+    const rows = await evalAllFrames(page, () => {
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+      };
+      const inputs = Array.from(document.querySelectorAll('input, textarea, select')).filter(visible).map((el) => ({
+        tag: el.tagName,
+        id: el.id || '',
+        name: el.name || '',
+        type: el.type || '',
+        autocomplete: el.autocomplete || '',
+        placeholder: el.placeholder || '',
+        aria: el.getAttribute('aria-label') || '',
+        valueLen: String(el.value || '').length,
+      })).slice(0, 40);
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(visible).map((el) => ({
+        tag: el.tagName,
+        type: el.type || '',
+        aria: el.getAttribute('aria-label') || '',
+        text: (el.innerText || el.textContent || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+        disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      })).slice(0, 20);
+      return { href: location.href.slice(0, 160), inputs, buttons };
+    }, null);
+    log('chatgpt custom diag', label, JSON.stringify(rows.filter(Boolean)).slice(0, 3000));
+  } catch (_) {}
+}
+
+async function clickChatgptCustomSubscribe(page) {
+  if (await clickSelectorAny(page, [
+    'button[aria-label*="サブスクリプション" i][type="submit"]',
+    'button[aria-label*="subscribe" i][type="submit"]',
+    'button[form][type="submit"]',
+    'form button[type="submit"]',
+  ], 'chatgpt-custom-subscribe-selector')) return true;
+  return clickByText(
+    page,
+    /^(サブスクリプションを登録する|登録する|購読する|subscribe|start trial|start free trial|confirm|pay)$/i,
+    'chatgpt-custom-subscribe-text',
+    3000,
+  );
+}
+
+async function chatgptCustomPaymentState(page) {
+  const states = await evalAllFrames(page, () => {
+    const visible = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+    };
+    const textOf = (el) => (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    const bodyText = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+    const paypalVisible = Array.from(document.querySelectorAll('button, label, [role="button"], [role="radio"], div, span'))
+      .filter(visible)
+      .some((el) => /paypal/i.test(textOf(el)));
+    const cardVisible = Array.from(document.querySelectorAll('input, textarea, div, span'))
+      .filter(visible)
+      .some((el) => {
+        const t = [
+          textOf(el),
+          el.placeholder || '',
+          el.name || '',
+          el.id || '',
+          el.autocomplete || '',
+        ].join(' ');
+        return /card number|cardnumber|cc-number|カード番号|expiration date|security code|cc-exp|cc-csc/i.test(t);
+      }) || /Your card number is incomplete|Your card.s expiration date is incomplete|Your card.s security code is incomplete/i.test(bodyText);
+    const paypalSelected = Array.from(document.querySelectorAll('button, label, [role="button"], [role="radio"], div'))
+      .filter(visible)
+      .some((el) => {
+        const t = textOf(el);
+        if (!/paypal/i.test(t)) return false;
+        const ariaChecked = el.getAttribute('aria-checked');
+        const ariaSelected = el.getAttribute('aria-selected');
+        const cls = String(el.className || '');
+        return ariaChecked === 'true' || ariaSelected === 'true' || /selected|active|checked/i.test(cls);
+      });
+    const subscribeVisible = Array.from(document.querySelectorAll('button, input[type="submit"]'))
+      .filter(visible)
+      .some((el) => /サブスクリプションを登録する|subscribe|start trial|start free trial/i.test(textOf(el)));
+    return {
+      href: location.href.slice(0, 140),
+      paypalVisible,
+      cardVisible,
+      paypalSelected,
+      subscribeVisible,
+      body: bodyText.slice(0, 220),
+    };
+  }, null).catch(() => []);
+  const useful = states.filter(Boolean);
+  return {
+    paypalVisible: useful.some((x) => x.paypalVisible),
+    cardVisible: useful.some((x) => x.cardVisible),
+    paypalSelected: useful.some((x) => x.paypalSelected) || (useful.some((x) => x.paypalVisible) && !useful.some((x) => x.cardVisible)),
+    subscribeVisible: useful.some((x) => x.subscribeVisible),
+    frames: useful,
+  };
+}
+
+async function waitForChatgptCustomState(page, label, predicate, timeoutMs = 20000, intervalMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await chatgptCustomPaymentState(page);
+    if (predicate(last)) {
+      log('chatgpt custom step ok', label, JSON.stringify({
+        paypalVisible: last.paypalVisible,
+        cardVisible: last.cardVisible,
+        paypalSelected: last.paypalSelected,
+        subscribeVisible: last.subscribeVisible,
+      }));
+      return last;
+    }
+    await sleep(intervalMs);
+  }
+  log('chatgpt custom step timeout', label, JSON.stringify(last || {}));
+  await chatgptCustomCheckoutDiag(page, `${label}-timeout`);
+  return null;
+}
+
+async function clickChatgptCustomPaypal(page) {
+  for (const frame of page.frames()) {
+    const frameUrl = frame.url();
+    if (!/js\.stripe\.com\/v3\/elements-inner-payment/i.test(frameUrl)) continue;
+    const attempts = [
+      ['text', () => frame.getByText(/paypal/i).click({ timeout: 3000, force: true })],
+      ['css-text', () => frame.locator('button, [role="button"], [role="radio"], label, div, span').filter({ hasText: /paypal/i }).first().click({ timeout: 1500, force: true })],
+    ];
+    for (const [label, fn] of attempts) {
+      try {
+        log('chatgpt custom paypal locator click', label);
+        await fn();
+        await sleep(1000);
+        return true;
+      } catch (e) {
+        log('chatgpt custom paypal locator miss', label, e && e.message ? String(e.message).split('\n')[0].slice(0, 160) : String(e).slice(0, 160));
+      }
+    }
+  }
+  log('chatgpt custom paypal click target not found');
+  return false;
+}
+
+async function fillChatgptCustomCheckout(page, addr, payload = {}, expectedDueCents = 0) {
+  const country = String(payload.country || addr.country || 'US').toUpperCase();
+  const fullName = String(
+    addr.full_name
+    || addr.name
+    || payload.fullName
+    || payload.full_name
+    || `${payload.firstName || ''} ${payload.lastName || ''}`.trim()
+    || `${addr.first_name || ''} ${addr.last_name || ''}`.trim()
+    || 'James Smith'
+  ).trim();
+
+  log('chatgpt custom checkout detected; selecting PayPal, filling name/address then subscribe');
+  const paymentReady = await waitForChatgptCustomState(
+    page,
+    'payment-method-ready',
+    (state) => state.paypalVisible || state.cardVisible,
+    30000,
+  );
+  if (!paymentReady || !paymentReady.paypalVisible) {
+    await pageSnapshot(page, T('custom_paypal_method_missing')).catch(() => {});
+    return false;
+  }
+  let paypalSelected = paymentReady.paypalSelected;
+  for (let i = 0; i < 5 && !paypalSelected; i += 1) {
+    await clickChatgptCustomPaypal(page);
+    const selectedState = await waitForChatgptCustomState(
+      page,
+      `paypal-selected-${i + 1}`,
+      (state) => state.paypalSelected && !state.cardVisible,
+      7000,
+      400,
+    );
+    paypalSelected = Boolean(selectedState);
+  }
+  log('chatgpt custom paypal selection', paypalSelected ? 'yes' : 'no');
+  if (!paypalSelected) {
+    await pageSnapshot(page, T('custom_paypal_not_selected')).catch(() => {});
+    return false;
+  }
+  await sleep(700);
+  await selectChatgptCustomCountry(page, country);
+  await sleep(400);
+  const fills = {
+    name: await fillChatgptCustomField(page, 'full-name', [
+      'input[name="name"]',
+      'input[name="billingName"]',
+      'input[autocomplete="cc-name"]',
+      'input[autocomplete="name"]',
+      'input[aria-label*="name" i]',
+      'input[placeholder*="name" i]',
+      'input[aria-label*="氏名" i]',
+      'input[placeholder*="氏名" i]',
+      'input[aria-label*="名前" i]',
+      'input[placeholder*="名前" i]',
+    ], fullName, '(^|\\s)(name|氏名|名前|cardholder|カード名義)(\\s|$)'),
+    line1: await fillChatgptCustomField(page, 'address-line1', [
+      'input[name="addressLine1"]',
+      'input[name="line1"]',
+      'input[name="billingLine1"]',
+      'input[autocomplete="address-line1"]',
+      'input[aria-label*="address" i]',
+      'input[placeholder*="address" i]',
+      'input[aria-label*="住所" i]',
+      'input[placeholder*="住所" i]',
+    ], addr.street, 'address|line 1|住所|番地'),
+    line2: await fillChatgptCustomField(page, 'address-line2', [
+      'input[name="addressLine2"]',
+      'input[name="line2"]',
+      'input[name="billingLine2"]',
+      'input[autocomplete="address-line2"]',
+    ], addr.line2 || addr.street2 || '', 'line 2|建物|部屋'),
+    city: await fillChatgptCustomField(page, 'city', [
+      'input[name="city"]',
+      'input[name="billingCity"]',
+      'input[autocomplete="address-level2"]',
+      'input[aria-label*="city" i]',
+      'input[placeholder*="city" i]',
+      'input[aria-label*="市区" i]',
+      'input[placeholder*="市区" i]',
+    ], addr.city, 'city|locality|市区|市町村'),
+    state: await fillChatgptCustomField(page, 'state', [
+      'input[name="state"]',
+      'input[name="billingState"]',
+      'input[name="billingAdministrativeArea"]',
+      'input[autocomplete="address-level1"]',
+      'input[aria-label*="state" i]',
+      'input[placeholder*="state" i]',
+      'input[aria-label*="都道府県" i]',
+      'input[placeholder*="都道府県" i]',
+    ], addr.state, 'state|province|prefecture|都道府県'),
+    postal: await fillChatgptCustomField(page, 'postal', [
+      'input[name="postalCode"]',
+      'input[name="zip"]',
+      'input[name="billingPostalCode"]',
+      'input[autocomplete="postal-code"]',
+      'input[aria-label*="postal" i]',
+      'input[placeholder*="postal" i]',
+      'input[aria-label*="zip" i]',
+      'input[placeholder*="zip" i]',
+      'input[aria-label*="郵便" i]',
+      'input[placeholder*="郵便" i]',
+    ], addr.zip, 'postal|zip|郵便'),
+  };
+  await sleep(900);
+  const subscribeReady = await waitForChatgptCustomState(
+    page,
+    'subscribe-ready',
+    (state) => state.paypalSelected && !state.cardVisible && state.subscribeVisible,
+    15000,
+    500,
+  );
+  await chatgptCustomCheckoutDiag(page, 'before-subscribe');
+  if (!subscribeReady) {
+    log('chatgpt custom PayPal not selected; skip subscribe to avoid card validation', JSON.stringify(fills));
+    await pageSnapshot(page, T('custom_paypal_not_selected')).catch(() => {});
+    return false;
+  }
+  if (Number(expectedDueCents || 0) === 0) {
+    const due = await stripeVisibleDue(page);
+    if (due) log('chatgpt custom visible due', JSON.stringify(due));
+    if (due && Number(due.amountCents || 0) > 0) {
+      await pageSnapshot(page, T('custom_due_mismatch'));
+      throw new Error(`chatgpt_custom_due_mismatch_before_submit amount_cents=${due.amountCents} text=${due.text}`);
+    }
+  }
+  const clicked = await clickChatgptCustomSubscribe(page);
+  if (!clicked) {
+    log('chatgpt custom subscribe button not found', JSON.stringify(fills));
+    await pageSnapshot(page, T('custom_subscribe_missing')).catch(() => {});
+    return false;
+  }
+  await sleep(3500);
+  return true;
+}
+
 function paypalClientCfci(rawUrl) {
   try {
     return new URL(rawUrl).searchParams.get('paypal_client_cfci') || '';
@@ -2553,6 +3011,7 @@ async function main() {
     log('sms api delayed until PayPal form fill');
   }
   const { browser } = await launchProjectChromium(payload);
+  await seedChatgptCookies(browser, payload);
   const page = browser.pages()[0] || await browser.newPage();
   const networkCapturePath = installNetworkCapture(page, payload);
   if (networkCapturePath) log('network capture enabled', networkCapturePath);
@@ -2656,6 +3115,7 @@ async function main() {
   let formFilled = false;
   let otpHandled = false;
   let stripeFilled = false;
+  let chatgptCustomFilled = false;
   let stripePaypalClicks = 0;
   let lastStripeSubmitClick = 0;
   let lastUrl = '';
@@ -2711,6 +3171,7 @@ async function main() {
       formFilled,
       otpHandled,
       stripeFilled,
+      chatgptCustomFilled,
       capturedReturnUrl,
     });
     if (url !== lastUrl) {
@@ -2904,6 +3365,36 @@ async function main() {
     }
     await addUserscriptStyle(page);
     await maybeDismiss(page);
+
+    if (/chatgpt\.com$/i.test(host) && /\/checkout\//i.test(pathname)) {
+      const isCustomCheckout = await chatgptCustomCheckoutVisible(page);
+      if (isCustomCheckout && !chatgptCustomFilled) {
+        const ok = await fillChatgptCustomCheckout(page, stripeAddr, payload, expectedDueCents);
+        if (ok) {
+          chatgptCustomFilled = true;
+          lastStripeSubmitClick = Date.now();
+        } else {
+          await sleep(2500);
+        }
+        continue;
+      }
+      if (isCustomCheckout && chatgptCustomFilled && Date.now() - lastStripeSubmitClick > 6000) {
+        const retryState = await chatgptCustomPaymentState(page);
+        if (retryState.paypalSelected && !retryState.cardVisible) {
+          await clickChatgptCustomSubscribe(page);
+        } else {
+          log('chatgpt custom PayPal lost selection; reselect before retry subscribe');
+          chatgptCustomFilled = false;
+        }
+        lastStripeSubmitClick = Date.now();
+        await sleep(3000);
+        continue;
+      }
+      if (!isCustomCheckout) {
+        await sleep(1500);
+        continue;
+      }
+    }
 
     // Full userscript path: start from pay.openai.com / checkout.stripe.com
     // and let Stripe's own checkout JS produce the PayPal redirect.  This is

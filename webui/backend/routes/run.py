@@ -22,10 +22,11 @@ class StartRequest(BaseModel):
     count: int = 0  # free_register 模式下注册次数（0 = 无限）
     register_mode: str = Field(default="browser", pattern="^(browser|protocol|phone_browser|phone_protocol|portal_protocol)$")
     phone: dict = Field(default_factory=dict)
-    # 选中账号定向操作：配合 pay_only 或 rt_only
+    # 选中账号定向操作：配合 pay_only / rt_only / session_only
     target_emails: list[str] = []
     rt_only: bool = False
     rt_force: bool = False
+    session_only: bool = False
 
 
 class OTPRequest(BaseModel):
@@ -120,5 +121,6 @@ def preview(req: StartRequest, user: str = CurrentUser):
         target_emails=req.target_emails,
         rt_only=req.rt_only,
         rt_force=req.rt_force,
+        session_only=req.session_only,
     )
     return {"cmd": cmd, "cmd_str": " ".join(cmd)}

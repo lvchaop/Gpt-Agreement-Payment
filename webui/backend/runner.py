@@ -1,6 +1,6 @@
 """单 active-run 的 pipeline 进程控制器。
 
-封装 `xvfb-run -a python pipeline.py [args]` 子进程：spawn / 流式收 stdout
+封装 `python pipeline.py [args]` 子进程：spawn / 流式收 stdout
 到环形日志缓冲 / SIGTERM-优先 stop / 暴露 status + log 给路由层。
 
 GoPay 模式下额外支持 OTP 中转：默认通过 WebUI 内部 HTTP endpoint
@@ -10,8 +10,10 @@ file provider 的兼容 fallback。
 """
 import json
 import os
+import platform
 import re
 import signal
+import shutil
 import subprocess
 import threading
 import time
@@ -37,6 +39,22 @@ _otp_pending: bool = False             # set when gopay.py asks/waits for OTP
 _otp_file_is_temp: bool = False
 _active_gopay_phone: str = ""          # digits-only phone for the running gopay flow
 _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls across iterations
+
+
+def _python_executable() -> str:
+    venv_python = s.ROOT / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+    return shutil.which("python3") or shutil.which("python") or "python"
+
+
+def _pipeline_prefix() -> list[str]:
+    base = [_python_executable(), "-u"]
+    if platform.system().lower() == "linux" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        xvfb = shutil.which("xvfb-run")
+        if xvfb:
+            return [xvfb, "-a", *base]
+    return base
 
 
 def _state_path() -> Path:
@@ -338,11 +356,10 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
               register_only: bool, pay_only: bool, gopay: bool = False,
               gopay_otp_file: str = "", count: int = 0,
               target_emails: Optional[list] = None, rt_only: bool = False,
-              rt_force: bool = False,
+              rt_force: bool = False, session_only: bool = False,
               register_mode: str = "browser", cardw_config_path: str = "") -> list[str]:
     """根据参数拼出最终命令行。"""
-    cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
-           "--config", str(s.PAY_CONFIG_PATH)]
+    cmd = [*_pipeline_prefix(), "pipeline.py", "--config", str(s.PAY_CONFIG_PATH)]
     if cardw_config_path:
         cmd.extend(["--cardw-config", str(cardw_config_path)])
 
@@ -408,6 +425,8 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
         cmd.append("--rt-only")
         if rt_force:
             cmd.append("--rt-force")
+    if session_only:
+        cmd.append("--session-only")
     if target_emails:
         joined = ",".join(e.strip() for e in target_emails if e and e.strip())
         if joined:
@@ -451,7 +470,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
           gopay: bool = False, count: int = 0, register_mode: str = "browser",
           env_overrides: Optional[dict] = None,
           target_emails: Optional[list] = None, rt_only: bool = False,
-          rt_force: bool = False,
+          rt_force: bool = False, session_only: bool = False,
           phone: Optional[dict] = None) -> dict:
     global _proc, _started_at, _ended_at, _exit_code, _cmd, _mode
     global _log_lines, _seq_counter, _otp_file, _otp_to_db, _otp_pending, _otp_file_is_temp
@@ -478,6 +497,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
                         register_only, pay_only, gopay=gopay,
                         gopay_otp_file="", count=count,
                         target_emails=target_emails, rt_only=rt_only, rt_force=rt_force,
+                        session_only=session_only,
                         register_mode=register_mode,
                         cardw_config_path=cardw_config_path)
 

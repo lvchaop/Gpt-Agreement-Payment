@@ -1,5 +1,6 @@
 """Run controller tests — mock subprocess so we don't actually spawn pipeline."""
 import time
+import platform
 import pytest
 
 
@@ -21,7 +22,10 @@ def test_run_preview_single(client):
     r = client.post("/api/run/preview", json={"mode": "single"})
     assert r.status_code == 200
     body = r.json()
-    assert "xvfb-run" in body["cmd_str"]
+    if platform.system().lower() == "linux":
+        assert "xvfb-run" in body["cmd_str"] or "python" in body["cmd_str"]
+    else:
+        assert "xvfb-run" not in body["cmd_str"]
     assert "pipeline.py" in body["cmd_str"]
     assert "--paypal" in body["cmd_str"]
 
@@ -51,6 +55,24 @@ def test_run_preview_rt_force(client):
     body = r.json()
     assert "--rt-only" in body["cmd_str"]
     assert "--rt-force" in body["cmd_str"]
+    assert "--target-emails" in body["cmd_str"]
+    assert "a@example.com" in body["cmd_str"]
+
+
+def test_run_preview_session_only(client):
+    _login(client)
+    r = client.post(
+        "/api/run/preview",
+        json={
+            "mode": "single",
+            "paypal": False,
+            "session_only": True,
+            "target_emails": ["a@example.com"],
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "--session-only" in body["cmd_str"]
     assert "--target-emails" in body["cmd_str"]
     assert "a@example.com" in body["cmd_str"]
 

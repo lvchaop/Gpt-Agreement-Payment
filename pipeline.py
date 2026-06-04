@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import random
 import re
@@ -2576,6 +2577,272 @@ def rt_only_targets(card_config_path: str, target_emails: list[str],
             fail += 1
     print(f"\n[rt-only] 完成: ok={ok} skip={skip} fail={fail} 共 {len(results)}")
     return {"results": results, "ok": ok, "skip": skip, "fail": fail}
+
+
+# ──────────────────────────────────────────────
+# Session-only：对已注册账号补抓 ChatGPT session（不付款）
+# ──────────────────────────────────────────────
+
+
+def _update_registered_account_session_fields(email: str, fields: dict) -> dict:
+    """Update latest registered_accounts row for email with non-empty session fields."""
+    target = _norm_email(email)
+    allowed = {
+        "session_token",
+        "access_token",
+        "device_id",
+        "csrf_token",
+        "id_token",
+        "refresh_token",
+        "cookie_header",
+    }
+    clean = {}
+    for key in allowed:
+        val = fields.get(key)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text:
+            clean[key] = text
+    if not target:
+        return {"status": "no_email"}
+    if not clean:
+        return {"status": "no_fields", "email": target}
+
+    db = get_db()
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT id FROM registered_accounts WHERE email = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (target,),
+        ).fetchone()
+        if not row:
+            return {"status": "row_gone", "email": target}
+        row_id = int(row["id"])
+        sets = ", ".join(f"{key} = ?" for key in clean.keys())
+        cur = c.execute(
+            f"UPDATE registered_accounts SET {sets} WHERE id = ?",
+            [*clean.values(), row_id],
+        )
+        updated = int(cur.rowcount or 0)
+    return {"status": "succeeded" if updated else "update_zero", "email": target, "id": row_id, "fields": clean}
+
+
+class _SessionOnlyLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            print(f"[session-only:auth] {msg}", flush=True)
+        except Exception:
+            pass
+
+
+def _install_session_only_logging() -> tuple[list[logging.Logger], _SessionOnlyLogHandler]:
+    handler = _SessionOnlyLogHandler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    loggers = [
+        logging.getLogger("auth_flow"),
+        logging.getLogger("mail_provider"),
+        logging.getLogger("cf_kv_otp_provider"),
+        logging.getLogger("imap_otp_provider"),
+        logging.getLogger("sentinel"),
+        logging.getLogger("sentinel_quickjs"),
+    ]
+    for logger in loggers:
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return loggers, handler
+
+
+def _remove_session_only_logging(loggers: list[logging.Logger], handler: logging.Handler) -> None:
+    for logger in loggers:
+        try:
+            logger.removeHandler(handler)
+        except Exception:
+            pass
+
+
+def session_only_for_email(cardw_config_path: str | None, target_email: str,
+                           proxy_stage_plan=None) -> dict:
+    """对单个 email 跑协议登录，补 session_token/access_token/cookie_header 写回 DB。
+
+    复用 CTF-reg 的已有账号协议登录链路；不会注册新号、不会付款、不会改账号 plan。
+    """
+    target = _norm_email(target_email)
+    if not target:
+        return {"status": "no_email"}
+
+    account = get_db().find_latest_registered_account(target) or {}
+    if not account:
+        print(f"[session-only] ⚠ DB 找不到账号: {target}")
+        return {"status": "no_account", "email": target}
+
+    src_cfg = Path(cardw_config_path or "") if cardw_config_path else (ROOT / "CTF-reg" / "config.paypal-proxy.json")
+    if not src_cfg.exists():
+        print(f"[session-only] 缺注册配置: {src_cfg}")
+        return {"status": "no_reg_cfg", "email": target, "config": str(src_cfg)}
+
+    stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    effective_cfg = str(src_cfg)
+    if stage_plan.has_any():
+        proxy_url = stage_plan.register or stage_plan.payment or stage_plan.checkout or ""
+        print(f"[ProxyStage] session-only 阶段代理: {_describe_stage_plan(stage_plan)}")
+        if proxy_url:
+            effective_cfg = _rewrite_cardw_with_domain(str(src_cfg), "", proxy_url, stage_plan)
+
+    sys.path.insert(0, str(CARDW_DIR))
+    try:
+        from config import Config
+        from auth_flow import AuthFlow
+        from mail_provider import MailProvider
+    except Exception as e:
+        print(f"[session-only] import CTF-reg 登录链路失败: {e}")
+        return {"status": "import_failed", "error": str(e)[:200], "email": target}
+
+    print(
+        f"[session-only] 启动协议登录 → email={target} "
+        f"password={'有' if account.get('password') else '无(passwordless)'}"
+    )
+    print(f"[session-only] 使用注册配置: {effective_cfg}", flush=True)
+    session_env = {
+        "SKIP_OAUTH_TOKEN_EXCHANGE": "1",
+        "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
+        "OAUTH_CODEX_RT_EXCHANGE": "0",
+        "OAUTH_SECONDARY_AUTHORIZE_EXCHANGE": "0",
+        "OAUTH_REFRESH_ONLY": "0",
+    }
+    old_env = {key: os.environ.get(key) for key in session_env}
+    os.environ.update(session_env)
+    loggers, log_handler = _install_session_only_logging()
+    try:
+        print("[session-only] 初始化 CTF-reg Config/MailProvider/AuthFlow", flush=True)
+        cfg = Config.from_file(effective_cfg)
+        print(
+            f"[session-only] mail mode={getattr(cfg.mail, 'mode', '')} "
+            f"otp_timeout={getattr(cfg.mail, 'otp_timeout', '')} proxy={'有' if getattr(cfg, 'proxy', '') else '无'}",
+            flush=True,
+        )
+        try:
+            max_login_attempts = max(1, int(os.getenv("SESSION_ONLY_LOGIN_RETRIES", "3") or "3"))
+        except Exception:
+            max_login_attempts = 3
+        result = None
+        last_error: Exception | None = None
+        for attempt in range(1, max_login_attempts + 1):
+            mail_provider = MailProvider.from_config(cfg.mail, config_path=effective_cfg)
+            print(
+                f"[session-only] 开始 run_protocol_login attempt={attempt}/{max_login_attempts}"
+                "（等待 auth/OTP/session 日志）",
+                flush=True,
+            )
+            try:
+                result = AuthFlow(cfg).run_protocol_login(
+                    mail_provider,
+                    target,
+                    account.get("password", "") or "",
+                    existing_only=True,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                err = str(e)
+                if ("invalid_state" in err or "sign-in session is no longer valid" in err) and attempt < max_login_attempts:
+                    wait_s = min(2.0 * attempt, 6.0)
+                    print(
+                        f"[session-only] auth session invalid_state，整条登录链路从头重试 "
+                        f"attempt={attempt + 1}/{max_login_attempts} wait={wait_s:.1f}s",
+                        flush=True,
+                    )
+                    time.sleep(wait_s)
+                    continue
+                raise
+        if result is None:
+            raise last_error or RuntimeError("run_protocol_login 未返回结果")
+        bundle = result.to_dict()
+        print(
+            f"[session-only] 登录流程返回: session={len(str(bundle.get('session_token') or ''))} "
+            f"access={len(str(bundle.get('access_token') or ''))} "
+            f"cookie={len(str(bundle.get('cookie_header') or ''))}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[session-only] 异常: {type(e).__name__}: {str(e)[:240]}")
+        return {"status": "exception", "error": str(e)[:240], "email": target}
+    finally:
+        _remove_session_only_logging(loggers, log_handler)
+        for key, val in old_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        try:
+            sys.path.remove(str(CARDW_DIR))
+        except ValueError:
+            pass
+
+    returned_email = _norm_email(bundle.get("email") or target)
+    if returned_email and returned_email != target:
+        print(f"[session-only] 邮箱不匹配: target={target} returned={returned_email}")
+        return {"status": "email_mismatch", "email": target, "returned_email": returned_email}
+
+    session_token = str(bundle.get("session_token") or "")
+    access_token = str(bundle.get("access_token") or "")
+    cookie_header = str(bundle.get("cookie_header") or "")
+    if not (session_token and access_token):
+        print(
+            f"[session-only] ❌ {target} 未获得完整 session "
+            f"(session={len(session_token)} access={len(access_token)} cookie={len(cookie_header)})"
+        )
+        return {"status": "no_session", "email": target}
+
+    try:
+        wr = _update_registered_account_session_fields(target, bundle)
+    except Exception as e:
+        print(f"[session-only] 拿到 session 但写库失败: {e}")
+        return {"status": "write_failed", "email": target, "error": str(e)[:200]}
+    if wr.get("status") != "succeeded":
+        print(f"[session-only] 写库未生效: status={wr.get('status')} email={target}")
+        return wr
+
+    fields = wr.get("fields") or {}
+    print(
+        f"[session-only] ✅ {target} session 已写库 "
+        f"(session={len(session_token)} access={len(access_token)} "
+        f"cookie={len(cookie_header)} rt={len(str(fields.get('refresh_token') or ''))} "
+        f"id={wr.get('id')})"
+    )
+    return {
+        "status": "succeeded",
+        "email": target,
+        "id": wr.get("id"),
+        "session_token_len": len(session_token),
+        "access_token_len": len(access_token),
+        "cookie_header_len": len(cookie_header),
+        "refresh_token_len": len(str(fields.get("refresh_token") or "")),
+    }
+
+
+def session_only_targets(cardw_config_path: str | None, target_emails: list[str],
+                         proxy_stage_allocator=None, proxy_stage_plan=None) -> dict:
+    """批量 session-only：串行跑每个 email，汇总结果。"""
+    results = []
+    ok = 0
+    fail = 0
+    for em in target_emails:
+        em = (em or "").strip()
+        if not em:
+            continue
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = session_only_for_email(cardw_config_path, em, proxy_stage_plan=plan)
+        results.append(r)
+        if r.get("status") == "succeeded":
+            ok += 1
+        else:
+            fail += 1
+    print(f"\n[session-only] 完成: ok={ok} fail={fail} 共 {len(results)}")
+    return {"results": results, "ok": ok, "fail": fail}
 
 
 def pay_only_targets(card_config_path: str, target_emails: list[str], *,
@@ -5134,6 +5401,9 @@ def main():
                         help="配合 --rt-only 使用：即使账号已有 refresh_token 也强制重新补 RT 并覆盖写回")
     parser.add_argument("--rt-session-id", default="",
                         help="--rt-only 后补本次支付记录时使用的 checkout session_id")
+    parser.add_argument("--session-only", action="store_true",
+                        help="只对 --target-emails 跑已有账号协议登录：补 session_token/"
+                             "access_token/cookie_header 写回 DB（不注册不付款）")
     parser.add_argument("--proxy-mode", default="config",
                         choices=("config", "manual", "trojan-pool"),
                         help="代理来源：config=沿用配置，manual=使用 --proxy，trojan-pool=从 Trojan 池分配")
@@ -5210,6 +5480,22 @@ def main():
         target_emails_list: list[str] = []
         if args.target_emails:
             target_emails_list = [e.strip() for e in args.target_emails.split(",") if e.strip()]
+
+        if args.session_only:
+            if args.rt_only:
+                print("[ERROR] --session-only 与 --rt-only 互斥", file=sys.stderr)
+                sys.exit(2)
+            if not target_emails_list:
+                print("[ERROR] --session-only 必须配合 --target-emails 使用", file=sys.stderr)
+                sys.exit(2)
+            r = session_only_targets(
+                args.cardw_config,
+                target_emails_list,
+                proxy_stage_allocator=proxy_stage_allocator,
+                proxy_stage_plan=proxy_stage_plan,
+            )
+            print(f"\n结果: ok={r['ok']} fail={r['fail']}")
+            return
 
         if args.rt_only:
             if not target_emails_list:

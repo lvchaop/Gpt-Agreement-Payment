@@ -397,6 +397,7 @@
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unpushedIds.length === 0" @click="pushAllUnpushed">推送全部未推送 ({{ unpushedIds.length }})</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="payOnlySelected">选中跑 pay-only</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="rtOnlySelected">选中补 RT</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="sessionOnlySelected">选中补 session</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="deleteSelected">删除选中</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="invalidIds.length === 0" @click="deleteAllInvalid">删除所有失效 ({{ invalidIds.length }})</TermBtn>
           </div>
@@ -1411,6 +1412,33 @@ async function rtOnlySelected() {
       target_emails: emails,
     });
     message.success(`已对 ${emails.length} 个账号启动 rt-only`);
+    await refreshStatus();
+    if (status.value.running) openStream();
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || "启动失败");
+  } finally {
+    starting.value = false;
+  }
+}
+
+async function sessionOnlySelected() {
+  const emails = _selectedEmails();
+  if (!emails.length) { message.warning("没有选中账号"); return; }
+  const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
+  if (!confirm(`对 ${emails.length} 个选中账号跑 session-only（补 session_token/access_token/cookie，不注册不付款）？\n${preview}`)) return;
+  starting.value = true;
+  try {
+    await api.post("/run/start", {
+      mode: "single",
+      paypal: false,
+      gopay: false,
+      pay_only: false,
+      register_only: false,
+      session_only: true,
+      register_mode: form.value.register_mode || "browser",
+      target_emails: emails,
+    });
+    message.success(`已对 ${emails.length} 个账号启动 session-only`);
     await refreshStatus();
     if (status.value.running) openStream();
   } catch (e: any) {

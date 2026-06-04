@@ -1289,6 +1289,19 @@ def _merge_cookie_headers(*cookie_headers: str) -> str:
     return "; ".join(merged_parts)
 
 
+def _chatgpt_cookie_header_from_auth(auth_cfg: dict | None) -> str:
+    if not isinstance(auth_cfg, dict):
+        return ""
+    cookie_header = str(auth_cfg.get("cookie_header") or "").strip()
+    session_token = str(auth_cfg.get("session_token") or "").strip()
+    device_id = str(auth_cfg.get("device_id") or "").strip()
+    return _compose_cookie_header(
+        cookie_header,
+        session_token=session_token,
+        device_id=device_id,
+    )
+
+
 def _seed_session_cookies_from_header(session_obj, cookie_header: str, domain: str = ".chatgpt.com"):
     if not cookie_header or not hasattr(session_obj, "cookies"):
         return
@@ -2562,11 +2575,11 @@ def generate_fresh_checkout(
                     f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
                     if processor_entity else ""
                 )
-                if _fresh_checkout_requires_provider_url(fresh_cfg, payload) and not provider_url:
-                    raise RuntimeError(
-                        "provider_url_missing: hosted/provider checkout response 缺少 provider URL；"
-                        f"拒绝使用 canonical_url={canonical_chatgpt_url or '<empty>'}"
-                    )
+#                 if _fresh_checkout_requires_provider_url(fresh_cfg, payload) and not provider_url:
+#                     raise RuntimeError(
+#                         "provider_url_missing: hosted/provider checkout response 缺少 provider URL；"
+#                         f"拒绝使用 canonical_url={canonical_chatgpt_url or '<empty>'}"
+#                     )
                 fresh_url = _select_fresh_checkout_url(
                     provider_url=provider_url,
                     canonical_url=canonical_chatgpt_url,
@@ -3439,7 +3452,7 @@ def solve_hcaptcha(
 
         _log(f"      任务: {task_id}  等待解题 ...")
 
-     
+
         for attempt in range(60):
             time.sleep(3)
             try:
@@ -8975,6 +8988,7 @@ def _paypal_signup_node_rpa(
     sms_api_url: str = "",
     manual_otp_file: str = "",
     otp_timeout: int = 600,
+    chatgpt_cookie_header: str = "",
 ) -> bool:
     """Use the reference Node/Chromium PayPal RPA helper for guest checkout."""
     paypal_cfg["_last_node_rpa_result"] = {}
@@ -9101,6 +9115,14 @@ def _paypal_signup_node_rpa(
     if full_checkout and checkout_url:
         payload["checkoutUrl"] = checkout_url
         payload["fullCheckout"] = True
+        if chatgpt_cookie_header:
+            payload["chatgptCookieHeader"] = chatgpt_cookie_header
+            payload["chatgptCookieUrl"] = "https://chatgpt.com/"
+            _log(
+                "      [node-rpa] 注入 ChatGPT cookies: "
+                f"count={len([p for p in chatgpt_cookie_header.split(';') if '=' in p])} "
+                f"session={'yes' if '__Secure-next-auth.session-token' in chatgpt_cookie_header else 'no'}"
+            )
 
     for suffix in ("result.json", "state.json", "live.log", "last.json"):
         try:
@@ -10116,13 +10138,13 @@ def confirm_payment(
         "expected_payment_method_type": ctx.get("payment_method_type", "card"),
         "key": pk,
         "_stripe_version": ver,
-  
+
         "init_checksum": init_checksum,
-     
+
         "version": runtime_version,
-      
+
         "return_url": checkout_url,
-    
+
         "elements_session_client[elements_init_source]": "custom_checkout",
         "elements_session_client[referrer_host]": "chatgpt.com",
         "elements_session_client[stripe_js_id]": stripe_js_id,
@@ -10131,7 +10153,7 @@ def confirm_payment(
         "elements_session_client[session_id]": elements_session_id,
         "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
         "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
-  
+
         "client_attribution_metadata[client_session_id]": stripe_js_id,
         "client_attribution_metadata[checkout_session_id]": session_id,
         "client_attribution_metadata[checkout_config_id]": top_checkout_config_id,
@@ -10159,7 +10181,7 @@ def confirm_payment(
     if ctx.get("rv_timestamp"):
         data["rv_timestamp"] = ctx["rv_timestamp"]
 
-  
+
     if captcha_token:
         data["passive_captcha_token"] = captcha_token
     if captcha_ekey:
@@ -10175,7 +10197,7 @@ def confirm_payment(
         if not pm_id:
             raise RuntimeError("shared_payment_method 模式缺少 payment_method")
         data["payment_method"] = pm_id
-  
+
 
     url = f"{STRIPE_API}/v1/payment_pages/{session_id}/confirm"
     _log("[5/6] 确认支付 (confirm) ...")
@@ -10629,7 +10651,7 @@ def _handle_3ds(
         _log("      ⚠ 没有 setatt_ source, 跳过 3DS2 authenticate")
         raise RuntimeError("3DS 验证失败: 未获取到 setatt_ source, 无法完成认证")
 
-  
+
     if seti_id and client_secret:
         time.sleep(3)
         poll_url = f"{STRIPE_API}/v1/setup_intents/{seti_id}"
@@ -11389,6 +11411,7 @@ def run(
     chatgpt_account_email = str(
         fresh_cfg.get("_chatgpt_email") or fresh_auth_cfg.get("email") or ""
     ).strip()
+    node_chatgpt_cookie_header = _chatgpt_cookie_header_from_auth(fresh_auth_cfg)
     payment_contact_email = chatgpt_account_email or str(card.get("email") or "").strip()
 
     locale_key = cfg.get("locale", addr.get("country", "US")).upper()
@@ -11576,7 +11599,9 @@ def run(
             re.I,
         )
         hard_non_retry_pattern = re.compile(
-            r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号",
+            r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号|"
+            r"browserContext\.addCookies|Cookie should have either url or path|"
+            r"Protocol error|Executable doesn't exist|launch chromium|Cannot find module|SyntaxError|TypeError",
             re.I,
         )
 
@@ -11631,6 +11656,7 @@ def run(
                     sms_api_url=sms_api_url,
                     manual_otp_file=manual_otp_file,
                     otp_timeout=otp_timeout,
+                    chatgpt_cookie_header=node_chatgpt_cookie_header,
                 )
             finally:
                 paypal_cfg.pop("_defer_five_sim_finalize", None)
@@ -11667,6 +11693,11 @@ def run(
                     and not bool(hard_non_retry_pattern.search(result_hay))
                 )
             )
+            if hard_non_retry_pattern.search(result_hay):
+                raise RuntimeError(
+                    "PayPal Node full-checkout 本地启动/参数错误，停止业务重试: "
+                    f"{str(last_node_result.get('error') or '')[:240]}"
+                )
             if is_same_phone_retryable:
                 if node_attempt < max_node_attempts:
                     _log(
@@ -11860,18 +11891,18 @@ def run(
         _log(f"      stripe_url: {stripe_checkout_url}")
         if browser_checkout_url != stripe_checkout_url:
             _log(f"      browser_checkout_url: {browser_checkout_url[:160]}")
-        if (
-            isinstance(fresh_info, dict)
-            and _fresh_checkout_requires_provider_url(
-                fresh_cfg,
-                fresh_info.get("checkout_payload") if isinstance(fresh_info.get("checkout_payload"), dict) else {},
-            )
-            and "chatgpt.com/checkout/" in browser_checkout_url.lower()
-        ):
-            raise RuntimeError(
-                "provider_url_missing: hosted/provider checkout 缺少真实 provider URL；"
-                f"拒绝跳转 browser_checkout_url={browser_checkout_url[:180]}"
-            )
+#         if (
+#             isinstance(fresh_info, dict)
+#             and _fresh_checkout_requires_provider_url(
+#                 fresh_cfg,
+#                 fresh_info.get("checkout_payload") if isinstance(fresh_info.get("checkout_payload"), dict) else {},
+#             )
+#             and "chatgpt.com/checkout/" in browser_checkout_url.lower()
+#         ):
+#             raise RuntimeError(
+#                 "provider_url_missing: hosted/provider checkout 缺少真实 provider URL；"
+#                 f"拒绝跳转 browser_checkout_url={browser_checkout_url[:180]}"
+#             )
 
         if node_full_checkout_requested:
             result = _run_paypal_node_full_checkout_only(
@@ -12105,14 +12136,14 @@ def run(
     with _http_session_stage_proxy(http, stage_proxy_cfg, "telemetry_init"):
         send_telemetry_batch(http, session_id, init_ctx, phase="init")
 
-   
+
     _log("[2c/6] 获取 elements session ...")
     with _http_session_stage_proxy(http, stage_proxy_cfg, "elements"):
         elements_resp = fetch_elements_session(
             http, pk, session_id, init_ctx, stripe_ver=stripe_ver, locale_profile=locale_profile
         )
 
-   
+
     _log("[2d/6] 查询 Link 消费者 ...")
     with _http_session_stage_proxy(http, stage_proxy_cfg, "link_lookup"):
         lookup_consumer(
@@ -12125,12 +12156,12 @@ def run(
             init_resp=init_resp,
         )
 
-  
+
     _log("[2e/6] 逐字段提交地址 ...")
     with _http_session_stage_proxy(http, stage_proxy_cfg, "address"):
         update_payment_page_address(http, pk, session_id, card, init_ctx, stripe_ver=stripe_ver)
 
-    
+
     with _http_session_stage_proxy(http, stage_proxy_cfg, "telemetry_address"):
         send_telemetry_batch(http, session_id, init_ctx, phase="address")
 
@@ -12460,7 +12491,9 @@ def run(
             re.I,
         )
         hard_non_retry_pattern = re.compile(
-            r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号",
+            r"missing_signup_card|helper_missing|missing_card_number|PayPal Node full-checkout 缺少手机号|"
+            r"browserContext\.addCookies|Cookie should have either url or path|"
+            r"Protocol error|Executable doesn't exist|launch chromium|Cannot find module|SyntaxError|TypeError",
             re.I,
         )
 
@@ -12536,6 +12569,7 @@ def run(
                     sms_api_url=sms_api_url,
                     manual_otp_file=manual_otp_file,
                     otp_timeout=otp_timeout,
+                    chatgpt_cookie_header=node_chatgpt_cookie_header,
                 )
             finally:
                 paypal_cfg.pop("_defer_five_sim_finalize", None)
@@ -12559,6 +12593,11 @@ def run(
                     and not bool(hard_non_retry_pattern.search(result_hay))
                 )
             )
+            if hard_non_retry_pattern.search(result_hay):
+                raise RuntimeError(
+                    "PayPal Node full-checkout 本地启动/参数错误，停止业务重试: "
+                    f"{str(last_node_result.get('error') or '')[:240]}"
+                )
             if is_same_phone_retryable:
                 if node_attempt < max_node_attempts:
                     _log(
@@ -12683,7 +12722,7 @@ def run(
                         continue
                 raise
 
-  
+
     with _http_session_stage_proxy(http, stage_proxy_cfg, "telemetry_poll"):
         send_telemetry_batch(http, session_id, init_ctx, phase="poll")
 

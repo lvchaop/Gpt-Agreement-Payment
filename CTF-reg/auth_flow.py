@@ -580,6 +580,20 @@ class AuthFlow:
         return str(os.getenv(name, default)).lower() in ("1", "true", "yes", "on")
 
     @staticmethod
+    def _is_try_again_later_response(resp) -> bool:
+        if resp is None or getattr(resp, "status_code", None) != 400:
+            return False
+        text = (getattr(resp, "text", "") or "").lower()
+        return "please try again later" in text or "try again later" in text
+
+    @staticmethod
+    def _retry_count_env(name: str, default: int = 2) -> int:
+        try:
+            return max(1, int(os.getenv(name, str(default)) or default))
+        except Exception:
+            return default
+
+    @staticmethod
     def _b64url_no_pad(raw: bytes) -> str:
         return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
@@ -1773,6 +1787,12 @@ class AuthFlow:
         if login_hint or screen_hint or prompt:
             if not self.result.device_id:
                 self.result.device_id = str(uuid.uuid4())
+            try:
+                self.session.cookies.set("oai-did", self.result.device_id, domain=".openai.com", path="/")
+                self.session.cookies.set("oai-did", self.result.device_id, domain=".auth.openai.com", path="/")
+                self.session.cookies.set("oai-did", self.result.device_id, domain=".chatgpt.com", path="/")
+            except Exception:
+                pass
             if prompt:
                 query["prompt"] = prompt
             elif default_prompt:
@@ -1842,8 +1862,14 @@ class AuthFlow:
                 device_id = m.group(1)
 
         if not device_id:
-            device_id = str(uuid.uuid4())
-            logger.warning(f"未从响应中获取 device_id，使用生成值: {device_id}")
+            device_id = self.result.device_id or str(uuid.uuid4())
+            logger.warning(f"未从响应中获取 device_id，使用已有/生成值: {device_id}")
+            try:
+                self.session.cookies.set("oai-did", device_id, domain=".openai.com", path="/")
+                self.session.cookies.set("oai-did", device_id, domain=".auth.openai.com", path="/")
+                self.session.cookies.set("oai-did", device_id, domain=".chatgpt.com", path="/")
+            except Exception:
+                pass
 
         self.result.device_id = device_id
         logger.info(f"Device ID: {device_id}")
@@ -2130,13 +2156,33 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
-        resp = self.session.post(
-            "https://auth.openai.com/api/accounts/password/verify",
-            headers=headers,
-            json={"password": password},
-            timeout=30,
-        )
-        self._trace_http("login_password_verify", resp)
+        max_attempts = self._retry_count_env("AUTH_PASSWORD_TRY_AGAIN_RETRIES", 5)
+        resp = None
+        for attempt in range(1, max_attempts + 1):
+            logger.info("提交登录密码 attempt=%s/%s", attempt, max_attempts)
+            resp = self.session.post(
+                "https://auth.openai.com/api/accounts/password/verify",
+                headers=headers,
+                json={"password": password},
+                timeout=30,
+            )
+            self._trace_http(
+                "login_password_verify" if attempt == 1 else f"login_password_verify_retry_{attempt}",
+                resp,
+            )
+            if resp.status_code == 200:
+                break
+            if self._is_try_again_later_response(resp) and attempt < max_attempts:
+                wait_s = min(2.0 * attempt, 5.0)
+                logger.warning(
+                    "密码登录返回 400 Please try again later，重提相同密码 attempt=%s/%s wait=%.1fs",
+                    attempt + 1,
+                    max_attempts,
+                    wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            break
         if resp.status_code != 200:
             body = (resp.text or "")[:260]
             raise RuntimeError(f"密码登录失败: {resp.status_code} - {body}")
@@ -2150,13 +2196,33 @@ class AuthFlow:
         logger.info("[7/10] 验证 OTP...")
         headers = self._common_headers("https://auth.openai.com/email-verification")
         headers["Content-Type"] = "application/json"
-        resp = self.session.post(
-            "https://auth.openai.com/api/accounts/email-otp/validate",
-            headers=headers,
-            json={"code": otp_code},
-            timeout=30,
-        )
-        self._trace_http("validate_email_otp", resp)
+        max_attempts = self._retry_count_env("AUTH_OTP_TRY_AGAIN_RETRIES", 5)
+        resp = None
+        for attempt in range(1, max_attempts + 1):
+            logger.info("提交邮箱 OTP attempt=%s/%s", attempt, max_attempts)
+            resp = self.session.post(
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers=headers,
+                json={"code": otp_code},
+                timeout=30,
+            )
+            self._trace_http(
+                "validate_email_otp" if attempt == 1 else f"validate_email_otp_retry_{attempt}",
+                resp,
+            )
+            if resp.status_code == 200:
+                break
+            if self._is_try_again_later_response(resp) and attempt < max_attempts:
+                wait_s = min(2.0 * attempt, 5.0)
+                logger.warning(
+                    "OTP 验证返回 400 Please try again later，用同一验证码重试 attempt=%s/%s wait=%.1fs",
+                    attempt + 1,
+                    max_attempts,
+                    wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            break
         if resp.status_code != 200:
             body = (resp.text or "")[:260]
             raise RuntimeError(f"OTP 验证失败: {resp.status_code} - {body}")
@@ -2434,17 +2500,37 @@ class AuthFlow:
         self._trace_http("chatgpt_auth_session", resp)
         resp.raise_for_status()
 
-        session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
-        access_token = resp.json().get("accessToken", "")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        session_token = (
+            self.session.cookies.get("__Secure-next-auth.session-token", "")
+            or (data.get("sessionToken", "") if isinstance(data, dict) else "")
+        )
+        access_token = data.get("accessToken", "") if isinstance(data, dict) else ""
 
         if session_token:
             self.result.session_token = session_token
+            try:
+                self.session.cookies.set(
+                    "__Secure-next-auth.session-token",
+                    session_token,
+                    domain=".chatgpt.com",
+                    path="/",
+                )
+            except Exception:
+                pass
         if access_token:
             self.result.access_token = access_token
         self.result.cookie_header = self._build_chatgpt_cookie_header()
 
-        logger.info(f"session_token: {'有' if session_token else '无'}, "
-                     f"access_token: {'有' if access_token else '无'}")
+        logger.info(
+            "session_token: %s, access_token: %s, json_keys=%s",
+            "有" if session_token else "无",
+            "有" if access_token else "无",
+            list(data.keys())[:12] if isinstance(data, dict) else [],
+        )
         return session_token, access_token
 
     # ── 可选: OAuth Token 交换 ──
@@ -2835,7 +2921,16 @@ class AuthFlow:
 
         # 登录/注册链路
         csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token)
+        if existing_only:
+            auth_url = self.get_auth_url(
+                csrf_token,
+                login_hint=email,
+                screen_hint="login",
+                prompt="login",
+                default_prompt="login",
+            )
+        else:
+            auth_url = self.get_auth_url(csrf_token)
         device_id = self.auth_oauth_init(auth_url)
         sentinel = self.get_sentinel_token(device_id)
         is_new = self.signup(email, sentinel)
@@ -3067,10 +3162,18 @@ class AuthFlow:
         return self.result
 
     # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
-    def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
+    def run_protocol_login(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+        *,
+        existing_only: bool = False,
+    ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
         - 适配 passwordless / login_password 两类已有账号入口
+        - existing_only=True 时只走登录，不回退 signup/register
         - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
         """
         if not (email or "").strip():
@@ -3137,12 +3240,20 @@ class AuthFlow:
                         (continue_url or "")[:180] or "(empty)",
                     )
             except Exception as e:
+                if existing_only:
+                    logger.warning(f"login screen_hint 失败，existing_only 不回退 signup: {e}")
+                    raise
                 logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
                 continue_url = ""
                 page_type = ""
                 mode = ""
 
         if not continue_url and page_type not in ("login_password", "email_otp_verification"):
+            if existing_only:
+                raise RuntimeError(
+                    "existing_only 登录未进入 password/otp 分支: "
+                    f"page_type={page_type or '(empty)'} continue_url={(continue_url or '')[:180]}"
+                )
             is_new = self.signup(email, sentinel)
             if is_new:
                 logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
@@ -3214,7 +3325,7 @@ class AuthFlow:
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
-            if pre_exchange:
+            if pre_exchange and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
                 self.oauth_token_exchange(continue_url, continue_url)
             callback_url, final_url = self.follow_redirect_chain(continue_url)
             if (not callback_url) and final_url and ("/workspace" in final_url):
@@ -3227,7 +3338,8 @@ class AuthFlow:
 
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
-            self.oauth_token_exchange(callback_url or "", continue_url or "")
+            if not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self.oauth_token_exchange(callback_url or "", continue_url or "")
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
