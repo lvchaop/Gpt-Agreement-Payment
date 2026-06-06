@@ -1460,16 +1460,19 @@ async function sessionOnlySelected() {
   const { emails, batchNote } = _selectedEmailsForBatch();
   if (!emails.length) { message.warning("没有选中账号"); return; }
   const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
-  if (!confirm(`对 ${emails.length} 个选中账号跑 session-only（补 session_token/access_token/cookie，不注册不付款）？${batchNote}\n${preview}`)) return;
+  const workers = Math.max(1, Number(form.value.workers || 1));
+  if (!confirm(`对 ${emails.length} 个选中账号跑 session-only（补 session_token/access_token/cookie，不注册不付款）？${batchNote}\n${preview}\n\nworkers=${workers}`)) return;
   starting.value = true;
   try {
     await api.post("/run/start", {
-      mode: "single",
+      mode: emails.length > 1 ? "batch" : "single",
       paypal: false,
       gopay: false,
       pay_only: false,
       register_only: false,
       session_only: true,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers,
       register_mode: form.value.register_mode || "browser",
       target_emails: emails,
     });

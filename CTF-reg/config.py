@@ -132,6 +132,11 @@ class PortalProtocolConfig:
     client_id: str = "00000000480728C5"
     scope: str = "profile offline_access openid service::outlook.office.com::MBI_SSL"
     redirect_uri: str = "https://login.live.com/oauth20_desktop.srf"
+    mail_oauth_enabled: bool = True
+    mail_oauth_client_id: str = "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
+    mail_oauth_scope: str = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+    mail_oauth_redirect_uri: str = "http://localhost"
+    mail_oauth_prompt: str = "consent"
     locale: str = "zh-CN"
     user_agent: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) PKeyAuth/1.0"
     accept_language: str = "zh-CN,zh-Hans;q=0.9"

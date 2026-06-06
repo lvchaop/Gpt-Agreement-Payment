@@ -2373,6 +2373,20 @@ def generate_fresh_checkout(
             "未提供 fresh_checkout.auth.access_token，且也无法通过 session_token/cookie 刷新"
         )
 
+    # ChatGPT backend endpoints reject oversized Cookie headers (HTTP 431).
+    # Some current session tokens are 4KB+, so after using them to refresh the
+    # access token, keep checkout cookies lean and authenticate with Bearer.
+    checkout_cookie_header = _compose_cookie_header(
+        bootstrap_cookie_header or bootstrap.get("cookie_header", ""),
+        device_id=oai_device_id,
+    )
+    if len(cookie_header) > 4096 and len(checkout_cookie_header) < len(cookie_header):
+        _log(
+            "      [fresh] checkout cookie 过大，后续请求改用精简 cookie "
+            f"({len(cookie_header)} -> {len(checkout_cookie_header)})"
+        )
+        cookie_header = checkout_cookie_header
+
     extracted_email = (
         (auth_data.get("user") or {}).get("email", "")
         or _extract_email_from_access_token(access_token)
@@ -2420,6 +2434,16 @@ def generate_fresh_checkout(
         session_token = warm_result.get("session_token") or session_token
         access_token = warm_result.get("access_token") or access_token
         oai_device_id = warm_result.get("device_id") or oai_device_id
+        warmed_checkout_cookie = _compose_cookie_header(
+            bootstrap_cookie_header or bootstrap.get("cookie_header", ""),
+            device_id=oai_device_id,
+        )
+        if len(cookie_header) > 4096 and len(warmed_checkout_cookie) < len(cookie_header):
+            _log(
+                "      [fresh] 预热后 cookie 过大，checkout 继续使用精简 cookie "
+                f"({len(cookie_header)} -> {len(warmed_checkout_cookie)})"
+            )
+            cookie_header = warmed_checkout_cookie
         _log(
             "      [fresh] 预热后凭证: "
             f"access_token={'yes' if access_token else 'no'} "

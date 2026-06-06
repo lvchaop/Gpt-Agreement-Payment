@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import sys
+import types
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -15,7 +16,7 @@ if str(REG_DIR) not in sys.path:
 
 from config import Config
 from portal_identity import generate_password, next_username
-from portal_protocol import PortalProtocol, PortalSignupState
+from portal_protocol import PortalProtocol, PortalSignupState, detect_outlook_challenge, portal_protocol_register
 
 
 def test_portal_identity_username_shape_and_password_policy(tmp_path):
@@ -44,6 +45,7 @@ class _FakeResponse:
         self.text = text
         self._data = data
         self.status_code = status_code
+        self.headers = {}
 
     def json(self):
         if self._data is None:
@@ -150,6 +152,7 @@ def test_portal_protocol_uses_hmac_identity_and_live_api_shape(tmp_path):
     cfg.portal_protocol.state_path = str(tmp_path / "identity.json")
     cfg.portal_protocol.namespace = "test-portal"
     cfg.portal_protocol.account_domain = "outlook.com"
+    cfg.portal_protocol.mail_oauth_enabled = False
 
     result = PortalProtocol(cfg, session=session).run().to_dict()
 
@@ -166,6 +169,9 @@ def test_portal_protocol_uses_hmac_identity_and_live_api_shape(tmp_path):
     create_headers = next(headers for url, headers in session.post_headers if "CreateAccount" in url)
     assert create_headers["client-request-id"] == "uaid123"
     assert create_headers["correlationId"] == "uaid123"
+    authorize_url = next(url for url in session.gets if "oauth20_authorize.srf" in url)
+    authorize_qs = parse_qs(urlparse(authorize_url).query)
+    assert authorize_qs["client_id"] == ["00000000480728C5"]
 
     fpt_headers = next(headers for url, headers in session.get_headers if "fpt.live.com/?session_id=uaid123" in url)
     assert fpt_headers["Sec-Fetch-Site"] == "same-site"
@@ -178,6 +184,62 @@ def test_portal_protocol_uses_hmac_identity_and_live_api_shape(tmp_path):
     assert "fh=07d7339f27cd6608358c55b7fda0f9ec" in esi
     assert "c=bdef6bc2985d5a701a6bf7d693ef085b" in esi
     assert '"vdr":"WebKit"' in eci
+
+
+def test_portal_protocol_mail_oauth_uses_separate_client_id(tmp_path, monkeypatch):
+    server_data = {
+        "apiCanary": "initial-canary",
+        "sUnauthSessionID": "uaid123",
+        "sClientId": "cid",
+        "sMkt": "zh-CN",
+        "hpgid": 200225,
+        "iUiFlavor": 1,
+        "iScenarioId": 100118,
+        "urlCheckAvailableSigninNames": "https://signup.live.com/API/CheckAvailableSigninNames",
+        "urlCreateAccount": "https://signup.live.com/API/CreateAccount",
+        "urlClientExperiment": "https://signup.live.com/API/EvaluateExperimentAssignments",
+    }
+    signup_html = f"<html><script>var ServerData = {json.dumps(server_data)};</script></html>"
+    session = _FakeSession(signup_html)
+    captured = {}
+
+    class FakeOAuth:
+        client_id = "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
+
+        def to_mail_fields(self):
+            return {
+                "mail_account_id": self.client_id,
+                "mail_access_token": "mail-at",
+                "mail_refresh_token": "mail-rt",
+                "mail_oauth_scope": "offline_access test.scope",
+            }
+
+    def fake_authorize(cfg, used_session, *, email, password):
+        captured["client_id"] = cfg.portal_protocol.client_id
+        captured["mail_oauth_client_id"] = cfg.portal_protocol.mail_oauth_client_id
+        captured["same_session"] = used_session is session
+        captured["email"] = email
+        captured["password"] = password
+        return FakeOAuth()
+
+    fake_mod = types.ModuleType("outlook_oauth")
+    fake_mod.authorize_outlook_mailbox = fake_authorize
+    monkeypatch.setitem(sys.modules, "outlook_oauth", fake_mod)
+
+    cfg = Config()
+    cfg.portal_protocol.state_path = str(tmp_path / "identity.json")
+    cfg.portal_protocol.namespace = "test-portal"
+    cfg.portal_protocol.account_domain = "outlook.com"
+
+    result = PortalProtocol(cfg, session=session).run().to_dict()
+
+    assert captured["client_id"] == "00000000480728C5"
+    assert captured["mail_oauth_client_id"] == "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
+    assert captured["same_session"] is True
+    assert captured["email"] == result["email"]
+    assert captured["password"] == result["password"]
+    assert result["mail_account_id"] == "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
+    assert result["mail_refresh_token"] == "mail-rt"
 
 
 def test_portal_protocol_retries_birthdate_error_with_same_account(tmp_path):
@@ -202,6 +264,7 @@ def test_portal_protocol_retries_birthdate_error_with_same_account(tmp_path):
     cfg.portal_protocol.namespace = "test-portal"
     cfg.portal_protocol.account_domain = "outlook.com"
     cfg.portal_protocol.country = "JP"
+    cfg.portal_protocol.mail_oauth_enabled = False
 
     result = PortalProtocol(cfg, session=session).run().to_dict()
 
@@ -249,3 +312,85 @@ def test_portal_birth_date_formats_by_country_not_server_display_order():
     assert re.fullmatch(r"\d{2}:\d{2}:\d{4}", mdy)
     assert mdy_order == "MDY"
     assert mdy_source == "country:US"
+
+
+def test_detect_outlook_challenge_markers():
+    px_resp = _FakeResponse(url="https://signup.live.com/", text='<div id="px-captcha">Press and hold</div>')
+    assert detect_outlook_challenge(px_resp) == ("perimeterx", "px-captcha")
+
+    reason, marker = detect_outlook_challenge(data={"error": {"field": "hipChallenge", "data": "GetHIP"}})
+    assert reason == "microsoft_hip"
+    assert marker in {"hipchallenge", "gethip"}
+
+    reason, marker = detect_outlook_challenge(data={"error": {"field": "humanCaptcha", "code": "1059"}})
+    assert reason == "generic_challenge"
+    assert marker == "humancaptcha"
+
+
+def test_portal_authorize_ignores_har_hsprotect_weak_marker():
+    cfg = Config()
+    portal = PortalProtocol(cfg, session=_FakeSession("<html></html>"))
+    resp = _FakeResponse(url="https://signup.live.com/signup", text="<script src='https://hsprotect.net/foo.js'></script>")
+
+    portal._raise_if_challenge(resp, stage="authorize/signup")
+
+
+def test_portal_protocol_challenge_falls_back_to_outlook_browser(tmp_path, monkeypatch):
+    server_data = {
+        "apiCanary": "initial-canary",
+        "sUnauthSessionID": "uaid123",
+        "sClientId": "cid",
+        "sMkt": "zh-CN",
+        "hpgid": 200225,
+        "iUiFlavor": 1,
+        "iScenarioId": 100118,
+        "urlCheckAvailableSigninNames": "https://signup.live.com/API/CheckAvailableSigninNames",
+        "urlCreateAccount": "https://signup.live.com/API/CreateAccount",
+        "urlClientExperiment": "https://signup.live.com/API/EvaluateExperimentAssignments",
+    }
+    signup_html = f"<html><script>var ServerData = {json.dumps(server_data)};</script></html>"
+
+    class ChallengeSession(_FakeSession):
+        def post(self, url, json=None, data=None, **kwargs):
+            if "CheckAvailableSigninNames" in url:
+                return _FakeResponse(url=url, data={
+                    "error": {
+                        "field": "hipChallenge",
+                        "data": "GetHIP",
+                    }
+                })
+            return super().post(url, json=json, data=data, **kwargs)
+
+    captured = {}
+
+    def fake_browser_register(cfg, *, email="", password="", username_seq=0, challenge_reason=""):
+        captured.update({
+            "email": email,
+            "password": password,
+            "username_seq": username_seq,
+            "challenge_reason": challenge_reason,
+        })
+        return {
+            "email": email,
+            "password": password,
+            "register_method": "portal_browser",
+        }
+
+    fake_mod = types.ModuleType("outlook_browser_register")
+    fake_mod.outlook_browser_register = fake_browser_register
+    monkeypatch.setitem(sys.modules, "outlook_browser_register", fake_mod)
+
+    cfg = Config()
+    cfg.portal_protocol.state_path = str(tmp_path / "identity.json")
+    cfg.portal_protocol.namespace = "test-portal"
+    cfg.portal_protocol.account_domain = "outlook.com"
+    cfg.portal_protocol.mail_oauth_enabled = False
+
+    result = portal_protocol_register(cfg, session=ChallengeSession(signup_html))
+
+    assert result["register_method"] == "portal_browser"
+    assert result["email"].endswith("@outlook.com")
+    assert captured["email"] == result["email"]
+    assert captured["password"] == result["password"]
+    assert captured["username_seq"] == 1
+    assert captured["challenge_reason"] == "microsoft_hip"

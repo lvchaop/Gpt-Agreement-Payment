@@ -38,6 +38,29 @@ class PortalProtocolError(RuntimeError):
     """Raised when the portal protocol flow cannot complete."""
 
 
+class PortalChallengeError(PortalProtocolError):
+    """Raised when Live signup returns a browser challenge."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        stage: str = "",
+        email: str = "",
+        password: str = "",
+        username_seq: int = 0,
+        marker: str = "",
+    ):
+        self.reason = reason
+        self.stage = stage
+        self.email = email
+        self.password = password
+        self.username_seq = username_seq
+        self.marker = marker
+        suffix = f" marker={marker}" if marker else ""
+        super().__init__(f"portal challenge detected stage={stage or '<unknown>'} reason={reason}{suffix}")
+
+
 @dataclass
 class PortalSignupState:
     signup_url: str
@@ -60,6 +83,10 @@ class PortalProtocolResult:
     username_seq: int
     final_url: str = ""
     oauth_code_captured: bool = False
+    mail_oauth_client_id: str = ""
+    mail_access_token: str = ""
+    mail_refresh_token: str = ""
+    mail_oauth_scope: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -76,6 +103,11 @@ class PortalProtocolResult:
             "portal_username_seq": self.username_seq,
             "portal_final_url": self.final_url,
             "portal_oauth_code_captured": self.oauth_code_captured,
+            "mail_oauth_client_id": self.mail_oauth_client_id,
+            "mail_account_id": self.mail_oauth_client_id,
+            "mail_access_token": self.mail_access_token,
+            "mail_refresh_token": self.mail_refresh_token,
+            "mail_oauth_scope": self.mail_oauth_scope,
         }
 
 
@@ -156,6 +188,75 @@ def _json_or_error(resp, label: str) -> dict:
     return data
 
 
+_CHALLENGE_MARKERS: dict[str, tuple[str, ...]] = {
+    "perimeterx": (
+        "perimeterx",
+        "px-captcha",
+        "_px.init",
+        "_pxhd",
+        "pxvid",
+        "px3",
+        "pxde",
+        "px-block",
+        "hsprotect",
+        "press and hold",
+        "bot protection",
+        "按住",
+        "长按",
+    ),
+    "arkose": (
+        "arkose",
+        "funcaptcha",
+        "arkose_enforcement",
+        "enforcement",
+        "fc-token",
+    ),
+    "microsoft_hip": (
+        "hiptemplatecontainer",
+        "hippaneform",
+        "gethip",
+        "hipchallenge",
+    ),
+    "generic_challenge": (
+        "humancaptcha",
+        "verify you are human",
+        "security check",
+        "unusual activity",
+        "challenge-platform",
+    ),
+}
+
+
+def detect_outlook_challenge(resp: Any = None, data: Any = None) -> tuple[str, str]:
+    """Return (reason, marker) when a Live/Outlook challenge is visible.
+
+    The protocol lane should not treat bare HTTP status as a challenge.  We only
+    trigger on concrete Live/PerimeterX/Arkose/HIP markers found in URL,
+    Location, HTML, or JSON payloads.
+    """
+    parts: list[str] = []
+    if resp is not None:
+        parts.append(str(getattr(resp, "url", "") or ""))
+        try:
+            parts.append(str((getattr(resp, "headers", {}) or {}).get("Location", "") or ""))
+        except Exception:
+            pass
+        parts.append(str(getattr(resp, "text", "") or ""))
+    if data is not None:
+        try:
+            parts.append(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        except Exception:
+            parts.append(str(data))
+    haystack = "\n".join(parts).lower()
+    if not haystack:
+        return "", ""
+    for reason, markers in _CHALLENGE_MARKERS.items():
+        for marker in markers:
+            if marker.lower() in haystack:
+                return reason, marker
+    return "", ""
+
+
 def _attrs(tag: str) -> dict[str, str]:
     attrs: dict[str, str] = {}
     for match in re.finditer(r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(['\"])(.*?)\2", tag, re.S):
@@ -196,7 +297,7 @@ class PortalProtocol:
         self.timeout = float(_cfg_value(cfg, "timeout_s", 30) or 30)
         self.user_agent = str(_cfg_value(cfg, "user_agent", PORTAL_USER_AGENT) or PORTAL_USER_AGENT)
         self.accept_language = str(_cfg_value(cfg, "accept_language", "zh-CN,zh-Hans;q=0.9") or "zh-CN,zh-Hans;q=0.9")
-        self.session = session or create_http_session(proxy=cfg.proxy, impersonate="chrome136")
+        self.session = session or create_http_session(proxy=cfg.proxy, impersonate="chrome131")
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -322,12 +423,21 @@ class PortalProtocol:
             )
             email = f"{username}@{account_domain}"
             password = generate_password(12)
-            available, state = self._check_name(state, email)
-            if not available:
-                last_error = f"{email} unavailable"
-                logger.info("[portal-protocol] username unavailable attempt=%s email=%s", attempt, email)
-                continue
-            create_data = self._create_account(state, email, password)
+            try:
+                available, state = self._check_name(state, email)
+                if not available:
+                    last_error = f"{email} unavailable"
+                    logger.info("[portal-protocol] username unavailable attempt=%s email=%s", attempt, email)
+                    continue
+                create_data = self._create_account(state, email, password)
+            except PortalChallengeError as e:
+                if not e.email:
+                    e.email = email
+                if not e.password:
+                    e.password = password
+                if not e.username_seq:
+                    e.username_seq = seq
+                raise
             redirect_url = str(create_data.get("redirectUrl") or "").strip()
             if not redirect_url:
                 raise PortalProtocolError("CreateAccount 成功响应缺少 redirectUrl")
@@ -335,12 +445,22 @@ class PortalProtocol:
             parsed_final = urlparse(final_url)
             code_captured = bool(parse_qs(parsed_final.query).get("code"))
             logger.info("[portal-protocol] created email=%s seq=%s oauth_code=%s", email, seq, code_captured)
+            mail_fields: dict[str, str] = {}
+            if bool(_cfg_value(self.cfg, "mail_oauth_enabled", True)):
+                from outlook_oauth import authorize_outlook_mailbox
+
+                mail_oauth = authorize_outlook_mailbox(self.cfg, self.session, email=email, password=password)
+                mail_fields = mail_oauth.to_mail_fields()
             return PortalProtocolResult(
                 email=email,
                 password=password,
                 username_seq=seq,
                 final_url=urlunparse(parsed_final._replace(query="")),
                 oauth_code_captured=code_captured,
+                mail_oauth_client_id=mail_fields.get("mail_account_id", ""),
+                mail_access_token=mail_fields.get("mail_access_token", ""),
+                mail_refresh_token=mail_fields.get("mail_refresh_token", ""),
+                mail_oauth_scope=mail_fields.get("mail_oauth_scope", ""),
             )
 
         raise PortalProtocolError(last_error or "没有可用用户名")
@@ -380,6 +500,7 @@ class PortalProtocol:
             allow_redirects=True,
         )
         self._raise_for_status(resp, "authorize/signup")
+        self._raise_if_challenge(resp, stage="authorize/signup")
         signup_url = getattr(resp, "url", "") or ""
         data = _extract_server_data(getattr(resp, "text", "") or "")
         api_canary = str(data.get("apiCanary") or "").strip()
@@ -615,6 +736,7 @@ class PortalProtocol:
         )
         self._raise_for_status(resp, "CheckAvailableSigninNames")
         data = _json_or_error(resp, "CheckAvailableSigninNames")
+        self._raise_if_challenge(resp, data, stage="CheckAvailableSigninNames", email=email)
         canary_updated = bool(data.get("apiCanary"))
         if data.get("apiCanary"):
             state.api_canary = str(data["apiCanary"])
@@ -740,6 +862,7 @@ class PortalProtocol:
             )
             self._raise_for_status(resp, "CreateAccount")
             data = _json_or_error(resp, "CreateAccount")
+            self._raise_if_challenge(resp, data, stage="CreateAccount", email=email, password=password)
             if data.get("apiCanary"):
                 state.api_canary = str(data["apiCanary"])
             if data.get("error"):
@@ -792,6 +915,7 @@ class PortalProtocol:
         logger.info("[portal-protocol] redirect start url=%s", self._safe_url_label(redirect_url))
         resp = self.session.post(redirect_url, data={}, timeout=self.timeout, allow_redirects=True)
         self._raise_for_status(resp, "post-create redirect")
+        self._raise_if_challenge(resp, stage="post-create redirect")
         for _ in range(8):
             current_url = getattr(resp, "url", "") or redirect_url
             logger.info(
@@ -817,15 +941,58 @@ class PortalProtocol:
                 else:
                     resp = self.session.get(action, params=fields, timeout=self.timeout, allow_redirects=True)
                 self._raise_for_status(resp, "html form redirect")
+                self._raise_if_challenge(resp, stage="html form redirect")
                 continue
             next_url = _redirect_from_html(text, current_url)
             if next_url:
                 logger.info("[portal-protocol] redirect html url=%s", self._safe_url_label(next_url))
                 resp = self.session.get(next_url, timeout=self.timeout, allow_redirects=True)
                 self._raise_for_status(resp, "html redirect")
+                self._raise_if_challenge(resp, stage="html redirect")
                 continue
             return current_url
         return getattr(resp, "url", "") or redirect_url
+
+    def _raise_if_challenge(
+        self,
+        resp: Any = None,
+        data: Any = None,
+        *,
+        stage: str = "",
+        email: str = "",
+        password: str = "",
+        username_seq: int = 0,
+    ) -> None:
+        reason, marker = detect_outlook_challenge(resp, data)
+        if not reason:
+            return
+        weak_initial_markers = {"hsprotect", "pxvid", "px3", "pxde"}
+        if stage == "authorize/signup" and reason == "perimeterx" and marker in weak_initial_markers:
+            logger.info(
+                "[portal-protocol] weak challenge marker ignored stage=%s reason=%s marker=%s url=%s",
+                stage,
+                reason,
+                marker,
+                self._safe_url_label(getattr(resp, "url", "") or "") if resp is not None else "",
+            )
+            return
+        logger.warning(
+            "[portal-protocol] challenge detected stage=%s reason=%s marker=%s status=%s url=%s email=%s",
+            stage or "<unknown>",
+            reason,
+            marker or "<none>",
+            getattr(resp, "status_code", "") if resp is not None else "",
+            self._safe_url_label(getattr(resp, "url", "") or "") if resp is not None else "",
+            email or "<none>",
+        )
+        raise PortalChallengeError(
+            reason,
+            stage=stage,
+            email=email,
+            password=password,
+            username_seq=username_seq,
+            marker=marker,
+        )
 
     @staticmethod
     def _raise_for_status(resp, label: str) -> None:
@@ -835,5 +1002,47 @@ class PortalProtocol:
             raise PortalProtocolError(f"{label} HTTP {status}: {text}")
 
 
-def portal_protocol_register(cfg: Config) -> dict:
-    return PortalProtocol(cfg).run().to_dict()
+def portal_protocol_register(cfg: Config, session=None) -> dict:
+    fallback_enabled = str(os.environ.get("PORTAL_BROWSER_FALLBACK", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    try:
+        return PortalProtocol(cfg, session=session).run().to_dict()
+    except PortalChallengeError as e:
+        if not fallback_enabled:
+            raise
+        logger.info(
+            "[portal-protocol] falling back to Camoufox Outlook browser flow reason=%s stage=%s email=%s",
+            e.reason,
+            e.stage or "<unknown>",
+            e.email or "<auto>",
+        )
+        from outlook_browser_register import outlook_browser_register
+
+        result = outlook_browser_register(
+            cfg,
+            email=e.email,
+            password=e.password,
+            username_seq=e.username_seq,
+            challenge_reason=e.reason,
+        )
+        if (
+            bool(_cfg_value(cfg, "mail_oauth_enabled", True))
+            and not result.get("mail_refresh_token")
+            and result.get("register_method") != "portal_browser"
+        ):
+            from outlook_oauth import authorize_outlook_mailbox
+
+            oauth_session = create_http_session(getattr(cfg, "proxy", None))
+            mail_oauth = authorize_outlook_mailbox(
+                cfg,
+                oauth_session,
+                email=str(result.get("email") or ""),
+                password=str(result.get("password") or ""),
+            )
+            result.update(mail_oauth.to_mail_fields())
+            result["mail_oauth_client_id"] = mail_oauth.client_id
+        return result

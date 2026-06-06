@@ -82,8 +82,20 @@
     "payment_method_checkout_config_id": "",
     "frontend_execution": ""
   },
-  "proxy": {
-    "host": "127.0.0.1",
-    "port": 7897
+  "proxy": "socks5://127.0.0.1:18898",
+  "webshare": {
+    "enabled": true,
+    "api_key": "gfnl1y0s333zsvsmoezotfn8xkpummvvydlbdxrv",
+    "country": "US",
+    "rotate_cooldown_s": 300,
+    "mode": "backbone",
+    "backbone_host": "p.webshare.io"
+  },
+  "proxies": {
+    "enabled": true,
+    "rotation": "random",
+    "list": [
+      "socks5://127.0.0.1:18898"
+    ]
   }
 }

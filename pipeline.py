@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -673,6 +674,7 @@ def register(cardw_config_path, proxy=None, python="python3", timeout=600,
 
     返回 dict: {email, session_token, access_token, device_id, ...}
     """
+    python = python if python and python != "python3" else sys.executable
     cardw_config_path = str(Path(cardw_config_path).resolve())
     auth_bundle_dir = str(CARDW_DIR)
     method = (
@@ -789,6 +791,8 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
     env.pop("HTTPS_PROXY", None)
     env.pop("http_proxy", None)
     env.pop("https_proxy", None)
+    if method == "portal_protocol":
+        env.setdefault("FORCE_REQUESTS_HTTP_CLIENT", "1")
     if proxy:
         # 代理通过配置文件传递，不通过环境变量
 
@@ -840,6 +844,9 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
                 "mail_password": entry.get("password", ""),
                 "provider": "outlook",
                 "status": "unused",
+                "account_id": entry.get("mail_account_id") or entry.get("mail_oauth_client_id") or entry.get("account_id") or "",
+                "access_token": entry.get("mail_access_token") or entry.get("access_token") or "",
+                "refresh_token": entry.get("mail_refresh_token") or entry.get("refresh_token") or "",
                 "first": entry.get("first") or entry.get("first_name") or "",
                 "last": entry.get("last") or entry.get("last_name") or "",
             }])
@@ -1322,6 +1329,36 @@ def _run_one_rt_only(args_tuple):
             proxy_stage_plan=plan,
             session_id=str(local_kwargs.get("session_id") or ""),
             force=bool(local_kwargs.get("force", False)),
+        )
+        r["batch_index"] = idx
+        r["target_email"] = target_email
+        print(f"{thread_tag} done status={r.get('status', '?')}")
+        return r
+    except Exception as e:
+        print(f"{thread_tag} error={str(e)[:300]}")
+        return {
+            "batch_index": idx,
+            "target_email": target_email,
+            "status": "error",
+            "error": str(e)[:500],
+        }
+
+
+def _run_one_session_only(args_tuple):
+    """单个 session-only 任务。并发时每个 worker 处理固定 target_email。"""
+    idx, cardw_config_path, target_email, kwargs = args_tuple
+    log_context = _thread_log_context("session-only", idx=idx, email=target_email)
+    thread_tag = _log_tag("thread", log_context)
+    local_kwargs = dict(kwargs or {})
+    proxy_stage_allocator = local_kwargs.get("proxy_stage_allocator")
+    proxy_stage_plan = local_kwargs.get("proxy_stage_plan")
+    try:
+        print(f"{thread_tag} start")
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = session_only_for_email(
+            cardw_config_path,
+            target_email,
+            proxy_stage_plan=plan,
         )
         r["batch_index"] = idx
         r["target_email"] = target_email
@@ -2442,6 +2479,54 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
 # ──────────────────────────────────────────────
 
 
+def _latest_registered_account_id(email: str) -> int:
+    target = _norm_email(email)
+    if not target:
+        return 0
+    db = get_db()
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT id FROM registered_accounts WHERE email = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (target,),
+        ).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def _mark_rt_only_cpa_imported(email: str, account_id: int, cpa_cfg: dict) -> bool:
+    row_id = int(account_id or 0) or _latest_registered_account_id(email)
+    if not row_id:
+        print(f"[rt-only] CPA 推送成功但找不到账号 id，无法更新状态: {email}")
+        return False
+    plan_tag = str((cpa_cfg or {}).get("plan_tag") or "plus").strip().lower() or "plus"
+    ok = get_db().update_account_check(
+        row_id,
+        "valid",
+        "rt-only cpa import ok",
+        plan_tag,
+    )
+    if ok:
+        print(f"[rt-only] ✅ {email} 状态已更新: valid/{plan_tag} id={row_id}")
+    else:
+        print(f"[rt-only] CPA 推送成功但状态更新失败: {email} id={row_id}")
+    return ok
+
+
+def _record_rt_only_cpa_result(email: str, cpa_status: str) -> None:
+    target = _norm_email(email)
+    if not target:
+        return
+    _append_result({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": "rt_only",
+        "status": "ok" if cpa_status == "ok" else "fail",
+        "registration": {"status": "reused", "email": target},
+        "payment": {"status": "skipped", "email": target},
+        "domain": target.split("@", 1)[1] if "@" in target else "",
+        "cpa_import": cpa_status,
+    })
+
+
 def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan=None,
                       session_id: str = "", force: bool = False) -> dict:
     """对单个 email 跑 RT 交换：用 DB 里现有 password/session 走 Codex OAuth
@@ -2477,6 +2562,10 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
                 print(f"[rt-only] CPA 导入异常: {e}")
                 cpa_status = "error"
             result["cpa_import"] = cpa_status
+            _record_rt_only_cpa_result(target, cpa_status)
+            if cpa_status == "ok":
+                status_updated = _mark_rt_only_cpa_imported(target, 0, cpa_cfg)
+                result["status_updated"] = status_updated
             print(f"[rt-only] CPA({target}) → {cpa_status}")
         return result
     if account.get("refresh_token") and force:
@@ -2570,6 +2659,10 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
                 print(f"[rt-only] CPA 导入异常: {e}")
                 cpa_status = "error"
             result["cpa_import"] = cpa_status
+            _record_rt_only_cpa_result(target, cpa_status)
+            if cpa_status == "ok":
+                status_updated = _mark_rt_only_cpa_imported(target, row_id, cpa_cfg)
+                result["status_updated"] = status_updated
             print(f"[rt-only] CPA({target}) → {cpa_status}")
         return result
     except Exception as e:
@@ -2730,11 +2823,14 @@ class _SessionOnlyLogHandler(logging.Handler):
             pass
 
 
-def _install_session_only_logging() -> tuple[list[logging.Logger], _SessionOnlyLogHandler]:
-    handler = _SessionOnlyLogHandler()
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
-    loggers = [
+_SESSION_ONLY_LOGGING_LOCK = threading.Lock()
+_SESSION_ONLY_LOGGING_HANDLER: _SessionOnlyLogHandler | None = None
+_SESSION_ONLY_LOGGING_LOGGERS: list[logging.Logger] = []
+_SESSION_ONLY_LOGGING_REFS = 0
+
+
+def _session_only_auth_loggers() -> list[logging.Logger]:
+    return [
         logging.getLogger("auth_flow"),
         logging.getLogger("mail_provider"),
         logging.getLogger("cf_kv_otp_provider"),
@@ -2742,19 +2838,50 @@ def _install_session_only_logging() -> tuple[list[logging.Logger], _SessionOnlyL
         logging.getLogger("sentinel"),
         logging.getLogger("sentinel_quickjs"),
     ]
-    for logger in loggers:
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-    return loggers, handler
+
+
+def _install_session_only_logging() -> tuple[list[logging.Logger], _SessionOnlyLogHandler]:
+    global _SESSION_ONLY_LOGGING_HANDLER
+    global _SESSION_ONLY_LOGGING_LOGGERS
+    global _SESSION_ONLY_LOGGING_REFS
+    with _SESSION_ONLY_LOGGING_LOCK:
+        if _SESSION_ONLY_LOGGING_HANDLER is None:
+            handler = _SessionOnlyLogHandler()
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+            loggers = _session_only_auth_loggers()
+            for logger in loggers:
+                logger.addHandler(handler)
+                logger.setLevel(logging.INFO)
+                logger.propagate = False
+            _SESSION_ONLY_LOGGING_HANDLER = handler
+            _SESSION_ONLY_LOGGING_LOGGERS = loggers
+        _SESSION_ONLY_LOGGING_REFS += 1
+        return list(_SESSION_ONLY_LOGGING_LOGGERS), _SESSION_ONLY_LOGGING_HANDLER
 
 
 def _remove_session_only_logging(loggers: list[logging.Logger], handler: logging.Handler) -> None:
-    for logger in loggers:
-        try:
-            logger.removeHandler(handler)
-        except Exception:
-            pass
+    global _SESSION_ONLY_LOGGING_HANDLER
+    global _SESSION_ONLY_LOGGING_LOGGERS
+    global _SESSION_ONLY_LOGGING_REFS
+    with _SESSION_ONLY_LOGGING_LOCK:
+        if handler is not _SESSION_ONLY_LOGGING_HANDLER:
+            for logger in loggers:
+                try:
+                    logger.removeHandler(handler)
+                except Exception:
+                    pass
+            return
+        _SESSION_ONLY_LOGGING_REFS = max(0, _SESSION_ONLY_LOGGING_REFS - 1)
+        if _SESSION_ONLY_LOGGING_REFS > 0:
+            return
+        for logger in _SESSION_ONLY_LOGGING_LOGGERS or loggers:
+            try:
+                logger.removeHandler(handler)
+            except Exception:
+                pass
+        _SESSION_ONLY_LOGGING_HANDLER = None
+        _SESSION_ONLY_LOGGING_LOGGERS = []
 
 
 def session_only_for_email(cardw_config_path: str | None, target_email: str,
@@ -2918,22 +3045,55 @@ def session_only_for_email(cardw_config_path: str | None, target_email: str,
 
 
 def session_only_targets(cardw_config_path: str | None, target_emails: list[str],
-                         proxy_stage_allocator=None, proxy_stage_plan=None) -> dict:
-    """批量 session-only：串行跑每个 email，汇总结果。"""
+                         proxy_stage_allocator=None, proxy_stage_plan=None,
+                         workers: int = 1) -> dict:
+    """批量 session-only：对指定 email 列表补 session，workers>1 时并发处理。"""
+    target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
     results = []
     ok = 0
     fail = 0
-    for em in target_emails:
-        em = (em or "").strip()
-        if not em:
-            continue
-        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
-        r = session_only_for_email(cardw_config_path, em, proxy_stage_plan=plan)
-        results.append(r)
+
+    def _count_result(r: dict) -> None:
+        nonlocal ok, fail
         if r.get("status") == "succeeded":
             ok += 1
         else:
             fail += 1
+
+    workers = max(1, int(workers or 1))
+    if workers > 1 and len(target_emails) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(workers, len(target_emails))
+        print(f"[session-only-targets] 并发: {len(target_emails)} accounts workers={workers}")
+        kwargs = {
+            "proxy_stage_allocator": proxy_stage_allocator,
+            "proxy_stage_plan": proxy_stage_plan,
+        }
+        tasks = [(idx, cardw_config_path, em, kwargs) for idx, em in enumerate(target_emails)]
+        ordered: list[dict | None] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_run_one_session_only, task): task[0] for task in tasks}
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                item = future.result()
+                ordered[idx] = item
+                _count_result(item)
+                mark = "✓" if item.get("status") == "succeeded" else "✗"
+                err = f" err={item.get('error')}" if item.get("error") else ""
+                print(
+                    f"[session-only-targets] {mark} "
+                    f"[{sum(1 for x in ordered if x)}/{len(tasks)}] "
+                    f"{item.get('target_email') or target_emails[idx]} status={item.get('status')}{err}"
+                )
+        results = [item for item in ordered if item]
+        print(f"\n[session-only] 完成: ok={ok} fail={fail} 共 {len(results)}")
+        return {"results": results, "ok": ok, "fail": fail}
+
+    for em in target_emails:
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = session_only_for_email(cardw_config_path, em, proxy_stage_plan=plan)
+        results.append(r)
+        _count_result(r)
     print(f"\n[session-only] 完成: ok={ok} fail={fail} 共 {len(results)}")
     return {"results": results, "ok": ok, "fail": fail}
 
@@ -3883,10 +4043,15 @@ class WebshareClient:
 
     BASE = "https://proxy.webshare.io/api/v2"
 
-    def __init__(self, api_key: str, timeout_s: int = 30):
+    def __init__(self, api_key: str, timeout_s: int = 30,
+                 mode: str = "direct", backbone_host: str = "p.webshare.io",
+                 country: str = ""):
         import urllib.request
         self.api_key = api_key.strip()
         self.timeout_s = timeout_s
+        self.mode = (mode or "direct").strip()
+        self.backbone_host = (backbone_host or "p.webshare.io").strip()
+        self.country = (country or "").strip().upper()
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
         )
@@ -3946,12 +4111,22 @@ class WebshareClient:
 
     def get_current_proxy(self) -> dict:
         """GET /proxy/list/ 返回第一个 proxy。未校验 valid。"""
-        with self._req("/proxy/list/?mode=direct&page=1&page_size=5") as r:
+        import urllib.parse
+        params = {"page": "1", "page_size": "5"}
+        if self.mode:
+            params["mode"] = self.mode
+        if self.country:
+            params["country_code__in"] = self.country
+        query = urllib.parse.urlencode(params)
+        with self._req(f"/proxy/list/?{query}") as r:
             data = json.loads(r.read().decode())
         results = data.get("results") or []
         if not results:
             raise RuntimeError("Webshare 代理列表为空")
-        return results[0]
+        proxy = dict(results[0])
+        if not proxy.get("proxy_address") and self.mode == "backbone":
+            proxy["proxy_address"] = self.backbone_host
+        return proxy
 
     def wait_for_fresh_proxy(self, prev_ip: str = "", max_wait_s: int = 120,
                               poll_interval_s: int = 5) -> dict:
@@ -4083,7 +4258,12 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
             return False
     print(f"[gost] listen :{listen_port} 无监听，自动拉起")
     try:
-        client = WebshareClient(api_key)
+        client = WebshareClient(
+            api_key,
+            mode=str(ws_cfg.get("mode", "direct")),
+            backbone_host=str(ws_cfg.get("backbone_host", "p.webshare.io")),
+            country=str(ws_cfg.get("country", "")),
+        )
         px = client.get_current_proxy()
     except Exception as e:
         print(f"[gost] 查询 Webshare 当前 IP 失败: {e}")
@@ -4145,7 +4325,12 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "",
             )
             return _LAST_ROTATE_PX
 
-    client = WebshareClient(api_key)
+    client = WebshareClient(
+        api_key,
+        mode=str(ws_cfg.get("mode", "direct")),
+        backbone_host=str(ws_cfg.get("backbone_host", "p.webshare.io")),
+        country=str(ws_cfg.get("country", "")),
+    )
     try:
         quota = client.get_replacement_quota()
         print(f"[Webshare] 替换额度：available={quota['available']}/{quota['total']} used={quota['used']}")
@@ -4268,6 +4453,35 @@ def _failed_proxy_nodes_path() -> Path:
     if raw:
         return Path(raw).expanduser()
     return OUTPUT_DIR / "failed_proxy_nodes.jsonl"
+
+
+def _recent_failed_register_servers(*, max_age_s: float = 21600.0) -> set[str]:
+    path = _failed_proxy_nodes_path()
+    if not path.exists():
+        return set()
+    now = datetime.now(timezone.utc).timestamp()
+    failed: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines()[-500:]:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if str(item.get("phase") or "").startswith("register") is False:
+                continue
+            ts_raw = str(item.get("ts") or "")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = 0
+            if ts and now - ts > max_age_s:
+                continue
+            server = str(item.get("server") or "").strip()
+            if server:
+                failed.add(server)
+    except Exception:
+        return set()
+    return failed
 
 
 def _register_proxy_failure_summary(proxy_stage_plan) -> dict:
@@ -5393,7 +5607,7 @@ def _build_cli_proxy_stage_controls(args):
             return False
         if bool(getattr(args, "proxy_register_all_alive", False)):
             return True
-        return resolve_register_method_for_args() == "phone_protocol"
+        return resolve_register_method_for_args() in {"phone_protocol", "portal_protocol"}
 
     if mode == "trojan-pool":
         pool_file = str(getattr(args, "trojan_pool_file", "") or "").strip()
@@ -5412,10 +5626,31 @@ def _build_cli_proxy_stage_controls(args):
                 probe_url=str(getattr(args, "proxy_alive_probe_url", "") or ""),
             )
             if not alive:
-                raise TrojanBridgeError("Trojan 池没有探活通过的节点可用于 phone_protocol 注册")
+                raise TrojanBridgeError("Trojan 池没有探活通过的节点可用于注册")
+            recent_failed = _recent_failed_register_servers()
+            if recent_failed:
+                def server_label(node) -> str:
+                    try:
+                        parsed = urllib.parse.urlsplit(node.url)
+                        host = parsed.hostname or ""
+                        port = parsed.port or (3443 if parsed.scheme.lower() in {"hysteria2", "hy2"} else 443)
+                        return f"{host}:{port}" if host else ""
+                    except Exception:
+                        return ""
+
+                filtered = [node for node in alive if server_label(node) not in recent_failed]
+                if filtered:
+                    print(
+                        f"[ProxyStage] 跳过最近失败注册节点: skipped={len(alive)-len(filtered)} "
+                        f"remain={len(filtered)}"
+                    )
+                    alive = filtered
+                else:
+                    print("[ProxyStage] 最近失败节点覆盖全部存活节点，继续使用完整 alive 列表")
+            random.shuffle(alive)
             allocator = manager.allocator(register_nodes=alive)
             print(
-                f"[ProxyStage] phone_protocol register-only 使用全部存活 Trojan 节点轮询: "
+                f"[ProxyStage] register-only 使用全部存活 Trojan 节点轮询: "
                 f"{len(alive)}/{len(manager.nodes)}"
             )
             return allocator, None
@@ -5581,11 +5816,15 @@ def main():
             if not target_emails_list:
                 print("[ERROR] --session-only 必须配合 --target-emails 使用", file=sys.stderr)
                 sys.exit(2)
+            if args.batch > 0 and len(target_emails_list) > args.batch:
+                print(f"[session-only-targets] batch={args.batch}，从 {len(target_emails_list)} 个 target_emails 中截取前 {args.batch} 个")
+                target_emails_list = target_emails_list[:args.batch]
             r = session_only_targets(
                 args.cardw_config,
                 target_emails_list,
                 proxy_stage_allocator=proxy_stage_allocator,
                 proxy_stage_plan=proxy_stage_plan,
+                workers=args.workers,
             )
             print(f"\n结果: ok={r['ok']} fail={r['fail']}")
             return

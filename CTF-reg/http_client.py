@@ -3,6 +3,7 @@ HTTP 客户端 - 使用 curl_cffi 实现 TLS 指纹模拟
 支持 Cloudflare 绕过，降级到 requests
 """
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,7 @@ logger = logging.getLogger(__name__)
 # 尝试使用 curl_cffi（推荐，自带 TLS 指纹模拟）
 try:
     from curl_cffi.requests import Session as CffiSession
+    from curl_cffi.requests.exceptions import ImpersonateError
 
     _HAS_CFFI = True
     logger.debug("curl_cffi 可用，使用 TLS 指纹模拟")
@@ -21,6 +23,20 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+class CompatCffiSession(CffiSession if _HAS_CFFI else object):
+    """curl_cffi Session with request-time impersonate fallback."""
+
+    def request(self, method, url, *args, **kwargs):
+        try:
+            return super().request(method, url, *args, **kwargs)
+        except ImpersonateError:
+            fallback = os.getenv("CURL_CFFI_FALLBACK_IMPERSONATE", "chrome").strip() or "chrome"
+            logger.warning("curl_cffi 请求时不支持 impersonate=%s，回退到 %s", getattr(self, "impersonate", ""), fallback)
+            self.impersonate = fallback
+            kwargs.pop("impersonate", None)
+            return super().request(method, url, *args, **kwargs)
+
 # 通用 UA
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -28,13 +44,20 @@ USER_AGENT = (
 )
 
 
-def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome136"):
+def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome131"):
     """
     创建 HTTP 会话。优先使用 curl_cffi 模拟浏览器 TLS 指纹，
     不可用时降级到 requests。
     """
+    impersonate = (os.getenv("CURL_CFFI_IMPERSONATE", "") or impersonate or "chrome131").strip()
     if _HAS_CFFI:
-        session = CffiSession(impersonate=impersonate)
+        if str(os.getenv("FORCE_REQUESTS_HTTP_CLIENT", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return _requests_session(proxy)
+        try:
+            session = CompatCffiSession(impersonate=impersonate)
+        except Exception as e:
+            logger.warning("curl_cffi 初始化失败，降级 requests: %s", e)
+            return _requests_session(proxy)
         # 使用显式配置，避免被系统 HTTP(S)_PROXY 隐式污染。
         session.trust_env = False
         if proxy:
@@ -50,18 +73,22 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome1
             session.proxies = {"https": "", "http": ""}
         return session
     else:
-        session = requests.Session()
-        session.trust_env = False
-        retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST"],
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        if proxy:
-            session.proxies = {"https": proxy, "http": proxy}
-        session.headers["User-Agent"] = USER_AGENT
-        return session
+        return _requests_session(proxy)
+
+
+def _requests_session(proxy: Optional[str] = None):
+    session = requests.Session()
+    session.trust_env = False
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    if proxy:
+        session.proxies = {"https": proxy, "http": proxy}
+    session.headers["User-Agent"] = USER_AGENT
+    return session

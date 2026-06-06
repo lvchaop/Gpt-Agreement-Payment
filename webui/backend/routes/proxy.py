@@ -148,7 +148,12 @@ def get_current(user: str = CurrentUser):
             pass
 
     try:
-        client = WebshareClient(api_key)
+        client = WebshareClient(
+            api_key,
+            mode=str(ws_cfg.get("mode", "direct")),
+            backbone_host=str(ws_cfg.get("backbone_host", "p.webshare.io")),
+            country=str(ws_cfg.get("country", "")),
+        )
         px = client.get_current_proxy()
         quota = client.get_replacement_quota()
         return {
@@ -192,7 +197,12 @@ def rotate_ip(user: str = CurrentUser):
     # 拿当前 IP 作为 prev_ip 参考，让 wait_for_fresh_proxy 能正确识别新 IP
     prev_ip = ""
     try:
-        cur = WebshareClient(ws_cfg["api_key"]).get_current_proxy()
+        cur = WebshareClient(
+            ws_cfg["api_key"],
+            mode=str(ws_cfg.get("mode", "direct")),
+            backbone_host=str(ws_cfg.get("backbone_host", "p.webshare.io")),
+            country=str(ws_cfg.get("country", "")),
+        ).get_current_proxy()
         prev_ip = cur.get("proxy_address", "") or ""
     except Exception:
         pass

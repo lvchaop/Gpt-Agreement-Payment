@@ -1862,14 +1862,8 @@ class AuthFlow:
                 device_id = m.group(1)
 
         if not device_id:
-            device_id = self.result.device_id or str(uuid.uuid4())
-            logger.warning(f"未从响应中获取 device_id，使用已有/生成值: {device_id}")
-            try:
-                self.session.cookies.set("oai-did", device_id, domain=".openai.com", path="/")
-                self.session.cookies.set("oai-did", device_id, domain=".auth.openai.com", path="/")
-                self.session.cookies.set("oai-did", device_id, domain=".chatgpt.com", path="/")
-            except Exception:
-                pass
+            device_id = str(uuid.uuid4())
+            logger.warning(f"未从响应中获取 device_id，使用生成值: {device_id}")
 
         self.result.device_id = device_id
         logger.info(f"Device ID: {device_id}")
@@ -2921,16 +2915,7 @@ class AuthFlow:
 
         # 登录/注册链路
         csrf_token = self.get_csrf_token()
-        if existing_only:
-            auth_url = self.get_auth_url(
-                csrf_token,
-                login_hint=email,
-                screen_hint="login",
-                prompt="login",
-                default_prompt="login",
-            )
-        else:
-            auth_url = self.get_auth_url(csrf_token)
+        auth_url = self.get_auth_url(csrf_token)
         device_id = self.auth_oauth_init(auth_url)
         sentinel = self.get_sentinel_token(device_id)
         is_new = self.signup(email, sentinel)
