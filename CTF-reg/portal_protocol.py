@@ -83,6 +83,7 @@ class PortalProtocolResult:
     username_seq: int
     final_url: str = ""
     oauth_code_captured: bool = False
+    portal_register_client_id: str = ""
     mail_oauth_client_id: str = ""
     mail_access_token: str = ""
     mail_refresh_token: str = ""
@@ -103,6 +104,7 @@ class PortalProtocolResult:
             "portal_username_seq": self.username_seq,
             "portal_final_url": self.final_url,
             "portal_oauth_code_captured": self.oauth_code_captured,
+            "portal_register_client_id": self.portal_register_client_id,
             "mail_oauth_client_id": self.mail_oauth_client_id,
             "mail_account_id": self.mail_oauth_client_id,
             "mail_access_token": self.mail_access_token,
@@ -406,8 +408,48 @@ class PortalProtocol:
         country_code = self._normalise_country(country)
         return _COUNTRY_DATE_ORDERS.get(country_code, "DMY"), f"country:{country_code or 'default'}"
 
+    def _prewarm_px_cookies(self) -> None:
+        enabled = str(os.environ.get("PORTAL_PX_PREWARM", "0") or "0").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if not enabled:
+            return
+        have = set(self._cookie_names())
+        if {"_px3", "_pxde", "_pxvid"}.issubset(have):
+            return
+        try:
+            from outlook_browser_register import prewarm_outlook_px_cookies
+
+            cookies = prewarm_outlook_px_cookies(
+                self.cfg,
+                timeout_s=float(os.environ.get("PORTAL_PX_PREWARM_TIMEOUT_S", "25") or 25),
+            )
+            injected = 0
+            for cookie in cookies or []:
+                name = str(cookie.get("name") or "")
+                value = str(cookie.get("value") or "")
+                if name not in {"_px3", "_pxde", "_pxvid"} or not value:
+                    continue
+                for domain in ("signup.live.com", ".signup.live.com", ".live.com"):
+                    self.session.cookies.set(name, value, domain=domain, path=str(cookie.get("path") or "/"))
+                    injected += 1
+            names = set(self._cookie_names())
+            logger.info(
+                "[portal-protocol] px prewarm injected=%s has_pxde=%s has_px3=%s has_pxvid=%s",
+                injected,
+                "_pxde" in names,
+                "_px3" in names,
+                "_pxvid" in names,
+            )
+        except Exception as e:
+            logger.warning("[portal-protocol] px prewarm failed, continuing protocol without px cookies: %s", e)
+
     def run(self) -> PortalProtocolResult:
         state = self._load_signup_state()
+        self._prewarm_px_cookies()
         account_domain = str(_cfg_value(self.cfg, "account_domain", "outlook.com") or "outlook.com").strip().lstrip("@").lower()
         namespace = str(_cfg_value(self.cfg, "namespace", "portal-live") or "portal-live")
         state_path = str(_cfg_value(self.cfg, "state_path", "output/portal_identity_state.json") or "")
@@ -441,11 +483,55 @@ class PortalProtocol:
             redirect_url = str(create_data.get("redirectUrl") or "").strip()
             if not redirect_url:
                 raise PortalProtocolError("CreateAccount 成功响应缺少 redirectUrl")
-            final_url = self._follow_post_create_redirect(redirect_url)
+            mail_fields: dict[str, str] = {}
+            if bool(_cfg_value(self.cfg, "mail_oauth_enabled", True)):
+                try:
+                    from outlook_oauth import authorize_outlook_mailbox
+
+                    logger.info(
+                        "[portal-protocol] CreateAccount succeeded; authorizing mailbox before post-create redirect email=%s",
+                        email,
+                    )
+                    mail_oauth = authorize_outlook_mailbox(self.cfg, self.session, email=email, password=password)
+                    mail_fields = mail_oauth.to_mail_fields()
+                    logger.info(
+                        "[portal-protocol] created+mail oauth email=%s seq=%s client_id=%s rt_len=%s",
+                        email,
+                        seq,
+                        mail_fields.get("mail_account_id", ""),
+                        len(mail_fields.get("mail_refresh_token", "") or ""),
+                    )
+                    return PortalProtocolResult(
+                        email=email,
+                        password=password,
+                        username_seq=seq,
+                        final_url="",
+                        oauth_code_captured=False,
+                        portal_register_client_id=str(_cfg_value(self.cfg, "client_id", "00000000480728C5") or ""),
+                        mail_oauth_client_id=mail_fields.get("mail_account_id", ""),
+                        mail_access_token=mail_fields.get("mail_access_token", ""),
+                        mail_refresh_token=mail_fields.get("mail_refresh_token", ""),
+                        mail_oauth_scope=mail_fields.get("mail_oauth_scope", ""),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[portal-protocol] immediate mail oauth failed after CreateAccount email=%s error=%s; continuing post-create redirect",
+                        email,
+                        e,
+                    )
+            try:
+                final_url = self._follow_post_create_redirect(redirect_url)
+            except PortalChallengeError as e:
+                if not e.email:
+                    e.email = email
+                if not e.password:
+                    e.password = password
+                if not e.username_seq:
+                    e.username_seq = seq
+                raise
             parsed_final = urlparse(final_url)
             code_captured = bool(parse_qs(parsed_final.query).get("code"))
             logger.info("[portal-protocol] created email=%s seq=%s oauth_code=%s", email, seq, code_captured)
-            mail_fields: dict[str, str] = {}
             if bool(_cfg_value(self.cfg, "mail_oauth_enabled", True)):
                 from outlook_oauth import authorize_outlook_mailbox
 
@@ -457,6 +543,7 @@ class PortalProtocol:
                 username_seq=seq,
                 final_url=urlunparse(parsed_final._replace(query="")),
                 oauth_code_captured=code_captured,
+                portal_register_client_id=str(_cfg_value(self.cfg, "client_id", "00000000480728C5") or ""),
                 mail_oauth_client_id=mail_fields.get("mail_account_id", ""),
                 mail_access_token=mail_fields.get("mail_access_token", ""),
                 mail_refresh_token=mail_fields.get("mail_refresh_token", ""),
@@ -901,6 +988,21 @@ class PortalProtocol:
                         len(birth_candidates),
                     )
                     continue
+                error_code = str(err.get("code") if isinstance(err, dict) else data.get("errorCode") or "")
+                if error_code == "1347":
+                    logger.warning(
+                        "[portal-protocol] create account blocked, fallback to browser email=%s code=%s",
+                        email,
+                        error_code,
+                    )
+                    raise PortalChallengeError(
+                        "create_account_blocked",
+                        stage="CreateAccount",
+                        email=email,
+                        password=password,
+                        username_seq=0,
+                        marker=error_code,
+                    )
                 raise PortalProtocolError(f"CreateAccount error={data.get('error')} code={data.get('errorCode')}")
             logger.info(
                 "[portal-protocol] create account response email=%s has_redirect=%s response_keys=%s",
@@ -1003,7 +1105,7 @@ class PortalProtocol:
 
 
 def portal_protocol_register(cfg: Config, session=None) -> dict:
-    fallback_enabled = str(os.environ.get("PORTAL_BROWSER_FALLBACK", "1")).strip().lower() not in {
+    fallback_enabled = str(os.environ.get("PORTAL_BROWSER_FALLBACK", "0")).strip().lower() not in {
         "0",
         "false",
         "no",
@@ -1014,6 +1116,34 @@ def portal_protocol_register(cfg: Config, session=None) -> dict:
     except PortalChallengeError as e:
         if not fallback_enabled:
             raise
+        post_create_stage = str(e.stage or "").lower() in {
+            "post-create redirect",
+            "html form redirect",
+            "html redirect",
+        }
+        if post_create_stage and e.email and e.password and bool(_cfg_value(cfg, "mail_oauth_enabled", True)):
+            logger.info(
+                "[portal-protocol] account already created; authorizing mailbox instead of re-registering email=%s stage=%s",
+                e.email,
+                e.stage or "<unknown>",
+            )
+            from outlook_oauth import authorize_outlook_mailbox
+
+            oauth_session = create_http_session(getattr(cfg, "proxy", None))
+            mail_oauth = authorize_outlook_mailbox(cfg, oauth_session, email=e.email, password=e.password)
+            mail_fields = mail_oauth.to_mail_fields()
+            return PortalProtocolResult(
+                email=e.email,
+                password=e.password,
+                username_seq=e.username_seq,
+                final_url="",
+                oauth_code_captured=False,
+                portal_register_client_id=str(_cfg_value(cfg, "client_id", "00000000480728C5") or ""),
+                mail_oauth_client_id=mail_fields.get("mail_account_id", ""),
+                mail_access_token=mail_fields.get("mail_access_token", ""),
+                mail_refresh_token=mail_fields.get("mail_refresh_token", ""),
+                mail_oauth_scope=mail_fields.get("mail_oauth_scope", ""),
+            ).to_dict()
         logger.info(
             "[portal-protocol] falling back to Camoufox Outlook browser flow reason=%s stage=%s email=%s",
             e.reason,
@@ -1022,11 +1152,24 @@ def portal_protocol_register(cfg: Config, session=None) -> dict:
         )
         from outlook_browser_register import outlook_browser_register
 
+        dirty_create_account = str(e.stage or "").lower() == "createaccount" or str(e.reason or "") in {
+            "generic_challenge",
+            "create_account_blocked",
+            "perimeterx",
+        }
+        browser_email = "" if dirty_create_account else e.email
+        browser_password = "" if dirty_create_account else e.password
+        browser_username_seq = 0 if dirty_create_account else e.username_seq
+        if dirty_create_account:
+            logger.info(
+                "[portal-protocol] browser fallback will use fresh email after dirty protocol challenge old_email=%s",
+                e.email or "<none>",
+            )
         result = outlook_browser_register(
             cfg,
-            email=e.email,
-            password=e.password,
-            username_seq=e.username_seq,
+            email=browser_email,
+            password=browser_password,
+            username_seq=browser_username_seq,
             challenge_reason=e.reason,
         )
         if (

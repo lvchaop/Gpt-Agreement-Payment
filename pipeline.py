@@ -646,6 +646,8 @@ def _normalize_register_method(value: str | None) -> str:
         return "phone_protocol"
     if v in ("portal", "portal_protocol", "live_protocol", "outlook_protocol", "microsoft_protocol"):
         return "portal_protocol"
+    if v in ("portal_browser", "outlook_browser", "live_browser", "microsoft_browser"):
+        return "portal_browser"
     raise RegistrationError(f"未知注册路径: {value}")
 
 
@@ -669,7 +671,7 @@ def register(cardw_config_path, proxy=None, python="python3", timeout=600,
     注册路径优先级：显式 register_method > WEBUI_REG_METHOD/WEBUI_REG_MODE >
     config.registration.method > 旧 browser 参数 > 默认 browser。
     `phone_browser` 走手机号入口注册；`phone_protocol` 走手机号纯协议注册。
-    `portal_protocol` 走 Live/portal 纯协议注册，返回账号密码，不产出 ChatGPT session。
+    `portal_protocol` 走 Live/portal 纯协议注册；`portal_browser` 走 Live/portal 纯浏览器注册。
     WebUI 在 Run 页加了切换按钮，每次启动 pipeline 时把选择透传成环境变量。
 
     返回 dict: {email, session_token, access_token, device_id, ...}
@@ -765,6 +767,19 @@ cfg = Config.from_file(config_path)
 result = portal_protocol_register(cfg)
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
 """
+    elif method == "portal_browser":
+        script = r"""
+import json, logging, os, sys
+auth_bundle_dir = sys.argv[1]
+config_path = sys.argv[2]
+sys.path.insert(0, auth_bundle_dir)
+from config import Config
+from outlook_browser_register import outlook_browser_register
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+cfg = Config.from_file(config_path)
+result = outlook_browser_register(cfg)
+print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
+"""
     else:
         script = r"""
 import json, logging, os, sys
@@ -838,18 +853,27 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         entry = dict(result_json)
         entry.setdefault("register_method", method)
         entry["ts"] = datetime.now(timezone.utc).isoformat()
-        if method == "portal_protocol":
-            get_db().append_mail_accounts([{
-                "email": entry.get("email", ""),
-                "mail_password": entry.get("password", ""),
-                "provider": "outlook",
-                "status": "unused",
-                "account_id": entry.get("mail_account_id") or entry.get("mail_oauth_client_id") or entry.get("account_id") or "",
-                "access_token": entry.get("mail_access_token") or entry.get("access_token") or "",
-                "refresh_token": entry.get("mail_refresh_token") or entry.get("refresh_token") or "",
-                "first": entry.get("first") or entry.get("first_name") or "",
-                "last": entry.get("last") or entry.get("last_name") or "",
-            }])
+        if method in {"portal_protocol", "portal_browser"}:
+            mail_refresh_token = entry.get("mail_refresh_token") or ""
+            mail_account_id = entry.get("mail_account_id") or entry.get("mail_oauth_client_id") or ""
+            if mail_refresh_token and mail_account_id:
+                get_db().append_mail_accounts([{
+                    "email": entry.get("email", ""),
+                    "mail_password": entry.get("password", ""),
+                    "provider": "outlook",
+                    "status": "unused",
+                    "account_id": mail_account_id,
+                    "access_token": entry.get("mail_access_token") or "",
+                    "refresh_token": mail_refresh_token,
+                    "openai_password": entry.get("password", ""),
+                    "first": entry.get("first") or entry.get("first_name") or "",
+                    "last": entry.get("last") or entry.get("last_name") or "",
+                }])
+            else:
+                print(
+                    f"{register_tag} 跳过 mail_accounts 写入: "
+                    f"缺 mail_refresh_token 或目标 mail_oauth_client_id"
+                )
         else:
             get_db().add_registered_account(entry)
     except Exception as e:
@@ -1791,8 +1815,17 @@ def _register_one(args_tuple):
         if pool and (pool.domains or pool.provisioner):
             picked_domain = pool.pick()
             pool.mark_used(picked_domain)
-        if picked_domain or stage_plan.register:
-            temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, stage_plan.register, stage_plan)
+        sticky_proxy = ""
+        if not stage_plan.register:
+            sticky_proxy = _batch_register_sticky_proxy_url(cardw_config_path, idx)
+            if sticky_proxy:
+                print(
+                    f"[Webshare] batch register-only sticky idx={idx}: "
+                    f"{_proxy_endpoint_label(sticky_proxy)}"
+                )
+        register_proxy = stage_plan.register or sticky_proxy
+        if picked_domain or register_proxy:
+            temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain, register_proxy, stage_plan)
             effective = temp_cardw
         r = register(effective, register_method=register_method, log_context=log_context)
         print(f"{thread_tag} done status=ok email={r.get('email', '?')}")
@@ -4111,8 +4144,16 @@ class WebshareClient:
 
     def get_current_proxy(self) -> dict:
         """GET /proxy/list/ 返回第一个 proxy。未校验 valid。"""
+        results = self.get_proxy_page(page_size=5)
+        proxy = dict(results[0])
+        if not proxy.get("proxy_address") and self.mode == "backbone":
+            proxy["proxy_address"] = self.backbone_host
+        return proxy
+
+    def get_proxy_page(self, page: int = 1, page_size: int = 50) -> list[dict]:
+        """GET /proxy/list/ 返回当前筛选页，用于 backbone 多端口轮换。"""
         import urllib.parse
-        params = {"page": "1", "page_size": "5"}
+        params = {"page": str(page), "page_size": str(page_size)}
         if self.mode:
             params["mode"] = self.mode
         if self.country:
@@ -4123,10 +4164,7 @@ class WebshareClient:
         results = data.get("results") or []
         if not results:
             raise RuntimeError("Webshare 代理列表为空")
-        proxy = dict(results[0])
-        if not proxy.get("proxy_address") and self.mode == "backbone":
-            proxy["proxy_address"] = self.backbone_host
-        return proxy
+        return [dict(p) for p in results]
 
     def wait_for_fresh_proxy(self, prev_ip: str = "", max_wait_s: int = 120,
                               poll_interval_s: int = 5) -> dict:
@@ -4265,6 +4303,10 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
             country=str(ws_cfg.get("country", "")),
         )
         px = client.get_current_proxy()
+        if str(ws_cfg.get("mode", "direct")).strip().lower() == "backbone":
+            backbone_port = int(ws_cfg.get("backbone_port", 0) or 0)
+            if backbone_port > 0:
+                px["port"] = backbone_port
     except Exception as e:
         print(f"[gost] 查询 Webshare 当前 IP 失败: {e}")
         return False
@@ -4348,6 +4390,10 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "",
         print(f"[Webshare] refresh pool（prev_ip={prev_ip or '?'}）")
     client.refresh_pool(country=lock_country)
     new_px = client.wait_for_fresh_proxy(prev_ip=prev_ip, max_wait_s=poll_wait)
+    if str(ws_cfg.get("mode", "direct")).strip().lower() == "backbone":
+        backbone_port = int(ws_cfg.get("backbone_port", 0) or 0)
+        if backbone_port > 0:
+            new_px["port"] = backbone_port
     new_ip = new_px["proxy_address"]
     new_port = int(new_px["port"])
     user = new_px["username"]
@@ -4484,6 +4530,35 @@ def _recent_failed_register_servers(*, max_age_s: float = 21600.0) -> set[str]:
     return failed
 
 
+def _recent_failed_register_server_counts(*, max_age_s: float = 21600.0) -> dict[str, int]:
+    path = _failed_proxy_nodes_path()
+    if not path.exists():
+        return {}
+    now = datetime.now(timezone.utc).timestamp()
+    counts: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines()[-500:]:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if str(item.get("phase") or "").startswith("register") is False:
+                continue
+            ts_raw = str(item.get("ts") or "")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = 0
+            if ts and now - ts > max_age_s:
+                continue
+            server = str(item.get("server") or "").strip()
+            if server:
+                counts[server] = counts.get(server, 0) + 1
+    except Exception:
+        return {}
+    return counts
+
+
 def _register_proxy_failure_summary(proxy_stage_plan) -> dict:
     plan = ProxyStagePlan.from_obj(proxy_stage_plan)
     meta = dict(plan.register_meta or {})
@@ -4529,10 +4604,21 @@ def _record_failed_register_node(*, idx: int, proxy_stage_plan, error: str, phas
         print(f"[failed-node] 写入失败 idx={idx}: {e}", file=sys.stderr)
 
 
-def _rewrite_cardw_with_domain(src_path, domain, proxy_url="", proxy_stage_plan=None):
+def _rewrite_cardw_with_domain(src_path, domain, proxy_url="", proxy_stage_plan=None, overlay_config_path=""):
     """读 CTF-reg config，把 catch_all_domain 覆盖为 domain，可选覆盖 proxy，写到临时文件返回路径"""
     with open(src_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    if overlay_config_path:
+        try:
+            with open(overlay_config_path, "r", encoding="utf-8") as f:
+                overlay = json.load(f)
+            portal_overlay = overlay.get("portal_protocol")
+            if isinstance(portal_overlay, dict):
+                portal = data.setdefault("portal_protocol", {})
+                if isinstance(portal, dict):
+                    portal.update(portal_overlay)
+        except Exception as e:
+            print(f"[WARN] portal_protocol 覆盖配置读取失败: {overlay_config_path}: {e}", file=sys.stderr)
     mail = data.setdefault("mail", {})
     if domain:
         mail["catch_all_domain"] = domain
@@ -4565,6 +4651,102 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url="", proxy_stage_plan=
     json.dump(data, tmp, ensure_ascii=False, indent=2)
     tmp.close()
     return tmp.name
+
+
+def _proxy_url_for_register_config(proxy_url: str) -> str:
+    proxy_url = str(proxy_url or "").strip()
+    if proxy_url.startswith("socks5://"):
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    return proxy_url
+
+
+def _webshare_direct_proxy_url(card_cfg: dict, attempt_index: int = 0) -> str:
+    ws_cfg = (card_cfg or {}).get("webshare") or {}
+    if not ws_cfg.get("enabled"):
+        return ""
+    api_key = str(ws_cfg.get("api_key") or "").strip()
+    if not api_key:
+        return ""
+    client = WebshareClient(
+        api_key,
+        mode=str(ws_cfg.get("mode", "direct")),
+        backbone_host=str(ws_cfg.get("backbone_host", "p.webshare.io")),
+        country=str(ws_cfg.get("country", "")),
+    )
+    mode = str(ws_cfg.get("mode", "direct")).strip().lower()
+    if mode == "backbone":
+        px = client.get_current_proxy()
+        host = str(ws_cfg.get("backbone_host") or px.get("proxy_address") or "p.webshare.io").strip()
+        port = int(ws_cfg.get("backbone_port", 0) or 80)
+        country = str(ws_cfg.get("country") or px.get("country_code") or "").strip().upper()
+        base_user = str(px.get("username") or "").strip()
+        if country:
+            suffix = f"-{country}-"
+            marker = base_user.find(suffix)
+            if marker > 0:
+                base_user = base_user[:marker]
+            sticky_session = int(time.time()) * 1000 + max(int(attempt_index or 0), 0)
+            user = f"{base_user}-{country}-{sticky_session}"
+        else:
+            user = base_user
+    else:
+        px = client.get_current_proxy()
+        host = str(px.get("proxy_address") or "").strip()
+        port = int(px.get("port") or 0)
+        user = str(px.get("username") or "").strip()
+    password = str(px.get("password") or "").strip()
+    if not (host and port and user and password):
+        raise RuntimeError("Webshare 当前代理信息不完整，无法构造直连代理")
+    scheme = str(ws_cfg.get("direct_scheme", "http") or "http").strip()
+    return f"{scheme}://{user}:{password}@{host}:{port}"
+
+
+def _sticky_webshare_proxy_from_proxy_url(proxy_url: str, idx: int = 0) -> str:
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url or "webshare.io" not in proxy_url:
+        return ""
+    parsed = urllib.parse.urlparse(proxy_url)
+    user = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
+    host = parsed.hostname or ""
+    port = parsed.port or 80
+    if not (user and password and host):
+        return ""
+
+    parts = user.split("-")
+    country = ""
+    base = user
+    if len(parts) >= 3 and parts[-1].lower() == "rotate":
+        country = parts[-2].upper()
+        base = "-".join(parts[:-2])
+    elif len(parts) >= 3 and parts[-1].isdigit():
+        # Already sticky; keep as-is so callers do not accidentally churn IPs.
+        return proxy_url
+    else:
+        return ""
+
+    session_seed = int(time.time()) * 1000 + max(int(idx or 0), 0)
+    sticky_user = f"{base}-{country}-{session_seed}" if country else f"{base}-{session_seed}"
+    scheme = parsed.scheme or "http"
+    return (
+        f"{scheme}://{urllib.parse.quote(sticky_user, safe='')}:"
+        f"{urllib.parse.quote(password, safe='')}@{host}:{port}"
+    )
+
+
+def _batch_register_sticky_proxy_url(cardw_config_path: str, idx: int) -> str:
+    try:
+        with open(cardw_config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return ""
+    try:
+        direct = _webshare_direct_proxy_url(cfg, attempt_index=idx)
+        if direct:
+            return direct
+    except Exception as e:
+        print(f"[Webshare] batch register-only sticky 构造失败 idx={idx}: {e}")
+    return _sticky_webshare_proxy_from_proxy_url(str(cfg.get("proxy") or ""), idx=idx)
 
 
 def _rewrite_card_with_proxy(src_path, proxy_url):
@@ -5607,7 +5789,7 @@ def _build_cli_proxy_stage_controls(args):
             return False
         if bool(getattr(args, "proxy_register_all_alive", False)):
             return True
-        return resolve_register_method_for_args() in {"phone_protocol", "portal_protocol"}
+        return resolve_register_method_for_args() in {"phone_protocol", "portal_protocol", "portal_browser"}
 
     if mode == "trojan-pool":
         pool_file = str(getattr(args, "trojan_pool_file", "") or "").strip()
@@ -5627,7 +5809,8 @@ def _build_cli_proxy_stage_controls(args):
             )
             if not alive:
                 raise TrojanBridgeError("Trojan 池没有探活通过的节点可用于注册")
-            recent_failed = _recent_failed_register_servers()
+            recent_failed_counts = _recent_failed_register_server_counts()
+            recent_failed = set(recent_failed_counts)
             if recent_failed:
                 def server_label(node) -> str:
                     try:
@@ -5646,7 +5829,15 @@ def _build_cli_proxy_stage_controls(args):
                     )
                     alive = filtered
                 else:
-                    print("[ProxyStage] 最近失败节点覆盖全部存活节点，继续使用完整 alive 列表")
+                    alive.sort(key=lambda node: recent_failed_counts.get(server_label(node), 0))
+                    limit_raw = str(os.environ.get("REGISTER_NODE_CANDIDATE_LIMIT", "")).strip()
+                    limit = int(limit_raw) if limit_raw.isdigit() and int(limit_raw) > 0 else min(3, len(alive))
+                    alive = alive[:limit]
+                    print(
+                        "[ProxyStage] 最近失败节点覆盖全部存活节点，改用失败次数最少候选: "
+                        f"limit={limit} candidates="
+                        + ",".join(f"{server_label(n)}:{recent_failed_counts.get(server_label(n), 0)}" for n in alive)
+                    )
             random.shuffle(alive)
             allocator = manager.allocator(register_nodes=alive)
             print(
@@ -5697,8 +5888,8 @@ def main():
     parser.add_argument("--register-only", action="store_true",
                         help="仅注册，不支付")
     parser.add_argument("--register-method", default="",
-                        choices=("", "browser", "protocol", "phone_browser", "phone_protocol", "portal_protocol"),
-                        help="注册路径：browser / protocol / phone_browser / phone_protocol / portal_protocol；空则读 WEBUI_REG_MODE 或注册配置")
+                        choices=("", "browser", "protocol", "phone_browser", "phone_protocol", "portal_protocol", "portal_browser"),
+                        help="注册路径：browser / protocol / phone_browser / phone_protocol / portal_protocol / portal_browser；空则读 WEBUI_REG_MODE 或注册配置")
     parser.add_argument("--pay-only", action="store_true",
                         help="仅支付（按注册顺序优先复用未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,
@@ -5876,34 +6067,93 @@ def main():
 
         elif args.register_only:
             cardw_cfg = args.cardw_config
+            config_proxy_url = ""
+            cfg = {}
             if not cardw_cfg:
                 with open(args.config) as f:
                     cfg = json.load(f)
                 cardw_cfg = cfg.get("fresh_checkout", {}).get("auth", {}).get(
                     "auto_register", {}).get("config_path", "CTF-reg/config.noproxy.json")
-            plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
-            temp_cardw = None
-            effective_cardw = cardw_cfg
-            try:
-                if plan.register:
-                    temp_cardw = _rewrite_cardw_with_domain(cardw_cfg, "", plan.register, plan)
-                    effective_cardw = temp_cardw
-                    print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
-                result = register(effective_cardw, register_method=args.register_method or None)
-                if plan.has_any():
-                    result["proxy_stage_plan"] = plan.to_dict()
-            except Exception as e:
-                _record_failed_register_node(
-                    idx=0,
-                    proxy_stage_plan=plan,
-                    error=str(e),
-                    phase="register-only",
-                )
-                raise
-            finally:
-                if temp_cardw and os.path.exists(temp_cardw):
-                    try: os.unlink(temp_cardw)
-                    except Exception: pass
+                config_proxy_url = str(cfg.get("proxy") or "").strip()
+            else:
+                try:
+                    with open(args.config) as f:
+                        cfg = json.load(f)
+                    config_proxy_url = str(cfg.get("proxy") or "").strip()
+                except Exception:
+                    config_proxy_url = ""
+            use_webshare_direct = bool((cfg.get("webshare") or {}).get("enabled"))
+            resolved_method = _normalize_register_method(args.register_method or None) or _register_method_from_config(cardw_cfg)
+            max_attempts = 1
+            if resolved_method in {"portal_protocol", "portal_browser"}:
+                raw_attempts = str(os.environ.get("REGISTER_ONLY_MAX_ATTEMPTS") or "").strip()
+                # portal_* 只有拿到目标 mail_oauth_client_id 的 refresh_token
+                # 才算 register-only 成功。默认持续重试；需要有界重试时设置
+                # REGISTER_ONLY_MAX_ATTEMPTS=N。
+                max_attempts = int(raw_attempts) if raw_attempts.isdigit() and int(raw_attempts) > 0 else 0
+            result = None
+            last_error: Exception | None = None
+            attempt = 0
+            while max_attempts <= 0 or attempt < max_attempts:
+                attempt += 1
+                plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+                temp_cardw = None
+                effective_cardw = cardw_cfg
+                try:
+                    attempt_proxy_url = config_proxy_url
+                    if use_webshare_direct:
+                        try:
+                            attempt_proxy_url = _webshare_direct_proxy_url(cfg, attempt_index=attempt - 1)
+                            attempt_label = f"{attempt}/{max_attempts}" if max_attempts > 0 else f"{attempt}/∞"
+                            print(
+                                f"[Webshare] register-only 使用直连代理池 attempt={attempt_label}: "
+                                f"{_proxy_endpoint_label(attempt_proxy_url)}"
+                            )
+                        except Exception as e:
+                            print(f"[Webshare] register-only 直连代理构造失败，回退配置代理: {e}")
+                    if plan.register:
+                        temp_cardw = _rewrite_cardw_with_domain(
+                            cardw_cfg, "", _proxy_url_for_register_config(plan.register), plan, args.config
+                        )
+                        effective_cardw = temp_cardw
+                        if max_attempts > 0:
+                            suffix = f" attempt={attempt}/{max_attempts}" if max_attempts > 1 else ""
+                        else:
+                            suffix = f" attempt={attempt}/∞"
+                        print(f"[ProxyStage] register-only 阶段代理{suffix}: {_describe_stage_plan(plan)}")
+                    elif attempt_proxy_url:
+                        temp_cardw = _rewrite_cardw_with_domain(
+                            cardw_cfg, "", _proxy_url_for_register_config(attempt_proxy_url), plan, args.config
+                        )
+                        effective_cardw = temp_cardw
+                        print(f"[ProxyStage] register-only 使用配置代理: register={_proxy_url_for_register_config(attempt_proxy_url)}")
+                    result = register(effective_cardw, register_method=args.register_method or None)
+                    if plan.has_any():
+                        result["proxy_stage_plan"] = plan.to_dict()
+                    if resolved_method in {"portal_protocol", "portal_browser"}:
+                        mail_rt = result.get("mail_refresh_token") or ""
+                        mail_client_id = result.get("mail_account_id") or result.get("mail_oauth_client_id") or ""
+                        if not (mail_rt and mail_client_id):
+                            raise RegistrationError(f"{resolved_method} 注册成功但未获得目标 mail_oauth_client_id 的 mail refresh_token")
+                    break
+                except Exception as e:
+                    last_error = e
+                    _record_failed_register_node(
+                        idx=attempt - 1,
+                        proxy_stage_plan=plan,
+                        error=str(e),
+                        phase="register-only",
+                    )
+                    if max_attempts > 0 and attempt >= max_attempts:
+                        raise
+                    attempt_label = f"{attempt}/{max_attempts}" if max_attempts > 0 else f"{attempt}/∞"
+                    print(f"[register-only] attempt {attempt_label} 失败，继续重试直到拿到 mail refresh_token: {e}")
+                finally:
+                    if temp_cardw and os.path.exists(temp_cardw):
+                        try: os.unlink(temp_cardw)
+                        except Exception: pass
+            if result is None:
+                raise last_error or RegistrationError("register-only 未产生结果")
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         elif args.pay_only:

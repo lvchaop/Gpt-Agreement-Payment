@@ -238,6 +238,7 @@ def test_portal_protocol_mail_oauth_uses_separate_client_id(tmp_path, monkeypatc
     assert captured["same_session"] is True
     assert captured["email"] == result["email"]
     assert captured["password"] == result["password"]
+    assert result["portal_register_client_id"] == "00000000480728C5"
     assert result["mail_account_id"] == "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
     assert result["mail_refresh_token"] == "mail-rt"
 

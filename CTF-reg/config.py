@@ -134,8 +134,9 @@ class PortalProtocolConfig:
     redirect_uri: str = "https://login.live.com/oauth20_desktop.srf"
     mail_oauth_enabled: bool = True
     mail_oauth_client_id: str = "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
+    mail_oauth_client_secret: str = ""
     mail_oauth_scope: str = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
-    mail_oauth_redirect_uri: str = "http://localhost"
+    mail_oauth_redirect_uri: str = "http://localhost:5001/token-tool/callback"
     mail_oauth_prompt: str = "consent"
     locale: str = "zh-CN"
     user_agent: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) PKeyAuth/1.0"
