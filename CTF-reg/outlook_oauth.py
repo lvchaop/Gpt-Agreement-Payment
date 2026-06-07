@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import html
 import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 TOKEN_ENDPOINT = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 AUTHORIZE_ENDPOINT = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
 COMMON_AUTHORIZE_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+OIDC_SCOPES = {"openid", "profile", "email", "offline_access"}
 
 
 class OutlookOAuthError(RuntimeError):
@@ -788,6 +791,45 @@ def _url_oauth_error(url: str) -> str:
     return qs.get("error_description", qs.get("error", [""]))[0]
 
 
+def _pkce_pair() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _scope_resource(scope: str) -> str:
+    if scope.startswith("https://"):
+        parts = scope.split("/")
+        if len(parts) >= 4:
+            return "/".join(parts[:3])
+    return ""
+
+
+def _normalize_single_resource_scope(scope: str) -> str:
+    tokens = [s.strip() for s in re.split(r"[\s,;]+", str(scope or "")) if s.strip()]
+    token_set = set(tokens)
+    if {
+        "https://outlook.office.com/IMAP.AccessAsUser.All",
+        "https://outlook.office.com/SMTP.Send",
+    }.issubset(token_set):
+        logger.warning("[outlook-oauth] legacy mixed Outlook IMAP/SMTP scope detected; using IMAP-only single-resource scope")
+        tokens = ["offline_access", "https://outlook.office.com/IMAP.AccessAsUser.All"]
+    if "offline_access" not in tokens:
+        tokens.insert(0, "offline_access")
+    api_scopes = [s for s in tokens if s not in OIDC_SCOPES]
+    if not api_scopes:
+        raise OutlookOAuthError("mail_oauth_scope 至少需要一个 API scope")
+    has_default = any(s.endswith("/.default") for s in api_scopes)
+    has_named = any(not s.endswith("/.default") for s in api_scopes)
+    if has_default and has_named:
+        raise OutlookOAuthError("mail_oauth_scope 中 .default 不能和命名 scope 混用")
+    resources = {_scope_resource(s) for s in api_scopes if _scope_resource(s)}
+    if len(resources) > 1:
+        raise OutlookOAuthError(f"mail_oauth_scope 必须是单资源 scope，当前资源={sorted(resources)}")
+    return " ".join(dict.fromkeys(tokens))
+
+
 def _follow_redirects(session: Any, resp: Any, redirect_uri: str, timeout: int) -> Any:
     for _ in range(12):
         status = int(getattr(resp, "status_code", 0) or 0)
@@ -817,6 +859,7 @@ def _exchange_code(
     client_id: str,
     client_secret: str = "",
     code: str,
+    code_verifier: str,
     redirect_uri: str,
     scope: str,
     timeout: int,
@@ -825,6 +868,7 @@ def _exchange_code(
         "client_id": client_id,
         "grant_type": "authorization_code",
         "code": code,
+        "code_verifier": code_verifier,
         "redirect_uri": redirect_uri,
         "scope": scope,
     }
@@ -860,13 +904,23 @@ def _oauth_settings(cfg: Config) -> tuple[str, str, str, str, str, int]:
     client_id = str(_cfg_value(cfg, "mail_oauth_client_id", "") or "").strip()
     if not client_id:
         raise OutlookOAuthError("portal_protocol.mail_oauth_client_id 为空")
-    client_secret = str(
-        os.environ.get("MAIL_OAUTH_CLIENT_SECRET", "")
-        or _cfg_value(cfg, "mail_oauth_client_secret", "")
+    confidential = str(
+        os.environ.get("MAIL_OAUTH_CONFIDENTIAL_CLIENT", "")
+        or _cfg_value(cfg, "mail_oauth_confidential_client", "")
         or ""
-    ).strip()
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    client_secret = ""
+    if confidential:
+        client_secret = str(
+            os.environ.get("MAIL_OAUTH_CLIENT_SECRET", "")
+            or _cfg_value(cfg, "mail_oauth_client_secret", "")
+            or ""
+        ).strip()
     redirect_uri = str(_cfg_value(cfg, "mail_oauth_redirect_uri", "http://localhost") or "http://localhost").strip()
-    scope = str(_cfg_value(cfg, "mail_oauth_scope", "offline_access https://outlook.office.com/IMAP.AccessAsUser.All") or "").strip()
+    scope = _normalize_single_resource_scope(str(
+        _cfg_value(cfg, "mail_oauth_scope", "offline_access https://outlook.office.com/IMAP.AccessAsUser.All")
+        or ""
+    ).strip())
     prompt = str(_cfg_value(cfg, "mail_oauth_prompt", "consent") or "").strip()
     timeout = int(_cfg_value(cfg, "timeout_s", 30) or 30)
     return client_id, client_secret, redirect_uri, scope, prompt, timeout
@@ -879,22 +933,25 @@ def _authorize_url(
     prompt_override: str | None = None,
     endpoint: str = AUTHORIZE_ENDPOINT,
     include_login_hint: bool = True,
-) -> tuple[str, str, str, str, int]:
+) -> tuple[str, str, str, str, str, int]:
     client_id, _client_secret, redirect_uri, scope, prompt, timeout = _oauth_settings(cfg)
     if prompt_override is not None:
         prompt = prompt_override
+    verifier, challenge = _pkce_pair()
     params = {
         "client_id": client_id,
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "scope": scope,
         "response_mode": "query",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
     }
     if include_login_hint:
         params["login_hint"] = email
     if prompt:
         params["prompt"] = prompt
-    return endpoint + "?" + urlencode(params, quote_via=quote), client_id, redirect_uri, scope, timeout
+    return endpoint + "?" + urlencode(params, quote_via=quote), client_id, redirect_uri, scope, verifier, timeout
 
 
 def _requests_oauth_session(cfg: Config) -> Any:
@@ -1065,14 +1122,14 @@ def _log_browser_cookie_names(page: Any, *, label: str) -> None:
 
 def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, password: str = "") -> OutlookOAuthResult:
     """Authorize mailbox in the already logged-in browser context, then exchange code."""
-    auth_url, client_id, redirect_uri, scope, timeout = _authorize_url(
+    auth_url, client_id, redirect_uri, scope, verifier, timeout = _authorize_url(
         cfg,
         email=email,
         prompt_override="",
         endpoint=COMMON_AUTHORIZE_ENDPOINT,
         include_login_hint=False,
     )
-    login_auth_url, _login_client_id, _login_redirect_uri, _login_scope, _login_timeout = _authorize_url(cfg, email=email, prompt_override="login")
+    login_auth_url, _login_client_id, _login_redirect_uri, _login_scope, login_verifier, _login_timeout = _authorize_url(cfg, email=email, prompt_override="login")
     _client_id, client_secret, _redirect_uri, _scope, _prompt, _timeout = _oauth_settings(cfg)
     logger.info("[outlook-oauth] browser authorize start email=%s client_id=%s", email, client_id)
     _log_browser_cookie_names(page, label="before_common_authorize")
@@ -1106,6 +1163,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                 client_id=client_id,
                 client_secret=client_secret,
                 code=code,
+                code_verifier=verifier,
                 redirect_uri=redirect_uri,
                 scope=scope,
                 timeout=timeout,
@@ -1118,6 +1176,8 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                 passkey_seen = False
                 denied_retries += 1
                 retry_url = auth_url if denied_retries != 2 else login_auth_url
+                if retry_url == login_auth_url:
+                    verifier = login_verifier
                 logger.info("[outlook-oauth] retry authorize after access_denied email=%s retry=%s prompt=%s", email, denied_retries, "login" if retry_url == login_auth_url else "common")
                 page.goto(retry_url, wait_until="domcontentloaded", timeout=max(timeout, 45) * 1000)
                 page.wait_for_timeout(1500)
@@ -1424,8 +1484,30 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                 page.wait_for_timeout(2500)
                 continue
 
-        if "proofs/add" in current_url.lower() or "add security info" in text:
-            if _click_browser_first(page, ['button:has-text("Skip")', 'a:has-text("Skip")', '#iShowSkip', '#idBtn_Back']):
+        if "proofs/add" in current_url.lower() or "add security info" in text or "保护你的帐户" in text or "保护你的账户" in text:
+            logger.info(
+                "[outlook-oauth] proofs/Add security-info page detected email=%s url=%s text=%s",
+                email,
+                current_url[:500],
+                re.sub(r"\s+", " ", text)[:240],
+            )
+            if _click_browser_first(
+                page,
+                [
+                    'button:has-text("暂时跳过")',
+                    'a:has-text("暂时跳过")',
+                    'input[value*="暂时跳过"]',
+                    'button:has-text("跳过")',
+                    'a:has-text("跳过")',
+                    'input[value*="跳过"]',
+                    'button:has-text("Skip")',
+                    'a:has-text("Skip")',
+                    'input[value*="Skip"]',
+                    '#iShowSkip',
+                    '#idBtn_Back',
+                ],
+            ):
+                logger.info("[outlook-oauth] clicked proofs/Add skip email=%s", email)
                 page.wait_for_timeout(2000)
                 continue
 
@@ -1433,6 +1515,23 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
             page.wait_for_timeout(2000)
             continue
         page.wait_for_timeout(1000)
+
+    final_url = str(getattr(page, "url", "") or "")
+    code = _url_auth_code(final_url, redirect_uri)
+    if code:
+        logger.info("[outlook-oauth] browser final-url code captured email=%s url=%s", email, final_url[:500])
+        result = _exchange_code(
+            _requests_oauth_session(cfg),
+            client_id=client_id,
+            client_secret=client_secret,
+            code=code,
+            code_verifier=verifier,
+            redirect_uri=redirect_uri,
+            scope=scope,
+            timeout=timeout,
+        )
+        logger.info("[outlook-oauth] browser refresh_token acquired email=%s client_id=%s rt_len=%s", email, client_id, len(result.refresh_token))
+        return result
 
     marker = ""
     try:
@@ -1444,9 +1543,9 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
 
 def authorize_outlook_mailbox(cfg: Config, session: Any, *, email: str, password: str) -> OutlookOAuthResult:
     """Authorize the new Outlook mailbox to the configured target client_id."""
-    auth_url, client_id, redirect_uri, scope, timeout = _authorize_url(cfg, email=email)
+    auth_url, client_id, redirect_uri, scope, verifier, timeout = _authorize_url(cfg, email=email)
     if str(_cfg_value(cfg, "mail_oauth_har_entry", "") or "").strip().lower() in {"1", "true", "yes"}:
-        auth_url, client_id, redirect_uri, scope, timeout = _authorize_url(
+        auth_url, client_id, redirect_uri, scope, verifier, timeout = _authorize_url(
             cfg,
             email=email,
             prompt_override="",
@@ -1474,6 +1573,7 @@ def authorize_outlook_mailbox(cfg: Config, session: Any, *, email: str, password
                 client_id=client_id,
                 client_secret=client_secret,
                 code=code,
+                code_verifier=verifier,
                 redirect_uri=redirect_uri,
                 scope=scope,
                 timeout=timeout,

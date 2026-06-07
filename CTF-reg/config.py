@@ -135,7 +135,7 @@ class PortalProtocolConfig:
     mail_oauth_enabled: bool = True
     mail_oauth_client_id: str = "d8bd9ced-3bad-4ecf-86f2-090009874b3e"
     mail_oauth_client_secret: str = ""
-    mail_oauth_scope: str = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+    mail_oauth_scope: str = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
     mail_oauth_redirect_uri: str = "http://localhost:5001/token-tool/callback"
     mail_oauth_prompt: str = "consent"
     locale: str = "zh-CN"

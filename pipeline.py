@@ -4619,6 +4619,10 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url="", proxy_stage_plan=
                     portal.update(portal_overlay)
         except Exception as e:
             print(f"[WARN] portal_protocol 覆盖配置读取失败: {overlay_config_path}: {e}", file=sys.stderr)
+    portal = data.setdefault("portal_protocol", {})
+    if isinstance(portal, dict):
+        portal["mail_oauth_client_secret"] = ""
+        portal["mail_oauth_scope"] = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
     mail = data.setdefault("mail", {})
     if domain:
         mail["catch_all_domain"] = domain
