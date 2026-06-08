@@ -11,6 +11,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlunparse
 
@@ -918,7 +919,7 @@ def _oauth_settings(cfg: Config) -> tuple[str, str, str, str, str, int]:
         ).strip()
     redirect_uri = str(_cfg_value(cfg, "mail_oauth_redirect_uri", "http://localhost") or "http://localhost").strip()
     scope = _normalize_single_resource_scope(str(
-        _cfg_value(cfg, "mail_oauth_scope", "offline_access https://outlook.office.com/IMAP.AccessAsUser.All")
+        _cfg_value(cfg, "mail_oauth_scope", "offline_access https://graph.microsoft.com/Mail.Read")
         or ""
     ).strip())
     prompt = str(_cfg_value(cfg, "mail_oauth_prompt", "consent") or "").strip()
@@ -1120,12 +1121,813 @@ def _log_browser_cookie_names(page: Any, *, label: str) -> None:
         logger.debug("[outlook-oauth] cookie names failed label=%s error=%s", label, e)
 
 
+def _webmail_artifact_prefix(label: str, email: str) -> Path:
+    out_dir = Path("output/outlook_browser")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_email = re.sub(r"[^A-Za-z0-9_.@-]+", "_", email)[:80]
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)[:80]
+    return out_dir / f"webmail_{safe_label}_{safe_email}_{int(time.time())}"
+
+
+def _dump_webmail_artifacts(page: Any, *, label: str, email: str, network: list[dict[str, Any]] | None = None) -> None:
+    prefix = _webmail_artifact_prefix(label, email)
+    try:
+        html_text = page.content()
+        prefix.with_suffix(".html").write_text(html_text, encoding="utf-8", errors="replace")
+    except Exception as e:
+        logger.debug("[outlook-oauth] webmail html artifact failed label=%s error=%s", label, e)
+    try:
+        page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True)
+    except Exception as e:
+        logger.debug("[outlook-oauth] webmail screenshot artifact failed label=%s error=%s", label, e)
+    snapshot: dict[str, Any] = {}
+    try:
+        snapshot = page.evaluate(
+            """() => {
+              const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+              const attrs = (el) => {
+                const r = el.getBoundingClientRect();
+                return {
+                  tag: el.tagName,
+                  id: el.id || '',
+                  cls: String(el.className || '').slice(0, 120),
+                  role: el.getAttribute('role') || '',
+                  type: el.getAttribute('type') || '',
+                  name: el.getAttribute('name') || '',
+                  ariaLabel: el.getAttribute('aria-label') || '',
+                  ariaChecked: el.getAttribute('aria-checked') || '',
+                  title: el.getAttribute('title') || '',
+                  text: norm(el.innerText || el.textContent).slice(0, 300),
+                  disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                  checked: !!el.checked,
+                  rect: {x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)},
+                  visible: r.width > 0 && r.height > 0,
+                };
+              };
+              const controls = [...document.querySelectorAll('button,input,select,textarea,label,a,[role]')]
+                .map(attrs)
+                .filter(x => x.visible || /imap|pop|forward|转发|保存|同步|sync/i.test([x.text, x.ariaLabel, x.title, x.name].join(' ')));
+              const scrollables = [...document.querySelectorAll('body,main,section,div,[role="main"],[role="tabpanel"]')]
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  return {
+                    tag: el.tagName,
+                    id: el.id || '',
+                    role: el.getAttribute('role') || '',
+                    text: norm(el.innerText || el.textContent).slice(0, 180),
+                    rect: {x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)},
+                    scrollTop: el.scrollTop || 0,
+                    clientHeight: el.clientHeight || 0,
+                    scrollHeight: el.scrollHeight || 0,
+                  };
+                })
+                .filter(x => x.scrollHeight > x.clientHeight + 50)
+                .slice(0, 80);
+              return {
+                url: location.href,
+                title: document.title,
+                body: norm(document.body && document.body.innerText).slice(0, 5000),
+                controls,
+                interestingControls: controls.filter(x => /imap|pop|forward|转发|保存|同步|sync|device|设备|应用|app/i.test([x.text, x.ariaLabel, x.title, x.name].join(' '))),
+                scrollables,
+              };
+            }"""
+        )
+    except Exception as e:
+        snapshot = {"error": str(e)}
+    if network is not None:
+        snapshot["network"] = network[-300:]
+    try:
+        prefix.with_suffix(".json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug("[outlook-oauth] webmail json artifact failed label=%s error=%s", label, e)
+    logger.info("[outlook-oauth] webmail artifacts label=%s email=%s prefix=%s", label, email, prefix)
+
+
+def _make_recovery_mailbox(cfg: Config) -> tuple[Any, str]:
+    from mail_provider import MailProvider
+
+    mail_provider = MailProvider.from_config(getattr(cfg, "mail", None))
+    recovery_email = str(os.environ.get("OUTLOOK_RECOVERY_EMAIL", "") or "").strip()
+    if not recovery_email:
+        recovery_email = mail_provider.create_mailbox()
+    return mail_provider, recovery_email
+
+
+def _complete_proofs_add_email(
+    page: Any,
+    *,
+    cfg: Config,
+    account_email: str,
+    mail_provider: Any | None = None,
+    recovery_email: str = "",
+) -> dict[str, Any]:
+    """Complete account.live.com/proofs/Add by adding a catch-all recovery email."""
+    if mail_provider is None or not recovery_email:
+        mail_provider, recovery_email = _make_recovery_mailbox(cfg)
+    if not recovery_email or "@" not in recovery_email:
+        return {"ok": False, "stage": "recovery_email", "error": "missing_recovery_email"}
+
+    issued_at = time.time()
+    first = page.evaluate(
+        """email => {
+          const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+          const visible = node => {
+            if (!node) return false;
+            const r = node.getBoundingClientRect();
+            const s = getComputedStyle(node);
+            return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+          };
+          const select = [...document.querySelectorAll('select')].filter(visible)[0];
+          if (select) {
+            let target = [...select.options].find(o => /email|邮件|电子邮件|备用/i.test(norm(o.textContent || o.value)));
+            if (target) {
+              select.value = target.value;
+              select.dispatchEvent(new Event('input', {bubbles: true}));
+              select.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+          }
+          const inputs = [...document.querySelectorAll('input')].filter(visible);
+          const emailInput = inputs.find(el => {
+            const t = norm([el.type, el.name, el.id, el.placeholder, el.getAttribute('aria-label')].filter(Boolean).join(' '));
+            return /email|邮件|电子邮件|alias|proof/i.test(t) || el.type === 'email';
+          }) || inputs.find(el => /text|email/.test(String(el.type || 'text').toLowerCase()));
+          if (!emailInput) {
+            return {ok: false, stage: 'fill_email', error: 'email_input_not_found', inputs: inputs.map(el => norm([el.type, el.name, el.id, el.placeholder, el.getAttribute('aria-label')].filter(Boolean).join(' '))).slice(0, 20)};
+          }
+          emailInput.focus();
+          const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(emailInput), 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+          if (desc && desc.set) desc.set.call(emailInput, email); else emailInput.value = email;
+          for (const name of ['input', 'change', 'keyup', 'blur']) emailInput.dispatchEvent(new Event(name, {bubbles: true}));
+          const controls = [...document.querySelectorAll('button,input[type="submit"],input[type="button"],[role="button"]')].filter(visible);
+          const next = controls.find(el => /^(next|下一步|继续|continue)$/i.test(norm([el.innerText, el.textContent, el.value, el.getAttribute('aria-label')].filter(Boolean).join(' ')))) || controls[controls.length - 1];
+          if (!next) return {ok: false, stage: 'click_next', error: 'next_not_found', recoveryEmail: email};
+          const nextText = norm([next.innerText, next.textContent, next.value, next.getAttribute('aria-label')].filter(Boolean).join(' '));
+          next.click();
+          return {ok: true, stage: 'sent', recoveryEmail: email, nextText};
+        }""",
+        recovery_email,
+    )
+    if not isinstance(first, dict) or not first.get("ok"):
+        return dict(first or {"ok": False, "stage": "fill_email"})
+    logger.info(
+        "[outlook-oauth] proofs/Add recovery email submitted account=%s recovery=%s action=%s",
+        account_email,
+        recovery_email,
+        first,
+    )
+    page.wait_for_timeout(2500)
+    timeout = int(os.environ.get("OUTLOOK_RECOVERY_OTP_TIMEOUT_S", os.environ.get("OTP_TIMEOUT", "180")) or "180")
+    code = mail_provider.wait_for_otp(recovery_email, timeout=timeout, issued_after=issued_at)
+    code_action = page.evaluate(
+        """code => {
+          const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+          const visible = node => {
+            if (!node) return false;
+            const r = node.getBoundingClientRect();
+            const s = getComputedStyle(node);
+            return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+          };
+          const inputs = [...document.querySelectorAll('input')].filter(visible);
+          const codeInput = inputs.find(el => {
+            const t = norm([el.type, el.name, el.id, el.placeholder, el.getAttribute('aria-label')].filter(Boolean).join(' '));
+            return /code|otp|otc|verification|安全代码|验证码|代码/i.test(t);
+          }) || inputs.find(el => /tel|text|number/.test(String(el.type || 'text').toLowerCase()));
+          if (!codeInput) {
+            return {ok: false, stage: 'fill_code', error: 'code_input_not_found', inputs: inputs.map(el => norm([el.type, el.name, el.id, el.placeholder, el.getAttribute('aria-label')].filter(Boolean).join(' '))).slice(0, 20)};
+          }
+          codeInput.focus();
+          const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(codeInput), 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+          if (desc && desc.set) desc.set.call(codeInput, code); else codeInput.value = code;
+          for (const name of ['input', 'change', 'keyup', 'blur']) codeInput.dispatchEvent(new Event(name, {bubbles: true}));
+          const controls = [...document.querySelectorAll('button,input[type="submit"],input[type="button"],[role="button"]')].filter(visible);
+          const submit = controls.find(el => /^(next|submit|verify|done|下一步|提交|验证|完成|继续|continue)$/i.test(norm([el.innerText, el.textContent, el.value, el.getAttribute('aria-label')].filter(Boolean).join(' ')))) || controls[controls.length - 1];
+          if (!submit) return {ok: false, stage: 'click_submit', error: 'submit_not_found'};
+          const submitText = norm([submit.innerText, submit.textContent, submit.value, submit.getAttribute('aria-label')].filter(Boolean).join(' '));
+          submit.click();
+          return {ok: true, stage: 'code_submitted', submitText};
+        }""",
+        code,
+    )
+    logger.info(
+        "[outlook-oauth] proofs/Add recovery code submitted account=%s recovery=%s action=%s",
+        account_email,
+        recovery_email,
+        code_action,
+    )
+    page.wait_for_timeout(5000)
+    return {
+        "ok": isinstance(code_action, dict) and bool(code_action.get("ok")),
+        "stage": "complete",
+        "recoveryEmail": recovery_email,
+        "sent": first,
+        "submitted": code_action,
+    }
+
+
+def _probe_outlook_web_mailbox(page: Any, *, cfg: Config | None = None, email: str, password: str = "") -> None:
+    """Open Outlook Web once after OAuth so mailbox/IMAP state can initialize."""
+    if str(os.environ.get("OUTLOOK_SKIP_WEBMAIL_INIT", "") or "").lower() in {"1", "true", "yes"}:
+        return
+    network: list[dict[str, Any]] = []
+    try:
+        def _interesting_url(url: str) -> bool:
+            return bool(re.search(r"(outlook|office|owa|options|mailbox|forward|imap|pop|service\\.svc|Get|Set)", url, re.I))
+
+        def _on_request(req: Any) -> None:
+            try:
+                url = str(req.url)
+                if not _interesting_url(url):
+                    return
+                post = ""
+                try:
+                    post = str(req.post_data or "")[:1000]
+                except Exception:
+                    pass
+                network.append({"kind": "request", "method": str(req.method), "url": url[:1200], "post": post})
+            except Exception:
+                pass
+
+        def _on_response(resp: Any) -> None:
+            try:
+                url = str(resp.url)
+                if not _interesting_url(url):
+                    return
+                network.append({"kind": "response", "status": int(resp.status), "url": url[:1200]})
+            except Exception:
+                pass
+
+        page.on("request", _on_request)
+        page.on("response", _on_response)
+    except Exception:
+        pass
+    try:
+        recovery_mail_provider = None
+        recovery_email = ""
+        if cfg is not None:
+            try:
+                recovery_mail_provider, recovery_email = _make_recovery_mailbox(cfg)
+                logger.info(
+                    "[outlook-oauth] prepared recovery mailbox account=%s recovery=%s",
+                    email,
+                    recovery_email,
+                )
+            except Exception as e:
+                logger.info("[outlook-oauth] prepare recovery mailbox failed account=%s error=%s", email, e)
+        page.goto("https://outlook.live.com/mail/0/", wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(12000)
+        url = str(getattr(page, "url", "") or "")
+        text = ""
+        try:
+            text = re.sub(r"\s+", " ", (page.inner_text("body", timeout=5000) or "")[:500])
+        except Exception:
+            pass
+        logger.info("[outlook-oauth] webmail init visited email=%s url=%s text=%s", email, url[:500], text[:300])
+        _dump_webmail_artifacts(page, label="init", email=email, network=network)
+        page.goto("https://outlook.live.com/mail/0/options/mail/forwarding", wait_until="domcontentloaded", timeout=90000)
+        loaded_action: dict[str, Any] = {}
+        try:
+            loaded_action = page.evaluate(
+                """async () => {
+                  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+                  const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+                  const hasSettings = () => {
+                    const body = norm(document.body && document.body.innerText);
+                    if (/正在加载|Loading/i.test(body)) {
+                      return false;
+                    }
+                    return /(登录并验证|sign in and verify|验证你的帐户|sync to devices|同步到设备|Let devices[^\\n]{0,80}use IMAP|Let devices[^\\n]{0,80}use POP|使用 IMAP|使用 POP|使用\\s*IMAP|使用\\s*POP|允许[^\\n]{0,80}IMAP|允许[^\\n]{0,80}POP|POP 设置|IMAP 设置)/i.test(body);
+                  };
+                  let stable = 0;
+                  for (let i = 0; i < 100; i++) {
+                    if (hasSettings()) stable += 1;
+                    else stable = 0;
+                    if (stable >= 2) return {ok: true, waitedMs: i * 1000, url: location.href};
+                    await sleep(1000);
+                  }
+                  return {ok: false, waitedMs: 100000, url: location.href, body: norm(document.body && document.body.innerText).slice(0, 500)};
+                }"""
+            )
+        except Exception as e:
+            loaded_action = {"error": str(e)}
+            page.wait_for_timeout(10000)
+        logger.info("[outlook-oauth] webmail forwarding wait email=%s action=%s", email, loaded_action)
+        url = str(getattr(page, "url", "") or "")
+        text = ""
+        try:
+            text = re.sub(r"\s+", " ", (page.inner_text("body", timeout=5000) or "")[:800])
+        except Exception:
+            pass
+        logger.info("[outlook-oauth] webmail forwarding/imap visited email=%s url=%s text=%s", email, url[:500], text[:500])
+        _dump_webmail_artifacts(page, label="forwarding_before", email=email, network=network)
+        try:
+            verify_action = page.evaluate(
+                """async () => {
+                  const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+                  const visible = node => {
+                    if (!node) return false;
+                    const r = node.getBoundingClientRect();
+                    const s = getComputedStyle(node);
+                    return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+                  };
+                  const body = norm(document.body && document.body.innerText);
+                  if (!/(登录并验证|sign in and verify|verify your account|sync to devices|同步到设备)/i.test(body)) {
+                    return {needed: false, body: body.slice(0, 220)};
+                  }
+                  const controls = [...document.querySelectorAll('button,a,[role="button"],input[type="submit"]')].filter(visible);
+                  const target = controls.find(el => {
+                    const t = norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('title'), el.value].filter(Boolean).join(' '));
+                    return /^(登录|sign in|log in|verify|验证)$/i.test(t) || /登录|sign in|verify|验证/i.test(t);
+                  });
+                  if (!target) return {needed: true, found: false, controls: controls.map(el => norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.value).slice(0, 80)).slice(0, 20)};
+                  return {needed: true, found: true, text: norm(target.innerText || target.textContent || target.getAttribute('aria-label') || target.value).slice(0, 120)};
+                }"""
+            )
+            if isinstance(verify_action, dict) and verify_action.get("needed"):
+                logger.info("[outlook-oauth] webmail verification login action email=%s action=%s", email, verify_action)
+                try:
+                    login_button = page.locator('button:has-text("登录"), button:has-text("Sign in"), button:has-text("Verify"), [role="button"]:has-text("登录"), [role="button"]:has-text("Sign in")').last
+                    if login_button.count() > 0 and login_button.is_visible(timeout=1500):
+                        try:
+                            with page.expect_popup(timeout=5000) as popup_info:
+                                login_button.click(timeout=5000, force=True)
+                            popup_page = popup_info.value
+                            try:
+                                popup_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                                popup_deadline = time.time() + float(os.environ.get("OUTLOOK_WEBMAIL_POPUP_TIMEOUT_S", "90") or "90")
+                                popup_events: list[str] = []
+                                while time.time() < popup_deadline:
+                                    try:
+                                        if popup_page.is_closed():
+                                            popup_events.append("closed")
+                                            break
+                                    except Exception:
+                                        popup_events.append("closed_error")
+                                        break
+                                    popup_url = str(getattr(popup_page, "url", "") or "")
+                                    popup_events.append(popup_url[:180])
+                                    try:
+                                        popup_loc = popup_page.evaluate(
+                                            """() => ({host: location.host, pathname: location.pathname, href: location.href})"""
+                                        )
+                                    except Exception:
+                                        popup_loc = {}
+                                    popup_host = str((popup_loc or {}).get("host") or "")
+                                    popup_path = str((popup_loc or {}).get("pathname") or "").lower()
+                                    if popup_host == "outlook.live.com" and ("oauthredirect.html" in popup_path or popup_path.startswith("/mail")):
+                                        break
+                                    try:
+                                        popup_body = re.sub(r"\s+", " ", (popup_page.inner_text("body", timeout=700) or ""))[:260]
+                                    except Exception:
+                                        popup_body = ""
+                                    if popup_body:
+                                        popup_events.append(f"body:{popup_body}")
+                                    if "proofs/add" in popup_url.lower() or "保护你的帐户" in popup_body or "保护你的账户" in popup_body or "add security info" in popup_body.lower():
+                                        if cfg is not None:
+                                            try:
+                                                proof_action = _complete_proofs_add_email(
+                                                    popup_page,
+                                                    cfg=cfg,
+                                                    account_email=email,
+                                                    mail_provider=recovery_mail_provider,
+                                                    recovery_email=recovery_email,
+                                                )
+                                                popup_events.append(f"proofs_add_email:{str(proof_action)[:500]}")
+                                                if isinstance(proof_action, dict) and proof_action.get("ok"):
+                                                    popup_page.wait_for_timeout(3000)
+                                                    continue
+                                            except Exception as e:
+                                                popup_events.append(f"proofs_add_email_error:{str(e)[:180]}")
+                                        try:
+                                            _dump_webmail_artifacts(popup_page, label="verification_popup_proofs", email=email, network=network)
+                                        except Exception as e:
+                                            popup_events.append(f"proofs_dump_error:{str(e)[:120]}")
+                                    try:
+                                        popup_email_action = popup_page.evaluate(
+                                            """value => {
+                                              const visible = node => {
+                                                if (!node) return false;
+                                                const r = node.getBoundingClientRect();
+                                                const s = getComputedStyle(node);
+                                                return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+                                              };
+                                              const inputs = [
+                                                document.querySelector('#i0116'),
+                                                document.querySelector('input[name="loginfmt"]'),
+                                                document.querySelector('input[type="email"]'),
+                                                ...document.querySelectorAll('input[type="text"], input[type="tel"]')
+                                              ].filter(visible);
+                                              const el = inputs.find(node => {
+                                                const t = `${node.id || ''} ${node.name || ''} ${node.type || ''} ${node.getAttribute('aria-label') || ''} ${node.getAttribute('placeholder') || ''}`.toLowerCase();
+                                                return t.includes('login') || t.includes('email') || t.includes('username') || t.includes('电子邮件') || node.id === 'i0116';
+                                              });
+                                              if (!el) return {found: false};
+                                              el.focus();
+                                              const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                                              if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+                                              for (const name of ['input', 'change', 'keyup', 'blur']) el.dispatchEvent(new Event(name, {bubbles: true}));
+                                              const buttons = [document.querySelector('#idSIButton9'), ...document.querySelectorAll('input[type="submit"],button,[role="button"]')].filter(visible);
+                                              const submit = buttons.find(b => {
+                                                const t = String(b.value || b.innerText || b.textContent || b.getAttribute('aria-label') || '').toLowerCase();
+                                                return b.id === 'idSIButton9' || t.includes('next') || t.includes('下一步');
+                                              }) || buttons[0];
+                                              if (submit) submit.click();
+                                              return {found: true, clicked: !!submit, text: submit ? String(submit.value || submit.innerText || submit.textContent || '').slice(0, 80) : ''};
+                                            }""",
+                                            email,
+                                        )
+                                        if isinstance(popup_email_action, dict) and popup_email_action.get("found"):
+                                            popup_events.append(f"email:{popup_email_action}")
+                                            popup_page.wait_for_timeout(1800)
+                                            continue
+                                    except Exception:
+                                        pass
+                                    if password:
+                                        try:
+                                            popup_pwd = popup_page.locator('input[type="password"], input[name="passwd"]').first
+                                            if popup_pwd.count() > 0 and popup_pwd.is_visible(timeout=500):
+                                                popup_pwd_action = popup_pwd.evaluate(
+                                                    """(el, value) => {
+                                                      const visible = node => {
+                                                        if (!node) return false;
+                                                        const r = node.getBoundingClientRect();
+                                                        const s = getComputedStyle(node);
+                                                        return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+                                                      };
+                                                      el.focus();
+                                                      const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                                                      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+                                                      for (const name of ['input', 'change', 'keyup', 'blur']) el.dispatchEvent(new Event(name, {bubbles: true}));
+                                                      const buttons = [document.querySelector('#idSIButton9'), ...document.querySelectorAll('input[type="submit"],button,[role="button"]')].filter(visible);
+                                                      const submit = buttons.find(b => {
+                                                        const t = String(b.value || b.innerText || b.textContent || b.getAttribute('aria-label') || '').toLowerCase();
+                                                        return b.id === 'idSIButton9' || t.includes('sign in') || t.includes('登录') || t.includes('next') || t.includes('下一步');
+                                                      }) || buttons[0];
+                                                      if (submit) submit.click();
+                                                      return {clicked: !!submit, text: submit ? String(submit.value || submit.innerText || submit.textContent || '').slice(0, 80) : ''};
+                                                    }""",
+                                                    password,
+                                                )
+                                                popup_events.append(f"password:{popup_pwd_action}")
+                                                popup_page.wait_for_timeout(2200)
+                                                continue
+                                        except Exception:
+                                            pass
+                                    if "proofs/add" in popup_url.lower() or "保护你的帐户" in popup_body or "保护你的账户" in popup_body or "add security info" in popup_body.lower():
+                                        try:
+                                            if _click_browser_first(
+                                                popup_page,
+                                                [
+                                                    'button:has-text("暂时跳过")',
+                                                    'a:has-text("暂时跳过")',
+                                                    'input[value*="暂时跳过"]',
+                                                    'button:has-text("跳过")',
+                                                    'a:has-text("跳过")',
+                                                    'input[value*="跳过"]',
+                                                    'button:has-text("以后")',
+                                                    'a:has-text("以后")',
+                                                    'button:has-text("稍后")',
+                                                    'a:has-text("稍后")',
+                                                    'button:has-text("Skip")',
+                                                    'a:has-text("Skip")',
+                                                    'button:has-text("Not now")',
+                                                    'a:has-text("Not now")',
+                                                    'input[value*="Skip"]',
+                                                    '#iShowSkip',
+                                                    '#idBtn_Back',
+                                                ],
+                                                timeout=1200,
+                                            ):
+                                                popup_events.append("proofs_skip_clicked")
+                                                popup_page.wait_for_timeout(2500)
+                                                continue
+                                        except Exception as e:
+                                            popup_events.append(f"proofs_skip_error:{str(e)[:120]}")
+                                        try:
+                                            form_skip = popup_page.evaluate(
+                                                """() => {
+                                                  const forms = [...document.querySelectorAll('form')];
+                                                  const form = forms.find(f => /proofs|add|post|ppsecure/i.test(String(f.action || f.id || f.name || ''))) || forms[0];
+                                                  if (!form) return {submitted: false, reason: 'no_form'};
+                                                  let action = form.querySelector('input[name="action"]');
+                                                  if (!action) {
+                                                    action = document.createElement('input');
+                                                    action.type = 'hidden';
+                                                    action.name = 'action';
+                                                    form.appendChild(action);
+                                                  }
+                                                  action.value = 'Skip';
+                                                  let canary = form.querySelector('input[name="canary"],input[name="Canary"],input[name="PPFT"]');
+                                                  const submit = form.querySelector('#iShowSkip,#idBtn_Back,input[value*="Skip"],input[value*="跳过"],button[name="action"][value="Skip"]');
+                                                  if (submit) {
+                                                    submit.click();
+                                                    return {submitted: true, mode: 'click', action: String(form.action || '').slice(0, 160), canary: !!canary};
+                                                  }
+                                                  if (form.requestSubmit) form.requestSubmit(); else form.submit();
+                                                  return {submitted: true, mode: 'form_submit', action: String(form.action || '').slice(0, 160), canary: !!canary};
+                                                }"""
+                                            )
+                                            popup_events.append(f"proofs_form_skip:{str(form_skip)[:400]}")
+                                            if isinstance(form_skip, dict) and form_skip.get("submitted"):
+                                                popup_page.wait_for_timeout(3000)
+                                                continue
+                                        except Exception as e:
+                                            popup_events.append(f"proofs_form_skip_error:{str(e)[:120]}")
+                                        try:
+                                            skip_action = popup_page.evaluate(
+                                                """() => {
+                                                  const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+                                                  const visible = node => {
+                                                    if (!node) return false;
+                                                    const r = node.getBoundingClientRect();
+                                                    const s = getComputedStyle(node);
+                                                    return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+                                                  };
+                                                  const nodes = [...document.querySelectorAll('button,a,input[type="submit"],input[type="button"],[role="button"]')].filter(visible);
+                                                  const controls = nodes.map((el, i) => ({
+                                                    i,
+                                                    tag: el.tagName,
+                                                    id: el.id || '',
+                                                    text: norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('title'), el.value].filter(Boolean).join(' ')).slice(0, 160),
+                                                  }));
+                                                  const target = nodes.find(el => /(skip|not now|later|暂时跳过|跳过|以后|稍后|取消)/i.test(norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.getAttribute('title'), el.value].filter(Boolean).join(' '))));
+                                                  if (!target) return {clicked: false, controls};
+                                                  const text = norm([target.innerText, target.textContent, target.getAttribute('aria-label'), target.getAttribute('title'), target.value].filter(Boolean).join(' '));
+                                                  target.click();
+                                                  return {clicked: true, text, controls};
+                                                }"""
+                                            )
+                                            popup_events.append(f"proofs_skip_js:{str(skip_action)[:400]}")
+                                            if isinstance(skip_action, dict) and skip_action.get("clicked"):
+                                                popup_page.wait_for_timeout(2500)
+                                                continue
+                                        except Exception as e:
+                                            popup_events.append(f"proofs_skip_js_error:{str(e)[:120]}")
+                                        try:
+                                            _dump_webmail_artifacts(popup_page, label="verification_popup_proofs", email=email, network=network)
+                                        except Exception as e:
+                                            popup_events.append(f"proofs_dump_error:{str(e)[:120]}")
+                                    try:
+                                        if _click_browser_first(popup_page, ['button:has-text("继续")', 'button:has-text("下一步")', 'button:has-text("Continue")', 'button:has-text("Next")', 'button:has-text("是")', 'button:has-text("Yes")', 'input[type="submit"]', 'button[type="submit"]'], timeout=700):
+                                            popup_page.wait_for_timeout(1500)
+                                            continue
+                                    except Exception:
+                                        pass
+                                    popup_page.wait_for_timeout(1500)
+                                logger.info(
+                                    "[outlook-oauth] webmail verification popup email=%s url=%s events=%s",
+                                    email,
+                                    str(getattr(popup_page, "url", "") or "")[:500],
+                                    popup_events[-8:],
+                                )
+                                try:
+                                    if not popup_page.is_closed():
+                                        popup_page.close()
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                try:
+                                    closed_state = popup_page.is_closed()
+                                except Exception:
+                                    closed_state = "unknown"
+                                try:
+                                    last_url = str(getattr(popup_page, "url", "") or "")
+                                except Exception:
+                                    last_url = ""
+                                logger.info(
+                                    "[outlook-oauth] webmail verification popup handling ended email=%s closed=%s url=%s error=%s",
+                                    email,
+                                    closed_state,
+                                    last_url[:500],
+                                    e,
+                                )
+                                try:
+                                    logger.info(
+                                        "[outlook-oauth] webmail verification popup events email=%s events=%s",
+                                        email,
+                                        popup_events[-20:],
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            login_button.click(timeout=5000, force=True)
+                        logger.info("[outlook-oauth] webmail verification playwright login clicked email=%s", email)
+                except Exception as e:
+                    logger.debug("[outlook-oauth] webmail verification playwright login click failed email=%s error=%s", email, e)
+                page.wait_for_timeout(3500)
+                verify_deadline = time.time() + float(os.environ.get("OUTLOOK_WEBMAIL_VERIFY_TIMEOUT_S", "90") or "90")
+                while time.time() < verify_deadline:
+                    current_url = str(getattr(page, "url", "") or "")
+                    body_text = ""
+                    try:
+                        body_text = re.sub(r"\s+", " ", (page.inner_text("body", timeout=1500) or ""))
+                    except Exception:
+                        pass
+                    if "outlook.live.com/mail/0/options/mail/forwarding" in current_url and re.search(r"(POP|IMAP|使用.*IMAP|use IMAP)", body_text, re.I) and not re.search(r"(登录并验证|sign in and verify)", body_text, re.I):
+                        break
+                    try:
+                        email_action = page.evaluate(
+                            """value => {
+                              const visible = node => {
+                                if (!node) return false;
+                                const r = node.getBoundingClientRect();
+                                const s = getComputedStyle(node);
+                                return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+                              };
+                              const inputs = [
+                                document.querySelector('#i0116'),
+                                document.querySelector('input[name="loginfmt"]'),
+                                document.querySelector('input[type="email"]'),
+                                ...document.querySelectorAll('input[type="text"], input[type="tel"]')
+                              ].filter(visible);
+                              const el = inputs.find(node => {
+                                const t = `${node.id || ''} ${node.name || ''} ${node.type || ''} ${node.getAttribute('aria-label') || ''} ${node.getAttribute('placeholder') || ''}`.toLowerCase();
+                                return t.includes('login') || t.includes('email') || t.includes('username') || t.includes('电子邮件') || node.id === 'i0116';
+                              });
+                              if (!el) return {found: false};
+                              el.focus();
+                              const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                              if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+                              for (const name of ['input', 'change', 'keyup', 'blur']) el.dispatchEvent(new Event(name, {bubbles: true}));
+                              const buttons = [document.querySelector('#idSIButton9'), ...document.querySelectorAll('input[type="submit"],button,[role="button"]')].filter(visible);
+                              const submit = buttons.find(b => {
+                                const t = String(b.value || b.innerText || b.textContent || b.getAttribute('aria-label') || '').toLowerCase();
+                                return b.id === 'idSIButton9' || t.includes('next') || t.includes('下一步');
+                              }) || buttons[0];
+                              if (submit) submit.click();
+                              return {found: true, clicked: !!submit, text: submit ? String(submit.value || submit.innerText || submit.textContent || '').slice(0, 80) : ''};
+                            }""",
+                            email,
+                        )
+                        if isinstance(email_action, dict) and email_action.get("found"):
+                            logger.info("[outlook-oauth] webmail verification submitted email email=%s action=%s", email, email_action)
+                            page.wait_for_timeout(3000)
+                            continue
+                    except Exception:
+                        pass
+                    if password:
+                        try:
+                            pwd = page.locator('input[type="password"], input[name="passwd"]').first
+                            if pwd.count() > 0 and pwd.is_visible(timeout=500):
+                                pwd_action = pwd.evaluate(
+                                    """(el, value) => {
+                                      const visible = node => {
+                                        if (!node) return false;
+                                        const r = node.getBoundingClientRect();
+                                        const s = getComputedStyle(node);
+                                        return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled;
+                                      };
+                                      el.focus();
+                                      const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                                      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+                                      for (const name of ['input', 'change', 'keyup', 'blur']) el.dispatchEvent(new Event(name, {bubbles: true}));
+                                      const buttons = [document.querySelector('#idSIButton9'), ...document.querySelectorAll('input[type="submit"],button,[role="button"]')].filter(visible);
+                                      const submit = buttons.find(b => {
+                                        const t = String(b.value || b.innerText || b.textContent || b.getAttribute('aria-label') || '').toLowerCase();
+                                        return b.id === 'idSIButton9' || t.includes('sign in') || t.includes('登录') || t.includes('next') || t.includes('下一步');
+                                      }) || buttons[0];
+                                      if (submit) submit.click();
+                                      return {clicked: !!submit, text: submit ? String(submit.value || submit.innerText || submit.textContent || '').slice(0, 80) : ''};
+                                    }""",
+                                    password,
+                                )
+                                logger.info("[outlook-oauth] webmail verification submitted password email=%s action=%s", email, pwd_action)
+                                page.wait_for_timeout(4000)
+                                continue
+                        except Exception:
+                            pass
+                    if _click_browser_first(page, ['button:has-text("继续")', 'button:has-text("下一步")', 'button:has-text("Continue")', 'button:has-text("Next")', 'button:has-text("是")', 'button:has-text("Yes")', 'input[type="submit"]', 'button[type="submit"]'], timeout=1000):
+                        page.wait_for_timeout(3000)
+                        continue
+                    page.wait_for_timeout(1500)
+                try:
+                    page.goto("https://outlook.live.com/mail/0/options/mail/forwarding", wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(10000)
+                    _dump_webmail_artifacts(page, label="forwarding_verified", email=email, network=network)
+                except Exception as e:
+                    logger.debug("[outlook-oauth] webmail verified forwarding revisit failed email=%s error=%s", email, e)
+        except Exception as e:
+            logger.debug("[outlook-oauth] webmail verification login ignored email=%s error=%s", email, e)
+        action = {}
+        try:
+            page.evaluate(
+                """async () => {
+                  for (const el of [document.scrollingElement, document.documentElement, document.body, ...document.querySelectorAll('*')]) {
+                    try {
+                      if (el && el.scrollHeight > el.clientHeight + 50) el.scrollTop = el.scrollHeight;
+                    } catch (_) {}
+                  }
+                }"""
+            )
+            page.wait_for_timeout(2500)
+            action = page.evaluate(
+                """async () => {
+                  const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+                  const textOf = el => norm([
+                    el.innerText,
+                    el.textContent,
+                    el.getAttribute && el.getAttribute('aria-label'),
+                    el.getAttribute && el.getAttribute('title'),
+                    el.getAttribute && el.getAttribute('name'),
+                    el.getAttribute && el.getAttribute('value'),
+                  ].filter(Boolean).join(' '));
+                  const visible = node => {
+                    if (!node) return false;
+                    const r = node.getBoundingClientRect();
+                    const s = getComputedStyle(node);
+                    return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+                  };
+                  const clicked = [];
+                  const allControls = [...document.querySelectorAll('button,[role="switch"],input[type="checkbox"],input[type="radio"],label')].filter(visible);
+                  const switchState = el => {
+                    const checked = (el.getAttribute && el.getAttribute('aria-checked')) || '';
+                    if (checked === 'true' || checked === 'false') return checked;
+                    if (typeof el.checked === 'boolean') return el.checked ? 'true' : 'false';
+                    const cls = String(el.className || '');
+                    const blob = norm([textOf(el), textOf(el.parentElement), cls].join(' '));
+                    if (/checked|selected|on|已启用|开启/i.test(blob)) return 'true';
+                    return '';
+                  };
+                  const clickControl = (el, label, kind) => {
+                    const role = (el.getAttribute && el.getAttribute('role')) || '';
+                    const type = (el.getAttribute && el.getAttribute('type')) || '';
+                    if (role === 'tab' || role === 'searchbox' || type === 'search') return false;
+                    const checked = switchState(el);
+                    if (checked === 'true') {
+                      clicked.push({kind: 'already_on', tag: el.tagName, role, type, via: kind, text: label.slice(0, 180)});
+                      return true;
+                    }
+                    try {
+                      try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (_) {}
+                      el.click();
+                      clicked.push({kind: 'click_pop_imap', tag: el.tagName, role, type, checked, via: kind, text: label.slice(0, 180)});
+                      return true;
+                    } catch (e) {
+                      clicked.push({kind: 'click_error', tag: el.tagName, role, type, via: kind, text: label.slice(0, 180), error: String(e).slice(0, 120)});
+                      return false;
+                    }
+                  };
+                  const findToggle = (needleRe) => {
+                    const labels = [...document.querySelectorAll('label,span,div')].filter(visible).filter(el => {
+                      const t = textOf(el);
+                      return t.length > 0 && t.length < 120 && needleRe.test(t);
+                    });
+                    for (const labelEl of labels) {
+                      const label = textOf(labelEl);
+                      let root = labelEl;
+                      for (let i = 0; i < 6 && root; i++, root = root.parentElement) {
+                        const localControls = [...root.querySelectorAll('input[type="checkbox"],[role="switch"],button[role="switch"],label')].filter(visible);
+                        const target = localControls.find(el => {
+                          const role = (el.getAttribute && el.getAttribute('role')) || '';
+                          const type = (el.getAttribute && el.getAttribute('type')) || '';
+                          if (role === 'switch' || type === 'checkbox') return true;
+                          return el.tagName === 'LABEL' && needleRe.test(textOf(el));
+                        });
+                        if (target) return {target, label};
+                      }
+                    }
+                    return null;
+                  };
+                  const pop = findToggle(/(允许设备和应用使用\\s*POP|let devices[^\\n]{0,80}use POP)/i);
+                  if (pop) clickControl(pop.target, pop.label, 'pop_exact');
+                  const imap = findToggle(/(允许设备和应用使用\\s*IMAP|let devices[^\\n]{0,80}use IMAP)/i);
+                  if (imap) clickControl(imap.target, imap.label, 'imap_exact');
+                  await new Promise(resolve => setTimeout(resolve, 1200));
+                  const saveRe = /^(save|save changes|保存|保存更改|应用|apply)$/i;
+                  const buttons = [...document.querySelectorAll('button,input[type="submit"]')].filter(visible);
+                  for (const el of buttons.reverse()) {
+                    const t = textOf(el);
+                    if (!saveRe.test(t)) continue;
+                    if (/更多应用|应用启动器|app launcher|more apps/i.test(t)) continue;
+                    const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+                    if (disabled) continue;
+                    try {
+                      try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (_) {}
+                      el.click();
+                      clicked.push({kind: 'click_save', tag: el.tagName, text: t.slice(0, 160)});
+                      break;
+                    } catch (e) {
+                      clicked.push({kind: 'save_error', tag: el.tagName, text: t.slice(0, 160), error: String(e).slice(0, 120)});
+                    }
+                  }
+                  return {url: location.href, clicked, body: norm(document.body && document.body.innerText).slice(0, 1000)};
+                }"""
+            )
+            page.wait_for_timeout(5000)
+        except Exception as e:
+            action = {"error": str(e)}
+        logger.info("[outlook-oauth] webmail imap enable attempted email=%s action=%s", email, action)
+        _dump_webmail_artifacts(page, label="forwarding_after", email=email, network=network)
+    except Exception as e:
+        logger.warning("[outlook-oauth] webmail init failed email=%s error=%s", email, e)
+
+
 def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, password: str = "") -> OutlookOAuthResult:
     """Authorize mailbox in the already logged-in browser context, then exchange code."""
     auth_url, client_id, redirect_uri, scope, verifier, timeout = _authorize_url(
         cfg,
         email=email,
-        prompt_override="",
+        prompt_override="consent",
         endpoint=COMMON_AUTHORIZE_ENDPOINT,
         include_login_hint=False,
     )
@@ -1151,7 +1953,8 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
         if "code=" not in current and "error=" not in current:
             logger.debug("[outlook-oauth] browser goto authorize raised before code: %s", e)
 
-    deadline = __import__("time").time() + max(float(timeout), 45.0)
+    browser_timeout = max(float(timeout), float(os.environ.get("OUTLOOK_BROWSER_OAUTH_TIMEOUT_S", "120") or "120"))
+    deadline = __import__("time").time() + browser_timeout
     passkey_seen = False
     denied_retries = 0
     while __import__("time").time() < deadline:
@@ -1169,6 +1972,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                 timeout=timeout,
             )
             logger.info("[outlook-oauth] browser refresh_token acquired email=%s client_id=%s rt_len=%s", email, client_id, len(result.refresh_token))
+            _probe_outlook_web_mailbox(page, cfg=cfg, email=email, password=password)
             return result
         oauth_error = _url_oauth_error(current_url)
         if oauth_error:
@@ -1181,7 +1985,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                 logger.info("[outlook-oauth] retry authorize after access_denied email=%s retry=%s prompt=%s", email, denied_retries, "login" if retry_url == login_auth_url else "common")
                 page.goto(retry_url, wait_until="domcontentloaded", timeout=max(timeout, 45) * 1000)
                 page.wait_for_timeout(1500)
-                deadline = max(deadline, __import__("time").time() + max(float(timeout), 45.0))
+                deadline = max(deadline, __import__("time").time() + browser_timeout)
                 continue
             raise OutlookOAuthError(f"browser authorize error: {oauth_error[:200]}")
 
@@ -1259,7 +2063,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                     str(getattr(page, "url", "") or "")[:500],
                 )
                 if solved or not visible:
-                    deadline = max(deadline, __import__("time").time() + max(float(timeout), 45.0))
+                    deadline = max(deadline, __import__("time").time() + browser_timeout)
                     page.wait_for_timeout(3000)
                     continue
             except Exception as e:
@@ -1268,7 +2072,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
         if any(k in current_url.lower() or k in text for k in ("passkey", "fido", "密钥", "安全窗口")):
             passkey_seen = True
             logger.info("[outlook-oauth] passkey/fido interrupt detected email=%s url=%s", email, current_url[:500])
-            deadline = max(deadline, __import__("time").time() + max(float(timeout), 45.0))
+            deadline = max(deadline, __import__("time").time() + browser_timeout)
             enroll_url = _passkey_enroll_url(current_url)
             if enroll_url:
                 try:
@@ -1361,7 +2165,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
             logger.info("[outlook-oauth] browser consent/update handled email=%s action=%s url=%s", email, action, current_url[:260])
             if action.get("ok"):
                 page.wait_for_timeout(3500)
-                deadline = max(deadline, __import__("time").time() + max(float(timeout), 45.0))
+                deadline = max(deadline, __import__("time").time() + browser_timeout)
                 continue
 
         # Same context usually skips login, but common authorize may ask again.
@@ -1403,13 +2207,13 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
                   const submit = buttons.find(b => {
                     const t = String(b.value || b.innerText || b.textContent || b.getAttribute('aria-label') || '').toLowerCase();
                     return b.id === 'idSIButton9' || t.includes('next') || t.includes('下一步');
-                  }) || buttons[0];
+                  });
                   if (submit) {
                     submit.focus();
                     submit.click();
                     return { found: true, clicked: true, id: submit.id || '', text: String(submit.value || submit.innerText || submit.textContent || '').slice(0, 80) };
                   }
-                  return { found: true, clicked: false, buttons: buttons.length };
+                  return { found: false, clicked: false, reason: 'submit_not_found', buttons: buttons.length };
                 }""",
                 email,
             )
@@ -1531,6 +2335,7 @@ def authorize_outlook_mailbox_browser(cfg: Config, page: Any, *, email: str, pas
             timeout=timeout,
         )
         logger.info("[outlook-oauth] browser refresh_token acquired email=%s client_id=%s rt_len=%s", email, client_id, len(result.refresh_token))
+        _probe_outlook_web_mailbox(page, cfg=cfg, email=email, password=password)
         return result
 
     marker = ""
@@ -1548,7 +2353,7 @@ def authorize_outlook_mailbox(cfg: Config, session: Any, *, email: str, password
         auth_url, client_id, redirect_uri, scope, verifier, timeout = _authorize_url(
             cfg,
             email=email,
-            prompt_override="",
+            prompt_override="consent",
             endpoint=COMMON_AUTHORIZE_ENDPOINT,
             include_login_hint=False,
         )

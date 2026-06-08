@@ -33,7 +33,7 @@ CONTEXT_RE = re.compile(
 )
 CHATGPT_RE = re.compile(r"(?:chatgpt|openai)[^0-9]{0,100}(\d{6})\b", re.I)
 ANY_6_RE = re.compile(r"\b(\d{6})\b")
-OUTLOOK_PASSWORD_HOST_FALLBACKS = ("imap-mail.outlook.com",)
+OUTLOOK_PASSWORD_HOST_FALLBACKS = ("outlook.live.com", "imap-mail.outlook.com")
 OUTLOOK_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 MS_TOKEN_ENDPOINTS = (
     "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",

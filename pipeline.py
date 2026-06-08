@@ -4622,7 +4622,7 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url="", proxy_stage_plan=
     portal = data.setdefault("portal_protocol", {})
     if isinstance(portal, dict):
         portal["mail_oauth_client_secret"] = ""
-        portal["mail_oauth_scope"] = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"
+        portal["mail_oauth_scope"] = "offline_access https://graph.microsoft.com/Mail.Read"
     mail = data.setdefault("mail", {})
     if domain:
         mail["catch_all_domain"] = domain
