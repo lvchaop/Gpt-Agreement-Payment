@@ -1311,8 +1311,16 @@ def _install_js_internal_trace(page, *, label: str) -> Path:
     return trace_path
 
 
+def _js_internal_trace_enabled() -> bool:
+    return str(os.environ.get("OUTLOOK_JS_INTERNAL_TRACE", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _hsprotect_js_patch_enabled() -> bool:
     return str(os.environ.get("OUTLOOK_HSPROTECT_JS_PATCH", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _hsprotect_js_patch_apply_enabled() -> bool:
+    return str(os.environ.get("OUTLOOK_HSPROTECT_JS_PATCH_APPLY", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
@@ -1384,7 +1392,7 @@ def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
         if tf_payload_needle in patched:
             patched = patched.replace(
                 tf_payload_needle,
-                "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d);try{__outlookPatchEmit('hsprotect.main.tf.payload',{activities:t,serialized:ut(t),meta:d,payload:String(v),pc:String(h),cs:String(f),stack:(new Error).stack})}catch(_){}p=[",
+                "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d);try{var __qi=Qi(),__marker=ne(J(__qi||Xs(118)),10);__outlookPatchEmit('hsprotect.main.tf.payload',{activities:t,serialized:ut(t),meta:d,payload:String(v),pc:String(h),cs:String(f),qi:String(__qi),marker:String(__marker),markerLen:String(__marker).length,stack:(new Error).stack})}catch(_){}p=[",
                 1,
             )
             patches.append(marker("main_tf_payload"))
@@ -1424,28 +1432,143 @@ def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
     return patched, patches
 
 
+def _write_hsprotect_patch_artifacts(
+    *,
+    label: str,
+    url: str,
+    source: str,
+    patched: str,
+    patches: list[str],
+) -> None:
+    try:
+        out_dir = _artifact_dir() / "hsprotect_js_patch"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sha = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()
+        ts = int(time.time())
+        kind = "captcha" if "captcha.hsprotect.net/" in url else "main"
+        base = out_dir / f"{kind}_{label}_{ts}_{sha[:12]}"
+        source_path = base.with_suffix(".source.js")
+        patched_path = base.with_suffix(".patched.js")
+        meta_path = base.with_suffix(".json")
+        probes = {
+            "main_min": "main.min.js" in url,
+            "captcha_js": "captcha.js" in url,
+            "has_Xn_event_bus": "var Xn={on:function" in source,
+            "has_sendBeacon_internal": "return o.sendBeacon(n,r)" in source,
+            "has_function_fp": "function fp(t,e)" in source,
+            "has_function_om": "function om(e,n)" in source,
+            "has_function_jl": "function jl(e,n)" in source,
+            "has_function_tf": "function tf(t,e)" in source,
+            "has_tf_vs_payload": "v=Vs(t,d)" in source,
+            "has_captcha_Ot": "function Ot(r,n,t,v)" in source,
+            "has_captcha_qs": "function qs(r,n,u,t,v,e,f,s,m)" in source,
+            "has_worker_new": "var w=new Worker(c);return w" in source,
+        }
+        indices = {key: source.find(key) for key in [
+            "var Xn={on:function",
+            "return o.sendBeacon(n,r)",
+            "function fp(t,e)",
+            "function om(e,n)",
+            "function jl(e,n)",
+            "function tf(t,e)",
+            "v=Vs(t,d)",
+            "function Ot(r,n,t,v)",
+            "function qs(r,n,u,t,v,e,f,s,m)",
+            "var w=new Worker(c);return w",
+        ]}
+        source_path.write_text(source, encoding="utf-8", errors="replace")
+        patched_path.write_text(patched, encoding="utf-8", errors="replace")
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "label": label,
+                    "url": url,
+                    "sha256": sha,
+                    "source_len": len(source),
+                    "patched_len": len(patched),
+                    "changed": source != patched,
+                    "patches": patches,
+                    "probes": probes,
+                    "indices": indices,
+                    "source_path": str(source_path),
+                    "patched_path": str(patched_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        logger.info(
+            "[outlook-browser] hsprotect JS patch artifact label=%s kind=%s sha256=%s patches=%s meta=%s",
+            label,
+            kind,
+            sha,
+            patches,
+            meta_path,
+        )
+    except Exception as e:
+        logger.debug("[outlook-browser] failed to write hsprotect JS patch artifact label=%s url=%s: %s", label, url, e)
+
+
 def _install_hsprotect_js_patch(ctx, *, label: str) -> None:
     if not _hsprotect_js_patch_enabled():
         return
-    logger.info("[outlook-browser] hsprotect JS patch enabled label=%s", label)
+    apply_patch = _hsprotect_js_patch_apply_enabled()
+    logger.info(
+        "[outlook-browser] hsprotect JS patch capture enabled label=%s apply=%s",
+        label,
+        apply_patch,
+    )
+
+    def should_capture(url: str) -> bool:
+        return (
+            ("client.hsprotect.net/" in url and "main.min.js" in url)
+            or ("captcha.hsprotect.net/" in url and "captcha.js" in url)
+        )
+
+    def write_artifacts_from_response(url: str, body: bytes) -> tuple[str, list[str]]:
+        source = body.decode("utf-8", errors="replace")
+        patched, patches = _patch_hsprotect_js_source(url, source)
+        _write_hsprotect_patch_artifacts(label=label, url=url, source=source, patched=patched, patches=patches)
+        if not patches:
+            logger.warning("[outlook-browser] hsprotect JS patch no-op label=%s url=%s", label, url)
+        else:
+            logger.info(
+                "[outlook-browser] hsprotect JS patch artifact captured label=%s url=%s patches=%s apply=%s",
+                label,
+                url,
+                patches,
+                apply_patch,
+            )
+        return patched, patches
+
+    if not apply_patch:
+        def response_handler(response) -> None:
+            url = str(getattr(response, "url", "") or "")
+            if not should_capture(url):
+                return
+            try:
+                write_artifacts_from_response(url, response.body())
+            except Exception as e:
+                logger.warning("[outlook-browser] hsprotect JS capture failed label=%s url=%s error=%s", label, url, e)
+
+        try:
+            ctx.on("response", response_handler)
+            logger.info("[outlook-browser] hsprotect JS capture installed without route interception label=%s", label)
+        except Exception as e:
+            logger.debug("[outlook-browser] hsprotect JS capture install failed label=%s error=%s", label, e)
+        return
 
     def handler(route, request) -> None:
         url = str(getattr(request, "url", "") or "")
-        if not (
-            ("client.hsprotect.net/" in url and "main.min.js" in url)
-            or ("captcha.hsprotect.net/" in url and "captcha.js" in url)
-        ):
+        if not should_capture(url):
             route.continue_()
             return
         try:
             resp = route.fetch()
             body = resp.body()
-            source = body.decode("utf-8", errors="replace")
-            patched, patches = _patch_hsprotect_js_source(url, source)
-            if not patches:
-                logger.warning("[outlook-browser] hsprotect JS patch no-op label=%s url=%s", label, url)
-            else:
-                logger.info("[outlook-browser] hsprotect JS patched label=%s url=%s patches=%s", label, url, patches)
+            patched, _patches = write_artifacts_from_response(url, body)
             headers = dict(getattr(resp, "headers", {}) or {})
             headers["content-type"] = "application/javascript; charset=utf-8"
             headers.pop("content-length", None)
@@ -3495,7 +3618,10 @@ def _register_in_context(cfg: Config, ctx, page, *, email: str, password: str, c
     first_name = str(_cfg_value(cfg, "first_name", "") or random.choice(FIRST_NAMES))
     last_name = str(_cfg_value(cfg, "last_name", "") or random.choice(LAST_NAMES))
     _install_runtime_trace(page, label=prefix or "outlook")
-    _install_js_internal_trace(page, label=prefix or "outlook")
+    if _js_internal_trace_enabled():
+        _install_js_internal_trace(page, label=prefix or "outlook")
+    else:
+        logger.info("[outlook-browser] JS internal trace disabled; set OUTLOOK_JS_INTERNAL_TRACE=1 to inject page hooks")
 
     signup_url = _browser_signup_authorize_url(cfg)
     logger.info("[outlook-browser] signup authorize entry client_id=%s", _cfg_value(cfg, "client_id", "00000000480728C5"))
