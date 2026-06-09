@@ -423,11 +423,11 @@ def _install_challenge_hooks(page) -> None:
                 push('message', {
                   origin: ev.origin || '',
                   dataType: typeof data,
-                  data: typeof data === 'object' ? JSON.stringify(data).slice(0, 500) : String(data || '').slice(0, 500)
+                  data: typeof data === 'object' ? JSON.stringify(data) : String(data || '')
                 });
               }, true);
               new MutationObserver(() => {
-                const text = (document.body && document.body.innerText || '').slice(0, 300);
+                const text = (document.body && document.body.innerText || '');
                 push('mutation', { url: location.href, text });
               }).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
               push('hooked', { url: location.href });
@@ -667,7 +667,7 @@ def _cache_signup_server_data(page, *, label: str) -> dict:
             bool(cached.get("hasApiCanary")),
             bool(cached.get("hasCheckUrl")),
             bool(cached.get("hasCreateUrl")),
-            _mask(str(cached.get("uaid") or "")),
+            str(cached.get("uaid") or ""),
         )
         return cached
     except Exception as e:
@@ -734,8 +734,9 @@ def _install_runtime_trace(page, *, label: str) -> Path:
                 "kind": "request",
                 "method": str(getattr(req, "method", "") or ""),
                 "url": url,
+                "headers": {str(k): str(v) for k, v in dict(getattr(req, "headers", {}) or {}).items()},
                 "post_len": len(post),
-                "post_preview": post[:500],
+                "post_data": post,
             })
         except Exception:
             pass
@@ -760,7 +761,7 @@ def _install_runtime_trace(page, *, label: str) -> Path:
                     except Exception:
                         parsed = None
                 try:
-                    setattr(page, "_outlook_last_create_response", parsed if isinstance(parsed, dict) else {"text": body[:2000]})
+                    setattr(page, "_outlook_last_create_response", parsed if isinstance(parsed, dict) else {"text": body})
                     if isinstance(parsed, dict):
                         redirect = str(parsed.get("redirectUrl") or parsed.get("redirect_url") or parsed.get("redirect") or "")
                         error = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
@@ -773,8 +774,50 @@ def _install_runtime_trace(page, *, label: str) -> Path:
                 "kind": "response",
                 "status": int(getattr(resp, "status", 0) or 0),
                 "url": url,
+                "headers": {str(k): str(v) for k, v in dict(getattr(resp, "headers", {}) or {}).items()},
                 "body_len": len(body),
-                "body_preview": body[:800],
+                "body": body,
+            })
+        except Exception:
+            pass
+
+    def on_request_failed(req) -> None:
+        try:
+            url = str(getattr(req, "url", "") or "")
+            if not is_interesting(url):
+                return
+            failure = {}
+            try:
+                failure = req.failure or {}
+            except Exception:
+                failure = {}
+            write({
+                "kind": "requestfailed",
+                "method": str(getattr(req, "method", "") or ""),
+                "url": url,
+                "failure": failure,
+            })
+        except Exception:
+            pass
+
+    def on_console(msg) -> None:
+        try:
+            text = str(getattr(msg, "text", "") or "")
+            if not is_interesting(text):
+                return
+            write({
+                "kind": "console",
+                "type": str(getattr(msg, "type", "") or ""),
+                "text": text[:3000],
+            })
+        except Exception:
+            pass
+
+    def on_page_error(err) -> None:
+        try:
+            write({
+                "kind": "pageerror",
+                "error": str(err)[:4000],
             })
         except Exception:
             pass
@@ -782,10 +825,639 @@ def _install_runtime_trace(page, *, label: str) -> Path:
     try:
         page.on("request", on_request)
         page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
+        page.on("console", on_console)
+        page.on("pageerror", on_page_error)
         logger.info("[outlook-browser] runtime trace path=%s", trace_path)
     except Exception as e:
         logger.debug("[outlook-browser] install runtime trace failed: %s", e)
     return trace_path
+
+
+def _install_js_internal_trace(page, *, label: str) -> Path:
+    """Install non-invasive JS hooks for HUMAN/hsprotect runtime analysis."""
+    artifacts = _artifact_dir()
+    trace_path = artifacts / f"js_internal_trace_{label}_{int(time.time())}.jsonl"
+
+    def write(item: dict[str, Any]) -> None:
+        try:
+            item["wall_t"] = time.time()
+            with trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
+    try:
+        page.expose_function("__outlookJsInternalTrace", write)
+    except Exception:
+        pass
+
+    def on_console(msg) -> None:
+        try:
+            text = str(msg.text or "")
+            marker = "__OUTLOOK_JS_INTERNAL_TRACE__"
+            if marker not in text:
+                return
+            payload = text.split(marker, 1)[1]
+            item = json.loads(payload)
+            if isinstance(item, dict):
+                item["console_type"] = str(getattr(msg, "type", "") or "")
+                write(item)
+        except Exception:
+            pass
+
+    try:
+        page.on("console", on_console)
+    except Exception:
+        pass
+
+    try:
+        page.add_init_script(
+            """
+            (() => {
+              if (window.__outlookJsInternalTraceInstalled) return;
+              window.__outlookJsInternalTraceInstalled = true;
+              const interesting = /hsprotect|perimeterx|px-cloud|px-client|collector|captcha|risk\\/verify|CreateAccount|CheckAvailableSigninNames/i;
+              const safeString = (value) => {
+                try {
+                  if (value === undefined) return '<undefined>';
+                  if (value === null) return '<null>';
+                  if (typeof value === 'string') return value;
+                  return JSON.stringify(value, (k, v) => {
+                    if (typeof v === 'function') return `[function ${v.name || 'anonymous'}]`;
+                    if (v instanceof Error) return { name: v.name, message: v.message, stack: String(v.stack || '') };
+                    return v;
+                  });
+                } catch (e) {
+                  try { return String(value); } catch (_) { return '<unstringifiable>'; }
+                }
+              };
+              const stack = () => {
+                try { return String((new Error()).stack || '').split('\\n').slice(2).join('\\n'); }
+                catch (_) { return ''; }
+              };
+              const emit = (kind, data = {}) => {
+                try {
+                  const item = {
+                    kind,
+                    href: String(location.href || ''),
+                    origin: String(location.origin || ''),
+                    frameTop: window === window.top,
+                    perf_t: Math.round(performance.now()),
+                    data
+                  };
+                  const fn = window.__outlookJsInternalTrace;
+                  if (typeof fn === 'function') fn(item);
+                  try { console.debug('__OUTLOOK_JS_INTERNAL_TRACE__' + JSON.stringify(item)); } catch (_) {}
+                } catch (_) {}
+              };
+              const maybeInteresting = url => interesting.test(String(url || location.href || ''));
+              emit('hook_installed', { ua: navigator.userAgent, title: document.title });
+
+              try {
+                const originalPostMessage = window.postMessage;
+                window.postMessage = function(message, targetOrigin, transfer) {
+                  emit('window.postMessage.call', {
+                    targetOrigin: safeString(targetOrigin, 160),
+                    message: safeString(message, 1000),
+                    stack: stack()
+                  });
+                  return originalPostMessage.apply(this, arguments);
+                };
+              } catch (e) {
+                emit('hook_error', { hook: 'window.postMessage', error: safeString(e) });
+              }
+
+              try {
+                const originalAdd = EventTarget.prototype.addEventListener;
+                const originalDispatch = EventTarget.prototype.dispatchEvent;
+                EventTarget.prototype.addEventListener = function(type, listener, options) {
+                  if (type === 'message' || type === 'pointerdown' || type === 'pointerup' || type === 'mousedown' || type === 'mouseup' || type === 'touchstart' || type === 'touchend') {
+                    let target = 'EventTarget';
+                    try { target = this === window ? 'window' : (this && this.constructor && this.constructor.name) || target; } catch (_) {}
+                    emit('addEventListener', { type, target, stack: stack() });
+                  }
+                  return originalAdd.apply(this, arguments);
+                };
+                EventTarget.prototype.dispatchEvent = function(event) {
+                  try {
+                    const type = event && event.type;
+                    if (type === 'message' || type === 'pointerdown' || type === 'pointerup' || type === 'mousedown' || type === 'mouseup' || type === 'touchstart' || type === 'touchend') {
+                      let target = 'EventTarget';
+                      try { target = this === window ? 'window' : (this && this.constructor && this.constructor.name) || target; } catch (_) {}
+                      emit('dispatchEvent', {
+                        type: String(type || ''),
+                        target,
+                        isTrusted: !!(event && event.isTrusted),
+                        pointerType: event && event.pointerType,
+                        button: event && event.button,
+                        buttons: event && event.buttons,
+                        clientX: event && event.clientX,
+                        clientY: event && event.clientY,
+                        stack: stack()
+                      });
+                    }
+                  } catch (_) {}
+                  return originalDispatch.apply(this, arguments);
+                };
+                window.addEventListener('message', ev => {
+                  emit('window.message.recv', {
+                    eventOrigin: String(ev.origin || ''),
+                    dataType: typeof ev.data,
+                    data: safeString(ev.data, 1000)
+                  });
+                }, true);
+              } catch (e) {
+                emit('hook_error', { hook: 'addEventListener', error: safeString(e) });
+              }
+
+              try {
+                if (window.MessageChannel) {
+                  const OriginalMessageChannel = window.MessageChannel;
+                  window.MessageChannel = function() {
+                    const channel = new OriginalMessageChannel();
+                    const wrapPort = (port, name) => {
+                      try {
+                        const originalPortPost = port.postMessage;
+                        port.postMessage = function(message, transfer) {
+                          emit('MessagePort.postMessage', { port: name, message: safeString(message, 1200), stack: stack() });
+                          return originalPortPost.apply(this, arguments);
+                        };
+                        port.addEventListener('message', ev => {
+                          emit('MessagePort.message', { port: name, data: safeString(ev.data, 1200) });
+                        });
+                      } catch (_) {}
+                    };
+                    wrapPort(channel.port1, 'port1');
+                    wrapPort(channel.port2, 'port2');
+                    emit('MessageChannel.new', { stack: stack() });
+                    return channel;
+                  };
+                  window.MessageChannel.prototype = OriginalMessageChannel.prototype;
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'MessageChannel', error: safeString(e) });
+              }
+
+              try {
+                const proto = XMLHttpRequest.prototype;
+                const originalOpen = proto.open;
+                const originalSend = proto.send;
+                const originalSetHeader = proto.setRequestHeader;
+                proto.open = function(method, url) {
+                  try {
+                    this.__outlookTrace = { method: String(method || ''), url: String(url || ''), headers: {}, openStack: stack() };
+                    if (maybeInteresting(url)) emit('xhr.open', this.__outlookTrace);
+                  } catch (_) {}
+                  return originalOpen.apply(this, arguments);
+                };
+                proto.setRequestHeader = function(name, value) {
+                  try {
+                    if (this.__outlookTrace) this.__outlookTrace.headers[String(name || '')] = String(value || '');
+                  } catch (_) {}
+                  return originalSetHeader.apply(this, arguments);
+                };
+                proto.send = function(body) {
+                  try {
+                    const meta = this.__outlookTrace || {};
+                    if (maybeInteresting(meta.url)) {
+                      emit('xhr.send', {
+                        method: meta.method,
+                        url: meta.url,
+                        headers: meta.headers || {},
+                        bodyLen: typeof body === 'string' ? body.length : (body && body.byteLength) || 0,
+                        body: typeof body === 'string' ? body : Object.prototype.toString.call(body),
+                        stack: stack()
+                      });
+                      this.addEventListener('loadend', () => {
+                        let text = '';
+                        try {
+                          if (typeof this.responseText === 'string') text = this.responseText;
+                        } catch (_) {}
+                        emit('xhr.loadend', {
+                          method: meta.method,
+                          url: meta.url,
+                          status: this.status,
+                          responseURL: this.responseURL,
+                          responseText: text
+                        });
+                      }, { once: true });
+                    }
+                  } catch (_) {}
+                  return originalSend.apply(this, arguments);
+                };
+              } catch (e) {
+                emit('hook_error', { hook: 'XMLHttpRequest', error: safeString(e) });
+              }
+
+              try {
+                if (window.fetch) {
+                  const originalFetch = window.fetch;
+                  window.fetch = function(input, init = {}) {
+                    const url = typeof input === 'string' ? input : (input && input.url) || '';
+                    if (maybeInteresting(url)) {
+                      emit('fetch.call', {
+                        url: String(url),
+                        method: String((init && init.method) || (input && input.method) || 'GET'),
+                        bodyLen: typeof init.body === 'string' ? init.body.length : (init.body && init.body.byteLength) || 0,
+                        body: typeof init.body === 'string' ? init.body : Object.prototype.toString.call(init.body),
+                        stack: stack()
+                      });
+                    }
+                    return originalFetch.apply(this, arguments).then(resp => {
+                      try {
+                        if (maybeInteresting(resp.url || url)) {
+                          emit('fetch.response', { url: resp.url || String(url), status: resp.status, type: resp.type });
+                        }
+                      } catch (_) {}
+                      return resp;
+                    });
+                  };
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'fetch', error: safeString(e) });
+              }
+
+              try {
+                if (navigator.sendBeacon) {
+                  const originalBeacon = navigator.sendBeacon.bind(navigator);
+                  navigator.sendBeacon = function(url, data) {
+                    let dataText = '';
+                    let len = 0;
+                    try {
+                      if (typeof data === 'string') { dataText = data; len = data.length; }
+                      else if (data && typeof data.size === 'number') { len = data.size; dataText = `[${data.constructor && data.constructor.name || 'Blob'} size=${data.size} type=${data.type || ''}]`; }
+                      else if (data) { len = data.byteLength || 0; dataText = Object.prototype.toString.call(data); }
+                    } catch (_) {}
+                    emit('sendBeacon.call', { url: String(url || ''), dataLen: len, data: dataText, stack: stack() });
+                    return originalBeacon(url, data);
+                  };
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'sendBeacon', error: safeString(e) });
+              }
+
+              try {
+                if (window.WebSocket) {
+                  const OriginalWebSocket = window.WebSocket;
+                  window.WebSocket = function(url, protocols) {
+                    emit('WebSocket.new', { url: safeString(url, 500), protocols: safeString(protocols, 500), stack: stack() });
+                    const ws = new OriginalWebSocket(url, protocols);
+                    const originalSend = ws.send;
+                    ws.send = function(data) {
+                      emit('WebSocket.send', { url: safeString(url, 500), data: safeString(data, 1200), stack: stack() });
+                      return originalSend.apply(this, arguments);
+                    };
+                    ws.addEventListener('message', ev => emit('WebSocket.message', { url: safeString(url, 500), data: safeString(ev.data, 1200) }));
+                    ws.addEventListener('error', ev => emit('WebSocket.error', { url: safeString(url, 500), error: safeString(ev, 800) }));
+                    return ws;
+                  };
+                  window.WebSocket.prototype = OriginalWebSocket.prototype;
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'WebSocket', error: safeString(e) });
+              }
+
+              try {
+                const OriginalBlob = window.Blob;
+                if (OriginalBlob) {
+                  window.Blob = function(parts, options) {
+                    const blob = new OriginalBlob(parts, options);
+                    try {
+                      const textParts = Array.isArray(parts) ? parts.filter(p => typeof p === 'string').join('\\n') : '';
+                      if (/sha256|postMessage|poi|captcha|worker/i.test(textParts)) {
+                        emit('Blob.created', {
+                          size: blob.size,
+                          type: blob.type || (options && options.type) || '',
+                          text: textParts,
+                          stack: stack()
+                        });
+                      }
+                    } catch (_) {}
+                    return blob;
+                  };
+                  window.Blob.prototype = OriginalBlob.prototype;
+                }
+                if (URL && URL.createObjectURL) {
+                  const originalCreateObjectURL = URL.createObjectURL.bind(URL);
+                  URL.createObjectURL = function(obj) {
+                    const out = originalCreateObjectURL(obj);
+                    try {
+                      emit('URL.createObjectURL', {
+                        url: String(out || ''),
+                        objectType: obj && obj.constructor && obj.constructor.name,
+                        size: obj && obj.size,
+                        type: obj && obj.type,
+                        stack: stack()
+                      });
+                    } catch (_) {}
+                    return out;
+                  };
+                }
+                if (window.Worker) {
+                  const OriginalWorker = window.Worker;
+                  window.Worker = function(scriptURL, options) {
+                    emit('Worker.new', { scriptURL: safeString(scriptURL, 500), options: safeString(options, 500), stack: stack() });
+                    const worker = new OriginalWorker(scriptURL, options);
+                    const originalWorkerPost = worker.postMessage;
+                    worker.postMessage = function(message, transfer) {
+                      emit('Worker.postMessage', { scriptURL: safeString(scriptURL, 300), message: safeString(message, 1000), stack: stack() });
+                      return originalWorkerPost.apply(this, arguments);
+                    };
+                    worker.addEventListener('message', ev => {
+                      emit('Worker.message', { scriptURL: safeString(scriptURL, 300), data: safeString(ev.data, 1000) });
+                    });
+                    worker.addEventListener('error', ev => {
+                      emit('Worker.error', { scriptURL: safeString(scriptURL, 300), message: safeString(ev.message, 500), filename: ev.filename, lineno: ev.lineno, colno: ev.colno });
+                    });
+                    return worker;
+                  };
+                  window.Worker.prototype = OriginalWorker.prototype;
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'Worker/Blob', error: safeString(e) });
+              }
+
+              try {
+                let desc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+                let proto = Document.prototype;
+                while ((!desc || !desc.set || !desc.get) && proto) {
+                  proto = Object.getPrototypeOf(proto);
+                  if (proto) desc = Object.getOwnPropertyDescriptor(proto, 'cookie');
+                }
+                if (desc && desc.configurable && desc.get && desc.set) {
+                  Object.defineProperty(document, 'cookie', {
+                    configurable: true,
+                    enumerable: desc.enumerable,
+                    get() {
+                      const value = desc.get.call(document);
+                      return value;
+                    },
+                    set(value) {
+                      const text = String(value || '');
+                      if (/_px3|_pxde|_pxvid|fptctx2|MUID|MSP|OParams|uaid/i.test(text)) {
+                        emit('document.cookie.set', { value: text, stack: stack() });
+                      }
+                      return desc.set.call(document, value);
+                    }
+                  });
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'document.cookie', error: safeString(e) });
+              }
+
+              try {
+                if (window.HTMLFormElement) {
+                  const formProto = window.HTMLFormElement.prototype;
+                  if (formProto.submit) {
+                    const originalSubmit = formProto.submit;
+                    formProto.submit = function() {
+                      emit('HTMLFormElement.submit', {
+                        action: this && this.action,
+                        method: this && this.method,
+                        id: this && this.id,
+                        stack: stack()
+                      });
+                      return originalSubmit.apply(this, arguments);
+                    };
+                  }
+                  if (formProto.requestSubmit) {
+                    const originalRequestSubmit = formProto.requestSubmit;
+                    formProto.requestSubmit = function(submitter) {
+                      emit('HTMLFormElement.requestSubmit', {
+                        action: this && this.action,
+                        method: this && this.method,
+                        id: this && this.id,
+                        submitter: submitter && (submitter.id || submitter.name || submitter.type),
+                        stack: stack()
+                      });
+                      return originalRequestSubmit.apply(this, arguments);
+                    };
+                  }
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'HTMLFormElement', error: safeString(e) });
+              }
+
+              try {
+                const wrapSdk = sdk => {
+                  try {
+                    if (!sdk || sdk.__outlookWrapped) return sdk;
+                    Object.defineProperty(sdk, '__outlookWrapped', { value: true });
+                    if (sdk.Events) {
+                      for (const name of ['on', 'one', 'off', 'subscribe', 'trigger']) {
+                        if (typeof sdk.Events[name] !== 'function' || sdk.Events[name].__outlookWrapped) continue;
+                        const original = sdk.Events[name];
+                        sdk.Events[name] = function() {
+                          emit('PX.Events.' + name, { args: Array.from(arguments).map(v => safeString(v, 500)), stack: stack() });
+                          return original.apply(this, arguments);
+                        };
+                        Object.defineProperty(sdk.Events[name], '__outlookWrapped', { value: true });
+                      }
+                    }
+                  } catch (e) {
+                    emit('hook_error', { hook: 'wrapSdk', error: safeString(e) });
+                  }
+                  return sdk;
+                };
+                const installPropertyWrapper = name => {
+                  try {
+                    let current = window[name];
+                    Object.defineProperty(window, name, {
+                      configurable: true,
+                      get() { return current; },
+                      set(value) {
+                        emit('window.property.set', { name, valueType: typeof value, valuePreview: safeString(value, 500), stack: stack() });
+                        if (name.endsWith('_asyncInit') && typeof value === 'function') {
+                          current = function(sdk) {
+                            emit('PX.asyncInit.call', { name, sdkKeys: sdk && Object.keys(sdk).slice(0, 30) });
+                            wrapSdk(sdk);
+                            return value.apply(this, arguments);
+                          };
+                        } else {
+                          current = wrapSdk(value);
+                        }
+                      }
+                    });
+                    if (current !== undefined) window[name] = current;
+                  } catch (e) {
+                    emit('hook_error', { hook: 'property:' + name, error: safeString(e) });
+                  }
+                };
+                installPropertyWrapper('PXzC5j78di_asyncInit');
+                installPropertyWrapper('PXzC5j78di');
+                installPropertyWrapper('PX');
+                const scan = () => {
+                  try {
+                    for (const key of Object.keys(window)) {
+                      if (/^PX[A-Za-z0-9]{4,12}(_asyncInit)?$/.test(key)) {
+                        const value = window[key];
+                        if (value && value.Events) wrapSdk(value);
+                      }
+                    }
+                  } catch (_) {}
+                };
+                setInterval(scan, 500);
+                scan();
+              } catch (e) {
+                emit('hook_error', { hook: 'PX sdk', error: safeString(e) });
+              }
+            })();
+            """
+        )
+        logger.info("[outlook-browser] js internal trace path=%s", trace_path)
+    except Exception as e:
+        logger.debug("[outlook-browser] install js internal trace failed: %s", e)
+    return trace_path
+
+
+def _hsprotect_js_patch_enabled() -> bool:
+    return str(os.environ.get("OUTLOOK_HSPROTECT_JS_PATCH", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
+    patches: list[str] = []
+    patched = source
+
+    def marker(name: str) -> str:
+        return f"__outlook_hsprotect_patch_{name}__"
+
+    emit_js = (
+        "function __outlookPatchEmit(kind,data){try{"
+        "var item={kind:kind,href:String(location.href||''),origin:String(location.origin||''),"
+        "frameTop:window===window.top,perf_t:Math.round(performance.now()),data:data||{}};"
+        "try{if(typeof window.__outlookJsInternalTrace==='function')window.__outlookJsInternalTrace(item)}catch(e){};"
+        "try{console.debug('__OUTLOOK_JS_INTERNAL_TRACE__'+JSON.stringify(item))}catch(e){}"
+        "}catch(e){}}"
+    )
+
+    if "client.hsprotect.net/" in url and "main.min.js" in url:
+        needle = "var Xn={on:function(t,e,n){this.subscribe(t,e,n,!1)},one:function(t,e,n){this.subscribe(t,e,n,!0)},off:function(t,e){var n,r;if(void 0!==this.channels[t])for(n=0,r=this.channels[t].length;n<r;n++){if(this.channels[t][n].fn===e){this.channels[t].splice(n,1);break}}},subscribe:function(t,e,n,r){void 0===this.channels&&(this.channels={}),this.channels[t]=this.channels[t]||[],this.channels[t].push({fn:e,ctx:n,once:r||!1})},trigger:function(e){if(this.channels&&this.channels.hasOwnProperty(e)){for(var n=Array.prototype.slice.call(arguments,1),r=[];this.channels[e].length>0;){var a=this.channels[e].shift();t(a.fn)===f&&a.fn.apply(a.ctx,n),a.once||r.push(a)}this.channels[e]=r}}},"
+        if needle in patched:
+            replacement = (
+                emit_js
+                + "var Xn={on:function(t,e,n){__outlookPatchEmit('hsprotect.Xn.on',{channel:String(t),listener:String(e&&e.name||''),stack:(new Error).stack});this.subscribe(t,e,n,!1)},"
+                + "one:function(t,e,n){__outlookPatchEmit('hsprotect.Xn.one',{channel:String(t),listener:String(e&&e.name||''),stack:(new Error).stack});this.subscribe(t,e,n,!0)},"
+                + "off:function(t,e){var n,r;if(void 0!==this.channels[t])for(n=0,r=this.channels[t].length;n<r;n++){if(this.channels[t][n].fn===e){this.channels[t].splice(n,1);break}}},"
+                + "subscribe:function(t,e,n,r){__outlookPatchEmit('hsprotect.Xn.subscribe',{channel:String(t),once:!!r,listener:String(e&&e.name||''),stack:(new Error).stack});void 0===this.channels&&(this.channels={}),this.channels[t]=this.channels[t]||[],this.channels[t].push({fn:e,ctx:n,once:r||!1})},"
+                + "trigger:function(e){__outlookPatchEmit('hsprotect.Xn.trigger',{channel:String(e),args:Array.prototype.slice.call(arguments,1).map(function(x){try{return JSON.stringify(x)}catch(_){return String(x)}}),stack:(new Error).stack});if(this.channels&&this.channels.hasOwnProperty(e)){for(var n=Array.prototype.slice.call(arguments,1),r=[];this.channels[e].length>0;){var a=this.channels[e].shift();t(a.fn)===f&&a.fn.apply(a.ctx,n),a.once||r.push(a)}this.channels[e]=r}}},"
+            )
+            patched = patched.replace(needle, replacement)
+            patches.append(marker("main_xn_event_bus"))
+        send_needle = "return o.sendBeacon(n,r)"
+        if send_needle in patched:
+            patched = patched.replace(
+                send_needle,
+                "__outlookPatchEmit('hsprotect.sendBeacon.internal',{url:String(n),blobSize:r&&r.size,blobType:r&&r.type,data:String(r&&r.text?'[blob:text-async]':r),stack:(new Error).stack});try{if(r&&typeof r.text==='function')r.text().then(function(__txt){__outlookPatchEmit('hsprotect.sendBeacon.blobText',{url:String(n),blobSize:r&&r.size,blobType:r&&r.type,text:String(__txt),stack:(new Error).stack})}).catch(function(__err){__outlookPatchEmit('hsprotect.sendBeacon.blobText.error',{url:String(n),error:String(__err),stack:(new Error).stack})})}catch(__beaconTextErr){__outlookPatchEmit('hsprotect.sendBeacon.blobText.error',{url:String(n),error:String(__beaconTextErr),stack:(new Error).stack})}return o.sendBeacon(n,r)",
+            )
+            patches.append(marker("main_sendbeacon_internal"))
+        fp_needle = "function fp(t,e){var n=235,r=251,a=279,o=235,i=Bv;np[i(279)](i(n),t,e),Ii[i(r)][i(a)](i(o),t)}"
+        if fp_needle in patched:
+            patched = patched.replace(
+                fp_needle,
+                "function fp(t,e){__outlookPatchEmit('hsprotect.main.fp.enter',{t:String(t),e:String(e),stack:(new Error).stack});var n=235,r=251,a=279,o=235,i=Bv;np[i(279)](i(n),t,e),Ii[i(r)][i(a)](i(o),t)}",
+            )
+            patches.append(marker("main_fp_enter"))
+        om_needle = "function om(e,n){var r,a=458,o=453,c=Yp;(Mv&&_r()&&i[c(a)](),n&&Yi())||(!function(e,n){var r=278,a=227,o=235,i=Tl,c=arguments[i(278)]>2&&void 0!==arguments[2]?arguments[2]:jl;if(!e||!e[i(r)])return!1;var u=Wl(e);if(t(u)!==l)c(u,!0);else{var s=j(u),f=el(n);c(u=ne(s,parseInt(f,10)%128)[i(a)](i(o)),!1)}}(e,Tt()),n&&(tm?Pc()&&um():(vr(rr[se])&&function(t){qo=t}(e),r=(new Date)[c(o)](),$o=r,tm=!0,function(){var e={F:455},n=Yp;ur=!0,hr(cr),nm=+fr(rr[ue]),function(){var t=vr(rr[Te]),e=Np()||vr(rr[Ae]);(t||e)&&Ep(e,t)}(),vr(rr[Me])&&_p(),t(nm)===s&&nm<=Jp?setTimeout(cm[n(e.F)](this,nm),nm):cm()}())))}"
+        if om_needle in patched:
+            patched = patched.replace(
+                om_needle,
+                "function om(e,n){__outlookPatchEmit('hsprotect.main.om.enter',{e:String(e),n:!!n,stack:(new Error).stack});var r,a=458,o=453,c=Yp;(Mv&&_r()&&i[c(a)](),n&&Yi())||(!function(e,n){var r=278,a=227,o=235,i=Tl,c=arguments[i(278)]>2&&void 0!==arguments[2]?arguments[2]:jl;if(!e||!e[i(r)])return!1;var u=Wl(e);try{__outlookPatchEmit('hsprotect.main.om.Wl',{input:String(e),outputType:typeof u,output:String(u),n:String(n),stack:(new Error).stack})}catch(_){}if(t(u)!==l)c(u,!0);else{var s=j(u),f=el(n),__decoded=ne(s,parseInt(f,10)%128),__parts=__decoded[i(a)](i(o));try{__outlookPatchEmit('hsprotect.main.om.decode',{u:String(u),j:String(s),el:String(f),mod:parseInt(f,10)%128,decoded:String(__decoded),parts:__parts,stack:(new Error).stack})}catch(_){}c(u=__parts,!1)}}(e,Tt()),n&&(tm?Pc()&&um():(vr(rr[se])&&function(t){qo=t}(e),r=(new Date)[c(o)](),$o=r,tm=!0,function(){var e={F:455},n=Yp;ur=!0,hr(cr),nm=+fr(rr[ue]),function(){var t=vr(rr[Te]),e=Np()||vr(rr[Ae]);(t||e)&&Ep(e,t)}(),vr(rr[Me])&&_p(),t(nm)===s&&nm<=Jp?setTimeout(cm[n(e.F)](this,nm),nm):cm()}())))}",
+            )
+            patches.append(marker("main_om_enter_decode"))
+        jl_needle = "function jl(e,n){var r=278,a=227,o=232,i=254,c=260,u=254,s=241,l=Tl;if(e){for(var h,d=[],v=0;v<e[l(r)];v++){var p=e[v];if(p){var m=p[l(a)](\"|\"),g=m[l(o)](),y=n?Cl[g]:Xl[g];if(m[0]===rr[pe]){h=R(R({},Fn,g),In,m);continue}f===t(y)&&(g===wl||g===Ml?d[l(i)](R(R({},Fn,g),In,m)):d[l(c)](R(R({},Fn,g),In,m)))}}h&&d[l(u)](h);for(var b=0;b<d[l(r)];b++){var I=d[b];try{(n?Cl[I[Fn]]:Xl[I[Fn]])[l(s)](R({},xn,d),I[In])}catch(t){kn(t,Cn[Fe])}}}}"
+        if jl_needle in patched:
+            patched = patched.replace(
+                jl_needle,
+                "function jl(e,n){__outlookPatchEmit('hsprotect.main.jl.enter',{n:!!n,len:e&&e.length,items:e,stack:(new Error).stack});var r=278,a=227,o=232,i=254,c=260,u=254,s=241,l=Tl;if(e){for(var h,d=[],v=0;v<e[l(r)];v++){var p=e[v];if(p){var m=p[l(a)](\"|\"),g=m[l(o)](),y=n?Cl[g]:Xl[g];try{__outlookPatchEmit('hsprotect.main.jl.item',{index:v,raw:String(p),handlerKey:String(g),args:m,table:n?'Cl':'Xl',handlerType:typeof y,stack:(new Error).stack})}catch(_){}if(m[0]===rr[pe]){h=R(R({},Fn,g),In,m);continue}f===t(y)&&(g===wl||g===Ml?d[l(i)](R(R({},Fn,g),In,m)):d[l(c)](R(R({},Fn,g),In,m)))}}h&&d[l(u)](h);try{__outlookPatchEmit('hsprotect.main.jl.queue',{n:!!n,queue:d.map(function(x){try{return{key:String(x[Fn]),args:x[In]}}catch(_){return String(x)}}),stack:(new Error).stack})}catch(_){}for(var b=0;b<d[l(r)];b++){var I=d[b];try{__outlookPatchEmit('hsprotect.main.jl.dispatch',{table:n?'Cl':'Xl',handlerKey:String(I[Fn]),args:I[In],queueLen:d.length,stack:(new Error).stack});(n?Cl[I[Fn]]:Xl[I[Fn]])[l(s)](R({},xn,d),I[In])}catch(t){kn(t,Cn[Fe])}}}}",
+            )
+            patches.append(marker("main_jl_dispatch"))
+        tf_start_needle = "function tf(t,e){for(var n=eu(),r=0;r<t.length;r++){"
+        if tf_start_needle in patched:
+            patched = patched.replace(
+                tf_start_needle,
+                "function tf(t,e){try{__outlookPatchEmit('hsprotect.main.tf.enter',{activities:t,configKeys:e&&Object.keys?Object.keys(e):[],stack:(new Error).stack})}catch(_){}for(var n=eu(),r=0;r<t.length;r++){",
+                1,
+            )
+            patches.append(marker("main_tf_enter"))
+        tf_payload_needle = "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d),p=["
+        if tf_payload_needle in patched:
+            patched = patched.replace(
+                tf_payload_needle,
+                "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d);try{__outlookPatchEmit('hsprotect.main.tf.payload',{activities:t,serialized:ut(t),meta:d,payload:String(v),pc:String(h),cs:String(f),stack:(new Error).stack})}catch(_){}p=[",
+                1,
+            )
+            patches.append(marker("main_tf_payload"))
+
+    if "captcha.hsprotect.net/" in url and "captcha.js" in url:
+        zt_needle = "var zt=function(r){function n(r,n){return mt(r- -665,n)}try{R()[window[v(n(-420,-426))]][v(n(-410,-403))][v(n(-422,-429))](v(n(-417,-412)),r)}catch(r){}};"
+        if zt_needle in patched:
+            patched = patched.replace(
+                zt_needle,
+                emit_js
+                + "var zt=function(r){function n(r,n){return mt(r- -665,n)}try{__outlookPatchEmit('hsprotect.captcha.zt.enter',{arg:String(r),stack:(new Error).stack})}catch(_){}try{R()[window[v(n(-420,-426))]][v(n(-410,-403))][v(n(-422,-429))](v(n(-417,-412)),r)}catch(r){}};",
+            )
+            patches.append(marker("captcha_zt_enter"))
+        ot_needle = "function Ot(r,n,t,v){function e(r,n){return Rt(r-705,n)}var f,s=u,m=su();clearTimeout(At),r=parseInt(r),zt(s(0===r?e(1095,1044):e(1042,972))),0===r&&B()&&m[s(\"PkU0HwwBODJgEBUZGDslQi4ZChw8\")]&&setTimeout(W,Kt-T),Hn[s(e(1147,1081))]=Kn()&&-1===r;var z,i=(z=qt,Ut=!0,setTimeout[u(\"NV8XFA\")](null,z?Qt:kt,Kt)),c=function(r,n,t){var v=u;if(r&&n&&t)return\"\"[e(-466,-443)](r,\"|\")[e(-466,-475)](n,\"|\")[e(-466,-473)](t);function e(r,n){return Rt(r- -864,n)}return v(\"\")}(n,t,v),o=((f={})[s(e(1155,1184))]=r,f);c&&(o[s(e(1184,1252))]=c),i(o,!0)}"
+        if ot_needle in patched:
+            patched = patched.replace(
+                ot_needle,
+                emit_js
+                + "function Ot(r,n,t,v){function e(r,n){return Rt(r-705,n)}var f,s=u,m=su();clearTimeout(At),r=parseInt(r);try{var __otState=s(0===r?e(1095,1044):e(1042,972));__outlookPatchEmit('hsprotect.captcha.Ot.enter',{r:r,n:String(n),t:String(t),v:String(v),state:String(__otState),zero:r===0,stack:(new Error).stack});zt(__otState)}catch(__otPatchErr){try{__outlookPatchEmit('hsprotect.captcha.Ot.patch_error',{error:String(__otPatchErr),stack:(new Error).stack})}catch(_){}}0===r&&B()&&m[s(\"PkU0HwwBODJgEBUZGDslQi4ZChw8\")]&&setTimeout(W,Kt-T),Hn[s(e(1147,1081))]=Kn()&&-1===r;var z,i=(z=qt,Ut=!0,setTimeout[u(\"NV8XFA\")](null,z?Qt:kt,Kt)),c=function(r,n,t){var v=u;if(r&&n&&t)return\"\"[e(-466,-443)](r,\"|\")[e(-466,-475)](n,\"|\")[e(-466,-473)](t);function e(r,n){return Rt(r- -864,n)}return v(\"\")}(n,t,v),o=((f={})[s(e(1155,1184))]=r,f);c&&(o[s(e(1184,1252))]=c),i(o,!0)}",
+            )
+            patches.append(marker("captcha_ot_enter"))
+        needle = "function qs(r,n,u,t,v,e,f,s,m){for(var z,i=r;i<=n;i++)(z=poi(i,u,t,v,e,f,0,m))&&postMessage(z);postMessage(!1)}"
+        if needle in patched:
+            replacement = (
+                emit_js
+                + "function qs(r,n,u,t,v,e,f,s,m){var __outlookPatchEmit=(typeof self!=='undefined'&&self.__outlookPatchEmit)||(typeof window!=='undefined'&&window.__outlookPatchEmit)||function(kind,data){try{console.debug('__OUTLOOK_JS_INTERNAL_TRACE__'+JSON.stringify({kind:kind,href:String(location&&location.href||''),origin:String(location&&location.origin||''),frameTop:false,perf_t:0,data:data||{},worker:true}))}catch(_){}};__outlookPatchEmit('hsprotect.captcha.qs.start',{from:r,to:n,mask:u,len:t,prefix:v,salt:e,target:m,stack:(new Error).stack});"
+                + "for(var z,i=r;i<=n;i++)(z=poi(i,u,t,v,e,f,0,m))&&(__outlookPatchEmit('hsprotect.captcha.pow.hit',{i:i,value:String(z)}),postMessage(z));"
+                + "__outlookPatchEmit('hsprotect.captcha.qs.exhausted',{from:r,to:n});postMessage(!1)}"
+            )
+            patched = patched.replace(needle, replacement)
+            patches.append(marker("captcha_qs_pow"))
+        worker_needle = "var w=new Worker(c);return w"
+        if worker_needle in patched:
+            patched = patched.replace(worker_needle, "__outlookPatchEmit('hsprotect.captcha.worker.new',{url:String(c),sourceLen:String(v||'').length,source:String(v||''),stack:(new Error).stack});var w=new Worker(c);try{w.addEventListener('message',function(ev){__outlookPatchEmit('hsprotect.captcha.worker.message',{url:String(c),data:String(ev&&ev.data),stack:(new Error).stack})});w.addEventListener('error',function(ev){__outlookPatchEmit('hsprotect.captcha.worker.error',{url:String(c),message:String(ev&&ev.message||''),stack:(new Error).stack})})}catch(_){}return w")
+            patches.append(marker("captcha_worker_new"))
+
+    return patched, patches
+
+
+def _install_hsprotect_js_patch(ctx, *, label: str) -> None:
+    if not _hsprotect_js_patch_enabled():
+        return
+    logger.info("[outlook-browser] hsprotect JS patch enabled label=%s", label)
+
+    def handler(route, request) -> None:
+        url = str(getattr(request, "url", "") or "")
+        if not (
+            ("client.hsprotect.net/" in url and "main.min.js" in url)
+            or ("captcha.hsprotect.net/" in url and "captcha.js" in url)
+        ):
+            route.continue_()
+            return
+        try:
+            resp = route.fetch()
+            body = resp.body()
+            source = body.decode("utf-8", errors="replace")
+            patched, patches = _patch_hsprotect_js_source(url, source)
+            if not patches:
+                logger.warning("[outlook-browser] hsprotect JS patch no-op label=%s url=%s", label, url)
+            else:
+                logger.info("[outlook-browser] hsprotect JS patched label=%s url=%s patches=%s", label, url, patches)
+            headers = dict(getattr(resp, "headers", {}) or {})
+            headers["content-type"] = "application/javascript; charset=utf-8"
+            headers.pop("content-length", None)
+            route.fulfill(status=int(getattr(resp, "status", 200) or 200), headers=headers, body=patched.encode("utf-8"))
+        except Exception as e:
+            logger.warning("[outlook-browser] hsprotect JS patch failed label=%s url=%s error=%s", label, url, e)
+            route.continue_()
+
+    try:
+        ctx.route("**/*", handler)
+    except Exception as e:
+        logger.debug("[outlook-browser] hsprotect JS patch install failed label=%s error=%s", label, e)
 
 
 _STATIC_CACHE_HEADER_ALLOWLIST = {
@@ -1090,6 +1762,7 @@ def prewarm_outlook_px_cookies(cfg: Config, *, timeout_s: float = 25.0) -> list[
     wanted = {"_px3", "_pxde", "_pxvid"}
     try:
         with Camoufox(**camoufox_kwargs) as ctx:
+            _install_hsprotect_js_patch(ctx, label="px_prewarm")
             _install_static_resource_cache(ctx, label="px_prewarm")
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto(_browser_signup_authorize_url(cfg), wait_until="domcontentloaded", timeout=45000)
@@ -2822,6 +3495,7 @@ def _register_in_context(cfg: Config, ctx, page, *, email: str, password: str, c
     first_name = str(_cfg_value(cfg, "first_name", "") or random.choice(FIRST_NAMES))
     last_name = str(_cfg_value(cfg, "last_name", "") or random.choice(LAST_NAMES))
     _install_runtime_trace(page, label=prefix or "outlook")
+    _install_js_internal_trace(page, label=prefix or "outlook")
 
     signup_url = _browser_signup_authorize_url(cfg)
     logger.info("[outlook-browser] signup authorize entry client_id=%s", _cfg_value(cfg, "client_id", "00000000480728C5"))
@@ -3068,6 +3742,7 @@ def outlook_browser_register(
     success = False
     try:
         with Camoufox(**camoufox_kwargs) as ctx:
+            _install_hsprotect_js_patch(ctx, label="main")
             _install_static_resource_cache(ctx, label="main")
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             _log_browser_evidence(page, label="context_created")
