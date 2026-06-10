@@ -1380,6 +1380,22 @@ def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
                 "function jl(e,n){__outlookPatchEmit('hsprotect.main.jl.enter',{n:!!n,len:e&&e.length,items:e,stack:(new Error).stack});var r=278,a=227,o=232,i=254,c=260,u=254,s=241,l=Tl;if(e){for(var h,d=[],v=0;v<e[l(r)];v++){var p=e[v];if(p){var m=p[l(a)](\"|\"),g=m[l(o)](),y=n?Cl[g]:Xl[g];try{__outlookPatchEmit('hsprotect.main.jl.item',{index:v,raw:String(p),handlerKey:String(g),args:m,table:n?'Cl':'Xl',handlerType:typeof y,stack:(new Error).stack})}catch(_){}if(m[0]===rr[pe]){h=R(R({},Fn,g),In,m);continue}f===t(y)&&(g===wl||g===Ml?d[l(i)](R(R({},Fn,g),In,m)):d[l(c)](R(R({},Fn,g),In,m)))}}h&&d[l(u)](h);try{__outlookPatchEmit('hsprotect.main.jl.queue',{n:!!n,queue:d.map(function(x){try{return{key:String(x[Fn]),args:x[In]}}catch(_){return String(x)}}),stack:(new Error).stack})}catch(_){}for(var b=0;b<d[l(r)];b++){var I=d[b];try{__outlookPatchEmit('hsprotect.main.jl.dispatch',{table:n?'Cl':'Xl',handlerKey:String(I[Fn]),args:I[In],queueLen:d.length,stack:(new Error).stack});(n?Cl[I[Fn]]:Xl[I[Fn]])[l(s)](R({},xn,d),I[In])}catch(t){kn(t,Cn[Fe])}}}}",
             )
             patches.append(marker("main_jl_dispatch"))
+        yc_bridge_needle = "function $c(t,e){Rc(t,Yc(e,t))}"
+        if yc_bridge_needle in patched:
+            patched = patched.replace(
+                yc_bridge_needle,
+                "function $c(t,e){var __y=Yc(e,t);try{__outlookPatchEmit('hsprotect.main.$c.yc',{activityType:String(t),input:e,inputKeys:e&&Object.keys?Object.keys(e):[],output:__y,outputKeys:__y&&Object.keys?Object.keys(__y):[],stack:(new Error).stack})}catch(_){}Rc(t,__y)}",
+                1,
+            )
+            patches.append(marker("main_yc_bridge_dollar_c"))
+        jc_needle = "function jc(t){var e=221,n=247,r=yc;Nc&&!t[Fc]&&(delete t[Fc],t[r(e)]=Nc),Ba(),Rc(r(n),Yc(t,r(n)))}"
+        if jc_needle in patched:
+            patched = patched.replace(
+                jc_needle,
+                "function jc(t){var e=221,n=247,r=yc;Nc&&!t[Fc]&&(delete t[Fc],t[r(e)]=Nc),Ba();var __activityType=r(n),__y=Yc(t,__activityType);try{__outlookPatchEmit('hsprotect.main.jc.yc',{activityType:String(__activityType),input:t,inputKeys:t&&Object.keys?Object.keys(t):[],output:__y,outputKeys:__y&&Object.keys?Object.keys(__y):[],stack:(new Error).stack})}catch(_){}Rc(__activityType,__y)}",
+                1,
+            )
+            patches.append(marker("main_yc_bridge_jc"))
         tf_start_needle = "function tf(t,e){for(var n=eu(),r=0;r<t.length;r++){"
         if tf_start_needle in patched:
             patched = patched.replace(

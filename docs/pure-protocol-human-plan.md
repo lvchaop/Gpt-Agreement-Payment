@@ -3869,3 +3869,1371 @@ OSkIb39DDA== -> 218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
 4. 成功样本中的长字符串来自更早/更晚同 key producer。
 
 当前仍不能把 `TBR9Ugl7emA=` 写成已闭合字段。
+
+### 21.15 `Ts` 局部 key 与 final `PX561.d` key 层审计：不能再把二者直接等同
+
+本节继续补 21.14.4 的证据缺口，只做增量追加。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_px561_ts_key_layer.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_ts_key_layer_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_ts_key_layer_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_px561_ts_key_layer.py
+python3 tools/audit_px561_ts_key_layer.py
+```
+
+#### 21.15.1 直接证据
+
+静态 `Ts` callback 字段来源仍是：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:11083-11099`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_ts_callback_fields.json`
+
+`main.Yc()` 的合并逻辑来源：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:2963-3009`
+
+关键代码行为：
+
+```text
+for (var B in e) {
+  var k = e[B];
+  if (t(k) !== h || Zt(k) || null === k) C[B] = k;
+  else for (var N in k) C[N] = k[N]
+}
+```
+
+这段只能证明 `Yc()` 对输入对象做 key copy / nested flatten，不能解释 `Ts` 局部 decoded key 到 final payload key 的任何“自动改名”。因此如果 final payload 中 key 不一致，转换点必须在 `Yc()` 之前的 captcha 对象构造层，或在输入对象实际 key 解码层，而不是凭空假定 `Yc()` 改名。
+
+#### 21.15.2 `Ts` decoded key 在 final `PX561.d` 中的存在性
+
+审计结果来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_ts_key_layer_audit.md`
+
+核心表：
+
+| `Ts` expression | decoded key | value expr | final `PX561.d` 中是否存在 | final value / 旁证 |
+|---|---|---|---|---|
+| `r[t(v(-540,-543))] = _s()` | `TBR9Ugl7emA=` | `_s() boolean` | True | final value 是长字符串 `Y@tvUUF@...`，仍与 `_s()` boolean 冲突 |
+| `r[t(v(-531,-522))] = Rs` | `instantiating` | `Rs` | False | final `PX561.d` 无该 key |
+| `r[t("FnM4CCwDASRmEyFT")] = Ws[t("Ng")]()` | `AEAxBkUsPjQ=` | `Ws[Ng]()` | True | final value 是 246 长度 hash |
+| `r[t(v(-541,-541))] = Ws[t("NQ")](n)` | `succeeded` | `Ws[NQ](n)` | False | final `PX561.d` 没有 key `succeeded`；但存在 `fyNOZTpPQF4= -> succeeded` |
+| `r[f(c(410,395))] = v` | `Bzt2fUFRcw==` | `Ts callback param v` | True | final value `642` |
+| `r[f(c(414,426))] = e` | `OSkIb39DDA==` | `Ts callback param e` | True | final value 为 POW answer `218e34c1...c43f` |
+| `r[f("D2csAy8QPCd9EyVT")] = parseInt(m() - t)` | `XQUsAxhpKjU=` | elapsed | True | final value `46916` |
+| `r[f(c(411,413))] = n` | `Ew9iCVZjYDw=` | `Ts callback param n` | True | final value `False` |
+| `r[f(c(429,410))] = os` | `PX12616` | `os` | False | final `PX561.d` 无该 key |
+| `r[f("B25IQlhZYw")] = ws` | `PX12617` | `ws` | False | final `PX561.d` 无该 key |
+| `r[f(c(415,422))] = Ks` | `XGRtYhkLbFM=` | `Ks` | True | final value `None` |
+
+#### 21.15.3 关键纠偏
+
+成功 `PX561.d` 中，目标区域的实际顺序是：
+
+```text
+EXFgN1QeZQU= -> 440be25de15f8e8a59b590f3233558683cdf89b5df1579ae849d052a16ed2490
+HCQtIllLKBE= -> 11
+Em4jaFcBJlg= -> 40
+bHQdcikYH0Q= -> true
+fyNOZTpPQF4= -> succeeded
+AEAxBkUsPjQ= -> bc9eb64492284f6e99f35edd54c32f729515766ad48a43d19aff6fe3a01743046548c71daf2441fc946cf888c80d92f3ad03586a4d3be640f752972f416a956665c2beb82cb20043bf9852bc4a3a8d82b1dc8ffe3b188d3b84df84a8456799ab6cc00886d50f9cffec59743d4d6a87cd2e610fa1422a30ed
+TBR9Ugl7emA= -> Y@tvUUF@W!kfHgFtWXNlXwpXFSUQa#E@JWcdNy!uUxIeWg(beEAsCx!sFE(ZFl$N)QFWUdcMkZWLFhtVl%EFBRNG@)oBWxofy$@TDoBGmpvNidTdExVQAURc)cBSDcg
+Bzt2fUFRcw== -> 642
+OSkIb39DDA== -> 218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
+XQUsAxhpKjU= -> 46916
+Ew9iCVZjYDw= -> false
+XGRtYhkLbFM= -> null
+```
+
+这带来两个经过证据约束的结论：
+
+1. `succeeded` 不是 final `PX561.d` 的 key，而是 final key `fyNOZTpPQF4=` 的 value。
+2. `Ts` callback 中 `t(v(-541,-541)) -> succeeded` 不能直接解释 final `fyNOZTpPQF4= -> succeeded`；两者之间还缺 key 生成或对象转换证据。
+
+#### 21.15.4 当前缩小后的未闭合点
+
+当前不能继续按旧路径“直接假设 `Ts` decoded key 就是 final payload key”。下一步必须追：
+
+```text
+captcha local object r
+  -> Ou()/i(activityType, r)
+  -> main $c/jc callback
+  -> Yc(e, PX561)
+  -> final bundle serialized PX561.d
+```
+
+其中 `Yc()` 已证明主要是 copy/flatten，所以重点应放在：
+
+- `Ts` callback 内 `r` 对象在 `i(PX561, r)` 前是否已有 overwrite；
+- `Ou()` 返回的 callback `i` 是否包装或转换了 `r`；
+- `$c()` / `jc()` 接收的 `e` 是否与 `Ts` 内局部 `r` 是同一个对象；
+- `fyNOZTpPQF4=` 的 producer 在源码中还未定位，需继续找原始 decoder 表达式；
+- `TBR9Ugl7emA=` 的长字符串 pw'w'w'w'w'w'w'w'w'w'w'w'w'wroducer 仍未定位，不能写成 `_s()`。
+
+因此当前进度没有倒退，而是修正了错误假设：`TBR9Ugl7emA=` 冲突不是单个字段问题，而是暴露出 `captcha local key` 与 `final PX561.d key` 之间还有一层未闭合转换链。
+
+### 21.16 `PX561` callback bridge 证据链：`Ts` 的 `r` 如何进入 main collector
+
+本节继续补 21.15 的“对象传递链”。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_px561_callback_bridge.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_callback_bridge_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_callback_bridge_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_px561_callback_bridge.py
+python3 tools/audit_px561_callback_bridge.py
+```
+
+#### 21.16.1 main 侧 callback 注册
+
+证据文件：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:3032-3041`
+
+代码：
+
+```text
+function Zc(t, e, n, r) {
+  ...
+  l = Lc(),
+  f = l && l[s(a)];
+  f && (l[s(o)] = jc, l[s(i)] = Oc, l[s(c)] = Kc, l[s(u)] = nu, f($c, t, e, n, r))
+}
+```
+
+解码后：
+
+| expression | decoded |
+|---|---|
+| `yc(277)` | `PX762` |
+| `yc(220)` | `PX763 -> jc` |
+| `yc(249)` | `PX1078 -> Oc` |
+| `yc(262)` | `PX1200 -> Kc` |
+| `yc(242)` | `PX1145 -> nu` |
+
+这证明 main 侧期望 `window[Su()][PX762]` 是 bridge entry，并把 `$c` 作为 collector callback 传入。
+
+#### 21.16.2 captcha 侧 `Fu()` 的边界仍不能忽略
+
+证据文件：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:4463-4477`
+
+当前可见代码：
+
+```text
+function Fu(r) {
+  window[Su()] = {
+    [t(v(-543,-542))]: function() {
+      var t = Array.prototype.slice.bind(arguments);
+      r.apply(this, t)
+    }
+  }
+}
+```
+
+当前解码：
+
+```text
+t(v(-543,-542)) -> slice
+```
+
+所以这里仍不能写成“`Fu()` 明文注册了 `PX762`”。当前只能写成：
+
+- main `Zc()` 需要 `PX762`；
+- captcha `Fu()` 确实把回调包装进 `window[Su()]`；
+- 但 `Fu()` 可见 key 是 `slice`，精确的 `PX762` assignment path 仍未闭合。
+
+#### 21.16.3 captcha `D()` 与 `Ts()` 对 `r` 的构造和发送
+
+证据文件：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:11046-11099`
+
+关键链：
+
+```text
+D(r,n,t)
+  -> r = pn(r, { NS0Ea3BBAVE=: usedWebWorkers, FU1kS1AhYX4=: numOfWebWorkers })
+  -> q = J(r)
+  -> optional window[Su()][PX1200](W0cqQR4rLnA=, d)
+  -> Ts(function(n,v,e) { ... mutate r ...; i = Ou(); i(PX561, r) })
+```
+
+已解码字段：
+
+| expression | decoded |
+|---|---|
+| `K(-173,-184)` | `PX763` |
+| `K(-166,-160)` | `PX1200` |
+| `K(-169,-188)` | `W0cqQR4rLnA=` |
+| `K(-174,-196)` | `FU1kS1AhYX4=` |
+| `K(-165,-176)` | `usedWebWorkers` |
+| `c(439,441)` | `PX561` |
+| `c(413,425)` | `PX763` |
+| `"B25ORlo"` | `PX764` |
+
+这证明 `Ts` callback 里被 mutation 的同一个 `r` 会通过：
+
+```text
+i = Ou()
+i(PX561, r)
+```
+
+送入 main 侧 callback。
+
+#### 21.16.4 main `$c()` / `Yc()` / `ds()` 最终入队
+
+证据文件：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:3078-3080`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:2963-3009`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:3455-3468`
+
+链路：
+
+```text
+$c(t,e) -> Rc(t, Yc(e,t))
+Yc(e,PX561) -> copy/flatten e into C
+ds(t,e) -> ss.push({t:t, d:e, ts:Date.now()})
+```
+
+这证明 final `PX561.d` 主要来自 main `$c` 收到的 `e` 经 `Yc()` copy/flatten 后进入队列。
+
+#### 21.16.5 本节收敛后的事实边界
+
+已证明：
+
+```text
+captcha Ts mutates r
+  -> Ou() returns Yu callback
+  -> i(PX561, r)
+  -> main $c(t,e)
+  -> Yc(e,PX561)
+  -> ds queue
+  -> final serialized bundle activity
+```
+
+仍未证明：
+
+1. `Fu()` 可见注册 key 为什么是 `slice`，而 main `Zc()` 读取的是 `PX762`；这里还有对象/decoder/运行时赋值层未闭合。
+2. `fyNOZTpPQF4=` 的 producer 仍未定位。
+3. `TBR9Ugl7emA=` 长字符串的 producer 或 overwrite path 仍未定位。
+
+因此当前纯协议构造的下一步不是直接发包，而是继续定位：
+
+```text
+fyNOZTpPQF4= producer
+TBR9Ugl7emA= long-string producer / overwrite
+Fu()/PX762 bridge assignment exact path
+```
+
+### 21.17 captcha bridge 静态扫描：`PX762` 缺口进一步收窄
+
+本节补 21.16 的 `Fu()/PX762` 缺口，不再只依赖人工读片段。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_captcha_bridge_static.mjs`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_bridge_static_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_bridge_static_audit.md`
+
+验证命令：
+
+```bash
+node --check tools/audit_captcha_bridge_static.mjs
+node tools/audit_captcha_bridge_static.mjs
+```
+
+#### 21.17.1 已证明的静态点
+
+`captcha_bridge_static_audit.md` 中 `Su/Fu decoded expressions` 证明：
+
+| expression | raw | decoded |
+|---|---|---|
+| `Su prefix n("CA")` | `CA` | `_` |
+| `Su location key n(r(1190,1187))` | `CEYBMR4YHTM` | `_pxAppId` |
+| `Su replace method n("JVMJHA8LMQ")` | `JVMJHA8LMQ` | `replace` |
+| `Su suffix n(r(1195,1187))` | `P1cXFAINJg` | `handler` |
+| `Fu visible key t(v(-543,-542))` | `B25ORlw` | `PX762` |
+| `Fu Array property n(e(630,633))` | `J0QWBAEcLSdT` | `prototype` |
+| `Fu bind/call property n(e(636,634))` | `JFoQEws` | `slice` |
+| `Fu slice/apply property n(e(625,622))` | `NFcVHA` | `call` |
+| `Fu apply call n("NkYJHBc")` | `NkYJHBc` | `apply` |
+
+这修正了 21.16 的旧结论：之前把 `Fu visible key` 解成 `slice` 是 decoder 没执行 `Vu()` 旋转 IIFE 导致的错误。修正脚本后，`Fu(r)` 的可见对象 key 已闭合为 `PX762`。
+
+因此 `Su()` 的运行时对象名可写成：
+
+```text
+"_" + window._pxAppId.replace(/px|PX/, "") + "handler"
+```
+
+在当前 appId `PXzC5j78di` 下，该对象名应为：
+
+```text
+_zC5j78dihandler
+```
+
+`D/Iz bridge decoded expressions` 证明 captcha 侧 `window[Su()]` 已可静态定位到这些 callback 槽：
+
+| line | raw | decoded |
+|---:|---|---|
+| `5131` | `B25IQFlQ` | `PX1078` |
+| `8210` | `B25IQlpQbA` | `PX12488` |
+| `10746` | `B25IQVhdbQ` | `PX11659` |
+| `11071` | `B25IQl5Y` | `PX1200` |
+| `11098` | `B25IQlhZYw` | `PX12617` |
+| `11099` | `B25ORlo` | `PX764` |
+
+同时 `D` 内部调用已经闭合：
+
+| expression | decoded | meaning |
+|---|---|---|
+| `D checks window[L][K(-173,-184)]` | `PX763` | submit 后 callback 存在性检查 |
+| `D calls window[L][K(-166,-160)]` | `PX1200` | 发 `W0cqQR4rLnA=` 预提交 payload |
+| `D PX1200 payload type K(-169,-188)` | `W0cqQR4rLnA=` | PX1200 activity type |
+
+#### 21.17.2 静态短 `B25*` literal 扫描边界
+
+脚本对 `captcha.beautified.js` 中短 `B25*` literal 做了扫描并解码。命令输出：
+
+```text
+contains_PX762 False
+window_hits 13
+```
+
+这里的 `contains_PX762 False` 仅表示“短 `B25*` literal 全局扫描表”没有捕获到 `PX762`。这不是 `Fu()` 的最终结论，因为 `Fu visible key` 来自 `_u()` 局部 decoder 表达式，不是简单短 literal 扫描。
+
+修正后的 bridge 链路是：
+
+```text
+main Zc() 明确读取 window[Su()][PX762]
+captcha Su() 生成同名 window handler 对象
+captcha Fu() 明确设置 window[Su()] = { PX762: wrapper }
+captcha 其他静态 window[Su()] 槽位包含 PX763/PX1200/PX764/PX1078/PX11659/PX12488
+```
+
+#### 21.17.3 当前可写成的结论
+
+现在可以写：
+
+```text
+Fu() 注册了 PX762
+```
+
+证据链：
+
+1. `main.beautified.js:3032-3041`：`Zc()` 读取 `Lc()[PX762]`，并调用 `f($c,t,e,n,r)`。
+2. `captcha.beautified.js:4455-4461`：`Su()` 生成 `_" + _pxAppId.replace(/px|PX/,"") + "handler"`。
+3. `captcha.beautified.js:4463-4477`：`Fu(r)` 写入 `window[Su()][PX762] = function(){ r.apply(this,args) }`。
+4. `captcha.beautified.js:10999-11006`：`Iz()` 调用 `Fu(function(r,n,t,v,e){ gz=r; jz=n; yz=t; Mz=v; Gz=e; ... })`，证明 `$c,t,e,n,r` 最终进入 captcha callback 参数。
+
+#### 21.17.4 仍未闭合点
+
+`PX762` bridge 已由静态证据闭合，但这不等于 `PX561` payload 全部闭合。剩余关键点仍是：
+
+```text
+fyNOZTpPQF4= producer
+TBR9Ugl7emA= long-string producer / overwrite
+Ts local r -> final PX561.d 是否存在 key rewrite/overwrite
+```
+
+因此下一步从 bridge 断点转向 key/value producer 断点。
+
+### 21.18 `Yc()` flatten/order 补证：`fyNOZTpPQF4=` 与 `TBR9Ugl7emA=` 的断点从 bridge 转向 `Ws.NQ(n)` / overwrite
+
+本节只追加证据，不覆盖 21.17。21.17 已把 `PX762` bridge 闭合；本节继续追剩余字段断点。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_px561_yc_flatten_order.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_yc_flatten_order_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_yc_flatten_order_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_px561_yc_flatten_order.py
+python3 tools/audit_px561_yc_flatten_order.py
+```
+
+#### 21.18.1 成功 `PX561.d` 中目标字段的最终顺序
+
+证据文件：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/bundle_activity_matches/bundle_activity_matches_ni109xdjp5zp_1780948211.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_yc_flatten_order_audit.json`
+
+成功样本 request line / seq：
+
+```text
+requestLine=308
+seq=2
+activity.type=PX561
+```
+
+成功 `PX561.d` 中目标字段顺序为：
+
+| final index | key | value evidence |
+|---:|---|---|
+| 73 | `fyNOZTpPQF4=` | `succeeded` |
+| 74 | `AEAxBkUsPjQ=` | `Ws.Ng()` 产出的 246 字符串 |
+| 75 | `TBR9Ugl7emA=` | `Y@tvUUF@...` 长字符串，len=127 |
+| 76 | `Bzt2fUFRcw==` | `642` |
+| 77 | `OSkIb39DDA==` | POW 解答 `218e34c1...c43f` |
+
+#### 21.18.2 静态赋值顺序与 final 顺序冲突
+
+静态赋值证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:11083-11088`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_ts_callback_fields.json`
+
+静态顺序：
+
+| static step | expression | decoded key | value source |
+|---:|---|---|---|
+| 1 | `r[t(v(-540,-543))] = _s()` | `TBR9Ugl7emA=` | `_s()` |
+| 2 | `r[t(v(-531,-522))] = Rs` | `instantiating` | `Rs` |
+| 3 | `r[t("FnM4CCwDASRmEyFT")] = Ws[t("Ng")]()` | `AEAxBkUsPjQ=` | `Ws.Ng()` |
+| 4 | `r[t(v(-541,-541))] = Ws[t("NQ")](n)` | `succeeded` | `Ws.NQ(n)` |
+
+冲突点：
+
+```text
+静态直接赋值：TBR9Ugl7emA= 在 AEAxBkUsPjQ= 之前
+final PX561.d：AEAxBkUsPjQ= index=74，TBR9Ugl7emA= index=75
+```
+
+因此，不能再把 final `TBR9Ugl7emA=` 的长字符串解释成 `captcha.beautified.js:11083` 这一条 `_s()` 布尔赋值的直接结果。
+
+#### 21.18.3 `Yc()` flatten 解释了为什么 final 没有 `succeeded` key
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:3003-3008`
+
+关键代码：
+
+```js
+for (var B in e) {
+  var k = e[B];
+  if (t(k) !== h || Zt(k) || null === k) C[B] = k;
+  else
+    for (var N in k) C[N] = k[N]
+}
+```
+
+这证明：
+
+- 如果 `r["succeeded"] = Ws.NQ(n)` 的返回值是 object；
+- 那么 `Yc(e, PX561)` 不会保留外层 key `succeeded`；
+- 而是把该 object 的内部 key flatten 到 final `PX561.d`。
+
+这与当前成功样本吻合：
+
+```text
+Ts 局部 decoded key `succeeded` 不存在于 final PX561.d key 集合；
+但 final PX561.d 中存在 `fyNOZTpPQF4= -> succeeded`。
+```
+
+边界：这还没有证明 `Ws.NQ(n)` 一定返回包含 `fyNOZTpPQF4=` / `TBR9Ugl7emA=` 的 object；它只证明了“为什么 final 可以没有 `succeeded` key”的转换机制。
+
+#### 21.18.4 收敛后的下一证据目标
+
+当前断点已经从 `PX762 bridge` 缩小到：
+
+```text
+Ws.NQ(n) return object
+或
+TBR9Ugl7emA= 在 Yc() 前后的 overwrite/rewrite path
+```
+
+下一步必须补的证据：
+
+1. 定位 `Ws.NQ(n)` 的 WebAssembly 导出函数输入/输出边界；
+2. 证明 `Ws.NQ(n)` 返回值是否为 object、string，或者经 JS/WASM glue 转换后的 object；
+3. 若返回 object，枚举其 key 顺序，验证是否包含：
+
+```text
+fyNOZTpPQF4=
+TBR9Ugl7emA=
+```
+
+4. 若不包含，则继续追 `TBR9Ugl7emA=` 的 overwrite/rewrite path。
+
+因此当前纯协议复现路线更新为：
+
+```text
+Ts callback r object
+  -> Ws.Ng() / Ws.NQ(n) runtime return
+  -> Yc(e,PX561) flatten
+  -> final PX561.d
+```
+
+而不是继续追已经闭合的 `PX762` bridge。
+
+### 21.19 成功 bundle vs 三个 `tf.payload` 样本差异：`fyNOZ` 不是成功充分条件，`TBR9` 是当前关键缺口
+
+本节继续补 21.18 的证据边界。21.18 证明了 `Yc()` flatten 可以解释 final 没有 `succeeded` key，但还没有证明 `Ws.NQ(n)` 产出哪些 nested key。本节先固定一个更直接的对照事实：`fyNOZTpPQF4=succeeded` 在失败/未放行的 `tf.payload` 样本里也存在，因此不能作为 HUMAN 成功包复现的充分条件。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_px561_success_tf_gap.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_success_tf_gap_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/px561_success_tf_gap_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_px561_success_tf_gap.py
+python3 tools/audit_px561_success_tf_gap.py
+```
+
+#### 21.19.1 对照样本
+
+成功样本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/bundle_activity_matches/bundle_activity_matches_ni109xdjp5zp_1780948211.json`
+- success request line `308`
+- seq `2`
+- decoded collector bundle activity `PX561`
+
+三个 `tf.payload` 样本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_internal_trace_hcxwyrtiudbg_1780949301.jsonl:223`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_internal_trace_i294e72kliud_1781017380.jsonl:223`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_internal_trace_whsnxy8ag5ji_1781017142.jsonl:223`
+
+#### 21.19.2 字段矩阵中的关键事实
+
+从 `px561_success_tf_gap_audit.md` 的 matrix 可得：
+
+| key | success | tf0 | tf1 | tf2 |
+|---|---|---|---|---|
+| `fyNOZTpPQF4=` | present, value=`succeeded` | present, value=`succeeded` | present, value=`succeeded` | present, value=`succeeded` |
+| `AEAxBkUsPjQ=` | present | present | present | present |
+| `TBR9Ugl7emA=` | present, long string | absent | absent | absent |
+| `Bzt2fUFRcw==` | present, value=`642` | present, value=`null` | present, value=`null` | present, value=`null` |
+| `OSkIb39DDA==` | present, POW answer | present, value=`null` | present, value=`null` | present, value=`null` |
+
+脚本 findings 原文：
+
+```text
+fyNOZTpPQF4=succeeded is shared by success and all three tf.payload samples; it is not sufficient to distinguish HUMAN success.
+TBR9Ugl7emA= is present only in the decoded success bundle sample and absent from all three tf.payload samples.
+Bzt2fUFRcw== is non-null in success but null in all three tf.payload samples.
+OSkIb39DDA== POW answer is non-null in success but null in all three tf.payload samples.
+```
+
+#### 21.19.3 关键矛盾更新
+
+现在的核心矛盾不是“`fyNOZTpPQF4=` 从哪里来”这一项本身，因为它在未放行样本里也存在。
+
+当前更关键的矛盾是：
+
+```text
+captcha.beautified.js:11083 静态显示：r[TBR9Ugl7emA=] = _s()
+但三个 tf.payload 的 PX561.d 都没有 TBR9Ugl7emA=
+成功 decoded collector bundle 中才出现 TBR9Ugl7emA= 长字符串
+```
+
+这说明至少存在以下一种情况，但目前还没有证据判定是哪一种：
+
+1. `tf.payload` hook 看到的是某个阶段的对象，最终 collector bundle 在 hook 后又被补入/改写了 `TBR9Ugl7emA=`；
+2. 成功样本走到的 runtime source/path 与三个 `tf.payload` 样本并非完全同一版本或同一分支；
+3. `TBR9Ugl7emA=` 不是 11083 直接赋值的最终产物，而是在 collector bundle 序列化前被 success-only path 覆盖或插入；
+4. 当前对 11083 decoded key 的静态映射仍需结合对应运行时 decoder/version 再验一次。
+
+#### 21.19.4 下一步证据目标调整
+
+下一步不再把 `fyNOZTpPQF4=succeeded` 当作成功包核心突破点，而是优先证明：
+
+```text
+TBR9Ugl7emA= 为什么在 tf.payload 缺失、在 success decoded bundle 出现
+```
+
+具体要补：
+
+1. 对成功样本 runtime trace 的 collector request body 与 `tf.payload` hook 结构做同源比较；
+2. 确认 success 样本有没有 `js_internal_trace`，如果没有，要避免把 failure/tf 的 hook 阶段直接等同于 success bundle 阶段；
+3. 追 main `tf()` 序列化过程是否会在 hook 后追加 success-only fields；
+4. 追 `captcha.beautified.js:11083` 的 `_s()` direct assignment 为什么没有出现在三个 `tf.payload` 中。
+
+当前可写成的边界结论：
+
+```text
+fyNOZTpPQF4=succeeded 是必要现象之一，但不是成功充分条件；
+TBR9Ugl7emA=、Bzt2fUFRcw== 非 null、OSkIb39DDA== POW answer 才是当前成功包差异核心。
+```
+
+### 21.20 路线纠偏：success/tf JS 版本同源性与 success bundle 阶段边界
+
+本节用于纠正 21.19 后的推进路径：不能再把三个 `tf.payload` 样本直接当作成功样本同阶段对象，也不能默认后续 patch/source JS 与权威成功样本 byte-identical。先补两个前置审计。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_hsprotect_source_versions.py`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_success_bundle_stage.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/hsprotect_source_version_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/hsprotect_source_version_audit.md`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/success_bundle_stage_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/success_bundle_stage_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_hsprotect_source_versions.py tools/audit_success_bundle_stage.py
+python3 tools/audit_hsprotect_source_versions.py
+python3 tools/audit_success_bundle_stage.py
+```
+
+#### 21.20.1 JS source/version 同源审计结果
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/hsprotect_source_version_audit.md`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/runtime_trace_ni109xdjp5zp_1780948211.jsonl`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/runtime_trace_hcxwyrtiudbg_1780949301.jsonl`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/runtime_trace_whsnxy8ag5ji_1781017142.jsonl`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/runtime_trace_i294e72kliud_1781017380.jsonl`
+
+审计表明：
+
+| run | main.min.js response etag | captcha.js response etag |
+|---|---|---|
+| `ni109xdjp5zp_1780948211` success | `"c84dd4de247dae690c1b1b4e99cce4e8"` | `"6944ea8ded7eda4932740a5d6055cdce"` |
+| `hcxwyrtiudbg_1780949301` tf | `"c84dd4de247dae690c1b1b4e99cce4e8"` | `"6944ea8ded7eda4932740a5d6055cdce"` |
+| `whsnxy8ag5ji_1781017142` tf | `"cf6dc0b430ccfe6c0a83005734bdda97"` | `"6944ea8ded7eda4932740a5d6055cdce"` |
+| `i294e72kliud_1781017380` tf | `"cf6dc0b430ccfe6c0a83005734bdda97"` | `"6944ea8ded7eda4932740a5d6055cdce"` |
+
+结论：
+
+1. `captcha.js` 在这四个样本里的 response etag 一致：`"6944ea8ded7eda4932740a5d6055cdce"`。
+2. `main.min.js` 分成两组：
+   - success `ni109` 与 tf `hcx` 是 `"c84dd4de247dae690c1b1b4e99cce4e8"`；
+   - later tf `whsn` / `i294` 是 `"cf6dc0b430ccfe6c0a83005734bdda97"`。
+3. 本地 `hsprotect_js_patch` 里的 source JS 是后续 `1781017xxx` run 拉下来的；metadata 中的 URL 对应 `cd23d5b0/ce463152` 或 `59453f70/5abd227a`，不是 success 的 `49cc4a30/4b399270`。
+4. 因此：当前 `captcha.beautified.js` 可继续用于同 etag 的 `captcha.js` 静态分析；但 `main.beautified.js` / patched `main` 对 success 的 byte-identical 关系尚未由本地 artifact 证明。后续凡涉及 `main.min.js` offset / function body，必须标注使用的是哪一版 etag。
+
+#### 21.20.2 success request 308 阶段边界
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/success_bundle_stage_audit.md`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/bundle_activity_matches/bundle_activity_matches_ni109xdjp5zp_1780948211.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/payload_chain/payload_chain_ni109xdjp5zp_1780948211.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_ni109xdjp5zp_1780948211.json`
+
+关键字段在 success decoded `/assets/js/bundle` request line `308` 中的位置：
+
+| final index | key | value |
+|---:|---|---|
+| 41 | `Ew9iCVZkZD4=` | `b78eabfb4f4a231aa3d4649efff95ae0e276bcf9761414a5841027f1153df7f9906856976185e69107e7838203c38cdef6f062c2598a397345fca0ab00cd5c77` |
+| 42 | `KVkYX28zG2o=` | `4948` |
+| 73 | `fyNOZTpPQF4=` | `succeeded` |
+| 74 | `AEAxBkUsPjQ=` | 246-byte string |
+| 75 | `TBR9Ugl7emA=` | 127-byte long string |
+| 76 | `Bzt2fUFRcw==` | `642` |
+| 77 | `OSkIb39DDA==` | `218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f` |
+
+同一审计给出的阶段证据：
+
+```text
+traceClassification.counts.tf_payloads=0
+traceClassification.counts.full_chain_tf_payload_events=0
+payloadChain.counts.tfPayloadEvents=0
+request308.markerMatch=True
+request308.jsonItemCount=5
+```
+
+runtime 边界：
+
+```text
+runtime line 307: hsprotect.Xn.trigger channel=JDBeOmJSWwo=
+  stack includes Iz/D/Ts in captcha.js
+runtime line 308: POST /assets/js/bundle
+  decoded PX561 contains target keys
+runtime line 310: /assets/js/bundle response body_len=0
+```
+
+结论：
+
+1. success 关键字段已证明存在于 request line `308` 的 decoded request body。
+2. 当前 success 样本没有 `hsprotect.main.tf.payload` hook 事件，所以不能证明这些字段在 `tf.payload` hook 阶段已经存在。
+3. 当前最接近的 runtime 构造边界是 line `307` 的 `JDBeOmJSWwo=` trigger，其 stack 进入 `captcha.js` 的 `Iz/D/Ts`，随后 line `308` 发出 `/assets/js/bundle`。
+4. line `310` response body 当前没有被抓到，不能用该 artifact 声称 bundle response 的 body 语义；只能证明 request payload 内容。
+
+#### 21.20.3 修正后的下一步
+
+当前路线应调整为：
+
+```text
+success line 307 JDBeOmJSWwo= trigger
+  -> captcha.js Iz/D/Ts
+  -> request line 308 /assets/js/bundle decoded PX561
+  -> TBR9 / Bzt2 / OSk / KVk / Ew9i 字段闭合
+  -> 再推进纯协议 builder
+```
+
+不再继续把三个 `tf.payload` 样本作为 success 同阶段对象。它们只能作为 failure/未完成阶段的对照样本。
+
+### 21.21 WASM / POW 边界审计：修正 `Ws.NQ(n)` object-flatten 假设
+
+本节继续 21.20 的新路线，对 `Ws.NQ(n)`、`Ws.Ng()`、`_s()`、`Ts` callback 与 POW 字段做边界审计。这里发现并修正一个重要错误假设：`Ws.NQ(n)` 不是已证明的 object producer；当前静态 wrapper 证据显示它返回的是 WASM memory 中 TextDecoder 解出的 string。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_captcha_wasm_pow_boundaries.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_wasm_pow_boundaries_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_wasm_pow_boundaries_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_captcha_wasm_pow_boundaries.py
+python3 tools/audit_captcha_wasm_pow_boundaries.py
+```
+
+#### 21.21.1 `Ws.Ng()` / `Ws.NQ(r)` wrapper 的真实返回边界
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:9115-9197`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:9428-9468`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_wasm_pow_boundaries_audit.json`
+
+关键静态事实：
+
+```text
+captcha.beautified.js:9115-9117
+  w(index) 从 JS object heap 取对象
+
+captcha.beautified.js:9142-9167
+  a(value, malloc, realloc) 把 JS string 编码到 WASM memory，并把长度存入 K
+
+captcha.beautified.js:9175-9182
+  H() 返回 WASM memory 的 Int32Array view
+
+captcha.beautified.js:9191-9197
+  y(ptr,len) 使用 TextDecoder 从 WASM memory 解出 JS string
+
+captcha.beautified.js:9428-9446
+  Ws.Ng():
+    c.Ng(stackPtr)
+    从 H() 读取 ptr/len
+    return y(ptr,len)
+
+captcha.beautified.js:9447-9468
+  Ws.NQ(r):
+    a(r, malloc, realloc) 把 r 写入 WASM memory
+    c.NQ(stackPtr, ptr, len)
+    从 H() 读取 ptr/len
+    return y(ptr,len)
+```
+
+结论：
+
+```text
+Ws.Ng() 返回 string
+Ws.NQ(r) 返回 string
+```
+
+因此，21.18 中“`Ws.NQ(n)` 返回 object 后被 `Yc()` flatten”的解释目前不成立，必须撤回为未证明假设。
+
+#### 21.21.2 `_s()` 不是 `TBR9Ugl7emA=` 长字符串 producer
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:9638-9644`
+
+源码边界：
+
+```text
+function _s() {
+  ...
+  return !(!window[...] || !window[...][...])
+}
+```
+
+结论：
+
+```text
+_s() 返回 boolean
+```
+
+而 success request line `308` 中：
+
+```text
+TBR9Ugl7emA= -> 127-byte long string
+```
+
+所以 `TBR9Ugl7emA=` 的 final success value 不能解释为 `captcha.beautified.js:11083` 的 `_s()` 直接输出。
+
+#### 21.21.3 `Yc()` flatten 只能解释 object，不能解释 `Ws.NQ` string
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/main.beautified.js:2963-3009`
+
+`Yc()` 逻辑：
+
+```js
+for (var B in e) {
+  var k = e[B];
+  if (t(k) !== h || Zt(k) || null === k) C[B] = k;
+  else for (var N in k) C[N] = k[N]
+}
+```
+
+结合 21.21.1：
+
+```text
+Ws.NQ(n) wrapper 返回 string
+```
+
+所以如果 `r["succeeded"] = Ws.NQ(n)` 是按当前 wrapper 执行，`Yc()` 应保留外层 key `succeeded`，而不是 flatten 出 `fyNOZTpPQF4=` / `TBR9Ugl7emA=`。
+
+当前 final success `PX561.d` 中没有外层 key `succeeded`，这说明仍缺一段关键证据。可能性不能写死，只能列为待证：
+
+1. `succeeded` key 在进入 `Yc()` 前被删除或重写；
+2. `captcha.beautified.js:11088` 的 decoded key 在 success 运行时上下文/版本下并非最终语义；
+3. `fyNOZ/TBR9` 组由另一条 path 插入；
+4. success 使用的 main/captcha runtime 与当前静态映射存在尚未证明的差异。
+
+#### 21.21.4 POW 字段边界目前已知与未闭合
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_ts_callback_fields.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/pow_response/pow_response_ni109xdjp5zp_1780948211.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/captcha_wasm_pow_boundaries_audit.json`
+
+已知映射：
+
+```text
+captcha.beautified.js:11097
+  r[Bzt2fUFRcw==] = v
+  r[OSkIb39DDA==] = e
+```
+
+success final：
+
+```text
+Bzt2fUFRcw== -> 642
+OSkIb39DDA== -> 218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
+```
+
+`pow_response_ni109...json` 证明当前 success 样本中存在 1 个 POW result。
+
+未闭合点：
+
+```text
+Ts callback 参数 (n, v, e) 的运行时实参还没有被直接捕获。
+```
+
+因此现在只能说：
+
+```text
+Bzt2fUFRcw== / OSkIb39DDA== 静态上来自 Ts callback 参数 v/e；
+OSk 的值与 POW result 一致；
+但 Ts 参数赋值桥仍需 runtime argument capture 才能闭合。
+```
+
+#### 21.21.5 修正后的下一证据目标
+
+下一步必须优先补：
+
+1. success 同源版本下 `Ts(callback)` 进入 callback 前的 `(n,v,e)` 参数；
+2. success 同源版本下 `Ws.Ng()` / `Ws.NQ(n)` 的入参和返回值；
+3. final `TBR9Ugl7emA=` 的插入/覆盖位置；
+4. success etag `"c84dd4de247dae690c1b1b4e99cce4e8"` 对应 `main.min.js` 与本地静态 `main.beautified.js` 的 byte/source 对齐证据。
+
+当前路线进一步修正为：
+
+```text
+line 307 JDBeOmJSWwo= trigger
+  -> captcha.js Iz/D/Ts
+  -> Ts callback args (n,v,e)   [待捕获]
+  -> Ws.Ng / Ws.NQ string outputs [待捕获]
+  -> PX561.d final key insertion/overwrite [待定位]
+  -> line 308 /assets/js/bundle decoded request body
+```
+
+### 21.22 trace 分类器 v2：建立 run 级证据索引
+
+本节补齐一个路线层缺口：不能只盯单个成功样本，也不能把失败 `tf.payload` 样本和成功 bundle 样本混用。新增 v2 分类器把每个 run 的 trace、JS source etag、bundle PX561、cookie timeline、POW、risk/verify 证据统一索引；缺失的 artifact 标记为 missing，不做推断。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/human_trace_classifier_v2.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_v2/human_trace_classifier_v2_summary.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_v2/human_trace_classifier_v2_summary.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/human_trace_classifier_v2.py
+python3 tools/human_trace_classifier_v2.py
+```
+
+运行结果：
+
+```json
+{
+  "json": "/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_v2/human_trace_classifier_v2_summary.json",
+  "md": "/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_v2/human_trace_classifier_v2_summary.md",
+  "runCount": 11
+}
+```
+
+#### 21.22.1 v2 分类结果
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_v2/human_trace_classifier_v2_summary.md`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_v2/human_trace_classifier_v2_summary.json`
+
+run 级分类：
+
+| run | stage | 关键证据 |
+|---|---|---|
+| `ni109xdjp5zp_1780948211` | `full_success_decoded` | full success checks 全 true；PX561 target 存在于 request line 308 seq 2；7/7 目标 key 全存在 |
+| `sv2n3df1y8fi_1780946111` | `browser_success_no_collector_decode` | `ot_succeeded` / captcha succeeded / parent succeeded / risk continue / CreateAccount redirect 为 true，但当前没有 decoded collector artifact |
+| `e4tprvk082rw_1781016494` | `microsoft_continue_no_human_decode` | parent succeeded / risk continue / CreateAccount redirect 为 true，但没有 decoded HUMAN success 证据 |
+| `hcxwyrtiudbg_1780949301` | `tf_payload_failure_stage` | `tf_payloads=6`，risk continue 为 0，CreateAccount redirect 为 false |
+| `whsnxy8ag5ji_1781017142` | `tf_payload_failure_stage` | `tf_payloads=6`，risk continue 为 0，CreateAccount redirect 为 false |
+| `i294e72kliud_1781017380` | `tf_payload_failure_stage` | `tf_payloads=6`，缺 risk_verify artifact，CreateAccount redirect 为 false |
+| `rdawhdfsqt6e_1780944209` | `captcha_success_pow_seen_no_risk` | captcha succeeded / parent succeeded / `pow_hits=2`，但没有 risk/create success |
+| `bcs0nitb7bef_1780942944` | `captcha_success_message_only` | captcha succeeded / parent succeeded，无 decoded collector / POW / risk |
+| `l74w94f94xdf_1780943704` | `captcha_success_message_only` | captcha succeeded / parent succeeded，无 decoded collector / POW / risk |
+| `nzkl1us2bp7r_1780943349` | `captcha_success_message_only` | captcha succeeded / parent succeeded，无 decoded collector / POW / risk |
+| `c0nw0cg8yyz9_1780941858` | `parent_success_message_only` | 只有 parent succeeded message 证据 |
+
+#### 21.22.2 当前唯一 decoded full success 样本
+
+v2 索引确认：当前能同时证明 HUMAN decoded success、PX561 目标字段、cookie timeline、risk/verify continue、CreateAccount redirect 的样本只有：
+
+```text
+ni109xdjp5zp_1780948211
+```
+
+证据路径：
+
+- trace classification: `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/trace_classification_ni109xdjp5zp_1780948211.json`
+- bundle activity: `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/bundle_activity_matches/bundle_activity_matches_ni109xdjp5zp_1780948211.json`
+- cookie timeline: `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/cookie_timeline/cookie_timeline_ni109xdjp5zp_1780948211.json`
+- risk/verify: `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/risk_verify/risk_verify_material_ni109xdjp5zp_1780948211.json`
+
+v2 抽出的 success PX561 目标：
+
+```text
+requestLine=308
+seq=2
+activityIndex=2
+dKeyCount=92
+target key presence=7/7
+```
+
+目标字段：
+
+| key | value |
+|---|---|
+| `Ew9iCVZkZD4=` | `b78eabfb4f4a231aa3d4649efff95ae0e276bcf9761414a5841027f1153df7f9906856976185e69107e7838203c38cdef6f062c2598a397345fca0ab00cd5c77` |
+| `KVkYX28zG2o=` | `4948` |
+| `fyNOZTpPQF4=` | `succeeded` |
+| `AEAxBkUsPjQ=` | `bc9eb64492284f6e99f35edd54c32f729515766ad48a43d19aff6fe3a01743046548c71daf2441fc946cf888c80d92f3ad03586a4d3be640f752972f416a956665c2beb82cb20043bf9852bc4a3a8d82b1dc8ffe3b188d3b84df84a8456799ab6cc00886d50f9cffec59743d4d6a87cd2e610fa1422a30edaec5cd` |
+| `TBR9Ugl7emA=` | `Y@tvUUF@W!kfHgFtWXNlXwpXFSUQa#E@JWcdNy!uUxIeWg(beEAsCx!sFE(ZFl$N)QFWUdcMkZWLFhtVl%EFBRNG@)oBWxofy$@TDoBGmpvNidTdExVQAURc)cBSDcg` |
+| `Bzt2fUFRcw==` | `642` |
+| `OSkIb39DDA==` | `218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f` |
+
+#### 21.22.3 v2 暴露的证据边界
+
+1. `sv2n3df1y8fi_1780946111` 不能被当成 decoded success 样本。它到达 browser/Microsoft success 检查，但当前没有 decoded collector artifact，也没有 v2 可抽取的 PX561 success target。
+2. `hcxwyrtiudbg_1780949301` 与 success `ni109` 共享 main etag `"c84dd4de247dae690c1b1b4e99cce4e8"` 和 captcha etag `"6944ea8ded7eda4932740a5d6055cdce"`，但它属于 `tf_payload_failure_stage`，不能当 success 同阶段对象。
+3. `whsnxy8ag5ji_1781017142` / `i294e72kliud_1781017380` 的 main etag 是 `"cf6dc0b430ccfe6c0a83005734bdda97"`，和 success `ni109` 不同；它们只能作为 later-main 失败对照。
+4. cookie timeline 中，`ni109` 有 decoded names：`_px3`, `_pxvid`, `cc`, `fed`, `_pxde`, `rf`, `fp`, `nf`, `challenge_success`；`hcx` 有前八个但没有 `challenge_success`。这支持把 `challenge_success` 作为 success cookie timeline 差异点，但还不能单独解释 success payload 构造。
+
+#### 21.22.4 下一步
+
+基于 v2 索引，下一步不再扩大样本猜测，而是回到唯一 decoded full success 样本 `ni109xdjp5zp_1780948211`：
+
+1. 追 `runtime line 307` 的 `JDBeOmJSWwo=` trigger 到 `PX561.d` final object 的构造边界；
+2. 重点闭合 `Ts callback args (n,v,e)` 与 `Bzt2fUFRcw==` / `OSkIb39DDA==`；
+3. 追 `TBR9Ugl7emA=` final 长字符串的插入或覆盖路径；
+4. 在这些字段闭合前，不进入纯协议 builder 发包阶段。
+
+### 21.23 `Ts(callback)` 运行时桥闭合：`Bzt2fUFRcw==` / `OSkIb39DDA==`
+
+本节继续 21.22.4 的第一、二项，目标是把 `Ts(callback)` 的静态参数边界和成功样本运行时值对齐。新增审计只使用现有 success trace、静态 `captcha.beautified.js`、POW solve artifact、decoded bundle artifact，不引入新运行。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_ts_callback_runtime_bridge.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/ts_callback_runtime_bridge_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/ts_callback_runtime_bridge_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_ts_callback_runtime_bridge.py
+python3 tools/audit_ts_callback_runtime_bridge.py
+```
+
+#### 21.23.1 静态链
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/ts_callback_runtime_bridge_audit.md`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js`
+
+关键源码边界：
+
+```text
+captcha.beautified.js:8490-8492
+  Us(r,n) => Ps = r, Es = m() - n, Ms = true
+
+captcha.beautified.js:8552-8561
+  worker message callback 取 event.data 为 n，然后 Us(n,f)
+
+captcha.beautified.js:8569-8574
+  sync fallback 中 poi(...) 命中后 Us(u,f)
+
+captcha.beautified.js:8585-8589
+  Ts(cb) 在 Ms true 后调用 cb(Gs, Es, Ps)
+
+captcha.beautified.js:11073-11099
+  D 传入 Ts(function(n,v,e){...})
+  r[Bzt2fUFRcw==] = v
+  r[OSkIb39DDA==] = e
+  r[Ew9iCVZjYDw=] = n
+  i(PX561, r)
+```
+
+由此静态证明：
+
+```text
+Ts callback arg n = Gs
+Ts callback arg v = Es = m() - f
+Ts callback arg e = Ps = POW value
+
+PX561.d.Bzt2fUFRcw== = Es
+PX561.d.OSkIb39DDA== = Ps
+PX561.d.Ew9iCVZjYDw= = Gs
+```
+
+#### 21.23.2 运行时对齐
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_internal_trace_ni109xdjp5zp_1780948211.jsonl`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/pow_response/pow_response_ni109xdjp5zp_1780948211.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/bundle_activity_matches/bundle_activity_matches_ni109xdjp5zp_1780948211.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/ts_callback_runtime_bridge_audit.json`
+
+运行时关键点：
+
+```text
+js_internal_trace line 227:
+  hsprotect.captcha.worker.new
+  url=blob:https://iframe.hsprotect.net/16a30791-95a5-401d-98ca-1fe58f9aaf19
+  wall_t=1780948253.8601222
+
+js_internal_trace line 272:
+  hsprotect.captcha.pow.hit
+  i=50239
+  value=218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
+
+js_internal_trace line 273:
+  hsprotect.captcha.worker.message
+  data=218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
+  wall_t=1780948254.5017269
+
+elapsed worker.new -> worker.message = 642 ms
+```
+
+POW solve artifact：
+
+```text
+pow_response_ni109...json:
+  i=50239
+  value=218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
+  matchesTarget=true
+```
+
+final `PX561.d`：
+
+```text
+requestLine=308
+seq=2
+activityIndex=2
+Ew9iCVZjYDw= false
+Bzt2fUFRcw== 642
+OSkIb39DDA== 218e34c1d956511db78149accdfacd205367d5b910c4e14b347640ac7564c43f
+XQUsAxhpKjU= 46916
+```
+
+#### 21.23.3 已闭合结论
+
+`OSkIb39DDA==` producer 已闭合：
+
+```text
+collector IooIIo POW seed
+  -> poi/sha256 求解
+  -> worker message data
+  -> Us(r,n) 的 r
+  -> Ps
+  -> Ts callback third arg e
+  -> r[OSkIb39DDA==] = e
+  -> final PX561.d.OSkIb39DDA==
+```
+
+`Bzt2fUFRcw==` producer 已闭合到时间差：
+
+```text
+worker search start f
+  -> Us(r,f) 中 Es = m() - f
+  -> Ts callback second arg v
+  -> r[Bzt2fUFRcw==] = v
+  -> final PX561.d.Bzt2fUFRcw== = 642
+```
+
+运行时外部可见时间差也对齐：
+
+```text
+worker.new wall_t 1780948253.8601222
+worker.message wall_t 1780948254.5017269
+round(delta_ms) = 642
+final PX561.d.Bzt2fUFRcw== = 642
+```
+
+边界：
+
+- 这闭合的是 `ni109xdjp5zp_1780948211` 成功样本里的 `Bzt2fUFRcw==` / `OSkIb39DDA==`。
+- `TBR9Ugl7emA=` 的 127-byte 长字符串 producer 仍未闭合。
+- `Ws.Ng()` / `Ws.NQ()` 的 success runtime 返回值仍未直接捕获；当前只通过 final `AEAxBkUsPjQ=` 和缺失外层 `succeeded` 做后验观察。
+
+### 21.24 `TBR9Ugl7emA=` success 边界审计：缺口缩小到 final PX561 bundle 构造/序列化阶段
+
+本节继续 21.23 的边界，目标不是猜 `TBR9Ugl7emA=`，而是用现有 success trace、decoded bundle、main/captcha 静态源码确认它到底在哪个阶段仍然缺证据。
+
+新增脚本：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/tools/audit_tbr9_success_boundary.py`
+
+新增产物：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/tbr9_success_boundary_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/tbr9_success_boundary_audit.md`
+
+验证命令：
+
+```bash
+python3 -m py_compile tools/audit_tbr9_success_boundary.py
+python3 tools/audit_tbr9_success_boundary.py
+```
+
+#### 21.24.1 final PX561 中的局部顺序
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/tbr9_success_boundary_audit.json`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/bundle_activity_matches/bundle_activity_matches_ni109xdjp5zp_1780948211.json`
+
+success request 308 的 final `PX561.d` 局部顺序：
+
+```text
+index 72  bHQdcikYH0Q=      true
+index 73  fyNOZTpPQF4=      succeeded
+index 74  AEAxBkUsPjQ=      246-byte Ws.Ng-like value
+index 75  TBR9Ugl7emA=      127-byte long string
+index 76  Bzt2fUFRcw==      642
+index 77  OSkIb39DDA==      218e34c1...
+index 78  XQUsAxhpKjU=      46916
+index 79  Ew9iCVZjYDw=      false
+index 80  XGRtYhkLbFM=      null
+```
+
+这说明 `TBR9Ugl7emA=` 在 final object 中位于 `AEAxBkUsPjQ=` 之后、`Bzt2fUFRcw==` 之前。
+
+#### 21.24.2 静态赋值顺序与 final 顺序冲突
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:11083`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:11085`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:11088`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_static_analysis/captcha.beautified.js:9638-9644`
+
+静态 `D/Ts` 局部顺序：
+
+```text
+captcha.beautified.js:11083
+  r[TBR9Ugl7emA=] = _s()
+
+captcha.beautified.js:11085
+  r[AEAxBkUsPjQ=] = Ws.Ng()
+
+captcha.beautified.js:11088
+  r[succeeded] = Ws.NQ(n)
+```
+
+`_s()` 边界：
+
+```text
+captcha.beautified.js:9638-9644
+  _s() returns boolean expression
+```
+
+因此，当前不能把 final `TBR9Ugl7emA=` 的 127-byte 字符串解释为 `captcha.beautified.js:11083` 的 `_s()` 直接结果。原因有两层证据：
+
+1. 值类型冲突：`_s()` 是 boolean，final value 是 127-byte string。
+2. 顺序冲突：静态直接赋值中 `TBR9` 在 `AEAx` 前；final object 中 `TBR9` 在 `AEAx` 后。
+
+#### 21.24.3 success response handler 不是 `TBR9` 来源
+
+证据来自：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/outlook_browser/js_internal_trace_ni109xdjp5zp_1780948211.jsonl`
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/output/protocol_reverse/source_offsets/tbr9_success_boundary_audit.json`
+
+运行时边界：
+
+```text
+js_internal_trace line 301:
+  hsprotect.Xn.trigger channel=JDBeOmJSWwo=
+  stack includes ds -> jc -> Iz/D/Ts
+
+js_internal_trace line 306:
+  hsprotect.main.om.decode
+  decoded parts include oIIoIooo|0
+  decoded parts do not contain TBR9Ugl7emA=
+  decoded parts do not contain Y@tvUUF@W...
+
+js_internal_trace line 307-329:
+  dispatch _px3 / _pxde / score / captcha succeeded handlers
+```
+
+所以 success collector response handler `oIIoIooo|0` 能解释后续 `captcha succeeded` / cookie 更新，但不能直接解释 `TBR9Ugl7emA=` 的长字符串 producer。
+
+#### 21.24.4 当前结论边界
+
+本轮不是闭合 `TBR9`，而是把缺口缩小：
+
+```text
+已排除：
+  - _s() boolean 直接生成 final long string
+  - success response decoded parts 直接携带 TBR9 key/value
+  - 简单“同 key 重新赋值但不改变插入顺序”的解释
+
+仍需证明：
+  - 传入 main.Yc(e, "PX561") 前的原始 object 中，TBR9 是什么值、什么位置
+  - main.Yc flatten 后、tf()/ut()/Vs() 前的 activity array 中，TBR9 是否已变成长字符串
+  - TBR9 是被 delete/re-add、由 nested object flatten 插入，还是由 serializer/WASM transform 后置生成
+```
+
+下一步证据目标变为：
+
+```text
+1. 捕获或静态复原传入 main.Yc(e, PX561) 的原始 e；
+2. 捕获或静态复原 tf(t,e) 入口处的 activities；
+3. 若不能从现有 trace 还原，则只能增加观测 hook，但必须明确这是观测层，不能改变 challenge 行为。
+```
+
+### 21.25 观测层补强：新增 `Yc(e, PX561)` 前后对象 hook，但不改变挑战逻辑
+
+本节落实 21.24 的第三项：如果现有 success trace 没有捕获 `Yc(e, PX561)` 前后的对象，就只能补观测 hook。这里仅修改观测层，不修改按压、challenge、solver、profile、代理或业务流程。
+
+代码变更：
+
+- `/Users/chaopenglv/data/me/Gpt-Agreement-Payment/CTF-reg/outlook_browser_register.py`
+
+新增 patch 点：
+
+```text
+main.min.js:
+  function $c(t,e){Rc(t,Yc(e,t))}
+    -> emits hsprotect.main.$c.yc
+       fields: activityType, input, inputKeys, output, outputKeys, stack
+
+  function jc(t){... Rc(r(n),Yc(t,r(n)))}
+    -> emits hsprotect.main.jc.yc
+       fields: activityType, input, inputKeys, output, outputKeys, stack
+```
+
+验证命令：
+
+```bash
+python3 -m py_compile CTF-reg/outlook_browser_register.py
+```
+
+本地 patch 覆盖验证：
+
+```text
+source: output/outlook_browser/js_probe/main.min.js
+url:    https://client.hsprotect.net/PXzC5j78di/main.min.js
+
+patches include:
+  __outlook_hsprotect_patch_main_yc_bridge_dollar_c__
+  __outlook_hsprotect_patch_main_yc_bridge_jc__
+  __outlook_hsprotect_patch_main_tf_enter__
+  __outlook_hsprotect_patch_main_tf_payload__
+
+patched source contains:
+  hsprotect.main.$c.yc = true
+  hsprotect.main.jc.yc = true
+```
+
+证据边界：
+
+- 这只能证明 patch 能命中当前本地 `main.min.js` 模板。
+- 还没有产生新的成功运行 trace。
+- 由于此前 `OUTLOOK_HSPROTECT_JS_PATCH=1` 已被观察到会进入风控，后续使用该 patch 采样时，必须把结果标记为“观测样本”，不能直接替代 unpatched success baseline。
+
+下一步：
+
+```text
+1. 若允许运行观测样本，用该 hook 捕获 hsprotect.main.$c.yc / hsprotect.main.jc.yc；
+2. 对比 input/output 中 TBR9Ugl7emA= 的值和插入顺序；
+3. 若 TBR9 在 Yc output 已是长字符串，则 producer 在 captcha D() -> $c/jc 之前；
+4. 若 Yc output 仍不是长字符串，而 final collector bundle 是长字符串，则继续追 tf()/ut()/Vs() 序列化阶段。
+```
