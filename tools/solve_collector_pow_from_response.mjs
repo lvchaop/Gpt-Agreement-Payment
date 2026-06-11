@@ -33,6 +33,7 @@ function sourceRef(doc, file) {
 }
 
 function solveSeed(part) {
+  const startedAtMs = Date.now();
   const fields = String(part).split("|");
   if (fields[0] !== "IooIIo") return null;
   const combinedSeed = fields[2] || "";
@@ -46,6 +47,7 @@ function solveSeed(part) {
     for (let i = 0; i < max; i++) {
       const value = candidateValue(i, width, prefixBase, seed);
       if (sha256Hex(value) === target) {
+        const endedAtMs = Date.now();
         return {
           raw: part,
           enabled: fields[1],
@@ -62,10 +64,14 @@ function solveSeed(part) {
           value,
           sha256: sha256Hex(value),
           matchesTarget: true,
+          solveStartedAtMs: startedAtMs,
+          solveEndedAtMs: endedAtMs,
+          solveElapsedMs: endedAtMs - startedAtMs,
         };
       }
     }
   }
+  const endedAtMs = Date.now();
   return {
     raw: part,
     enabled: fields[1],
@@ -78,6 +84,9 @@ function solveSeed(part) {
     width,
     searchSpacePerPrefix: max,
     solved: false,
+    solveStartedAtMs: startedAtMs,
+    solveEndedAtMs: endedAtMs,
+    solveElapsedMs: endedAtMs - startedAtMs,
   };
 }
 
@@ -95,11 +104,16 @@ function main() {
 
   const parts = parseParts(doc);
   const powParts = parts.filter((part) => String(part).startsWith("IooIIo|"));
+  const solveStartedAtMs = Date.now();
   const results = powParts.map(solveSeed);
+  const solveEndedAtMs = Date.now();
   const result = {
     input: abs,
     source: sourceRef(doc, abs),
     powPartCount: powParts.length,
+    solveStartedAtMs,
+    solveEndedAtMs,
+    solveElapsedMs: solveEndedAtMs - solveStartedAtMs,
     results,
   };
 
@@ -113,10 +127,10 @@ function main() {
   md.push(`input=${abs}`);
   md.push(`source=${result.source}`);
   md.push("");
-  md.push("| idx | difficulty | width | salt | prefixBase | i | value | matchesTarget | raw |");
-  md.push("|---:|---:|---:|---:|---:|---:|---|---|---|");
+  md.push("| idx | difficulty | width | salt | prefixBase | i | elapsed ms | value | matchesTarget | raw |");
+  md.push("|---:|---:|---:|---:|---:|---:|---:|---|---|---|");
   for (const [idx, r] of results.entries()) {
-    md.push(`| ${idx} | ${r.difficulty ?? ""} | ${r.width ?? ""} | ${r.salt ?? ""} | ${r.prefixBase ?? ""} | ${r.i ?? ""} | ${r.value ?? ""} | ${r.matchesTarget === true} | \`${r.raw || ""}\` |`);
+    md.push(`| ${idx} | ${r.difficulty ?? ""} | ${r.width ?? ""} | ${r.salt ?? ""} | ${r.prefixBase ?? ""} | ${r.i ?? ""} | ${r.solveElapsedMs ?? ""} | ${r.value ?? ""} | ${r.matchesTarget === true} | \`${r.raw || ""}\` |`);
   }
   fs.writeFileSync(mdPath, md.join("\n"), "utf8");
 

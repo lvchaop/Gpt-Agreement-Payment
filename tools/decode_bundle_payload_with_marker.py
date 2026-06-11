@@ -77,7 +77,13 @@ def remove_marker(payload: str, marker: str, cu: str) -> dict[str, str]:
 
 def decode_payload(payload: str, marker: str, cu: str) -> dict[str, Any]:
     removed = remove_marker(payload, marker, cu)
-    raw = base64.b64decode(removed["base"]).decode("latin1")
+    raw_bytes = base64.b64decode(removed["base"])
+    try:
+        raw = raw_bytes.decode("utf-8")
+        byte_encoding = "utf-8"
+    except UnicodeDecodeError:
+        raw = raw_bytes.decode("latin1")
+        byte_encoding = "latin1-fallback"
     text = xor_string(raw, 50)
     try:
         parsed: Any = json.loads(text)
@@ -88,6 +94,7 @@ def decode_payload(payload: str, marker: str, cu: str) -> dict[str, Any]:
     return {
         **removed,
         "markerMatch": removed["marker"] == marker,
+        "byteEncoding": byte_encoding,
         "decodedText": text,
         "json": parsed,
         "jsonError": json_error,

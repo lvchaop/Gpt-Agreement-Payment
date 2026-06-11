@@ -168,8 +168,9 @@ const result = {
   windowSuHits: findWindowSuHits(),
   conclusions: [
     "Su() expression components decode to a deterministic window property name prefix/suffix; exact runtime value still depends on window._pxAppId.",
-    "Fu() visible object key decodes to slice, not PX762.",
-    "Static B25 literals in captcha include PX1200/PX763/PX764-related callbacks but this scan must be compared with main Zc PX762 expectation before claiming exact bridge closure.",
+    "Fu() visible object key decodes to PX762 when the rotated Vu/_u decoder block is evaluated before decoding.",
+    "The earlier 'slice' interpretation belonged to the Array.prototype.slice.call helper expression, not the Fu() visible callback key.",
+    "Static captcha bridge evidence now supports main Zc/Lc PX762 -> captcha Fu() callback registration; remaining PX561 gaps are downstream field/value producer boundaries, not this bridge.",
   ],
 };
 

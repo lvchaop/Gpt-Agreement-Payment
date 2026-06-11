@@ -20,6 +20,11 @@ TARGET_KEYS = [
     "OSkIb39DDA==",
 ]
 
+OBSERVATION_CONTROL_FILES = [
+    PROTO / "source_offsets/tbr9_aeax_success_failure_reconciliation_20260611.json",
+    PROTO / "source_offsets/tbr9_aeax_negative_control_b0_20260611.json",
+]
+
 
 def read_json(path: Path) -> Any | None:
     if not path.exists():
@@ -232,6 +237,70 @@ def summarize_risk_verify(run_id: str) -> dict[str, Any]:
     }
 
 
+def normalize_observation_control(path: Path) -> dict[str, Any] | None:
+    data = read_json(path)
+    if data is None:
+        return {"path": str(path.resolve()), "exists": False}
+
+    if "new_runtime_observation_sample" in data:
+        sample = data["new_runtime_observation_sample"]
+        create = sample.get("create_account") or {}
+        pre_i = sample.get("pre_i_px561") or {}
+        tf = sample.get("final_px561_tf_payload") or {}
+        return {
+            "path": str(path.resolve()),
+            "exists": True,
+            "run": sample.get("run"),
+            "stage": "aeax_only_negative_control",
+            "jsTrace": sample.get("js_internal_trace"),
+            "runtimeTrace": sample.get("runtime_trace"),
+            "preIHasTBR": bool(pre_i.get("hasTbrInSnapshot")),
+            "preIHasAEAx": pre_i.get("aeaxLen") is not None,
+            "finalTfHasTBR": bool(tf.get("hasTBR")),
+            "finalTfHasAEAx": bool(tf.get("hasAEAx")),
+            "cookieBridgeOk": bool((sample.get("cookie_bridge") or {}).get("ok")),
+            "createAccountStatus": create.get("status"),
+            "createAccountHasRedirect": bool(create.get("hasRedirect")),
+            "createAccountErrorCode": create.get("error_code"),
+            "createAccountErrorField": create.get("error_field"),
+            "limitation": sample.get("limitation"),
+        }
+
+    run = data.get("run") or {}
+    create = data.get("create_account") or {}
+    pre_i = data.get("pre_i_px561") or {}
+    final_tf = data.get("final_tf_payload") or {}
+    px_activity = next((a for a in final_tf.get("activities") or [] if a.get("t") == "PX561"), {})
+    error = create.get("error") or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": True,
+        "run": run.get("id"),
+        "stage": "aeax_only_negative_control",
+        "jsTrace": run.get("js_internal_trace"),
+        "runtimeTrace": run.get("runtime_trace"),
+        "preIHasTBR": bool(pre_i.get("snapshot_has_tbr")),
+        "preIHasAEAx": bool(pre_i.get("snapshot_has_aeax")),
+        "finalTfHasTBR": bool(px_activity.get("hasTBR")),
+        "finalTfHasAEAx": bool(px_activity.get("hasAEAx")),
+        "cookieBridgeOk": bool((data.get("px_cookie_bridge") or {}).get("ok")),
+        "createAccountStatus": create.get("status"),
+        "createAccountHasRedirect": bool(create.get("hasRedirect")),
+        "createAccountErrorCode": error.get("code"),
+        "createAccountErrorField": error.get("field"),
+        "limitation": data.get("conclusion"),
+    }
+
+
+def build_observation_controls() -> list[dict[str, Any]]:
+    controls = []
+    for path in OBSERVATION_CONTROL_FILES:
+        item = normalize_observation_control(path)
+        if item is not None:
+            controls.append(item)
+    return controls
+
+
 def build_index() -> dict[str, Any]:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     source_versions = source_version_index()
@@ -265,6 +334,8 @@ def build_index() -> dict[str, Any]:
         "targetKeys": TARGET_KEYS,
         "runCount": len(runs),
         "runs": runs,
+        "observationControlCount": len([x for x in build_observation_controls() if x.get("exists")]),
+        "observationControls": build_observation_controls(),
         "sourceVersionAudit": str((PROTO / "source_offsets/hsprotect_source_version_audit.json").resolve()),
     }
 
@@ -283,6 +354,7 @@ def write_markdown(index: dict[str, Any], path: Path) -> None:
         "",
         f"- repo: `{index['repo']}`",
         f"- runCount: `{index['runCount']}`",
+        f"- observationControlCount: `{index.get('observationControlCount', 0)}`",
         f"- sourceVersionAudit: `{index['sourceVersionAudit']}`",
         "",
         "## stage summary",
@@ -335,10 +407,40 @@ def write_markdown(index: dict[str, Any], path: Path) -> None:
             for key in TARGET_KEYS:
                 lines.append(f"  - `{key}`: `{md_value((target.get('targetValues') or {}).get(key))}`")
         lines.append("")
+    controls = [c for c in index.get("observationControls", []) if c.get("exists")]
+    lines += ["", "## observation negative controls", ""]
+    if not controls:
+        lines.append("- none")
+    else:
+        lines += [
+            "| run | stage | pre-i TBR | pre-i AEAx | tf TBR | tf AEAx | cookie bridge | CreateAccount | evidence |",
+            "|---|---|---:|---:|---:|---:|---:|---|---|",
+        ]
+        for control in controls:
+            create_summary = "status={status} redirect={redirect} error={code}/{field}".format(
+                status=control.get("createAccountStatus"),
+                redirect=control.get("createAccountHasRedirect"),
+                code=control.get("createAccountErrorCode"),
+                field=control.get("createAccountErrorField"),
+            )
+            lines.append(
+                "| {run} | {stage} | {pre_tbr} | {pre_aeax} | {tf_tbr} | {tf_aeax} | {bridge} | {create} | `{path}` |".format(
+                    run=control.get("run"),
+                    stage=control.get("stage"),
+                    pre_tbr=control.get("preIHasTBR"),
+                    pre_aeax=control.get("preIHasAEAx"),
+                    tf_tbr=control.get("finalTfHasTBR"),
+                    tf_aeax=control.get("finalTfHasAEAx"),
+                    bridge=control.get("cookieBridgeOk"),
+                    create=create_summary,
+                    path=control.get("path"),
+                )
+            )
     lines += [
         "## evidence gaps exposed by v2",
         "",
         "- `full_success_decoded` is currently proven only for `ni109xdjp5zp_1780948211`.",
+        "- `fk8zn2nqhex1_1781115338` and `b0hnt0zycbpx_1781116322` are AEAx-only negative controls: they have pre-i/$c.yc/tf.payload evidence but CreateAccount returns `1059/humanCaptcha` instead of `redirectUrl`.",
         "- `sv2n3df1y8fi_1780946111` reaches browser/Microsoft success checks but has no decoded collector artifact in current v2 inputs.",
         "- `hcxwyrtiudbg_1780949301`, `whsnxy8ag5ji_1781017142`, and `i294e72kliud_1781017380` are tf.payload failure-stage controls, not success same-stage payloads.",
         "- Source etag evidence is available only for runs present in `hsprotect_source_version_audit.json`; all other runs are marked missing instead of inferred.",

@@ -86,7 +86,11 @@ def decode_collector_response(raw: str, tag: str) -> dict[str, Any]:
 
 
 def base_from_request_build(path: Path) -> str:
-    return path.name.removeprefix("collector_request_build_").removesuffix(".json")
+    return (
+        path.name.removeprefix("collector_request_build_")
+        .removeprefix("bundle_request_build_")
+        .removesuffix(".json")
+    )
 
 
 def headers_from_runtime(row: dict[str, Any], *, body: str, url: str, include_proxy_authorization: bool) -> dict[str, str]:
@@ -176,7 +180,8 @@ def build_probe(
     if index < 0 or index >= len(rows):
         raise IndexError(f"request index out of range: {index}; rows={len(rows)}")
     row = rows[index]
-    runtime_path = Path(build.get("runtimePath") or "")
+    evidence = build.get("evidenceFiles") or {}
+    runtime_path = Path(build.get("runtimePath") or evidence.get("runtimeTrace") or "")
     if runtime_path and not runtime_path.is_absolute():
         runtime_path = REPO / runtime_path
     runtime_req = find_runtime_request(runtime_path, int(row.get("requestLine") or 0)) or {}
@@ -204,7 +209,7 @@ def build_probe(
         "bodyLenBytes": len(body.encode("utf-8")),
         "source": {
             "bodySource": body_source,
-            "bodyExactMatch": row.get("exactBodyMatch"),
+            "bodyExactMatch": row.get("exactBodyMatch") if row.get("exactBodyMatch") is not None else row.get("bodyMatch"),
             "markerSource": row.get("markerSource"),
             "markerQi": row.get("markerQi"),
             "runtimeHeaderLine": runtime_req.get("_line"),

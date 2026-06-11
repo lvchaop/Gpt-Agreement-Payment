@@ -23,7 +23,9 @@ def parse_form_ordered(body: str) -> list[tuple[str, str]]:
         if not part:
             continue
         key, _, value = part.partition("=")
-        out.append((urllib.parse.unquote_plus(key), urllib.parse.unquote_plus(value)))
+        # HUMAN payload/pc material can contain literal '+'. Treating '+' as a
+        # form-space corrupts base64-like payload bytes before marker replay.
+        out.append((urllib.parse.unquote(key), urllib.parse.unquote(value)))
     return out
 
 
@@ -40,27 +42,23 @@ def marker_from_qi(qi: str | None) -> str:
     return xor_string(base64.b64encode(value.encode()).decode(), 10)
 
 
-def insertion_positions(text: str, insert_len: int, cu: str) -> list[int]:
+def insertion_positions(chars: str, base_len: int, cu: str) -> list[int]:
     h = xor_string(base64.b64encode(str(cu).encode()).decode(), 10)
-    max_value = -1
-    for p in range(len(text)):
-        m = int(p / len(h) + 1)
-        g = p % len(h) if p >= len(h) else p
-        if m >= len(h):
-            continue
-        y = ord(h[g]) * ord(h[m])
-        if y > max_value:
-            max_value = y
     positions: list[int] = []
-    for b in range(insert_len):
-        i = int(b / len(h)) + 1
-        e = b % len(h)
-        s = ord(h[e]) * ord(h[i])
-        if s >= len(text):
-            s = int((s / max_value) * (len(text) - 1))
-        while s in positions:
-            s += 1
-        positions.append(s)
+    max_value = -1
+    for p in range(len(chars)):
+        m = p // len(h) + 1
+        g = p % len(h) if p >= len(h) else p
+        max_value = max(max_value, ord(h[g]) * ord(h[m]))
+    for idx in range(len(chars)):
+        i = idx // len(h) + 1
+        e = idx % len(h)
+        pos = ord(h[e]) * ord(h[i])
+        if pos >= base_len:
+            pos = int((pos / max_value) * (base_len - 1))
+        while pos in positions:
+            pos += 1
+        positions.append(pos)
     return sorted(positions)
 
 
@@ -92,7 +90,7 @@ def extract_payload_base(payload: str, cu: str, marker_len: int = 24) -> dict[st
     base_len = len(payload) - marker_len
     if base_len <= 0:
         raise ValueError(f"payload too short for marker_len={marker_len}: len={len(payload)}")
-    positions = insertion_positions("X" * base_len, marker_len, cu)
+    positions = insertion_positions("X" * marker_len, base_len, cu)
     marker, base = remove_inserted(payload, positions)
     return {"marker": marker, "base": base}
 
@@ -137,7 +135,7 @@ def build(request_build_path: Path, live_probe_path: Path, index: int) -> dict[s
     current = dict(pairs)
     cu = current.get("uuid") or ""
     payload_info = extract_payload_base(current.get("payload") or "", cu, len(row.get("marker") or live["marker"]))
-    new_payload = insert_chars(live["marker"], payload_info["base"], insertion_positions(payload_info["base"], len(live["marker"]), cu))
+    new_payload = insert_chars(live["marker"], payload_info["base"], insertion_positions(live["marker"], len(payload_info["base"]), cu))
 
     replacements = {
         "payload": new_payload,

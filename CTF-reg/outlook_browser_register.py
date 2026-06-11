@@ -1404,14 +1404,31 @@ def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
                 1,
             )
             patches.append(marker("main_tf_enter"))
-        tf_payload_needle = "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d),p=["
-        if tf_payload_needle in patched:
+        tf_pc_needle = "var s,l,f=Li(),h=Jt(ut(t),(s=e[on],l=e[cn],[po(),s,l].join(\":\"))),d={"
+        if tf_pc_needle in patched:
             patched = patched.replace(
-                tf_payload_needle,
-                "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d);try{var __qi=Qi(),__marker=ne(J(__qi||Xs(118)),10);__outlookPatchEmit('hsprotect.main.tf.payload',{activities:t,serialized:ut(t),meta:d,payload:String(v),pc:String(h),cs:String(f),qi:String(__qi),marker:String(__marker),markerLen:String(__marker).length,stack:(new Error).stack})}catch(_){}p=[",
+                tf_pc_needle,
+                "var s,l,f=Li(),__outlookTfPcKey=(s=e[on],l=e[cn],[po(),s,l].join(\":\")),__outlookTfPcSerialized=ut(t),h=Jt(__outlookTfPcSerialized,__outlookTfPcKey);try{__outlookPatchEmit('hsprotect.main.tf.prepc',{activities:t,serialized:__outlookTfPcSerialized,key:String(__outlookTfPcKey),pc:String(h),cs:String(f),stack:(new Error).stack})}catch(_){}var d={",
                 1,
             )
-            patches.append(marker("main_tf_payload"))
+            patches.append(marker("main_tf_prepc"))
+        tf_payload_after_prepc_needle = "var d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d),p=["
+        if tf_payload_after_prepc_needle in patched:
+            patched = patched.replace(
+                tf_payload_after_prepc_needle,
+                "var d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d);try{var __qi=Qi(),__marker=ne(J(__qi||Xs(118)),10);__outlookPatchEmit('hsprotect.main.tf.payload',{activities:t,serialized:ut(t),meta:d,payload:String(v),pc:String(h),cs:String(f),qi:String(__qi),marker:String(__marker),markerLen:String(__marker).length,stack:(new Error).stack})}catch(_){}var p=[",
+                1,
+            )
+            patches.append(marker("main_tf_payload_after_prepc"))
+        else:
+            tf_payload_needle = "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d),p=["
+            if tf_payload_needle in patched:
+                patched = patched.replace(
+                    tf_payload_needle,
+                    "d={vid:Ct(),tag:e[on],appID:e[an],cu:po(),cs:f,pc:h},v=Vs(t,d);try{var __qi=Qi(),__marker=ne(J(__qi||Xs(118)),10);__outlookPatchEmit('hsprotect.main.tf.payload',{activities:t,serialized:ut(t),meta:d,payload:String(v),pc:String(h),cs:String(f),qi:String(__qi),marker:String(__marker),markerLen:String(__marker).length,stack:(new Error).stack})}catch(_){}p=[",
+                    1,
+                )
+                patches.append(marker("main_tf_payload"))
 
     if "captcha.hsprotect.net/" in url and "captcha.js" in url:
         zt_needle = "var zt=function(r){function n(r,n){return mt(r- -665,n)}try{R()[window[v(n(-420,-426))]][v(n(-410,-403))][v(n(-422,-429))](v(n(-417,-412)),r)}catch(r){}};"
@@ -1430,6 +1447,39 @@ def _patch_hsprotect_js_source(url: str, source: str) -> tuple[str, list[str]]:
                 + "function Ot(r,n,t,v){function e(r,n){return Rt(r-705,n)}var f,s=u,m=su();clearTimeout(At),r=parseInt(r);try{var __otState=s(0===r?e(1095,1044):e(1042,972));__outlookPatchEmit('hsprotect.captcha.Ot.enter',{r:r,n:String(n),t:String(t),v:String(v),state:String(__otState),zero:r===0,stack:(new Error).stack});zt(__otState)}catch(__otPatchErr){try{__outlookPatchEmit('hsprotect.captcha.Ot.patch_error',{error:String(__otPatchErr),stack:(new Error).stack})}catch(_){}}0===r&&B()&&m[s(\"PkU0HwwBODJgEBUZGDslQi4ZChw8\")]&&setTimeout(W,Kt-T),Hn[s(e(1147,1081))]=Kn()&&-1===r;var z,i=(z=qt,Ut=!0,setTimeout[u(\"NV8XFA\")](null,z?Qt:kt,Kt)),c=function(r,n,t){var v=u;if(r&&n&&t)return\"\"[e(-466,-443)](r,\"|\")[e(-466,-475)](n,\"|\")[e(-466,-473)](t);function e(r,n){return Rt(r- -864,n)}return v(\"\")}(n,t,v),o=((f={})[s(e(1155,1184))]=r,f);c&&(o[s(e(1184,1252))]=c),i(o,!0)}",
             )
             patches.append(marker("captcha_ot_enter"))
+        tbr_micro_needle = "function(r,n){var t=u;function v(r,n){return Vs(n,r- -148)}if(r[t(v(-540,-543))]=_s(),r[t(v(-531,-522))]=Rs,Ws){try{r[t(\"FnM4CCwDASRmEyFT\")]=Ws[t(\"Ng\")]()}catch(r){}try{r[t(v(-541,-541))]=Ws[t(\"NQ\")](n)}catch(r){}}}(r,e);var i=Ou();"
+        if tbr_micro_needle in patched:
+            patched = patched.replace(
+                tbr_micro_needle,
+                "function(r,n){var t=u;function v(r,n){return Vs(n,r- -148)}var __tbr=t(v(-540,-543)),__inst=t(v(-531,-522));r[__tbr]=_s();try{__outlookPatchEmit('hsprotect.captcha.tbr9.after_s',{key:String(__tbr),value:r&&r[__tbr],valueType:typeof(r&&r[__tbr]),keys:r&&Object.keys?Object.keys(r):[],stack:(new Error).stack})}catch(_){}r[__inst]=Rs;try{__outlookPatchEmit('hsprotect.captcha.tbr9.after_rs',{key:String(__tbr),value:r&&r[__tbr],valueType:typeof(r&&r[__tbr]),instKey:String(__inst),instValue:r&&r[__inst],keys:r&&Object.keys?Object.keys(r):[],stack:(new Error).stack})}catch(_){}if(Ws){try{var __aeax=t(\"FnM4CCwDASRmEyFT\");r[__aeax]=Ws[t(\"Ng\")]();__outlookPatchEmit('hsprotect.captcha.tbr9.after_ng',{key:String(__tbr),value:r&&r[__tbr],valueType:typeof(r&&r[__tbr]),aeaxKey:String(__aeax),aeaxValue:r&&r[__aeax],keys:r&&Object.keys?Object.keys(r):[],stack:(new Error).stack})}catch(r){}try{var __nq=t(v(-541,-541));r[__nq]=Ws[t(\"NQ\")](n);__outlookPatchEmit('hsprotect.captcha.tbr9.after_nq',{key:String(__tbr),value:r&&r[__tbr],valueType:typeof(r&&r[__tbr]),nqKey:String(__nq),nqValue:r&&r[__nq],nInput:n,nInputType:typeof n,nInputLen:typeof n===\"string\"?n.length:null,keys:r&&Object.keys?Object.keys(r):[],stack:(new Error).stack})}catch(r){}}}(r,e);var i=Ou();",
+                1,
+            )
+            patches.append(marker("captcha_tbr9_micro"))
+        tail_micro_needle = "}(r,e);var i=Ou();function c(r,n){return K(n,r-597)}s(i)===f(c(406,426))&&(r[f(c(410,395))]=v,r[f(c(414,426))]=e,r[f(\"D2csAy8QPCd9EyVT\")]=parseInt(m()-t),r[f(c(411,413))]=n,r[f(c(429,410))]=os,r[f(\"B25IQlhZYw\")]=ws,r[f(c(415,422))]=Ks,i(f(c(439,441)),r))"
+        if tail_micro_needle in patched:
+            patched = patched.replace(
+                tail_micro_needle,
+                "}(r,e);var __tailEmit=function(__kind,__extra){try{var __tbr=\"TBR9Ugl7emA=\",__aeax=\"AEAxBkUsPjQ=\",__bzt=\"Bzt2fUFRcw==\",__osk=\"OSkIb39DDA==\",__px561=\"PX561\",__base={activityType:String(__px561),key:String(__tbr),value:r&&r[__tbr],valueType:typeof(r&&r[__tbr]),snapshot:r,keys:r&&Object.keys?Object.keys(r):[],aeaxKey:String(__aeax),aeaxValue:r&&r[__aeax],bztKey:String(__bzt),bztValue:r&&r[__bzt],oskKey:String(__osk),oskValue:r&&r[__osk],stack:(new Error).stack};if(__extra)for(var __k in __extra)__base[__k]=__extra[__k];__outlookPatchEmit(__kind,__base)}catch(_){}};__tailEmit('hsprotect.captcha.tbr9.after_inner');var i=Ou();__tailEmit('hsprotect.captcha.tbr9.after_ou');function c(r,n){return K(n,r-597)}__tailEmit('hsprotect.captcha.tbr9.before_condition');var __tailCond=s(i)===f(c(406,426));__tailEmit('hsprotect.captcha.tbr9.after_condition',{condition:__tailCond});__tailCond&&(__tailEmit('hsprotect.captcha.tbr9.before_bzt'),r[f(c(410,395))]=v,__tailEmit('hsprotect.captcha.tbr9.after_bzt'),r[f(c(414,426))]=e,__tailEmit('hsprotect.captcha.tbr9.after_osk'),r[f(\"D2csAy8QPCd9EyVT\")]=parseInt(m()-t),__tailEmit('hsprotect.captcha.tbr9.after_time'),r[f(c(411,413))]=n,__tailEmit('hsprotect.captcha.tbr9.after_n'),r[f(c(429,410))]=os,__tailEmit('hsprotect.captcha.tbr9.after_os'),r[f(\"B25IQlhZYw\")]=ws,__tailEmit('hsprotect.captcha.tbr9.after_ws'),r[f(c(415,422))]=Ks,__tailEmit('hsprotect.captcha.tbr9.after_ks'),__tailEmit('hsprotect.captcha.pre_i_px561'),i(f(c(439,441)),r))",
+                1,
+            )
+            patches.append(marker("captcha_tbr9_tail_micro"))
+            patches.append(marker("captcha_pre_i_px561"))
+        pre_i_needle = "r[f(c(415,422))]=Ks,i(f(c(439,441)),r))"
+        if pre_i_needle in patched:
+            patched = patched.replace(
+                pre_i_needle,
+                "r[f(c(415,422))]=Ks,function(){try{var __px561=f(c(439,441)),__tbr=f(\"A3QrSTsPOGBTFDFT\"),__aeax=f(\"FnM4CCwDASRmEyFT\");__outlookPatchEmit('hsprotect.captcha.pre_i_px561',{activityType:String(__px561),snapshot:r,keys:r&&Object.keys?Object.keys(r):[],tbrKey:String(__tbr),tbrValue:r&&r[__tbr],tbrType:typeof(r&&r[__tbr]),aeaxKey:String(__aeax),aeaxValue:r&&r[__aeax],stack:(new Error).stack})}catch(_){}}(),i(f(c(439,441)),r))",
+                1,
+            )
+            patches.append(marker("captcha_pre_i_px561"))
+        wasm_needle = "function Is(r){var n=u;function t(r,n){return Xs(n- -17,r)}for(var v=st(r),e=new Uint8Array(v[n(\"O1MXFxoA\")]),f=0;f<v[n(t(228,297))];f++)e[f]=v[n(\"NF4YAi0HMDJ3DQ\")](f);return e[n(t(285,315))]}"
+        if wasm_needle in patched:
+            patched = patched.replace(
+                wasm_needle,
+                "function Is(r){var n=u;function t(r,n){return Xs(n- -17,r)}for(var v=st(r),e=new Uint8Array(v[n(\"O1MXFxoA\")]),f=0;f<v[n(t(228,297))];f++)e[f]=v[n(\"NF4YAi0HMDJ3DQ\")](f);var __buf=e[n(t(285,315))];try{var __u8=new Uint8Array(__buf),__first=[];for(var __i=0;__i<Math.min(8,__u8.length);__i++)__first.push(__u8[__i]);__outlookPatchEmit('hsprotect.captcha.wasm.material',{encoded:String(r),encodedLen:String(r).length,byteLen:__u8.length,firstBytes:__first,stack:(new Error).stack})}catch(_){}return __buf}",
+                1,
+            )
+            patches.append(marker("captcha_wasm_material"))
         needle = "function qs(r,n,u,t,v,e,f,s,m){for(var z,i=r;i<=n;i++)(z=poi(i,u,t,v,e,f,0,m))&&postMessage(z);postMessage(!1)}"
         if needle in patched:
             replacement = (
@@ -1477,6 +1527,7 @@ def _write_hsprotect_patch_artifacts(
             "has_function_tf": "function tf(t,e)" in source,
             "has_tf_vs_payload": "v=Vs(t,d)" in source,
             "has_captcha_Ot": "function Ot(r,n,t,v)" in source,
+            "has_captcha_pre_i_px561": "r[f(c(415,422))]=Ks,i(f(c(439,441)),r))" in source,
             "has_captcha_qs": "function qs(r,n,u,t,v,e,f,s,m)" in source,
             "has_worker_new": "var w=new Worker(c);return w" in source,
         }
@@ -1489,6 +1540,7 @@ def _write_hsprotect_patch_artifacts(
             "function tf(t,e)",
             "v=Vs(t,d)",
             "function Ot(r,n,t,v)",
+            "r[f(c(415,422))]=Ks,i(f(c(439,441)),r))",
             "function qs(r,n,u,t,v,e,f,s,m)",
             "var w=new Worker(c);return w",
         ]}
