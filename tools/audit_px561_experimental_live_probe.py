@@ -41,6 +41,23 @@ def handler_status(parts: list[str]) -> str | None:
     return None
 
 
+def conclusion_for(checks: dict[str, bool], status: str | None) -> tuple[str, str]:
+    if status == "success":
+        return (
+            "The experimental PX561 live probe reached the collector, decoded cleanly, and returned oIIoIooo|0. This proves collector acceptance for this explicit constructed PX561 body; Microsoft risk/verify replay remains a separate end-to-end requirement.",
+            "Replay the downstream Microsoft risk/verify flow using the returned collector state and cookie/token updates.",
+        )
+    if checks.get("constructorHasFreshTbr9"):
+        return (
+            "The experimental PX561 live probe reached the collector and decoded cleanly, but returned oIIoIooo|-1 rather than oIIoIooo|0. This body uses live POW OSk, live Bzt, and a fresh TBR9 reproduced offline from the captcha WASM NQ path with runtime _pxUuid evidence, so collector acceptance still has an additional unsatisfied condition beyond these three fields.",
+            "Diff the fresh constructed PX561 request against a same-generation accepted PX561 body at decoded serialized-field level, including dynamic state/cookie coupling, seq/rsc/sid/cts/vid, and any collector-side freshness boundary.",
+        )
+    return (
+        "The experimental PX561 live probe reached the collector and decoded cleanly, but returned oIIoIooo|-1 rather than oIIoIooo|0. Because this body does not yet prove a fresh TBR9 source, this remains a negative-control result for the current constructor.",
+        "Generate a fresh TBR9 value from runtime micro hooks or its exact producer before treating the PX561 constructor as success-ready.",
+    )
+
+
 def main() -> None:
     constructor = read_json(CONSTRUCTOR)
     probe_path = latest_sent_probe()
@@ -64,9 +81,10 @@ def main() -> None:
         "decodedHasSuccessHandler": bool(decoded.get("hasSuccessHandler")),
         "decodedHasFailureHandler": handler_status(parts) == "failure",
     }
+    conclusion, next_evidence = conclusion_for(checks, handler_status(parts))
 
     result = {
-        "purpose": "Classify the live collector response for the experimental PX561 body that uses live POW OSk and live Bzt but stale template TBR9.",
+        "purpose": "Classify the live collector response for the experimental PX561 body built from current constructor evidence.",
         "evidenceFiles": {
             "constructor": str(CONSTRUCTOR),
             "sentProbe": str(probe_path) if probe_path else None,
@@ -93,11 +111,8 @@ def main() -> None:
             "decodeError": decoded.get("error"),
         },
         "checks": checks,
-        "conclusion": (
-            "The experimental PX561 live probe reached the collector and decoded cleanly, but returned oIIoIooo|-1 rather than oIIoIooo|0. "
-            "Because this body uses live POW OSk and live Bzt while retaining stale template TBR9, this is a negative-control result for the current constructor; it does not prove TBR9 alone is the only missing acceptance condition."
-        ),
-        "nextEvidenceRequired": "Generate a fresh TBR9 value from runtime micro hooks or its exact producer before treating the PX561 constructor as success-ready.",
+        "conclusion": conclusion,
+        "nextEvidenceRequired": next_evidence,
     }
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

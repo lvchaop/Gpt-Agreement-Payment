@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import http.client
 import json
+import os
 import ssl
 import time
 import urllib.parse
@@ -93,25 +94,47 @@ def base_from_request_build(path: Path) -> str:
     )
 
 
-def headers_from_runtime(row: dict[str, Any], *, body: str, url: str, include_proxy_authorization: bool) -> dict[str, str]:
+def headers_from_runtime(
+    row: dict[str, Any],
+    *,
+    body: str,
+    url: str,
+    include_proxy_authorization: bool,
+    header_mode: str = "safe",
+) -> dict[str, str]:
     parsed = urllib.parse.urlparse(url)
     headers: dict[str, str] = {}
+    runtime_exact = header_mode == "runtime-exact"
     # Keep runtime order as much as Python dict preserves insertion order from JSON.
     runtime = row.get("runtimeHeaders") or row.get("headers") or {}
     for name, value in runtime.items():
         lower = str(name).lower()
-        if lower in {"host", "content-length", "connection"}:
+        if runtime_exact and lower == "host":
+            headers[name] = parsed.netloc
+            continue
+        if runtime_exact and lower == "content-length":
+            headers[name] = str(len(body.encode("utf-8")))
+            continue
+        if runtime_exact and lower == "content-type":
+            headers[name] = "application/x-www-form-urlencoded"
+            continue
+        if lower in {"host", "content-length"}:
+            continue
+        if lower == "connection" and not runtime_exact:
             continue
         if lower == "proxy-authorization" and not include_proxy_authorization:
             continue
-        # stdlib cannot decode zstd/br; request gzip/deflate only.
-        if lower == "accept-encoding":
+        # stdlib cannot decode zstd/br; request gzip/deflate only unless this is a header-parity control.
+        if lower == "accept-encoding" and not runtime_exact:
             headers[name] = "gzip, deflate"
             continue
         headers[name] = str(value)
-    headers["Host"] = parsed.netloc
-    headers["Content-Type"] = "application/x-www-form-urlencoded"
-    headers["Content-Length"] = str(len(body.encode("utf-8")))
+    if not any(k.lower() == "host" for k in headers):
+        headers["Host"] = parsed.netloc
+    if not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if not any(k.lower() == "content-length" for k in headers):
+        headers["Content-Length"] = str(len(body.encode("utf-8")))
     return headers
 
 
@@ -138,7 +161,47 @@ def decompress_body(body: bytes, encoding: str) -> bytes:
     return body
 
 
-def send_https(url: str, headers: dict[str, str], body: str, timeout: float) -> dict[str, Any]:
+def _proxy_auth_header(proxy: urllib.parse.ParseResult) -> str | None:
+    if proxy.username is None:
+        return None
+    user = urllib.parse.unquote(proxy.username)
+    password = urllib.parse.unquote(proxy.password or "")
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+
+
+def _https_connection(
+    parsed: urllib.parse.ParseResult,
+    *,
+    timeout: float,
+    context: ssl.SSLContext,
+    proxy_url: str | None,
+) -> tuple[http.client.HTTPSConnection, dict[str, Any]]:
+    if not proxy_url:
+        return http.client.HTTPSConnection(parsed.netloc, timeout=timeout, context=context), {
+            "mode": "direct",
+            "target": parsed.netloc,
+        }
+    proxy = urllib.parse.urlparse(proxy_url)
+    if proxy.scheme not in {"http", "https"} or not proxy.hostname:
+        raise ValueError(f"unsupported proxy url: {proxy_url}")
+    proxy_port = proxy.port or (443 if proxy.scheme == "https" else 80)
+    target_port = parsed.port or 443
+    conn = http.client.HTTPSConnection(proxy.hostname, proxy_port, timeout=timeout, context=context)
+    tunnel_headers: dict[str, str] = {}
+    auth = _proxy_auth_header(proxy)
+    if auth:
+        tunnel_headers["Proxy-Authorization"] = auth
+    conn.set_tunnel(parsed.hostname or parsed.netloc, target_port, headers=tunnel_headers)
+    return conn, {
+        "mode": "https-over-http-connect",
+        "proxy": f"{proxy.scheme}://{proxy.hostname}:{proxy_port}",
+        "target": f"{parsed.hostname}:{target_port}",
+        "hasProxyAuthorization": auth is not None,
+        "proxyUsername": urllib.parse.unquote(proxy.username) if proxy.username else None,
+    }
+
+
+def send_https(url: str, headers: dict[str, str], body: str, timeout: float, proxy_url: str | None = None) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
         raise ValueError(f"only https is supported: {url}")
@@ -147,7 +210,8 @@ def send_https(url: str, headers: dict[str, str], body: str, timeout: float) -> 
         path += "?" + parsed.query
     started = time.time()
     ctx = ssl.create_default_context()
-    conn = http.client.HTTPSConnection(parsed.netloc, timeout=timeout, context=ctx)
+    effective_proxy_url = proxy_url or os.environ.get("HSPROTECT_PROXY_URL")
+    conn, transport = _https_connection(parsed, timeout=timeout, context=ctx, proxy_url=effective_proxy_url)
     try:
         conn.request("POST", path, body=body.encode("utf-8"), headers=headers)
         resp = conn.getresponse()
@@ -163,6 +227,7 @@ def send_https(url: str, headers: dict[str, str], body: str, timeout: float) -> 
             "bodyLen": len(decoded_bytes),
             "bodyText": decoded_bytes.decode("utf-8", errors="replace"),
             "elapsedSeconds": elapsed,
+            "transport": transport,
         }
     finally:
         conn.close()
@@ -190,7 +255,11 @@ def build_probe(
     override_doc = None
     if body_override_path:
         override_doc = read_json(body_override_path)
-        body = override_doc.get("body") or body
+        body = (
+            override_doc.get("body")
+            or ((override_doc.get("experimental") or {}).get("body") if isinstance(override_doc.get("experimental"), dict) else None)
+            or body
+        )
         body_source = str(body_override_path)
     url = row.get("url") or runtime_req.get("url")
     headers = headers_from_runtime(runtime_req, body=body, url=url, include_proxy_authorization=include_proxy_authorization)

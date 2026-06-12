@@ -19,6 +19,7 @@ JS_TRACE = REPO / f"output/outlook_browser/js_internal_trace_{RUN}.jsonl"
 RUNTIME_TRACE = REPO / f"output/outlook_browser/runtime_trace_{RUN}.jsonl"
 BUNDLE_BUILD = REPO / f"output/protocol_reverse/bundle_request_build/bundle_request_build_{RUN}.json"
 LIVE_POW = REPO / "output/protocol_reverse/pow_response/pow_response_bc_collector_request_build_hcxwyrtiudbg_1780949301_idx0_1781023909.json"
+FRESH_TBR9_REPLAY = REPO / "output/protocol_reverse/wasm/captcha_wasm_nq_replay_s00ld1lglrw0_1781191381.json"
 
 TARGET_KEYS = ["AEAxBkUsPjQ=", "TBR9Ugl7emA=", "Bzt2fUFRcw==", "OSkIb39DDA=="]
 
@@ -130,6 +131,23 @@ def first_solved_pow(path: Path) -> dict[str, Any] | None:
     return None
 
 
+def first_fresh_tbr9(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    for row in doc.get("pxUuidReplay") or []:
+        if row.get("matchesTrace") is True and row.get("value"):
+            return {
+                "line": row.get("line"),
+                "env": row.get("env"),
+                "value": row.get("value"),
+                "len": row.get("len"),
+                "runtimePxUuid": row.get("runtimePxUuid"),
+                "sourceChecks": doc.get("checks"),
+            }
+    return None
+
+
 def build_from_activities(material: dict[str, Any], activities: list[dict[str, Any]]) -> dict[str, Any]:
     row = material["buildRow"]
     params = {pair["key"]: pair["value"] for pair in parse_form_ordered(material["request"].get("post_data") or "")}
@@ -166,7 +184,7 @@ def target_summary(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None) -> dict[str, Any]:
+def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None, fresh_tbr9_replay: Path) -> dict[str, Any]:
     material = template_material(run, tf_line)
     original_activities = material["activities"]
     px_idx = material["pxIndex"]
@@ -181,6 +199,7 @@ def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None) -> d
     same_rebuild = build_from_activities(material, same_activities)
 
     pow_row = first_solved_pow(live_pow)
+    fresh_tbr9 = first_fresh_tbr9(fresh_tbr9_replay)
     experimental = None
     if pow_row:
         exp_activities = copy.deepcopy(original_activities)
@@ -195,6 +214,10 @@ def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None) -> d
                 bzt = str(exp_d.get("Bzt2fUFRcw=="))
                 bzt_source = "template_original_placeholder"
         exp_d["Bzt2fUFRcw=="] = bzt
+        tbr9_source = "missing_fresh_tbr9"
+        if fresh_tbr9:
+            exp_d["TBR9Ugl7emA="] = fresh_tbr9["value"]
+            tbr9_source = "offline_wasm_nq_with_runtime_pxuuid_replay"
         exp_rebuild = build_from_activities(material, exp_activities)
         experimental = {
             "livePowSource": str(live_pow.resolve()),
@@ -206,12 +229,19 @@ def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None) -> d
             },
             "bztSource": bzt_source,
             "bzt": bzt,
-            "tbr9Source": "template_original_stale_not_proven_reusable",
+            "tbr9Source": tbr9_source,
+            "freshTbr9Source": {
+                "path": str(fresh_tbr9_replay.resolve()),
+                **(fresh_tbr9 or {}),
+            } if fresh_tbr9 else None,
             "rebuild": {
                 "serializedLen": len(exp_rebuild["serialized"]),
                 "payloadLen": len(exp_rebuild["payload"]),
                 "pc": exp_rebuild["pc"],
                 "bodyLen": len(exp_rebuild["body"]),
+                "serializedContainsFreshTbr9": bool(fresh_tbr9 and fresh_tbr9["value"] in exp_rebuild["serialized"]),
+                "payloadContainsFreshTbr9Plaintext": bool(fresh_tbr9 and fresh_tbr9["value"] in exp_rebuild["payload"]),
+                "bodyContainsFreshTbr9Plaintext": bool(fresh_tbr9 and fresh_tbr9["value"] in exp_rebuild["body"]),
             },
             "body": exp_rebuild["body"],
         }
@@ -227,7 +257,17 @@ def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None) -> d
         "experimentalHasLiveBztEvidence": bool(
             experimental and experimental["bztSource"] in {"argument", "live_pow_solve_elapsed_ms"}
         ),
-        "experimentalHasFreshTbr9Evidence": False,
+        "freshTbr9ReplayAvailable": fresh_tbr9 is not None,
+        "experimentalHasFreshTbr9Evidence": bool(experimental and experimental["tbr9Source"] == "offline_wasm_nq_with_runtime_pxuuid_replay"),
+        "experimentalSerializedUsesFreshTbr9": bool(
+            experimental and experimental["rebuild"].get("serializedContainsFreshTbr9")
+        ),
+        "experimentalPayloadDoesNotLeakFreshTbr9Plaintext": bool(
+            experimental and not experimental["rebuild"].get("payloadContainsFreshTbr9Plaintext")
+        ),
+        "experimentalBodyDoesNotLeakFreshTbr9Plaintext": bool(
+            experimental and not experimental["rebuild"].get("bodyContainsFreshTbr9Plaintext")
+        ),
     }
     return {
         "purpose": "Parameterize accepted PX561 POW tail fields while keeping evidence boundaries explicit.",
@@ -245,7 +285,8 @@ def analyze(run: str, tf_line: int | None, live_pow: Path, bzt: str | None) -> d
         "checks": checks,
         "conclusion": (
             "Accepted PX561 activities can be parameterized and re-encoded: same-value OSk/Bzt replacement is byte-exact. "
-            "A live-OSk/live-Bzt experimental body can be built, but it is not success-ready because fresh TBR9 producer evidence is still missing."
+            "A live-OSk/live-Bzt/fresh-TBR9 experimental body can be built. This is constructor evidence only; "
+            "collector acceptance still requires a live probe against a same-session coherent state."
         ),
     }
 
@@ -256,9 +297,10 @@ def main() -> int:
     parser.add_argument("--tf-line", type=int, default=487)
     parser.add_argument("--live-pow", type=Path, default=LIVE_POW)
     parser.add_argument("--bzt", default=None, help="Optional live solve elapsed value for Bzt2fUFRcw==.")
+    parser.add_argument("--fresh-tbr9-replay", type=Path, default=FRESH_TBR9_REPLAY)
     parser.add_argument("--out-prefix", default="px561_pow_tail_constructor_audit")
     args = parser.parse_args()
-    result = analyze(args.run, args.tf_line, args.live_pow, args.bzt)
+    result = analyze(args.run, args.tf_line, args.live_pow, args.bzt, args.fresh_tbr9_replay)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_json = OUT_DIR / f"{args.out_prefix}.json"
     out_md = OUT_DIR / f"{args.out_prefix}.md"

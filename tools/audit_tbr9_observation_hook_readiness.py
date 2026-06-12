@@ -41,6 +41,14 @@ REQUIRED_CAPTCHA_PATCH_MARKERS = [
     "hsprotect.captcha.tbr9.after_ks",
     "hsprotect.captcha.pre_i_px561",
     "hsprotect.captcha.wasm.material",
+    "hsprotect.captcha.wasm.import.wrap",
+    "hsprotect.captcha.wasm.import.call",
+    "hsprotect.captcha.wasm.import.return",
+    "hsprotect.captcha.wasm.bind",
+    "hsprotect.captcha.wasm.ng.before",
+    "hsprotect.captcha.wasm.ng.after",
+    "hsprotect.captcha.wasm.nq.before",
+    "hsprotect.captcha.wasm.nq.after",
 ]
 
 
@@ -73,6 +81,10 @@ def main() -> None:
     pre_i_needle = "r[f(c(415,422))]=Ks,i(f(c(439,441)),r))"
     micro_needle = "function(r,n){var t=u;function v(r,n){return Vs(n,r- -148)}if(r[t(v(-540,-543))]=_s(),r[t(v(-531,-522))]=Rs,Ws){try{r[t(\"FnM4CCwDASRmEyFT\")]=Ws[t(\"Ng\")]()}catch(r){}try{r[t(v(-541,-541))]=Ws[t(\"NQ\")](n)}catch(r){}}}(r,e);var i=Ou();"
     tail_micro_needle = "}(r,e);var i=Ou();function c(r,n){return K(n,r-597)}s(i)===f(c(406,426))&&(r[f(c(410,395))]=v,r[f(c(414,426))]=e,r[f(\"D2csAy8QPCd9EyVT\")]=parseInt(m()-t),r[f(c(411,413))]=n,r[f(c(429,410))]=os,r[f(\"B25IQlhZYw\")]=ws,r[f(c(415,422))]=Ks,i(f(c(439,441)),r))"
+    wasm_import_wrap_needle = "n[r(v(1021,1079))][v(1123,1104)]=function(){var r,n;return M(c[u((r=-447,n=-366,v(r,n- -1450)))])},n}function b"
+    wasm_bind_needle = "function b(r,n){var t,v;return c=r[u(\"Mk4JHxwcJw\")],h[(t=128,v=62,i(t,v- -1044))]=n,l=null,L=null,c}"
+    wasm_ng_needle = "f[v(\"Ng\")]=function(){function r(r,n){return i(n,r- -1813)}var n=u;try{var t=c[r(-715,-793)](-16);c[n(\"Ng\")](t);var v=H()[t/4+0],e=H()[t/4+1],f=H()[t/4+2],s=H()[t/4+3],m=v,z=e;if(s)throw m=0,z=0,g(f);return y(m,z)}finally{c[r(-715,-682)](16),c.__wbindgen_free(m,z)}}"
+    wasm_nq_needle = "f[v(\"NQ\")]=function(r){var n=u;function t(r,n){return i(r,n- -1266)}try{var v=c.__wbindgen_add_to_stack_pointer(-16),e=a(r,c[t(-156,-130)],c[t(-33,-74)]),f=K;c[n(\"NQ\")](v,e,f);var s=H()[v/4+0],m=H()[v/4+1],z=H()[v/4+2],o=H()[v/4+3],w=s,L=m;if(o)throw w=0,L=0,g(z);return y(w,L)}finally{c[t(-226,-168)](16),c[t(47,-33)](w,L)}}"
     result = {
         "inputs": {
             "outlookBrowserRegister": str(OUTLOOK_BROWSER),
@@ -88,9 +100,17 @@ def main() -> None:
             "preINeedle": pre_i_needle,
             "microNeedle": micro_needle,
             "tailMicroNeedle": tail_micro_needle,
+            "wasmImportWrapNeedle": wasm_import_wrap_needle,
+            "wasmBindNeedle": wasm_bind_needle,
+            "wasmNgNeedle": wasm_ng_needle,
+            "wasmNqNeedle": wasm_nq_needle,
             "preINeedleCountInExactCaptcha": captcha_source.count(pre_i_needle),
             "microNeedleCountInExactCaptcha": captcha_source.count(micro_needle),
             "tailMicroNeedleCountInExactCaptcha": captcha_source.count(tail_micro_needle),
+            "wasmImportWrapNeedleCountInExactCaptcha": captcha_source.count(wasm_import_wrap_needle),
+            "wasmBindNeedleCountInExactCaptcha": captcha_source.count(wasm_bind_needle),
+            "wasmNgNeedleCountInExactCaptcha": captcha_source.count(wasm_ng_needle),
+            "wasmNqNeedleCountInExactCaptcha": captcha_source.count(wasm_nq_needle),
             "patches": captcha_patches,
             "patchedChanged": patched_captcha != captcha_source,
             "preIEventCountInPatchedCaptcha": patched_captcha.count("hsprotect.captcha.pre_i_px561"),
@@ -123,9 +143,17 @@ def main() -> None:
         "preINeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["preINeedleCountInExactCaptcha"] == 1,
         "microNeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["microNeedleCountInExactCaptcha"] == 1,
         "tailMicroNeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["tailMicroNeedleCountInExactCaptcha"] == 1,
+        "wasmImportWrapNeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["wasmImportWrapNeedleCountInExactCaptcha"] == 1,
+        "wasmBindNeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["wasmBindNeedleCountInExactCaptcha"] == 1,
+        "wasmNgNeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["wasmNgNeedleCountInExactCaptcha"] == 1,
+        "wasmNqNeedleUniqueInExactCaptcha": result["captchaPatchProbe"]["wasmNqNeedleCountInExactCaptcha"] == 1,
         "captchaPreIPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_pre_i_px561__" in captcha_patches,
         "captchaTbr9MicroPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_tbr9_micro__" in captcha_patches,
         "captchaTbr9TailMicroPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_tbr9_tail_micro__" in captcha_patches,
+        "captchaWasmImportWrapPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_wasm_import_wrap__" in captcha_patches,
+        "captchaWasmBindPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_wasm_bind__" in captcha_patches,
+        "captchaWasmNgWrapperPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_wasm_ng_wrapper__" in captcha_patches,
+        "captchaWasmNqWrapperPatchAppliedOffline": "__outlook_hsprotect_patch_captcha_wasm_nq_wrapper__" in captcha_patches,
         "captchaPreIEventPresentOffline": result["captchaPatchProbe"]["preIEventCountInPatchedCaptcha"] == 1,
         "captchaTbr9MicroEventsPresentOffline": all(
             count == 1 for count in result["captchaPatchProbe"]["microEventCountsInPatchedCaptcha"].values()
@@ -139,17 +167,21 @@ def main() -> None:
         "The captcha TBR9 micro-window patch emits after_s, after_rs, after_ng, after_nq, after_inner, after_ou, before_condition, after_condition, and tail assignment observations in offline-patched exact captcha source.",
         "The new captcha pre-i PX561 patch needle is unique in the exact ni109 captcha source.",
         "Offline application of _patch_hsprotect_js_source to the exact ni109 captcha source inserts hsprotect.captcha.pre_i_px561 exactly once.",
+        "The WASM bind hook records exports key/name mapping and export keys when WebAssembly.Instance exports are bound into the wrapper.",
+        "The WASM import wrapper hook records wasm-bindgen import function names/arguments only while Ws.Ng/Ws.NQ exports are active.",
+        "The WASM Ng wrapper hook records Ng return and enables import-call correlation for Ng initialization.",
+        "The WASM NQ wrapper hook records input pointer/length/bytes, export function metadata, return pointer/length/bytes, and memory size around c[n('NQ')](sp, ptr, len).",
         "The runtime environment gates required to collect this observation are OUTLOOK_JS_INTERNAL_TRACE=1, OUTLOOK_HSPROTECT_JS_PATCH=1, and OUTLOOK_HSPROTECT_JS_PATCH_APPLY=1.",
     ]
     result["conclusion"] = (
         "The observation hook plan is ready at source level: a browser run with JS internal trace and hsprotect patch application enabled should capture "
-        "captcha TBR9 micro-window, tail assignment, captcha pre-i PX561, main $c/jc Yc, and tf.enter/tf.payload boundaries. This does not yet provide the observation sample; it proves the current "
+        "captcha TBR9 micro-window, tail assignment, captcha pre-i PX561, WASM import-call, bind/Ng/NQ wrapper state, main $c/jc Yc, and tf.enter/tf.payload boundaries. This does not yet provide the observation sample; it proves the current "
         "worktree has the required hook injection points."
     )
     result["nextEvidenceTargets"] = [
         "Run one explicitly labeled observation browser sample with OUTLOOK_JS_INTERNAL_TRACE=1 OUTLOOK_HSPROTECT_JS_PATCH=1 OUTLOOK_HSPROTECT_JS_PATCH_APPLY=1.",
-        "After the run, classify whether hsprotect.captcha.tbr9.after_s/after_rs/after_ng/after_nq/after_inner/after_ou/before_condition/after_condition/before_bzt/after_bzt/after_osk/after_time/after_n/after_os/after_ws/after_ks, hsprotect.captcha.pre_i_px561, hsprotect.main.$c.yc or hsprotect.main.jc.yc, and hsprotect.main.tf.enter are all present for PX561.",
-        "Compare TBR9 value/type/order at each micro-window hook, pre-i, Yc output, tf.enter, and decoded /assets/js/bundle.",
+        "After the run, classify whether hsprotect.captcha.wasm.import.wrap, hsprotect.captcha.wasm.import.call, hsprotect.captcha.wasm.ng.before/after, hsprotect.captcha.wasm.bind, hsprotect.captcha.wasm.nq.before/after, hsprotect.captcha.tbr9.after_nq, hsprotect.captcha.pre_i_px561, hsprotect.main.$c.yc or hsprotect.main.jc.yc, and hsprotect.main.tf.enter are all present for PX561.",
+        "Compare NQ input/output pointer bytes and memory metadata between browser runtime and offline replay, then update the minimal glue/import state accordingly.",
     ]
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -175,6 +207,10 @@ def main() -> None:
         f"- pre-i needle count in exact captcha: `{result['captchaPatchProbe']['preINeedleCountInExactCaptcha']}`",
         f"- micro needle count in exact captcha: `{result['captchaPatchProbe']['microNeedleCountInExactCaptcha']}`",
         f"- tail micro needle count in exact captcha: `{result['captchaPatchProbe']['tailMicroNeedleCountInExactCaptcha']}`",
+        f"- wasm import wrap needle count in exact captcha: `{result['captchaPatchProbe']['wasmImportWrapNeedleCountInExactCaptcha']}`",
+        f"- wasm bind needle count in exact captcha: `{result['captchaPatchProbe']['wasmBindNeedleCountInExactCaptcha']}`",
+        f"- wasm Ng needle count in exact captcha: `{result['captchaPatchProbe']['wasmNgNeedleCountInExactCaptcha']}`",
+        f"- wasm NQ needle count in exact captcha: `{result['captchaPatchProbe']['wasmNqNeedleCountInExactCaptcha']}`",
         f"- patches: `{result['captchaPatchProbe']['patches']}`",
         f"- pre-i event count in patched captcha: `{result['captchaPatchProbe']['preIEventCountInPatchedCaptcha']}`",
         f"- micro event counts in patched captcha: `{result['captchaPatchProbe']['microEventCountsInPatchedCaptcha']}`",

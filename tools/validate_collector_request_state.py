@@ -70,6 +70,9 @@ def apply_response_parts(state: dict[str, Any], parts: list[str], line_no: int) 
         elif key == "oIIooIIo" and args:
             state["memory"]["Fo"] = args[0]
             state["sources"]["Fo"] = source
+        elif key == "IooIoI" and len(args) >= 2:
+            state["memory"]["ci"] = args[1]
+            state["sources"]["ci"] = source
 
 
 def expected_fields_for_request(state: dict[str, Any], request_index: int) -> dict[str, dict[str, Any]]:
@@ -92,6 +95,8 @@ def expected_fields_for_request(state: dict[str, Any], request_index: int) -> di
         expected["vid"] = {"value": cookies["_pxvid"], "source": sources.get("_pxvid")}
     if memory.get("Fo"):
         expected["cts"] = {"value": memory["Fo"], "source": sources.get("Fo")}
+    if memory.get("ci"):
+        expected["ci"] = {"value": memory["ci"], "source": sources.get("ci")}
     return expected
 
 
@@ -127,13 +132,25 @@ def find_activity_session_id(trace_rows: list[dict[str, Any]], tf_line: int | No
     return None
 
 
+def runtime_request_body(runtime_rows: list[dict[str, Any]], request_line: int) -> str:
+    for row in runtime_rows:
+        if int(row.get("_line") or 0) == int(request_line):
+            return str(row.get("post_data") or "")
+    return ""
+
+
 def validate(request_build_path: Path, collector_decode_path: Path) -> dict[str, Any]:
     request_build = json.loads(request_build_path.read_text(encoding="utf-8"))
     collector_decode = json.loads(collector_decode_path.read_text(encoding="utf-8"))
-    trace_path = Path(request_build.get("tracePath") or "")
+    evidence = request_build.get("evidenceFiles") or {}
+    trace_path = Path(request_build.get("tracePath") or evidence.get("jsTrace") or "")
     if trace_path and not trace_path.is_absolute():
         trace_path = REPO / trace_path
     trace_rows = read_jsonl(trace_path) if trace_path else []
+    runtime_path = Path(evidence.get("runtimeTrace") or "")
+    if runtime_path and not runtime_path.is_absolute():
+        runtime_path = REPO / runtime_path
+    runtime_rows = read_jsonl(runtime_path) if runtime_path else []
     entries = sorted(collector_decode.get("decodedEntries", []), key=lambda e: int(e.get("lineNo") or 0))
     requests = sorted(request_build.get("rows", []), key=lambda r: int(r.get("requestLine") or 0))
 
@@ -150,13 +167,15 @@ def validate(request_build_path: Path, collector_decode_path: Path) -> dict[str,
             applied_lines.append(line_no)
             entry_pos += 1
 
-        observed = parse_form(req.get("observedBody") or "")
+        observed_body = req.get("observedBody") or runtime_request_body(runtime_rows, request_line)
+        observed = parse_form(observed_body)
         expected = expected_fields_for_request(state, request_index)
-        p1 = find_activity_session_id(trace_rows, int(req.get("tfLine") or 0) if req.get("tfLine") else None)
+        material_line = req.get("tfLine") or req.get("materialSourceLine")
+        p1 = find_activity_session_id(trace_rows, int(material_line or 0) if material_line else None)
         if p1:
             expected["p1"] = p1
         checks: dict[str, Any] = {}
-        for field in ["cs", "sid", "vid", "cts", "rsc", "p1"]:
+        for field in ["cs", "sid", "vid", "cts", "ci", "rsc", "p1"]:
             if field in expected:
                 expected_value = expected[field]["value"]
                 observed_value = observed.get(field)
@@ -185,6 +204,7 @@ def validate(request_build_path: Path, collector_decode_path: Path) -> dict[str,
                     "Yo": state["memory"].get("Yo"),
                     "_pxvid": state["cookies"].get("_pxvid"),
                     "Fo": state["memory"].get("Fo"),
+                    "ci": state["memory"].get("ci"),
                 },
                 "checks": checks,
             }
@@ -245,8 +265,8 @@ def write_outputs(result: dict[str, Any], out_dir: Path) -> tuple[Path, Path]:
     for key, value in result["summary"].items():
         lines.append(f"- {key}: {value}")
     lines.append("")
-    lines.append("| idx | req line | applied collector lines | cs | sid | vid | cts | rsc | p1 |")
-    lines.append("|---:|---:|---|---|---|---|---|---|---|")
+    lines.append("| idx | req line | applied collector lines | cs | sid | vid | cts | ci | rsc | p1 |")
+    lines.append("|---:|---:|---|---|---|---|---|---|---|---|")
     for row in result["rows"]:
         def mark(field: str) -> str:
             check = row["checks"][field]
@@ -256,7 +276,7 @@ def write_outputs(result: dict[str, Any], out_dir: Path) -> tuple[Path, Path]:
 
         lines.append(
             f"| {row['index']} | {row['requestLine']} | {','.join(map(str, row['appliedCollectorLines']))} | "
-            f"{mark('cs')} | {mark('sid')} | {mark('vid')} | {mark('cts')} | {mark('rsc')} | {mark('p1')} |"
+            f"{mark('cs')} | {mark('sid')} | {mark('vid')} | {mark('cts')} | {mark('ci')} | {mark('rsc')} | {mark('p1')} |"
         )
     lines.append("")
     lines.append("## evidence boundary")
@@ -264,6 +284,7 @@ def write_outputs(result: dict[str, Any], out_dir: Path) -> tuple[Path, Path]:
     lines.append("- `sid` is derived from decoded handler `IIoIIo` plus `Kl(Jo)`, static evidence `main.beautified.js:1917-1921`, `2675-2677`, `4797-4802`, `4840-4842`.")
     lines.append("- `vid` is derived from decoded handler `IooIoo`, static evidence `main.beautified.js:426-428`, `4404-4411`, `4844`.")
     lines.append("- `cts` is derived from decoded handler `oIIooIIo` -> `Fo`, static evidence `main.beautified.js:1901-1903`, `4523-4525`, `4850`.")
+    lines.append("- `ci` is derived from decoded handler `IooIoI` argument 2 -> `ci`, static evidence `main.beautified.js:4494-4510` and request append evidence around `main.beautified.js:4846-4848`.")
     lines.append("- `rsc` is derived from send counter `Fv(t)` appending `++wv`, static evidence `main.beautified.js:8423-8425`.")
     lines.append("- `p1` is derived from the iframe `session_id` present in the matched `tf.payload` activity URL; this matches static producer `Gi(e)` reading `_pxParam1` (`main.beautified.js:2640-2648`) and runtime samples where `p1 == session_id`.")
     md_path.write_text("\n".join(lines), encoding="utf-8")

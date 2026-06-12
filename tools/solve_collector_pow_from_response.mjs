@@ -19,6 +19,13 @@ function candidateValue(i, width, prefixBase, seed) {
 function parseParts(doc) {
   if (Array.isArray(doc?.decoded?.parts)) return doc.decoded.parts;
   if (Array.isArray(doc?.parts)) return doc.parts;
+  if (Array.isArray(doc?.steps)) {
+    const parts = [];
+    for (const step of doc.steps) {
+      for (const part of step?.decoded?.parts || []) parts.push(part);
+    }
+    return parts;
+  }
   const parts = [];
   for (const entry of doc?.decodedEntries || []) {
     for (const part of entry.parts || []) parts.push(part);
