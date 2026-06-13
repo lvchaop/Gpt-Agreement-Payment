@@ -21,9 +21,26 @@ def test_run_preview_single(client):
     r = client.post("/api/run/preview", json={"mode": "single"})
     assert r.status_code == 200
     body = r.json()
-    assert "xvfb-run" in body["cmd_str"]
     assert "pipeline.py" in body["cmd_str"]
     assert "--paypal" in body["cmd_str"]
+
+
+def test_build_cmd_uses_xvfb_when_available(monkeypatch):
+    import webui.backend.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda name: "/usr/bin/xvfb-run" if name == "xvfb-run" else None)
+    cmd = runner_mod.build_cmd("single", True, 1, 1, 0, False, False)
+    assert cmd[:3] == ["/usr/bin/xvfb-run", "-a", "python"]
+    assert "pipeline.py" in cmd
+
+
+def test_build_cmd_skips_xvfb_when_missing(monkeypatch):
+    import webui.backend.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda name: None)
+    cmd = runner_mod.build_cmd("single", True, 1, 1, 0, False, False)
+    assert cmd[:3] == ["python", "-u", "pipeline.py"]
+    assert "xvfb-run" not in cmd
 
 
 def test_run_preview_batch(client):
@@ -33,6 +50,60 @@ def test_run_preview_batch(client):
     assert "--batch" in body["cmd_str"]
     assert "5" in body["cmd_str"]
     assert "--workers" in body["cmd_str"]
+
+
+def test_run_preview_session_only(client):
+    _login(client)
+    r = client.post("/api/run/preview", json={
+        "mode": "single",
+        "paypal": False,
+        "session_only": True,
+        "target_emails": ["alice@example.test"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert "--session-only" in body["cmd_str"]
+    assert "--target-emails" in body["cmd_str"]
+    assert "alice@example.test" in body["cmd_str"]
+    assert "--register-method" not in body["cmd_str"]
+    assert "--paypal" not in body["cmd_str"]
+
+
+def test_build_cmd_session_only_skips_register_method_even_when_phone(monkeypatch):
+    import webui.backend.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda name: None)
+    cmd = runner_mod.build_cmd(
+        "single", False, 0, 1, 0, False, False,
+        target_emails=["alice@example.test"],
+        session_only=True,
+        register_mode="phone_protocol",
+    )
+    cmd_str = " ".join(cmd)
+    assert "--session-only" in cmd_str
+    assert "--target-emails" in cmd_str
+    assert "--register-method" not in cmd_str
+
+
+def test_run_preview_rt_force(client):
+    _login(client)
+    r = client.post("/api/run/preview", json={
+        "mode": "batch",
+        "batch": 2,
+        "workers": 2,
+        "paypal": False,
+        "rt_only": True,
+        "rt_force": True,
+        "target_emails": ["alice@example.test", "bob@example.test"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert "--rt-only" in body["cmd_str"]
+    assert "--rt-force" in body["cmd_str"]
+    assert "--target-emails" in body["cmd_str"]
+    assert "alice@example.test,bob@example.test" in body["cmd_str"]
+    assert "--register-method" not in body["cmd_str"]
+    assert "--paypal" not in body["cmd_str"]
 
 
 @pytest.mark.parametrize("register_mode", ["phone_browser", "phone_protocol"])

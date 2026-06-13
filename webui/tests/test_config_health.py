@@ -148,6 +148,37 @@ def test_config_health_phone_register_hero_sms_ok(client, tmp_path, monkeypatch,
     assert "service=tg" in phone_check["details"]
 
 
+def test_config_health_session_only_does_not_require_phone_provider(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed_configs(tmp_path, monkeypatch)
+
+    db = get_db()
+    db.clear_runtime_data()
+    db.set_runtime_json("secrets", {
+        "cloudflare": {
+            "api_token": "tok-abc",
+            "account_id": "acct-123",
+            "otp_kv_namespace_id": "kv-123",
+        }
+    })
+
+    r = client.post("/api/config/health", json={
+        "mode": "single",
+        "paypal": False,
+        "session_only": True,
+        "target_emails": ["alice@example.test"],
+        "register_mode": "phone_protocol",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["requires_registration"] is False
+    assert body["requires_email_otp"] is True
+    assert body["payment_kind"] == "none"
+    names = {c["name"] for c in body["blocking"]}
+    assert "phone_provider" not in names
+
+
 def test_run_start_blocked_by_config_health(client, tmp_path, monkeypatch):
     _login(client)
     _seed_configs(tmp_path, monkeypatch)

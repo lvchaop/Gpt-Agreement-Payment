@@ -58,6 +58,45 @@ def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch
     assert selected["access_token"] == "at-retry"
 
 
+def test_rt_only_force_replaces_existing_refresh_token(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({"proxy": {}, "cpa": {"enabled": False}}), encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "hasrt@example.com",
+        "password": "pw",
+        "session_token": "sess",
+        "access_token": "at",
+        "refresh_token": "old-rt",
+    })
+
+    reg_dir = tmp_path / "CTF-reg"
+    reg_dir.mkdir()
+    (reg_dir / "config.paypal-proxy.json").write_text(json.dumps({"mail": {"mode": "cloudflare_kv"}}), encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "ROOT", tmp_path)
+
+    calls = []
+
+    def fake_exchange(**kwargs):
+        calls.append(kwargs)
+        return "new-rt"
+
+    monkeypatch.setitem(sys.modules, "card", types.SimpleNamespace(
+        _exchange_refresh_token_with_session=fake_exchange,
+        _build_proxy_url_from_cfg=lambda cfg: "",
+        _codex_oauth_client_id_from_config=lambda cfg: "app_test",
+    ))
+
+    result = pipeline.rt_only_for_email(str(card_config), "hasrt@example.com", force=True)
+
+    assert result["status"] == "succeeded"
+    assert calls
+    row = db.find_latest_registered_account("hasrt@example.com")
+    assert row["refresh_token"] == "new-rt"
+
+
 def test_register_only_batch_uses_workers(tmp_path, monkeypatch):
     cardw_config = tmp_path / "reg.json"
     cardw_config.write_text("{}", encoding="utf-8")
@@ -234,7 +273,7 @@ def test_cpa_import_falls_back_to_access_token_without_refresh_token(tmp_path, m
     db = _reset_db(tmp_path, monkeypatch)
     db.add_registered_account({
         "email": "fallback@example.com",
-        "access_token": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifSwiZXhwIjoyNTM0MDk0NDAwfQ.sig",
+        "access_token": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyXzEyMyJ9LCJleHAiOjI1MzQwOTQ0MDB9.sig",
     })
     monkeypatch.setattr(pipeline, "_find_latest_refresh_token_for_email", lambda *args, **kwargs: "")
 
@@ -279,4 +318,120 @@ def test_cpa_import_falls_back_to_access_token_without_refresh_token(tmp_path, m
     assert body["email"] == "fallback@example.com"
     assert body["access_token"].startswith("eyJhbGciOiJub25lIn0.")
     assert body["refresh_token"] == ""
-    assert body["account_id"] == "acct_123"
+    assert body["account_id"] == "user_123"
+
+
+def test_cpa_import_uses_sub2api_codex_session_endpoint(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    db.add_registered_account({
+        "email": "sub2api@example.com",
+        "access_token": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9zdWIiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyX3N1YiJ9LCJleHAiOjI1MzQwOTQ0MDB9.sig",
+    })
+    monkeypatch.setattr(pipeline, "_find_latest_refresh_token_for_email", lambda *args, **kwargs: "")
+
+    fake_calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"code":0,"data":{"failed":0,"items":[{"action":"created"}]}}'
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.proxies = {}
+            self.trust_env = False
+
+        def post(self, url, params=None, json=None, headers=None, timeout=None):
+            fake_calls.append({"url": url, "params": params, "json": json, "headers": headers, "timeout": timeout})
+            return FakeResponse()
+
+    fake_requests = types.ModuleType("curl_cffi.requests")
+    fake_requests.Session = lambda impersonate=None: FakeSession()
+    fake_pkg = types.ModuleType("curl_cffi")
+    fake_pkg.requests = fake_requests
+    monkeypatch.setitem(sys.modules, "curl_cffi", fake_pkg)
+    monkeypatch.setitem(sys.modules, "curl_cffi.requests", fake_requests)
+
+    status = pipeline._cpa_import_after_team(
+        "sub2api@example.com",
+        "cs_test",
+        {
+            "enabled": True,
+            "base_url": "https://daboluo.zeabur.app",
+            "admin_key": "secret-admin-key",
+            "target": "sub2api",
+            "group_ids": [2],
+            "update_existing": True,
+            "plan_tag": "plus",
+        },
+    )
+
+    assert status == "ok"
+    assert fake_calls
+    call = fake_calls[0]
+    assert call["url"] == "https://daboluo.zeabur.app/api/v1/admin/accounts/import/codex-session"
+    assert call["params"] is None
+    payload = call["json"]
+    assert payload["name"].endswith("-plus.json")
+    assert payload["update_existing"] is True
+    assert payload["group_ids"] == [2]
+    content = json.loads(payload["content"])
+    assert content["email"] == "sub2api@example.com"
+    assert content["access_token"].startswith("eyJhbGciOiJub25lIn0.")
+    assert content["refresh_token"] == ""
+    assert content["account_id"] == "user_sub"
+
+
+def test_rt_only_success_imports_cpa(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({
+        "proxy": {},
+        "cpa": {
+            "enabled": True,
+            "base_url": "https://daboluo.zeabur.app",
+            "admin_key": "adm",
+            "target": "sub2api",
+            "plan_tag": "plus",
+        },
+    }), encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "needrt@example.com",
+        "password": "pw",
+        "session_token": "sess",
+        "access_token": "at",
+        "refresh_token": "",
+    })
+
+    reg_dir = tmp_path / "CTF-reg"
+    reg_dir.mkdir()
+    (reg_dir / "config.paypal-proxy.json").write_text(json.dumps({"mail": {"mode": "cloudflare_kv"}}), encoding="utf-8")
+    monkeypatch.setattr(pipeline, "ROOT", tmp_path)
+
+    monkeypatch.setitem(sys.modules, "card", types.SimpleNamespace(
+        _exchange_refresh_token_with_session=lambda **kwargs: "new-rt",
+        _build_proxy_url_from_cfg=lambda cfg: "",
+        _codex_oauth_client_id_from_config=lambda cfg: "app_test",
+    ))
+
+    cpa_calls = []
+
+    def fake_cpa(email, sid, cpa_cfg, **kwargs):
+        cpa_calls.append((email, sid, cpa_cfg, kwargs))
+        return "ok"
+
+    monkeypatch.setattr(pipeline, "_cpa_import_after_team", fake_cpa)
+
+    result = pipeline.rt_only_for_email(str(card_config), "needrt@example.com", session_id="sess-1", force=True)
+
+    assert result["status"] == "succeeded"
+    assert result["cpa_import"] == "ok"
+    assert cpa_calls
+    email, sid, cpa_cfg, kwargs = cpa_calls[0]
+    assert email == "needrt@example.com"
+    assert sid == "sess-1"
+    assert cpa_cfg["target"] == "sub2api"
+    assert kwargs["refresh_token"] == "new-rt"
+    rows = get_db().iter_pipeline_results()
+    assert rows[-1]["mode"] == "rt_only"
+    assert rows[-1]["cpa_import"] == "ok"

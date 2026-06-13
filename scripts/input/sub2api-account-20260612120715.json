@@ -1,0 +1,49 @@
+{
+  "exported_at": "2026-06-12T04:07:15Z",
+  "proxies": [],
+  "accounts": [
+    {
+      "name": "codex-1a04fbdc-steatkathokefield1987@cnnetdata.net-plus.json",
+      "platform": "openai",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjE5MzQ0ZTY1LWJiYzktNDRkMS1hOWQwLWY5NTdiMDc5YmQwZSIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS92MSJdLCJjbGllbnRfaWQiOiJhcHBfRU1vYW1FRVo3M2YwQ2tYYVhwN2hyYW5uIiwiZXhwIjoxNzgyMDcwMzMwLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiYW1yIjpbInB3ZCJdLCJjaGF0Z3B0X2FjY291bnRfaWQiOiI5YjFkMGM0Yy0yNzBhLTQzNmMtOGE3NC1kNWUzYzE0ZGI3NzUiLCJjaGF0Z3B0X2FjY291bnRfdXNlcl9pZCI6InVzZXItcFRnRGphaEJQOE85cTg2NUZycUZmck45X185YjFkMGM0Yy0yNzBhLTQzNmMtOGE3NC1kNWUzYzE0ZGI3NzUiLCJjaGF0Z3B0X2NvbXB1dGVfcmVzaWRlbmN5Ijoibm9fY29uc3RyYWludCIsImNoYXRncHRfcGxhbl90eXBlIjoidGVhbSIsImNoYXRncHRfdXNlcl9pZCI6InVzZXItcFRnRGphaEJQOE85cTg2NUZycUZmck45IiwibG9jYWxob3N0Ijp0cnVlLCJ1c2VyX2lkIjoidXNlci1wVGdEamFoQlA4TzlxODY1RnJxRmZyTjkifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9wcm9maWxlIjp7ImVtYWlsIjoic3RlYXRrYXRob2tlZmllbGQxOTg3QGNubmV0ZGF0YS5uZXQiLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZX0sImlhdCI6MTc4MTIwNjMzMCwiaXNzIjoiaHR0cHM6Ly9hdXRoLm9wZW5haS5jb20iLCJqdGkiOiI4MDJiMWYyOS1lODRkLTQ4YzUtOTczOS04YTM5OTljYTYyZWEiLCJuYmYiOjE3ODEyMDYzMzAsInB3ZF9hdXRoX3RpbWUiOjE3ODEyMDYzMjMyMDksInNjcCI6WyJvcGVuaWQiLCJlbWFpbCIsInByb2ZpbGUiLCJvZmZsaW5lX2FjY2VzcyJdLCJzZXNzaW9uX2lkIjoiYXV0aHNlc3NfZEdvODlPTHpRN0t6VTJ2RExUTnh5T2gyIiwic2wiOnRydWUsInN1YiI6ImF1dGgwfGY1a0xsRmxPRjNBUDhmQjEyUjVwRkRJZSJ9.fxjRGa2PH-vQZGt9_-F36bDbtzc3ed00q7KJUYMiAhicRFjNq2NRlKQBATlyeNimvv2AzgohA5XGHXu_sLHcqaFFMCGiz9gAdPzWBP4Fp7wW1IZA-Q3raA1L_VKcGxleXu9A2Is3cw4QVb8hvnWCkp01Tqqj-ZLSXRsxSTwPjnMyElmcGhAxEs9a5GREop7Yqax2J8sThTwS5IHuDCMsDTQMPWT8YEKoLb_2fyVsRKOxleI2uvYCkEi5aEDbPyGVML06_Iky9P9dK1_f9Pjmp4jBJy7xgT7aQox-BWIFAdEGNy1RJD4UyBiVLQji4xxIZZ930-fnE5IK4ciIfJqcfE55CgXCDZ2DmupqD5WD3IjmEt3bhg1ssFHo4ZITs1hLjNmudMSf17GC9JoI1yLRx5lhkxLnmZ-lJ94aMGDUkV8jkmw7HCea1kY7oudHYfSMihuSeC8PelaRAvrmS_BgNKT98QPU5UJjrpfFbcfpq8hsI6ZGRWj6fG5e9AiaK_Yb2AQqJc1bT2IpBqd7pNtNezRHPTTEM9OoWdhd7L2d-Q5_i0p1gEay6fPuG0DKVRp8D787ZIwIYLfZRVEL9MRaVXaJtK2cOK8gTiVzjiyswVjfpezGyLh6XKCjltyHHmI6uTnjmbCQp59ANiPnfP1flkteRgs-84l9ZeI0Dm1LeKg",
+        "chatgpt_account_id": "user-pTgDjahBP8O9q865FrqFfrN9",
+        "chatgpt_user_id": "user-pTgDjahBP8O9q865FrqFfrN9",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "email": "steatkathokefield1987@cnnetdata.net",
+        "expires_at": "2026-06-21T19:32:10Z",
+        "id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImIxZGQzZjhmLTlhYWQtNDdmZS1iMGU3LWVkYjAwOTc3N2Q2YiIsInR5cCI6IkpXVCJ9.eyJhbXIiOlsicHdkIl0sImF0X2hhc2giOiItLVY4X1pkamY4Y3pzMklTeUJxLTZRIiwiYXVkIjpbImFwcF9FTW9hbUVFWjczZjBDa1hhWHA3aHJhbm4iXSwiYXV0aF9wcm92aWRlciI6InBhc3N3b3JkIiwiYXV0aF90aW1lIjoxNzgxMjA2MzIzLCJlbWFpbCI6InN0ZWF0a2F0aG9rZWZpZWxkMTk4N0Bjbm5ldGRhdGEubmV0IiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImV4cCI6MTc4MTIwOTkzMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6IjliMWQwYzRjLTI3MGEtNDM2Yy04YTc0LWQ1ZTNjMTRkYjc3NSIsImNoYXRncHRfcGxhbl90eXBlIjoidGVhbSIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV9zdGFydCI6IjIwMjYtMDYtMTFUMTI6MTQ6MjIrMDA6MDAiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9hY3RpdmVfdW50aWwiOiIyMDI2LTA3LTExVDEyOjE0OjIyKzAwOjAwIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fbGFzdF9jaGVja2VkIjoiMjAyNi0wNi0xMVQxOTozMjowMy4yMTAwNTIrMDA6MDAiLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLXBUZ0RqYWhCUDhPOXE4NjVGcnFGZnJOOSIsImdyb3VwcyI6W10sImxvY2FsaG9zdCI6dHJ1ZSwib3JnYW5pemF0aW9ucyI6W3siaWQiOiJvcmctSGVrRlROTGtvV1V3MlZUZ1BSY1NIdW9HIiwiaXNfZGVmYXVsdCI6dHJ1ZSwicm9sZSI6Im93bmVyIiwidGl0bGUiOiJQZXJzb25hbCJ9XSwidXNlcl9pZCI6InVzZXItcFRnRGphaEJQOE85cTg2NUZycUZmck45In0sImlhdCI6MTc4MTIwNjMzMCwiaXNzIjoiaHR0cHM6Ly9hdXRoLm9wZW5haS5jb20iLCJqdGkiOiIwNGY1MGY5MS1lZjFmLTQ4MmUtOTM4Yi0xNmNiYTNlMjc1ODMiLCJuYW1lIjoiTWFyeSBTbWl0aCIsInJhdCI6MTc4MTIwNjI5Mywic2lkIjoiMDc2NzUxMmEtMjg2Zi00ZDRlLWIxZGItY2VlYzZkMWFlMjgxIiwic3ViIjoiYXV0aDB8ZjVrTGxGbE9GM0FQOGZCMTJSNXBGREllIn0.y3Aon4Pgfcz0LOYoA6Cp55HpGvsf8RNqKRjfpfUKXW6v5b5JZxtKDGBGSePpv3bRx6lqfm2setYWGLAbdvEHuNAWGa48hdtOZl8ZkVyifITSK0ZenmSsXDUUXGymDqc5pYsDm8mSx1thEG3dKvguMn1p9nQsly1tP0RqUWLGExjjrXC93su2VAWk8PqYO8_WvifaZJxSUu1K2BxZdZ3B6uPsXoEhrgVXa-7Atzm_6COGvPBbktfH_goY2F1gx9idTh3_kmNRjGeLUJZtqKNchQvnl6jEk6M4CattztP8wOKDrM57UjJUocrbGrSvhMfjqhHLugf5eEP2wNbqrvKXuYn-0YtAeUjbM-_39U0cinJwPv01vCElt6ySPrZSAPuHpn_tMcEtpm19_xjzE_7DAn2EhTrvA37kvM105Pt4G4zLL9CiptdvevwZeGPltH8Qz5BmMqSh8rh1veMoPtmubdB1mN5pEvzxBDxodLEinqwuLvd4dc6jP1_h8XWVPzOSpseQpQ5QRk8SDUwkgqb06MC2U9oKodUZ03gYoFwLgmM5AG3pEXcB52CurCb_U8LATQQ_4JOBWX9w6a_D-xTOMW7xeHTyar2S60miSbyduvOUayANM6hb5JnntMUr8X3eLFx5fOQPc3lHXmpegb-pGuk0-gZirT5Ga1W4y9AxvtI",
+        "organization_id": "org-HekFTNLkoWUw2VTgPRcSHuoG",
+        "plan_type": "team",
+        "refresh_token": "rt.1.AAA8ZWCP03Kylf46Ssk0kMiKT704L4Pe1vHb94CYlpOq_0kGE-Z5DzztcnDOWAX9W1jv-P51svKZuYxy9jLvTEbNCuCnSXKCRp87g9ZAw5frRAALm6PkT9coI35YGBMv-ZCcdy-8C9LeOLvUGKG9XqMWPd1nbuwLDxY8mGLOT4G13Dl8tPG1tg_ewqb33yKj4NUpfLR4uKV5CHA15xRiy4HWveSyXmVnrCUpP3PoyUU7HAMEO9PdqNLtPTIIPy3eX5qdZTTwHJO6BUJ6AUNBFOqDFsqDZZxcxDsZ5jYMHVztNInmYcmkr1qeL1VhyoiA7dRy7-MaTKK3fxlm5g"
+      },
+      "extra": {
+        "access_token_sha256": "fbe57cfd97637fc733b36212c81abee9ad02a3485eb49c8ae1ecbbeb0512e70b",
+        "codex_5h_reset_after_seconds": 0,
+        "codex_5h_reset_at": "2026-06-12T11:28:25+08:00",
+        "codex_5h_used_percent": 0,
+        "codex_5h_window_minutes": 0,
+        "codex_7d_reset_after_seconds": 2624810,
+        "codex_7d_reset_at": "2026-07-12T20:35:15+08:00",
+        "codex_7d_used_percent": 0,
+        "codex_7d_window_minutes": 43800,
+        "codex_primary_over_secondary_percent": 0,
+        "codex_primary_reset_after_seconds": 2624810,
+        "codex_primary_used_percent": 0,
+        "codex_primary_window_minutes": 43800,
+        "codex_secondary_reset_after_seconds": 0,
+        "codex_secondary_used_percent": 0,
+        "codex_secondary_window_minutes": 0,
+        "codex_usage_updated_at": "2026-06-12T11:28:25+08:00",
+        "import_source": "codex_session",
+        "imported_at": "2026-06-11T19:32:12Z",
+        "privacy_mode": "training_set_failed"
+      },
+      "concurrency": 3,
+      "priority": 50,
+      "rate_multiplier": 1,
+      "auto_pause_on_expired": true
+    }
+  ]
+}

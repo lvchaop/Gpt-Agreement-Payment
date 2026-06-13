@@ -2434,17 +2434,37 @@ class AuthFlow:
         self._trace_http("chatgpt_auth_session", resp)
         resp.raise_for_status()
 
-        session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
-        access_token = resp.json().get("accessToken", "")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        session_token = (
+            self.session.cookies.get("__Secure-next-auth.session-token", "")
+            or (data.get("sessionToken", "") if isinstance(data, dict) else "")
+        )
+        access_token = data.get("accessToken", "") if isinstance(data, dict) else ""
 
         if session_token:
             self.result.session_token = session_token
+            try:
+                self.session.cookies.set(
+                    "__Secure-next-auth.session-token",
+                    session_token,
+                    domain=".chatgpt.com",
+                    path="/",
+                )
+            except Exception:
+                pass
         if access_token:
             self.result.access_token = access_token
         self.result.cookie_header = self._build_chatgpt_cookie_header()
 
-        logger.info(f"session_token: {'有' if session_token else '无'}, "
-                     f"access_token: {'有' if access_token else '无'}")
+        logger.info(
+            "session_token: %s, access_token: %s, json_keys=%s",
+            "有" if session_token else "无",
+            "有" if access_token else "无",
+            list(data.keys())[:12] if isinstance(data, dict) else [],
+        )
         return session_token, access_token
 
     # ── 可选: OAuth Token 交换 ──
@@ -3067,10 +3087,18 @@ class AuthFlow:
         return self.result
 
     # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
-    def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
+    def run_protocol_login(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+        *,
+        existing_only: bool = False,
+    ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
         - 适配 passwordless / login_password 两类已有账号入口
+        - existing_only=True 时只走登录，不回退 signup/register
         - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
         """
         if not (email or "").strip():
@@ -3137,12 +3165,20 @@ class AuthFlow:
                         (continue_url or "")[:180] or "(empty)",
                     )
             except Exception as e:
+                if existing_only:
+                    logger.warning(f"login screen_hint 失败，existing_only 不回退 signup: {e}")
+                    raise
                 logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
                 continue_url = ""
                 page_type = ""
                 mode = ""
 
         if not continue_url and page_type not in ("login_password", "email_otp_verification"):
+            if existing_only:
+                raise RuntimeError(
+                    "existing_only 登录未进入 password/otp 分支: "
+                    f"page_type={page_type or '(empty)'} continue_url={(continue_url or '')[:180]}"
+                )
             is_new = self.signup(email, sentinel)
             if is_new:
                 logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
@@ -3214,7 +3250,7 @@ class AuthFlow:
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
-            if pre_exchange:
+            if pre_exchange and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
                 self.oauth_token_exchange(continue_url, continue_url)
             callback_url, final_url = self.follow_redirect_chain(continue_url)
             if (not callback_url) and final_url and ("/workspace" in final_url):
@@ -3227,7 +3263,8 @@ class AuthFlow:
 
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
-            self.oauth_token_exchange(callback_url or "", continue_url or "")
+            if not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self.oauth_token_exchange(callback_url or "", continue_url or "")
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):

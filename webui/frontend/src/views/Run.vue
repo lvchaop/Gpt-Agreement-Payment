@@ -330,6 +330,12 @@
             class="inv-filter-input"
             placeholder="🔍 邮箱关键字"
           />
+          <textarea
+            v-model="invFilters.emails"
+            class="inv-filter-textarea"
+            placeholder="批量邮箱筛选，一行一个；也支持逗号/分号/空格分隔，可填完整邮箱或 @ 前缀"
+            rows="3"
+          ></textarea>
           <select v-model="invFilters.plan" class="inv-filter-sel">
             <option value="">所有 plan</option>
             <option value="plus">plus</option>
@@ -390,8 +396,11 @@
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unknownOrUncheckedIds.length === 0" @click="verifyAllUnknown">验证全部未检 ({{ unknownOrUncheckedIds.length }})</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="pushSelectedToCpa">推送选中→CPA</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unpushedIds.length === 0" @click="pushAllUnpushed">推送全部未推送 ({{ unpushedIds.length }})</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="downloadSelectedAuth('cpa')">下载 CPA JSON</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="downloadSelectedAuth('sub2api')">下载 Sub2API JSON</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="payOnlySelected">选中跑 pay-only</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="rtOnlySelected">选中补 RT</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="sessionOnlySelected">选中补 SESSION</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="deleteSelected">删除选中</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="invalidIds.length === 0" @click="deleteAllInvalid">删除所有失效 ({{ invalidIds.length }})</TermBtn>
           </div>
@@ -617,6 +626,18 @@ interface SaleClaimResponse {
   sale_status: "sold" | string;
   sold_at: number;
   sale_note: string;
+}
+
+interface AuthExportResponse {
+  format: "cpa" | "sub2api";
+  filename: string;
+  count: number;
+  refreshed: number;
+  skipped: Array<{ id: number; email: string; reason: string }>;
+  warnings: Array<{ id: number; email: string; reason: string }>;
+  payload: any;
+  archive_base64: string;
+  archive_mime: string;
 }
 
 interface ConfigHealthCheck {
@@ -1147,6 +1168,7 @@ function toggleSelectAll() {
 // ── 账号库存筛选 ───────────────────────────────────────────────
 const invFilters = ref({
   search: "",
+  emails: "",
   plan: "",
   check: "",
   pay: "",
@@ -1165,11 +1187,29 @@ const hasActiveFilter = computed(() =>
   Object.values(invFilters.value).some(v => v !== "")
 );
 
+function parseEmailFilter(text: string): Set<string> {
+  const items = (text || "")
+    .split(/[\s,;，；]+/)
+    .map(v => v.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(items);
+}
+
+function matchesEmailFilter(email: string, filters: Set<string>): boolean {
+  if (!filters.size) return true;
+  const full = (email || "").trim().toLowerCase();
+  const local = full.split("@", 1)[0];
+  return filters.has(full) || filters.has(local);
+}
+
 const filteredAccounts = computed<InventoryAccount[]>(() => {
   const f = invFilters.value;
   const s = (f.search || "").trim().toLowerCase();
+  const emailFilters = parseEmailFilter(f.emails || "");
   return inventory.value.accounts.filter(acc => {
-    if (s && !(acc.email || "").toLowerCase().includes(s)) return false;
+    const email = acc.email || "";
+    if (s && !email.toLowerCase().includes(s)) return false;
+    if (!matchesEmailFilter(email, emailFilters)) return false;
     if (f.plan && acc.plan_tag !== f.plan) return false;
     if (f.check) {
       if (f.check === "unchecked") {
@@ -1234,7 +1274,7 @@ watch([() => filteredAccounts.value.length, inventoryTotalPages], () => {
 });
 
 function resetInvFilters() {
-  invFilters.value = { search: "", plan: "", check: "", pay: "", sale: "", rt: "", cpa: "" };
+  invFilters.value = { search: "", emails: "", plan: "", check: "", pay: "", sale: "", rt: "", cpa: "" };
 }
 
 const allPagedSelected = computed(() => {
@@ -1354,6 +1394,55 @@ function _selectedEmails(): string[] {
   return emailsForIds(Array.from(selectedIds.value)).filter(e => e && !e.startsWith("id="));
 }
 
+function downloadObject(filename: string, payload: any) {
+  const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadBase64(filename: string, base64: string, mime: string) {
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const blob = new Blob([bytes], { type: mime || "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadSelectedAuth(format: "cpa" | "sub2api") {
+  const ids = Array.from(selectedIds.value);
+  if (!ids.length) { message.warning("没有选中账号"); return; }
+  inventoryBusy.value = true;
+  try {
+    const r = await api.post<AuthExportResponse>("/inventory/accounts/export-auth", { ids, format });
+    if (r.data.archive_base64) {
+      downloadBase64(r.data.filename, r.data.archive_base64, r.data.archive_mime);
+    } else {
+      downloadObject(r.data.filename, r.data.payload);
+    }
+    const skipped = r.data.skipped?.length || 0;
+    const warnings = r.data.warnings?.length || 0;
+    const suffix = [
+      `刷新 ${r.data.refreshed || 0} 个 token`,
+      skipped ? `跳过 ${skipped} 个无 token/不存在账号` : "",
+      warnings ? `${warnings} 个刷新失败已用本地旧 token` : "",
+    ].filter(Boolean).join("，");
+    message.success(`已下载 ${r.data.count} 个账号的 ${format === "cpa" ? "CPA" : "Sub2API"} JSON（${suffix}）`);
+  } catch (e: any) {
+    message.error(`下载失败：${e?.response?.data?.detail || e?.message || e}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
+
 async function payOnlySelected() {
   const selectedEmails = _selectedEmails();
   if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
@@ -1388,23 +1477,66 @@ async function payOnlySelected() {
 }
 
 async function rtOnlySelected() {
-  const emails = _selectedEmails();
-  if (!emails.length) { message.warning("没有选中账号"); return; }
+  const selectedEmails = _selectedEmails();
+  if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
+  const requestedBatch = form.value.mode === "batch"
+    ? Math.max(1, Number(form.value.batch || 0))
+    : selectedEmails.length;
+  const emails = selectedEmails.slice(0, Math.min(selectedEmails.length, requestedBatch));
   const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
-  if (!confirm(`对 ${emails.length} 个选中账号跑 rt-only（只补 refresh_token，不付款）？\n${preview}`)) return;
+  const batchNote = selectedEmails.length > emails.length ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）` : "";
+  const workers = Math.max(1, Number(form.value.workers || 1));
+  if (!confirm(`对 ${emails.length} 个选中账号跑 rt-only（强制重补 refresh_token，不付款）？${batchNote}\n${preview}\n\nworkers=${workers}`)) return;
   starting.value = true;
   try {
     await api.post("/run/start", {
-      mode: "single",
+      mode: emails.length > 1 ? "batch" : "single",
       paypal: false,
       gopay: false,
       pay_only: false,
       register_only: false,
       rt_only: true,
-      register_mode: form.value.register_mode || "browser",
+      rt_force: true,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers,
+      register_mode: "browser",
       target_emails: emails,
     });
     message.success(`已对 ${emails.length} 个账号启动 rt-only`);
+    await refreshStatus();
+    if (status.value.running) openStream();
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || "启动失败");
+  } finally {
+    starting.value = false;
+  }
+}
+
+async function sessionOnlySelected() {
+  const selectedEmails = _selectedEmails();
+  if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
+  const requestedBatch = form.value.mode === "batch"
+    ? Math.max(1, Number(form.value.batch || 0))
+    : selectedEmails.length;
+  const emails = selectedEmails.slice(0, Math.min(selectedEmails.length, requestedBatch));
+  const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
+  const batchNote = selectedEmails.length > emails.length ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）` : "";
+  if (!confirm(`对 ${emails.length} 个选中账号补 SESSION（只重新登录补 session/access/cookie，不注册不付款）？${batchNote}\n${preview}`)) return;
+  starting.value = true;
+  try {
+    await api.post("/run/start", {
+      mode: emails.length > 1 ? "batch" : "single",
+      paypal: false,
+      gopay: false,
+      pay_only: false,
+      register_only: false,
+      session_only: true,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers: Math.max(1, Number(form.value.workers || 1)),
+      register_mode: "browser",
+      target_emails: emails,
+    });
+    message.success(`已对 ${emails.length} 个账号启动补 SESSION`);
     await refreshStatus();
     if (status.value.running) openStream();
   } catch (e: any) {
@@ -2103,6 +2235,21 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 .inv-filter-input:focus { border-color: var(--accent); outline: none; }
+.inv-filter-textarea {
+  flex: 1 1 260px;
+  min-width: 220px;
+  max-width: 420px;
+  min-height: 58px;
+  resize: vertical;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--fg-primary);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.inv-filter-textarea:focus { border-color: var(--accent); outline: none; }
 .inv-filter-sel {
   background: var(--bg-panel);
   border: 1px solid var(--border);

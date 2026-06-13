@@ -1,6 +1,7 @@
 """单 active-run 的 pipeline 进程控制器。
 
-封装 `xvfb-run -a python pipeline.py [args]` 子进程：spawn / 流式收 stdout
+封装 `python pipeline.py [args]` 子进程：有 `xvfb-run` 时自动包一层；
+spawn / 流式收 stdout
 到环形日志缓冲 / SIGTERM-优先 stop / 暴露 status + log 给路由层。
 
 GoPay 模式下额外支持 OTP 中转：默认通过 WebUI 内部 HTTP endpoint
@@ -11,6 +12,7 @@ file provider 的兼容 fallback。
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -338,10 +340,13 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
               register_only: bool, pay_only: bool, gopay: bool = False,
               gopay_otp_file: str = "", count: int = 0,
               target_emails: Optional[list] = None, rt_only: bool = False,
+              rt_force: bool = False,
+              session_only: bool = False,
               register_mode: str = "browser", cardw_config_path: str = "") -> list[str]:
     """根据参数拼出最终命令行。"""
-    cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
-           "--config", str(s.PAY_CONFIG_PATH)]
+    python_cmd = ["python", "-u", "pipeline.py", "--config", str(s.PAY_CONFIG_PATH)]
+    xvfb_run = shutil.which("xvfb-run")
+    cmd = [xvfb_run, "-a", *python_cmd] if xvfb_run else python_cmd
     if cardw_config_path:
         cmd.extend(["--cardw-config", str(cardw_config_path)])
 
@@ -387,7 +392,8 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.extend(["--gopay-otp-file", gopay_otp_file])
     elif paypal:
         cmd.append("--paypal")
-    if rm in ("protocol", "phone_browser", "phone_protocol"):
+    uses_registration = not (pay_only or rt_only or session_only)
+    if uses_registration and rm in ("protocol", "phone_browser", "phone_protocol"):
         cmd.extend(["--register-method", rm])
     # mode 决定循环结构（daemon ∞ / self_dealer / batch N / 单次）
     if mode == "daemon":
@@ -405,6 +411,10 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
         cmd.append("--pay-only")
     if rt_only:
         cmd.append("--rt-only")
+        if rt_force:
+            cmd.append("--rt-force")
+    if session_only:
+        cmd.append("--session-only")
     if target_emails:
         joined = ",".join(e.strip() for e in target_emails if e and e.strip())
         if joined:
@@ -448,6 +458,8 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
           gopay: bool = False, count: int = 0, register_mode: str = "browser",
           env_overrides: Optional[dict] = None,
           target_emails: Optional[list] = None, rt_only: bool = False,
+          rt_force: bool = False,
+          session_only: bool = False,
           phone: Optional[dict] = None) -> dict:
     global _proc, _started_at, _ended_at, _exit_code, _cmd, _mode
     global _log_lines, _seq_counter, _otp_file, _otp_to_db, _otp_pending, _otp_file_is_temp
@@ -463,7 +475,8 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         rm = (register_mode or "browser").strip().lower()
         cardw_config_path = ""
         runtime_env_overrides = dict(env_overrides or {})
-        if rm in ("phone", "phone_browser", "phone_protocol"):
+        uses_registration = not (pay_only or rt_only or session_only)
+        if uses_registration and rm in ("phone", "phone_browser", "phone_protocol"):
             cardw_config_path, phone_env = _runtime_phone_config(
                 phone,
                 method="phone_protocol" if rm == "phone_protocol" else "phone_browser",
@@ -474,6 +487,8 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
                         register_only, pay_only, gopay=gopay,
                         gopay_otp_file="", count=count,
                         target_emails=target_emails, rt_only=rt_only,
+                        rt_force=rt_force,
+                        session_only=session_only,
                         register_mode=register_mode,
                         cardw_config_path=cardw_config_path)
 
@@ -519,9 +534,13 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         env.setdefault("PHONE_TRACE_DUMP", "1")
         # 注册路径切换：browser=Camoufox/Playwright；protocol=auth_flow；phone_*=手机号入口/协议
         env["WEBUI_REG_MODE"] = (
-            "phone_protocol"
-            if rm == "phone_protocol"
-            else ("phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser"))
+            "browser"
+            if not uses_registration
+            else (
+                "phone_protocol"
+                if rm == "phone_protocol"
+                else ("phone_browser" if rm in ("phone", "phone_browser") else ("protocol" if rm == "protocol" else "browser"))
+            )
         )
         if runtime_env_overrides:
             for k, v in runtime_env_overrides.items():

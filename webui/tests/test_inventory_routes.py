@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import io
+import json
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 from webui.backend.db import get_db
@@ -208,6 +212,204 @@ def test_sale_toggle_switches_status(client):
 
     r3 = client.post("/api/inventory/accounts/sale/toggle", json={"id": 999999})
     assert r3.status_code == 404
+
+
+def _jwt(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    body = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return f"header.{body}.sig"
+
+
+def test_export_auth_requires_auth(client):
+    r = client.post("/api/inventory/accounts/export-auth", json={"ids": [1], "format": "cpa"})
+    assert r.status_code == 401
+
+
+def test_export_auth_cpa_json_refreshes_tokens(client, monkeypatch):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    access_token = _jwt({
+        "exp": 1782070330,
+        "sub": "auth0|abc",
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "user-123",
+        },
+    })
+    db.add_registered_account({
+        "email": "Export@Example.COM",
+        "access_token": access_token,
+        "id_token": "id-token-1",
+        "refresh_token": "rt-1",
+    })
+    account_id = db.iter_registered_accounts()[0]["id"]
+    db.update_account_check(account_id, "valid", "ok", plan_type="plus")
+    refreshed_access = _jwt({
+        "exp": 1782156730,
+        "https://api.openai.com/auth": {"chatgpt_user_id": "user-refreshed"},
+    })
+
+    monkeypatch.setattr("webui.backend.routes.inventory._exchange_refresh_token", lambda rt, client_id: {
+        "access_token": refreshed_access,
+        "id_token": "id-token-refreshed",
+        "refresh_token": "rt-refreshed",
+    })
+
+    r = client.post("/api/inventory/accounts/export-auth", json={"ids": [account_id], "format": "cpa"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["format"] == "cpa"
+    assert body["count"] == 1
+    assert body["refreshed"] == 1
+    assert body["skipped"] == []
+    assert body["warnings"] == []
+    assert body["filename"].endswith("-export@example.com-plus.json")
+    assert body["archive_base64"] == ""
+    assert body["archive_mime"] == ""
+    auth_body = body["payload"]
+    assert sorted(auth_body.keys()) == [
+        "access_token",
+        "email",
+        "id_token",
+        "refresh_token",
+        "saved_at",
+        "token_source",
+        "type",
+    ]
+    assert auth_body["email"] == "export@example.com"
+    assert auth_body["access_token"] == refreshed_access
+    assert auth_body["id_token"] == "id-token-refreshed"
+    assert auth_body["refresh_token"] == "rt-refreshed"
+    assert auth_body["token_source"] == "ChatGPT_plus"
+    assert auth_body["type"] == "codex"
+    assert auth_body["saved_at"]
+
+
+def test_export_auth_sub2api_json_refreshes_tokens_and_skips_rows_without_tokens(client, monkeypatch):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    refreshed_access = _jwt({"https://api.openai.com/auth": {"user_id": "user-refreshed"}})
+    monkeypatch.setattr("webui.backend.routes.inventory._exchange_refresh_token", lambda rt, client_id: {
+        "access_token": refreshed_access,
+        "id_token": "id-token-refreshed",
+        "refresh_token": "rt-refreshed",
+    })
+    db.add_registered_account({
+        "email": "with-token@example.com",
+        "access_token": _jwt({"https://api.openai.com/auth": {"user_id": "user-456"}}),
+        "refresh_token": "rt-456",
+    })
+    db.add_registered_account({"email": "no-token@example.com"})
+    ids = [row["id"] for row in db.iter_registered_accounts()]
+
+    r = client.post("/api/inventory/accounts/export-auth", json={"ids": ids, "format": "sub2api"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["format"] == "sub2api"
+    assert body["count"] == 1
+    assert body["refreshed"] == 1
+    assert body["filename"].startswith("sub2api-accounts-")
+    assert body["skipped"] == [{"id": ids[1], "email": "no-token@example.com", "reason": "no_token"}]
+    assert body["warnings"] == []
+    payload = body["payload"]
+    assert sorted(payload.keys()) == ["accounts", "exported_at", "proxies"]
+    assert payload["proxies"] == []
+    account = payload["accounts"][0]
+    assert account["name"].endswith("-with-token@example.com-free.json")
+    assert account["platform"] == "openai"
+    assert account["type"] == "oauth"
+    creds = account["credentials"]
+    assert creds["email"] == "with-token@example.com"
+    assert creds["access_token"] == refreshed_access
+    assert creds["id_token"] == "id-token-refreshed"
+    assert creds["refresh_token"] == "rt-refreshed"
+    assert creds["chatgpt_account_id"] == "user-refreshed"
+    assert creds["chatgpt_user_id"] == "user-refreshed"
+    assert creds["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann"
+    assert creds["plan_type"] == "free"
+
+
+def test_export_auth_download_falls_back_to_local_tokens_when_refresh_fails(client, monkeypatch):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+    local_access = _jwt({"https://api.openai.com/auth": {"user_id": "user-local"}})
+    db.add_registered_account({
+        "email": "fallback@example.com",
+        "access_token": local_access,
+        "id_token": "id-token-local",
+        "refresh_token": "rt-local",
+    })
+    account_id = db.iter_registered_accounts()[0]["id"]
+
+    def boom(rt, client_id):
+        raise RuntimeError("oauth down")
+
+    monkeypatch.setattr("webui.backend.routes.inventory._exchange_refresh_token", boom)
+
+    r = client.post("/api/inventory/accounts/export-auth", json={"ids": [account_id], "format": "cpa"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["refreshed"] == 0
+    assert body["warnings"][0]["email"] == "fallback@example.com"
+    assert "refresh_failed" in body["warnings"][0]["reason"]
+    assert body["payload"]["access_token"] == local_access
+    assert body["payload"]["id_token"] == "id-token-local"
+    assert body["payload"]["refresh_token"] == "rt-local"
+
+
+def test_export_auth_cpa_multiple_accounts_downloads_zip(client, monkeypatch):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+
+    def fake_exchange(rt, client_id):
+        suffix = rt.rsplit("-", 1)[-1]
+        return {
+            "access_token": _jwt({"https://api.openai.com/auth": {"user_id": f"user-{suffix}"}}),
+            "id_token": f"id-token-{suffix}",
+            "refresh_token": f"rt-refreshed-{suffix}",
+        }
+
+    monkeypatch.setattr("webui.backend.routes.inventory._exchange_refresh_token", fake_exchange)
+    db.add_registered_account({
+        "email": "one@example.com",
+        "access_token": "old-at-1",
+        "id_token": "old-id-1",
+        "refresh_token": "rt-1",
+    })
+    db.add_registered_account({
+        "email": "two@example.com",
+        "access_token": "old-at-2",
+        "id_token": "old-id-2",
+        "refresh_token": "rt-2",
+    })
+    ids = [row["id"] for row in db.iter_registered_accounts()]
+
+    r = client.post("/api/inventory/accounts/export-auth", json={"ids": ids, "format": "cpa"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["format"] == "cpa"
+    assert body["count"] == 2
+    assert body["refreshed"] == 2
+    assert body["filename"].endswith(".zip")
+    assert body["payload"] is None
+    assert body["archive_mime"] == "application/zip"
+    raw = base64.b64decode(body["archive_base64"])
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        names = sorted(zf.namelist())
+        assert len(names) == 2
+        assert names[0].endswith("-one@example.com-free.json")
+        assert names[1].endswith("-two@example.com-free.json")
+        first = json.loads(zf.read(names[0]).decode())
+        second = json.loads(zf.read(names[1]).decode())
+    assert first["email"] == "one@example.com"
+    assert first["refresh_token"] == "rt-refreshed-1"
+    assert second["email"] == "two@example.com"
+    assert second["refresh_token"] == "rt-refreshed-2"
 
 
 def test_delete_rejects_empty_ids(client):
