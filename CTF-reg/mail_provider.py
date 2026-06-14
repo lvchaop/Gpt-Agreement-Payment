@@ -123,11 +123,22 @@ class MailProvider:
         mode: str = "cloudflare_kv",
         otp_timeout: int = 180,
         mark_seen: bool = False,
+        external_base_url: str = "",
+        external_api_key: str = "",
+        external_provider_name: str = "cloudflare_temp_mail",
+        external_request_timeout_s: int = 20,
+        external_poll_interval_s: float = 3.0,
     ):
         self.mode = (mode or "cloudflare_kv").strip().lower()
         self.catch_all_domain = catch_all_domain
         self.otp_timeout = otp_timeout
         self.mark_seen = mark_seen
+        self.external_base_url = external_base_url
+        self.external_api_key = external_api_key
+        self.external_provider_name = external_provider_name or "cloudflare_temp_mail"
+        self.external_request_timeout_s = int(external_request_timeout_s or 20)
+        self.external_poll_interval_s = float(external_poll_interval_s or 3.0)
+        self._external_provider = None
         self._reuse_email: Optional[str] = None  # 兼容 register-only resume
         self._reserved_account = None
         self._pool = None
@@ -144,6 +155,15 @@ class MailProvider:
             mode=mode,
             otp_timeout=int(getattr(mail_cfg, "otp_timeout", 180) or 180),
             mark_seen=bool(getattr(mail_cfg, "mark_seen", False)),
+            external_base_url=getattr(mail_cfg, "external_base_url", "") or "",
+            external_api_key=getattr(mail_cfg, "external_api_key", "") or "",
+            external_provider_name=(
+                getattr(mail_cfg, "external_provider_name", "")
+                or getattr(mail_cfg, "provider_name", "")
+                or "cloudflare_temp_mail"
+            ),
+            external_request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 20) or 20),
+            external_poll_interval_s=float(getattr(mail_cfg, "external_poll_interval_s", 3.0) or 3.0),
         )
 
     @staticmethod
@@ -162,6 +182,8 @@ class MailProvider:
             self._reuse_email = None
             logger.info(f"复用邮箱: {addr}")
             self.last_persona = None  # resume 路径无法回推 first/last
+            if self.mode == "external_temp_mail":
+                self._external_mail_provider().ensure_email(addr)
             return addr
         if self.mode == "imap_list":
             account = self._email_pool().reserve_next()
@@ -179,6 +201,13 @@ class MailProvider:
             )
         persona = self._persona_gen.next()
         self.last_persona = persona
+        if self.mode == "external_temp_mail":
+            self._external_mail_provider().ensure_email(persona.email)
+            logger.info(
+                f"邮箱已创建: {persona.email} | persona={persona.first} {persona.last} "
+                f"(路径: External temp mail API ensure)"
+            )
+            return persona.email
         logger.info(
             f"邮箱已创建: {persona.email} | persona={persona.first} {persona.last} "
             f"(路径: CF Email Worker → KV)"
@@ -194,9 +223,21 @@ class MailProvider:
         """阻塞等 OTP。所有模式最终统一从 CF KV 读取。
 
         - cloudflare_kv: CF Email Worker 写 KV，本地轮询 KV。
+        - external_temp_mail: 外部邮箱管理 API 读取验证码。
         - imap_list: 只对当前 reserved 活跃邮箱启动本地 relay，relay 写 KV，
           本地仍轮询 KV。
         """
+        if self.mode == "external_temp_mail":
+            logger.info(
+                f"[mail] 走 External temp mail API 取 OTP -> {email_addr} "
+                f"(timeout={timeout}s)"
+            )
+            return self._external_mail_provider().wait_for_otp(
+                email_addr,
+                timeout=timeout,
+                issued_after=issued_after,
+            )
+
         from cf_kv_otp_provider import CloudflareKVOtpProvider
 
         kv_provider = CloudflareKVOtpProvider.from_env_or_secrets()
@@ -291,3 +332,16 @@ class MailProvider:
 
             self._pool = email_account_pool_from_path()
         return self._pool
+
+    def _external_mail_provider(self):
+        if self._external_provider is None:
+            from external_mail_api_provider import ExternalMailApiProvider
+
+            self._external_provider = ExternalMailApiProvider(
+                self.external_base_url,
+                self.external_api_key,
+                provider_name=self.external_provider_name,
+                request_timeout_s=self.external_request_timeout_s,
+                poll_interval_s=self.external_poll_interval_s,
+            )
+        return self._external_provider

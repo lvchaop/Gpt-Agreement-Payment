@@ -14,6 +14,7 @@ class MailConfig:
     mode:
       - cloudflare_kv: Cloudflare Email Routing → otp-relay Worker → KV
       - imap_list: 从 SQLite 邮箱池读取真实 Gmail/Outlook/IMAP 账号
+      - external_temp_mail: 外部邮箱管理 API；本地生成完整邮箱后调用 ensure，再读验证码
 
     KV 凭证（api_token / account_id / kv_namespace_id）放 SQLite runtime_meta[secrets]
     的 cloudflare 段或环境变量，不在 MailConfig 里。
@@ -26,6 +27,13 @@ class MailConfig:
     auto_provision: dict = field(default_factory=dict)
     otp_timeout: int = 180
     mark_seen: bool = False
+    external_base_url: str = ""
+    external_api_key: str = ""
+    # 兼容外部接口文档字段名；优先 external_provider_name，空时使用 provider_name。
+    provider_name: str = ""
+    external_provider_name: str = "cloudflare_temp_mail"
+    external_request_timeout_s: int = 20
+    external_poll_interval_s: float = 3.0
 
 
 @dataclass

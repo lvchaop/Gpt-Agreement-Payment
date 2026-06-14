@@ -7099,6 +7099,40 @@ def _fetch_openai_login_otp(
     mail_cfg = mail_cfg if isinstance(mail_cfg, dict) else {}
     mark_seen = str(mail_cfg.get("mark_seen", "")).strip().lower() in ("1", "true", "yes", "y", "on")
     mode = str(mail_cfg.get("mode") or "").strip().lower()
+    if mode == "external_temp_mail":
+        try:
+            from mail_provider import MailProvider
+            provider = MailProvider(
+                str(mail_cfg.get("catch_all_domain") or ""),
+                mode="external_temp_mail",
+                otp_timeout=timeout,
+                mark_seen=mark_seen,
+                external_base_url=str(mail_cfg.get("external_base_url") or ""),
+                external_api_key=str(mail_cfg.get("external_api_key") or ""),
+                external_provider_name=str(
+                    mail_cfg.get("external_provider_name")
+                    or mail_cfg.get("provider_name")
+                    or "cloudflare_temp_mail"
+                ),
+                external_request_timeout_s=int(mail_cfg.get("external_request_timeout_s") or 20),
+                external_poll_interval_s=float(mail_cfg.get("external_poll_interval_s") or 3.0),
+            )
+            _log(
+                f"      [RT-OTP] 从 External temp mail API 读取邮箱验证码 "
+                f"email={target_email} timeout={timeout}s"
+            )
+            return provider.wait_for_otp(
+                target_email,
+                timeout=timeout,
+                issued_after=issued_after,
+            )
+        except TimeoutError:
+            _log(f"      [RT-OTP] External temp mail API 等 OTP 超时 {timeout}s email={target_email}")
+            return ""
+        except Exception as e:
+            _log(f"      [RT-OTP] External temp mail API 取 OTP 失败: {e}")
+            return ""
+
     if mode == "imap_list":
         try:
             from mail_provider import MailProvider

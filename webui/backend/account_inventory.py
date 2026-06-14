@@ -166,17 +166,17 @@ def _oauth_cooldown_remaining_s(oauth: dict) -> int:
 
 
 def _rt_state(has_rt: bool, oauth: dict) -> str:
-    if has_rt:
-        return "has_rt"
     status = str(oauth.get("status") or "")
-    if status == "succeeded":
-        return "oauth_succeeded"
-    if status == "dead":
-        return "dead"
-    if status == "transient_failed":
-        return "cooldown" if _oauth_cooldown_remaining_s(oauth) > 0 else "retryable"
     if status == "pending":
         return "pending"
+    if status == "transient_failed":
+        return "cooldown" if _oauth_cooldown_remaining_s(oauth) > 0 else "retryable"
+    if status == "dead":
+        return "dead"
+    if has_rt:
+        return "has_rt"
+    if status == "succeeded":
+        return "oauth_succeeded"
     return "missing"
 
 
