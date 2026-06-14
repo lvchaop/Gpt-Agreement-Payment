@@ -1,6 +1,6 @@
 const EXPOSE_PATCH = "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t}({});";
 const EXPOSE_REPLACEMENT =
-  "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t.__debug_n=_n,t.__debug_bindProof=D,t}({});";
+  "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t.__debug_n=_n,t.__debug_bindProof=D,t.__debug_sessionObserverToken=async(challenge,flow)=>{se(flow,challenge);await new Promise(r=>setTimeout(r,600));return await t.sessionObserverToken(flow)},t}({});";
 const INSTANCE_PATCH = "var P=new _;";
 const INSTANCE_REPLACEMENT = "var P=new _;globalThis.__debugP=P;";
 const SDK_GLOBAL_PATCH = "var SentinelSDK=";
@@ -91,6 +91,10 @@ function createElement(tagName) {
 }
 
 function installRuntime(payload) {
+  const nativeSetTimeout =
+    typeof globalThis.setTimeout === "function" ? globalThis.setTimeout.bind(globalThis) : null;
+  const nativeClearTimeout =
+    typeof globalThis.clearTimeout === "function" ? globalThis.clearTimeout.bind(globalThis) : null;
   const screen = {
     width: Number(payload.screen_width || 1366),
     height: Number(payload.screen_height || 768),
@@ -242,11 +246,18 @@ function installRuntime(payload) {
   globalThis.__sentinel_init_pending = [];
   globalThis.__sentinel_token_pending = [];
 
-  globalThis.setTimeout = (cb) => {
-    if (typeof cb === "function") cb();
-    return 1;
+  globalThis.setTimeout = (cb, ms = 0, ...args) => {
+    if (typeof cb !== "function") return 1;
+    if (!nativeSetTimeout) {
+      cb(...args);
+      return 1;
+    }
+    const delay = Math.max(0, Math.min(Number(ms) || 0, 1000));
+    return nativeSetTimeout(() => cb(...args), delay);
   };
-  globalThis.clearTimeout = () => {};
+  globalThis.clearTimeout = (id) => {
+    if (nativeClearTimeout && id) nativeClearTimeout(id);
+  };
   globalThis.setInterval = () => 1;
   globalThis.clearInterval = () => {};
   globalThis.requestIdleCallback = (cb) => {
@@ -370,7 +381,14 @@ async function run(payload, sdkSource) {
     globalThis.SentinelSDK.__debug_bindProof(challenge, requestP);
     const dx = challenge && challenge.turnstile ? challenge.turnstile.dx : null;
     const tValue = dx ? await globalThis.SentinelSDK.__debug_n(challenge, dx) : null;
-    return { final_p: finalP, t: tValue };
+    const soToken =
+      challenge && challenge.so && challenge.so.snapshot_dx
+        ? await globalThis.SentinelSDK.__debug_sessionObserverToken(
+            challenge,
+            String(payload.flow || "__default__")
+          )
+        : null;
+    return { final_p: finalP, t: tValue, so_token: soToken || null };
   }
 
   throw new Error(`unsupported action: ${payload.action}`);

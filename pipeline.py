@@ -1315,6 +1315,7 @@ def _run_one_rt_only(args_tuple):
         return r
     except Exception as e:
         print(f"{thread_tag} error={str(e)[:300]}")
+        _set_account_oauth_status(target_email, "transient_failed", "exception")
         return {
             "batch_index": idx,
             "target_email": target_email,
@@ -2449,6 +2450,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         with open(card_config_path, "r", encoding="utf-8") as f:
             card_cfg = json.load(f)
     except Exception as e:
+        _set_account_oauth_status(target, "transient_failed", "read_card_cfg_failed")
         return {"status": "read_card_cfg_failed", "error": str(e)[:200], "email": target}
     cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
     cpa_enabled = bool(cpa_cfg.get("enabled"))
@@ -2462,6 +2464,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         rt = str(account.get("refresh_token") or "")
         if session_id:
             _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
+        _set_account_oauth_status(target, "succeeded")
         print(f"[rt-only] {target} 已有 refresh_token (len={len(rt)}), 跳过")
         result = {"status": "already_has_rt", "email": target, "refresh_token_len": len(rt)}
         if cpa_enabled:
@@ -2490,6 +2493,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         )
     except Exception as e:
         print(f"[rt-only] import card.py 失败: {e}")
+        _set_account_oauth_status(target, "transient_failed", "import_failed")
         return {"status": "import_failed", "error": str(e)[:200]}
     finally:
         try: sys.path.remove(str(CARD_DIR))
@@ -2506,6 +2510,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
 
     if not mail_cfg:
         print(f"[rt-only] 缺 mail_cfg（{reg_cfg_path}），无法接收 OTP")
+        _set_account_oauth_status(target, "transient_failed", "no_mail_cfg")
         return {"status": "no_mail_cfg", "email": target}
 
     stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
@@ -2518,6 +2523,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         f"password={'有' if account.get('password') else '无(passwordless)'} "
         f"force={bool(force)} oauth_client_id={oauth_client_id}"
     )
+    _set_account_oauth_status(target, "pending", "rt_only_force" if force else "rt_only")
     try:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -2525,21 +2531,28 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         # loop 的调用线程里执行，Playwright 会直接报错。放到独立线程执行可保证
         # 该线程没有 running loop，同时保持原同步调用语义。
         with ThreadPoolExecutor(max_workers=1) as executor:
-            rt = executor.submit(
-                _exchange_refresh_token_with_session,
-                email=target,
-                password=account.get("password", "") or "",
-                mail_cfg=mail_cfg,
-                proxy_url=proxy_url,
-                oauth_client_id=oauth_client_id,
+            rt, fail_reason = executor.submit(
+                _exchange_rt_with_classification,
+                target,
+                account.get("password", "") or "",
+                mail_cfg,
+                proxy_url,
+                oauth_client_id,
             ).result()
     except Exception as e:
         print(f"[rt-only] 异常: {type(e).__name__}: {str(e)[:200]}")
+        _set_account_oauth_status(target, "transient_failed", "exception")
         return {"status": "exception", "error": str(e)[:200], "email": target}
 
     if not rt:
-        print(f"[rt-only] ❌ {target} 未获得 refresh_token")
-        return {"status": "no_rt", "email": target}
+        fail_reason = fail_reason or "unknown"
+        if fail_reason == "account_dead":
+            _set_account_oauth_status(target, "dead", fail_reason)
+            print(f"[rt-only] ❌ {target} 未获得 refresh_token → dead ({fail_reason})")
+        else:
+            _set_account_oauth_status(target, "transient_failed", fail_reason)
+            print(f"[rt-only] ❌ {target} 未获得 refresh_token → transient_failed ({fail_reason})")
+        return {"status": "no_rt", "email": target, "fail_reason": fail_reason}
 
     # 写回 DB。注意：find_latest_registered_account() 的 SELECT 不返 id 字段，
     # 所以 account['id'] 是空。这里直接按 email 查最新一行的 id 再 UPDATE。
@@ -2553,6 +2566,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
             ).fetchone()
             if not row:
                 print(f"[rt-only] 拿到 RT 但找不到 {target} 在 DB 的行（被删了？）")
+                _set_account_oauth_status(target, "transient_failed", "row_gone")
                 return {"status": "row_gone", "email": target}
             row_id = int(row["id"])
             cur = c.execute(
@@ -2562,9 +2576,11 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
             updated = cur.rowcount
         if updated < 1:
             print(f"[rt-only] UPDATE 0 行（id={row_id}），写库未生效")
+            _set_account_oauth_status(target, "transient_failed", "update_zero")
             return {"status": "update_zero", "email": target, "id": row_id}
         if session_id:
             _augment_card_result_last_match(target, session_id, {"refresh_token": rt})
+        _set_account_oauth_status(target, "succeeded")
         print(f"[rt-only] ✅ {target} refresh_token 已写库 (len={len(rt)} id={row_id})")
         result = {"status": "succeeded", "email": target, "refresh_token_len": len(rt), "id": row_id}
         if cpa_enabled:
@@ -2581,6 +2597,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
         return result
     except Exception as e:
         print(f"[rt-only] 拿到 RT 但写库失败: {e}")
+        _set_account_oauth_status(target, "transient_failed", "write_failed")
         return {"status": "write_failed", "email": target, "error": str(e)[:200]}
 
 
@@ -3168,7 +3185,8 @@ def _classify_oauth_failure(log: str) -> str:
 
 
 def _exchange_rt_with_classification(
-    email: str, password: str, mail_cfg: dict, proxy_url: str
+    email: str, password: str, mail_cfg: dict, proxy_url: str,
+    oauth_client_id: str = "",
 ):
     """包 card._exchange_refresh_token_with_session 加失败分类。
 
@@ -3214,9 +3232,10 @@ def _exchange_rt_with_classification(
                 password=password,
                 mail_cfg=mail_cfg,
                 proxy_url=proxy_url,
+                oauth_client_id=oauth_client_id,
             )
         except Exception as e:
-            print(f"[free] _exchange_rt 异常: {e}")
+            print(f"[oauth] _exchange_rt 异常: {e}")
             return "", "exception"
     finally:
         sys.stdout = real_stdout

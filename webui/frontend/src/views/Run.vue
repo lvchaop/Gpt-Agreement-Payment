@@ -364,6 +364,7 @@
             <option value="">所有 RT</option>
             <option value="has_rt">有 RT</option>
             <option value="oauth_succeeded">OAuth 成功</option>
+            <option value="pending">处理中</option>
             <option value="missing">缺 RT</option>
             <option value="cooldown">冷却中</option>
             <option value="retryable">可重试</option>
@@ -574,7 +575,7 @@ interface InventoryAccount {
   has_refresh_token: boolean;
   pay_state: "reusable" | "consumed" | "coupon_ineligible" | "no_auth";
   pay_only_eligible: boolean;
-  rt_state: "has_rt" | "oauth_succeeded" | "dead" | "cooldown" | "retryable" | "missing";
+  rt_state: "has_rt" | "oauth_succeeded" | "dead" | "cooldown" | "retryable" | "missing" | "pending";
   can_backfill_rt: boolean;
   oauth_status: string;
   oauth_fail_reason: string;
@@ -1058,6 +1059,8 @@ function rtStateLabel(acc: InventoryAccount) {
       return "RT 冷却";
     case "retryable":
       return "可重试";
+    case "pending":
+      return "RT 处理中";
     default:
       return "RT 待补";
   }

@@ -16,6 +16,8 @@ import re
 import secrets
 import socket
 import subprocess
+import shutil
+import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -104,6 +106,7 @@ class AuthFlow:
         self._dump_login_verifier: str = ""
         self._codex_rt_attempted: bool = False
         self._last_register_password_error: str = ""
+        self._last_sentinel_so_token: str = ""
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
             "1", "true", "yes", "on"
@@ -293,6 +296,8 @@ class AuthFlow:
             body = (resp.text or "").replace("\n", " ").replace("\r", " ")
             body = body[:260]
             req_headers_lc = {(str(k).lower()): v for k, v in (req_headers or {}).items()}
+            sentinel_header = str(req_headers_lc.get("openai-sentinel-token", "") or "")
+            sentinel_so_header = str(req_headers_lc.get("openai-sentinel-so-token", "") or "")
 
             if self._http_trace_enabled:
                 logger.info(
@@ -335,6 +340,11 @@ class AuthFlow:
                                 "Accept": (req_headers_lc.get("accept", "") or "")[:240],
                                 "Referer": (req_headers_lc.get("referer", "") or "")[:500],
                                 "Origin": (req_headers_lc.get("origin", "") or "")[:120],
+                                "User-Agent": (req_headers_lc.get("user-agent", "") or "")[:240],
+                                "sec-ch-ua": (req_headers_lc.get("sec-ch-ua", "") or "")[:240],
+                                "sec-ch-ua-platform": (req_headers_lc.get("sec-ch-ua-platform", "") or "")[:80],
+                                "openai-sentinel-token-len": len(sentinel_header),
+                                "openai-sentinel-so-token-len": len(sentinel_so_header),
                                 **(
                                     {
                                         "Cookie": (req_headers_lc.get("cookie", "") or "")[:6000],
@@ -403,13 +413,17 @@ class AuthFlow:
             for it in obj:
                 AuthFlow._walk_collect_str_fields(it, wanted_keys, out, depth + 1, max_depth)
 
-    def fetch_client_auth_session_dump(self, stage: str = "") -> dict:
+    def fetch_client_auth_session_dump(
+        self,
+        stage: str = "",
+        referer: str = "https://auth.openai.com/email-verification",
+    ) -> dict:
         """
         尝试读取 auth.openai 的 client_auth_session_dump：
         - 可能包含 session_id / client_auth_session 的额外状态
         - 若出现 verifier/refresh 相关字段，自动注入当前流程
         """
-        headers = self._common_headers("https://auth.openai.com/email-verification")
+        headers = self._common_headers(referer)
         headers["Accept"] = "application/json"
         try:
             resp = self.session.get(
@@ -1093,6 +1107,7 @@ class AuthFlow:
         self.result.device_id = ""
         self.result.csrf_token = ""
         self._last_sentinel_token = ""
+        self._last_sentinel_so_token = ""
         self._last_register_password_error = ""
         self._client_auth_session_dump = {}
         self._client_auth_session_id = ""
@@ -1625,6 +1640,117 @@ class AuthFlow:
         return True
 
     @staticmethod
+    def _is_cloudflare_challenge_response(resp) -> bool:
+        if resp is None:
+            return False
+        status = getattr(resp, "status_code", 0)
+        text = (getattr(resp, "text", "") or "").lower()
+        server = ""
+        try:
+            server = (resp.headers.get("Server", "") or "").lower()
+        except Exception:
+            server = ""
+        return bool(
+            status == 403
+            and (
+                "just a moment" in text
+                or "challenge-platform" in text
+                or "cf-browser-verification" in text
+                or "cloudflare" in server
+            )
+        )
+
+    def _merge_browser_cookies(self, cookies: list[dict]) -> int:
+        merged = 0
+        jar = getattr(self.session, "cookies", None)
+        if jar is None:
+            return 0
+        for c in cookies or []:
+            name = (c.get("name") or "").strip()
+            value = c.get("value")
+            if not name or value is None:
+                continue
+            domain = (c.get("domain") or "").strip() or None
+            path = (c.get("path") or "/").strip() or "/"
+            try:
+                jar.set(name, value, domain=domain, path=path)
+                merged += 1
+                continue
+            except Exception:
+                pass
+            try:
+                jar.set(name, value)
+                merged += 1
+                continue
+            except Exception:
+                pass
+            try:
+                jar.update({name: value})
+                merged += 1
+            except Exception:
+                pass
+        return merged
+
+    def _browser_warm_auth_oauth_init(self, auth_url: str) -> bool:
+        """用 Camoufox 通过 auth.openai.com 的 Cloudflare challenge，并把 cookies 合并回协议会话。"""
+        if self._env_flag("PHONE_PROTOCOL_DISABLE_BROWSER_AUTH_WARMUP", "0"):
+            logger.warning("[phone-protocol] 浏览器 auth warmup 已被禁用")
+            return False
+        try:
+            from camoufox.sync_api import Camoufox
+            from browserforge.fingerprints import Screen
+            from browser_register import _camoufox_headless, _parse_proxy
+        except Exception as e:
+            logger.warning("[phone-protocol] Camoufox auth warmup 不可用: %s", e)
+            return False
+
+        tmp_profile = tempfile.mkdtemp(prefix="auth_oauth_warm_")
+        try:
+            cf_proxy = _parse_proxy(self.config.proxy)
+            headless = _camoufox_headless()
+            logger.info("[phone-protocol] auth_oauth_init 遇到 Cloudflare，启动 Camoufox warmup headless=%s", headless)
+            with Camoufox(
+                headless=headless,
+                humanize=True,
+                persistent_context=True,
+                user_data_dir=tmp_profile,
+                os="windows",
+                screen=Screen(max_width=1920, max_height=1080),
+                proxy=cf_proxy,
+                geoip=True,
+                locale="zh-CN",
+            ) as ctx:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
+                for _ in range(60):
+                    cur = (getattr(page, "url", "") or "")
+                    title = ""
+                    try:
+                        title = page.title() or ""
+                    except Exception:
+                        pass
+                    if "just a moment" not in title.lower() and "challenge-platform" not in cur:
+                        break
+                    time.sleep(1)
+                cookies = ctx.cookies()
+                merged = self._merge_browser_cookies(cookies)
+                logger.info(
+                    "[phone-protocol] Camoufox auth warmup 完成 url=%s cookies=%s merged=%s",
+                    (getattr(page, "url", "") or "")[:180],
+                    len(cookies or []),
+                    merged,
+                )
+                return merged > 0
+        except Exception as e:
+            logger.warning("[phone-protocol] Camoufox auth warmup 失败: %s", e)
+            return False
+        finally:
+            try:
+                shutil.rmtree(tmp_profile, ignore_errors=True)
+            except Exception:
+                pass
+
+    @staticmethod
     def _datadog_trace_headers() -> dict:
         """生成 Datadog APM 追踪头。
 
@@ -1668,9 +1794,17 @@ class AuthFlow:
 
         headers = {
             "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9",
             "Referer": referer,
             "Origin": origin,
             "User-Agent": USER_AGENT,
+            "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Priority": "u=1, i",
         }
 
         # auth.openai.com 侧请求补设备标识（若可得）
@@ -1717,9 +1851,24 @@ class AuthFlow:
         return False
 
     # ── Step 2: 获取 CSRF Token ──
+    def warm_auth_providers(self) -> None:
+        """按浏览器链路先请求 /api/auth/providers。"""
+        headers = self._common_headers("https://chatgpt.com/")
+        try:
+            resp = self.session.get(
+                "https://chatgpt.com/api/auth/providers",
+                headers=headers,
+                timeout=30,
+            )
+            self._trace_http("chatgpt_auth_providers", resp)
+            logger.info("chatgpt providers: %s", resp.status_code)
+        except Exception as e:
+            logger.warning("chatgpt providers 预请求失败，继续获取 csrf: %s", e)
+
     def get_csrf_token(self) -> str:
         logger.info("[1/10] 获取 CSRF Token...")
-        headers = self._common_headers("https://chatgpt.com/auth/login")
+        self.warm_auth_providers()
+        headers = self._common_headers("https://chatgpt.com/")
 
         # Cloudflare 可能在短时间内多次请求后返回 403，重试 3 次
         for attempt in range(3):
@@ -1766,7 +1915,7 @@ class AuthFlow:
         default_prompt: str = "login",
     ) -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
-        headers = self._common_headers("https://chatgpt.com/auth/login")
+        headers = self._common_headers("https://chatgpt.com/")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         signin_url = "https://chatgpt.com/api/auth/signin/openai"
         query = {}
@@ -1777,6 +1926,7 @@ class AuthFlow:
                 query["prompt"] = prompt
             elif default_prompt:
                 query["prompt"] = default_prompt
+            query["ext-passkey-client-capabilities"] = "11111"
             query["ext-oai-did"] = self.result.device_id
             query["auth_session_logging_id"] = str(uuid.uuid4())
             if screen_hint:
@@ -1811,11 +1961,18 @@ class AuthFlow:
         logger.info("[3/10] OAuth 初始化...")
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://chatgpt.com/auth/login",
+            "Referer": "https://chatgpt.com/",
             "User-Agent": self._common_headers()["User-Agent"],
         }
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
+        if self._is_cloudflare_challenge_response(resp):
+            warmed = self._browser_warm_auth_oauth_init(auth_url)
+            if warmed:
+                resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
+                self._trace_http("auth_oauth_init_after_browser_warmup", resp)
+            if self._is_cloudflare_challenge_response(resp):
+                raise RuntimeError("auth_oauth_init 被 Cloudflare challenge 拦截，浏览器 warmup 后仍未建立 auth session")
 
         # 从 cookie 获取 oai-did
         device_id = ""
@@ -1852,13 +2009,85 @@ class AuthFlow:
     # ── Step 5: 获取 Sentinel Token ──
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
-        from sentinel import get_sentinel_token
-        token = get_sentinel_token(self.session, device_id=device_id, flow="authorize_continue")
+        from sentinel import get_sentinel_tokens
+        token, so_token = get_sentinel_tokens(self.session, device_id=device_id, flow="authorize_continue")
         self._last_sentinel_token = token or ""
-        logger.info("Sentinel Token 获取成功")
+        self._last_sentinel_so_token = so_token or ""
+        logger.info("Sentinel Token 获取成功 so_len=%s", len(self._last_sentinel_so_token))
         return token
 
     # ── Step 6: 提交注册邮箱 ──
+    def _phone_protocol_password_verify_warmup(self, phone_e164: str) -> None:
+        """
+        对齐浏览器手机号注册链路：先触发两次 password/verify 的 401，再读取
+        client_auth_session_dump。HAR 里这一步会推进 auth session checksum。
+        """
+        if self._env_flag("PHONE_PROTOCOL_SKIP_PASSWORD_VERIFY_WARMUP", "0"):
+            logger.info("[phone-protocol] 已跳过 password_verify warmup")
+            return
+        device_id = (self.result.device_id or "").strip()
+        if not device_id:
+            logger.warning("[phone-protocol] password_verify warmup 缺少 device_id，跳过")
+            return
+
+        national = re.sub(r"\D+", "", phone_e164 or "")
+        raw_passwords = (
+            os.getenv("PHONE_PROTOCOL_PASSWORD_VERIFY_WARMUP_PASSWORDS", "")
+            or "zhangziqiangziqiang,{national}asd1asd"
+        )
+        passwords: list[str] = []
+        for item in raw_passwords.split(","):
+            pw = (item or "").strip().format(phone=phone_e164, national=national)
+            if pw and pw not in passwords:
+                passwords.append(pw)
+
+        for idx, password in enumerate(passwords, start=1):
+            try:
+                from sentinel import get_sentinel_tokens
+                token, _ = get_sentinel_tokens(
+                    self.session,
+                    device_id=device_id,
+                    flow="password_verify",
+                )
+            except Exception as e:
+                logger.warning("[phone-protocol] password_verify warmup sentinel 失败 idx=%s: %s", idx, e)
+                token = ""
+
+            headers = self._common_headers("https://auth.openai.com/log-in/password")
+            headers["Content-Type"] = "application/json"
+            if token:
+                headers["openai-sentinel-token"] = token
+            body = {"password": password}
+            try:
+                resp = self.session.post(
+                    "https://auth.openai.com/api/accounts/password/verify",
+                    headers=headers,
+                    json=body,
+                    timeout=30,
+                )
+                self._trace_http(
+                    f"phone_password_verify_warmup_{idx}",
+                    resp,
+                    extra_request={
+                        "method": "POST",
+                        "url": "https://auth.openai.com/api/accounts/password/verify",
+                        "body": json.dumps(body, separators=(",", ":")),
+                        "headers": headers,
+                    },
+                )
+                logger.info(
+                    "[phone-protocol] password_verify warmup idx=%s status=%s",
+                    idx,
+                    getattr(resp, "status_code", "N/A"),
+                )
+            except Exception as e:
+                logger.warning("[phone-protocol] password_verify warmup 请求异常 idx=%s: %s", idx, e)
+
+            self.fetch_client_auth_session_dump(
+                f"phone_password_verify_warmup_{idx}",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
     def authorize_continue(
         self,
         email: str,
@@ -1869,21 +2098,57 @@ class AuthFlow:
         username_kind: str = "email",
     ) -> dict:
         """调用 /api/accounts/authorize/continue，返回 JSON。"""
+        fresh_sentinel_token = sentinel_token
+        fresh_so_token = self._last_sentinel_so_token
+        try:
+            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        except Exception:
+            device_id = (self.result.device_id or "").strip()
+        if device_id:
+            try:
+                from sentinel import get_sentinel_tokens
+                fresh_sentinel_token, fresh_so_token = get_sentinel_tokens(
+                    self.session,
+                    device_id=device_id,
+                    flow="authorize_continue",
+                )
+                self._last_sentinel_token = fresh_sentinel_token or ""
+                self._last_sentinel_so_token = fresh_so_token or ""
+                logger.info(
+                    "authorize/continue 前已重新获取 Sentinel Token token_len=%s so_len=%s",
+                    len(self._last_sentinel_token),
+                    len(self._last_sentinel_so_token),
+                )
+            except Exception as e:
+                logger.warning("authorize/continue 前重新获取 sentinel 失败，回退使用已有 token: %s", e)
+
         headers = self._common_headers(referer)
         headers["Content-Type"] = "application/json"
-        if sentinel_token:
-            headers["openai-sentinel-token"] = sentinel_token
+        if fresh_sentinel_token:
+            headers["openai-sentinel-token"] = fresh_sentinel_token
+        if fresh_so_token:
+            headers["openai-sentinel-so-token"] = fresh_so_token
         payload = {
             "username": {"value": email, "kind": username_kind or "email"},
             "screen_hint": screen_hint,
         }
+        trace_body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
             headers=headers,
             json=payload,
             timeout=30,
         )
-        self._trace_http(trace_step or f"authorize_continue_{screen_hint}", resp)
+        self._trace_http(
+            trace_step or f"authorize_continue_{screen_hint}",
+            resp,
+            extra_request={
+                "method": "POST",
+                "url": "https://auth.openai.com/api/accounts/authorize/continue",
+                "body": trace_body,
+                "headers": headers,
+            },
+        )
         if resp.status_code != 200:
             body = (resp.text or "")[:360]
             raise RuntimeError(
@@ -1957,8 +2222,8 @@ class AuthFlow:
         data = self.authorize_continue(
             email=phone_e164,
             sentinel_token=sentinel_token,
-            screen_hint="signup",
-            referer="https://auth.openai.com/create-account",
+            screen_hint="login_or_signup",
+            referer="https://auth.openai.com/log-in-or-create-account?usernameKind=phone_number",
             trace_step="authorize_continue_phone_signup",
             username_kind=identity_kind,
         )
@@ -2690,10 +2955,12 @@ class AuthFlow:
                 csrf_token = self.get_csrf_token()
                 auth_url = self.get_auth_url(
                     csrf_token,
-                    screen_hint="signup",
-                    default_prompt="",
+                    login_hint=phone_e164,
+                    screen_hint="login_or_signup",
+                    prompt="login",
                 )
                 device_id = self.auth_oauth_init(auth_url)
+                self._phone_protocol_password_verify_warmup(phone_e164)
                 sentinel = self.get_sentinel_token(device_id)
                 self._prepare_phone_protocol_create_password_state(phone_e164, sentinel)
                 password_ok = False

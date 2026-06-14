@@ -41,8 +41,13 @@ logger = logging.getLogger(__name__)
 
 
 SENTINEL_VERSION = "20260219f9f6"
-SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_VERSION}/sdk.js"
+SENTINEL_SDK_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
+DEFAULT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
+DEFAULT_SEC_CH_UA = '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
 
 
 def _resolve_node_binary() -> str:
@@ -67,6 +72,10 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
             "accept": "*/*",
             "accept-language": "zh-CN,zh;q=0.9",
             "referer": "https://auth.openai.com/",
+            "user-agent": DEFAULT_UA,
+            "sec-ch-ua": DEFAULT_SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
             "sec-fetch-dest": "script",
             "sec-fetch-mode": "no-cors",
             "sec-fetch-site": "same-site",
@@ -177,6 +186,10 @@ def _fetch_sentinel_challenge(
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "zh-CN,zh;q=0.9",
+            "user-agent": DEFAULT_UA,
+            "sec-ch-ua": DEFAULT_SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -191,15 +204,15 @@ def _fetch_sentinel_challenge(
     return payload
 
 
-def get_sentinel_token_via_quickjs(
+def get_sentinel_tokens_via_quickjs(
     session: Any,
     device_id: str,
     *,
     flow: str = "authorize_continue",
     timeout_ms: int = 45000,
     log: Optional[Callable[[str], None]] = None,
-) -> Optional[str]:
-    """Try the QuickJS path. Return JSON string on success, None on any failure.
+) -> Optional[tuple[str, str]]:
+    """Try the QuickJS path. Return (sentinel_token, so_token) on success, None on any failure.
 
     Caller is expected to fall back to pure-Python sentinel on None.
     """
@@ -241,6 +254,7 @@ def get_sentinel_token_via_quickjs(
                 "device_id": did,
                 "request_p": request_p,
                 "challenge": challenge,
+                "flow": flow,
             },
             timeout_ms=timeout_ms,
         )
@@ -260,8 +274,54 @@ def get_sentinel_token_via_quickjs(
             separators=(",", ":"),
             ensure_ascii=False,
         )
-        log(f"Sentinel QuickJS 成功 (p_len={len(final_p)} t_len={len(t_value)} c_len={len(c_value)})")
-        return token
+        so_token = ""
+        so_token_raw = solved.get("so_token")
+        if so_token_raw:
+            try:
+                so_obj = json.loads(str(so_token_raw))
+                so_value = so_obj.get("so") if isinstance(so_obj, dict) else ""
+                if isinstance(so_obj, dict):
+                    so_obj["c"] = c_value
+                    so_obj["id"] = did
+                    so_obj["flow"] = flow
+                    so_token = json.dumps(so_obj, separators=(",", ":"), ensure_ascii=False)
+                else:
+                    so_value = ""
+            except Exception:
+                so_value = ""
+        else:
+            so_value = solved.get("so")
+        if (not so_token) and so_value:
+            so_token = json.dumps(
+                {"so": so_value, "c": c_value, "id": did, "flow": flow},
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        log(
+            "Sentinel QuickJS 成功 "
+            f"(p_len={len(final_p)} t_len={len(t_value)} c_len={len(c_value)} so_len={len(str(so_value or ''))})"
+        )
+        return token, so_token
     except Exception as e:
         log(f"Sentinel QuickJS 异常: {e}")
         return None
+
+
+def get_sentinel_token_via_quickjs(
+    session: Any,
+    device_id: str,
+    *,
+    flow: str = "authorize_continue",
+    timeout_ms: int = 45000,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    tokens = get_sentinel_tokens_via_quickjs(
+        session,
+        device_id=device_id,
+        flow=flow,
+        timeout_ms=timeout_ms,
+        log=log,
+    )
+    if not tokens:
+        return None
+    return tokens[0]

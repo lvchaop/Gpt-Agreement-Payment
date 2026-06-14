@@ -526,8 +526,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         if gopay:
             env["WEBUI_GOPAY_OTP_URL"] = wa_relay.otp_url()
-        # Portal 抓包模式：默认只保留浏览器手机号 trace；协议 auth trace 需要显式开启。
-        # 只落盘，不把每个 HTTP 片段刷到 WebUI 日志里。
+        # 默认关闭协议 HTTP 明文 trace，避免注册稳定后持续落盘抓包文件。
         env["AUTH_TRACE_DUMP"] = "0"
         env["AUTH_HTTP_TRACE"] = "0"
         env["AUTH_TRACE_INCLUDE_COOKIE"] = "0"

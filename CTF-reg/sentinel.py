@@ -33,16 +33,17 @@ logger = logging.getLogger(__name__)
 
 
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
-SENTINEL_REFERER = "https://sentinel.openai.com/backend-api/sentinel/frame.html"
-SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js"
+SENTINEL_VERSION = "20260219f9f6"
+SENTINEL_REFERER = f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}"
+SENTINEL_SDK_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
 
 DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
+    "Chrome/148.0.0.0 Safari/537.36"
 )
 DEFAULT_SEC_CH_UA = (
-    '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
+    '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
 )
 
 
@@ -167,7 +168,7 @@ def fetch_sentinel_challenge(
         "User-Agent": user_agent or DEFAULT_UA,
         "sec-ch-ua": sec_ch_ua or DEFAULT_SEC_CH_UA,
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform": '"macOS"',
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
@@ -234,6 +235,49 @@ def build_sentinel_token(
     return json.dumps(payload, separators=(",", ":"))
 
 
+def build_sentinel_tokens(
+    session,
+    device_id: str,
+    flow: str = "authorize_continue",
+    user_agent: str | None = None,
+    sec_ch_ua: str | None = None,
+    impersonate: str | None = None,
+) -> tuple[str, str] | None:
+    """完整 Sentinel token + 可选 so-token。"""
+    challenge = fetch_sentinel_challenge(
+        session,
+        device_id,
+        flow=flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+    )
+    if not challenge:
+        return None
+
+    c_value = str(challenge.get("token") or "").strip()
+    if not c_value:
+        logger.warning("Sentinel 响应缺 token 字段")
+        return None
+
+    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    pow_data = challenge.get("proofofwork") or {}
+    if pow_data.get("required") and pow_data.get("seed"):
+        p_value = generator.generate_token(
+            seed=pow_data.get("seed"),
+            difficulty=pow_data.get("difficulty", "0"),
+        )
+    else:
+        p_value = generator.generate_requirements_token()
+
+    token = json.dumps(
+        {"p": p_value, "t": "", "c": c_value, "id": device_id, "flow": flow},
+        separators=(",", ":"),
+    )
+    so_token = ""
+    return token, so_token
+
+
 def get_sentinel_token(
     session,
     device_id: str,
@@ -290,3 +334,59 @@ def get_sentinel_token(
         "id": device_id,
         "flow": flow,
     }, separators=(",", ":"))
+
+
+def get_sentinel_tokens(
+    session,
+    device_id: str,
+    flow: str = "authorize_continue",
+    user_agent: str = DEFAULT_UA,
+) -> tuple[str, str]:
+    """返回 (openai-sentinel-token, openai-sentinel-so-token)。so-token 可能为空。"""
+    if not os.environ.get("OPENAI_SENTINEL_DISABLE_QUICKJS"):
+        try:
+            from sentinel_quickjs import get_sentinel_tokens_via_quickjs
+            qtokens = get_sentinel_tokens_via_quickjs(
+                session,
+                device_id=device_id,
+                flow=flow,
+                log=lambda m: logger.info(m),
+            )
+            if qtokens:
+                token, so_token = qtokens
+                logger.info(
+                    "Sentinel Token 组装完成 (QuickJS token长度=%s so长度=%s)",
+                    len(token or ""),
+                    len(so_token or ""),
+                )
+                return token or "", so_token or ""
+            logger.warning("Sentinel QuickJS 失败，回退到纯 Python")
+        except Exception as e:
+            logger.warning(f"Sentinel QuickJS 加载/调用异常，回退到纯 Python: {e}")
+
+    tokens = build_sentinel_tokens(
+        session,
+        device_id=device_id,
+        flow=flow,
+        user_agent=user_agent,
+    )
+    if tokens:
+        token, so_token = tokens
+        logger.info(
+            "Sentinel Token 组装完成 (纯 Python token长度=%s so长度=%s)",
+            len(token or ""),
+            len(so_token or ""),
+        )
+        return token or "", so_token or ""
+
+    logger.warning("Sentinel /req 也失败，回退到无 challenge 模式")
+    fallback_p = SentinelTokenGenerator(
+        device_id=device_id, user_agent=user_agent
+    ).generate_requirements_token()
+    return json.dumps({
+        "p": fallback_p,
+        "t": "",
+        "c": "",
+        "id": device_id,
+        "flow": flow,
+    }, separators=(",", ":")), ""

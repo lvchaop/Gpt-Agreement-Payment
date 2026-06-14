@@ -175,6 +175,8 @@ def _rt_state(has_rt: bool, oauth: dict) -> str:
         return "dead"
     if status == "transient_failed":
         return "cooldown" if _oauth_cooldown_remaining_s(oauth) > 0 else "retryable"
+    if status == "pending":
+        return "pending"
     return "missing"
 
 
