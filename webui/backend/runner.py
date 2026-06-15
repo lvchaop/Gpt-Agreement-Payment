@@ -342,6 +342,8 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
               target_emails: Optional[list] = None, rt_only: bool = False,
               rt_force: bool = False,
               session_only: bool = False,
+              session_otp_prepare: bool = False,
+              session_otp_submit: bool = False,
               register_mode: str = "browser", cardw_config_path: str = "") -> list[str]:
     """根据参数拼出最终命令行。"""
     python_cmd = ["python", "-u", "pipeline.py", "--config", str(s.PAY_CONFIG_PATH)]
@@ -392,7 +394,7 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.extend(["--gopay-otp-file", gopay_otp_file])
     elif paypal:
         cmd.append("--paypal")
-    uses_registration = not (pay_only or rt_only or session_only)
+    uses_registration = not (pay_only or rt_only or session_only or session_otp_prepare or session_otp_submit)
     if uses_registration and rm in ("protocol", "phone_browser", "phone_protocol"):
         cmd.extend(["--register-method", rm])
     # mode 决定循环结构（daemon ∞ / self_dealer / batch N / 单次）
@@ -415,6 +417,10 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
             cmd.append("--rt-force")
     if session_only:
         cmd.append("--session-only")
+    if session_otp_prepare:
+        cmd.append("--session-otp-prepare")
+    if session_otp_submit:
+        cmd.append("--session-otp-submit")
     if target_emails:
         joined = ",".join(e.strip() for e in target_emails if e and e.strip())
         if joined:
@@ -460,6 +466,8 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
           target_emails: Optional[list] = None, rt_only: bool = False,
           rt_force: bool = False,
           session_only: bool = False,
+          session_otp_prepare: bool = False,
+          session_otp_submit: bool = False,
           phone: Optional[dict] = None) -> dict:
     global _proc, _started_at, _ended_at, _exit_code, _cmd, _mode
     global _log_lines, _seq_counter, _otp_file, _otp_to_db, _otp_pending, _otp_file_is_temp
@@ -475,7 +483,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
         rm = (register_mode or "browser").strip().lower()
         cardw_config_path = ""
         runtime_env_overrides = dict(env_overrides or {})
-        uses_registration = not (pay_only or rt_only or session_only)
+        uses_registration = not (pay_only or rt_only or session_only or session_otp_prepare or session_otp_submit)
         if uses_registration and rm in ("phone", "phone_browser", "phone_protocol"):
             cardw_config_path, phone_env = _runtime_phone_config(
                 phone,
@@ -489,6 +497,8 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
                         target_emails=target_emails, rt_only=rt_only,
                         rt_force=rt_force,
                         session_only=session_only,
+                        session_otp_prepare=session_otp_prepare,
+                        session_otp_submit=session_otp_submit,
                         register_mode=register_mode,
                         cardw_config_path=cardw_config_path)
 

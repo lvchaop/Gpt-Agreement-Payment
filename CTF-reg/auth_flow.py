@@ -106,6 +106,7 @@ class AuthFlow:
         self._dump_login_verifier: str = ""
         self._codex_rt_attempted: bool = False
         self._last_register_password_error: str = ""
+        self._last_sentinel_token: str = ""
         self._last_sentinel_so_token: str = ""
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
@@ -115,6 +116,146 @@ class AuthFlow:
         self._init_trace_dump()
         if self.config.proxy or getattr(self.config, "proxy_meta", None):
             logger.info("[proxy-trace] register %s", self._register_proxy_trace())
+
+    def _export_cookie_jar(self) -> list[dict[str, Any]]:
+        """Serialize current HTTP cookie jar with enough metadata to restore it later."""
+        out: list[dict[str, Any]] = []
+        jar = getattr(self.session, "cookies", None)
+        if jar is None:
+            return out
+        try:
+            iterable = list(jar)
+        except Exception:
+            iterable = []
+        for cookie in iterable:
+            name = str(getattr(cookie, "name", "") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "value": str(getattr(cookie, "value", "") or ""),
+                "domain": str(getattr(cookie, "domain", "") or ""),
+                "path": str(getattr(cookie, "path", "") or "/") or "/",
+                "expires": getattr(cookie, "expires", None),
+                "secure": bool(getattr(cookie, "secure", False)),
+                "discard": bool(getattr(cookie, "discard", False)),
+            })
+        if out:
+            return out
+        try:
+            items = jar.get_dict().items()
+        except Exception:
+            try:
+                items = dict(jar).items()
+            except Exception:
+                items = []
+        for name, value in items:
+            if name:
+                out.append({"name": str(name), "value": str(value), "domain": "", "path": "/"})
+        return out
+
+    def _restore_cookie_jar(self, cookies: list[dict[str, Any]]) -> None:
+        """Restore cookies saved by _export_cookie_jar into the current HTTP session."""
+        jar = getattr(self.session, "cookies", None)
+        if jar is None:
+            return
+        try:
+            jar.clear()
+        except Exception:
+            pass
+        for item in cookies or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            value = str(item.get("value") or "")
+            domain = str(item.get("domain") or "").strip()
+            path = str(item.get("path") or "/").strip() or "/"
+            try:
+                if domain:
+                    jar.set(name, value, domain=domain, path=path)
+                else:
+                    jar.set(name, value, path=path)
+            except Exception:
+                try:
+                    jar.set(name, value)
+                except Exception:
+                    pass
+
+    def export_protocol_snapshot(self, **extra: Any) -> dict[str, Any]:
+        """Export resumable auth-flow state for OTP split-phase workflows."""
+        return {
+            "schema": "auth_flow_protocol_snapshot.v1",
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "email": self.result.email,
+            "password": self.result.password,
+            "device_id": self.result.device_id,
+            "csrf_token": self.result.csrf_token,
+            "result": self.result.to_dict(),
+            "cookies": self._export_cookie_jar(),
+            "impersonate_idx": self._impersonate_idx,
+            "oauth": {
+                "client_secret": self._oauth_client_secret,
+                "client_id": self._oauth_client_id,
+                "redirect_uri": self._oauth_redirect_uri,
+                "scope": self._oauth_scope,
+                "state": self._oauth_state,
+                "auth_url": self._oauth_auth_url,
+                "manual_login_verifier": self._manual_login_verifier,
+                "captured_login_verifier": self._captured_login_verifier,
+                "dump_login_verifier": self._dump_login_verifier,
+                "client_auth_session_id": self._client_auth_session_id,
+            },
+            "sentinel": {
+                "last_token": self._last_sentinel_token,
+                "last_so_token": self._last_sentinel_so_token,
+            },
+            **extra,
+        }
+
+    def restore_protocol_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Restore auth-flow state exported by export_protocol_snapshot."""
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("协议快照格式错误")
+        try:
+            idx = int(snapshot.get("impersonate_idx") or 0)
+        except Exception:
+            idx = 0
+        self._impersonate_idx = max(0, min(idx, len(self._impersonate_candidates) - 1))
+        expected_proxy = str(snapshot.get("proxy") or "").strip()
+        if expected_proxy and expected_proxy != str(getattr(self.config, "proxy", "") or "").strip():
+            self.config.proxy = expected_proxy
+        self.session = create_http_session(
+            proxy=self.config.proxy,
+            impersonate=self._impersonate_candidates[self._impersonate_idx],
+        )
+        self._restore_cookie_jar(snapshot.get("cookies") or [])
+
+        result_obj = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+        for key, value in result_obj.items():
+            if hasattr(self.result, key):
+                setattr(self.result, key, str(value or ""))
+        self.result.email = str(snapshot.get("email") or self.result.email or "")
+        self.result.password = str(snapshot.get("password") or self.result.password or "")
+        self.result.device_id = str(snapshot.get("device_id") or self.result.device_id or "")
+        self.result.csrf_token = str(snapshot.get("csrf_token") or self.result.csrf_token or "")
+
+        oauth = snapshot.get("oauth") if isinstance(snapshot.get("oauth"), dict) else {}
+        self._oauth_client_secret = str(oauth.get("client_secret") or self._oauth_client_secret or "")
+        self._oauth_client_id = str(oauth.get("client_id") or self._oauth_client_id or "")
+        self._oauth_redirect_uri = str(oauth.get("redirect_uri") or self._oauth_redirect_uri or "")
+        self._oauth_scope = str(oauth.get("scope") or self._oauth_scope or "")
+        self._oauth_state = str(oauth.get("state") or self._oauth_state or "")
+        self._oauth_auth_url = str(oauth.get("auth_url") or self._oauth_auth_url or "")
+        self._manual_login_verifier = str(oauth.get("manual_login_verifier") or self._manual_login_verifier or "")
+        self._captured_login_verifier = str(oauth.get("captured_login_verifier") or self._captured_login_verifier or "")
+        self._dump_login_verifier = str(oauth.get("dump_login_verifier") or self._dump_login_verifier or "")
+        self._client_auth_session_id = str(oauth.get("client_auth_session_id") or self._client_auth_session_id or "")
+
+        sentinel = snapshot.get("sentinel") if isinstance(snapshot.get("sentinel"), dict) else {}
+        self._last_sentinel_token = str(sentinel.get("last_token") or self._last_sentinel_token or "")
+        self._last_sentinel_so_token = str(sentinel.get("last_so_token") or self._last_sentinel_so_token or "")
 
     def _init_trace_dump(self) -> None:
         if not self._trace_dump_enabled:
@@ -3352,6 +3493,141 @@ class AuthFlow:
 
         logger.info("注册流程完成!")
         return self.result
+
+    def run_protocol_login_prepare_otp(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+        *,
+        existing_only: bool = True,
+    ) -> dict[str, Any]:
+        """
+        纯协议登录拆分阶段 1：跑到 OTP 已获取但尚未提交。
+
+        返回可落盘快照；不会调用 email-otp/validate，不会拿 ChatGPT session。
+        """
+        if not (email or "").strip():
+            raise RuntimeError("run_protocol_login_prepare_otp 缺少邮箱")
+
+        if not self.check_proxy():
+            logger.warning("网络预检查未通过，继续尝试登录链路以获取精确错误...")
+
+        email = email.strip()
+        self.result.email = email
+        login_password = (password or "").strip() or self._default_password_from_email(email)
+        self.result.password = login_password
+
+        csrf_token = self.get_csrf_token()
+        auth_url = self.get_auth_url(csrf_token)
+        device_id = self.auth_oauth_init(auth_url)
+        sentinel = self.get_sentinel_token(device_id)
+
+        try:
+            otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
+        except Exception:
+            otp_timeout = 180
+
+        page_type = ""
+        mode = ""
+        continue_url = ""
+        logger.info("已有账号协议登录预组装：探测 password/otp 分支")
+        login_step = self.authorize_continue(
+            email=email,
+            sentinel_token=sentinel,
+            screen_hint="login",
+            referer="https://auth.openai.com/log-in",
+            trace_step="authorize_continue_login_prepare_otp",
+        )
+        page_type = (self._extract_page_type(login_step) or "").lower()
+        continue_url = self._normalize_continue_url(
+            self._extract_continue_url_from_step(login_step)
+        )
+        page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
+        payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+        mode = (payload.get("email_verification_mode", "") or "").lower()
+        self._existing_page_type = page_type
+        self._existing_email_verification_mode = mode
+
+        if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
+            logger.info("预组装分支: login_password -> password/verify")
+            login_resp = self.login_password_verify(login_password)
+            page_type = (self._extract_page_type(login_resp) or "").lower()
+            continue_url = self._normalize_continue_url(
+                self._extract_continue_url_from_step(login_resp)
+            )
+            page = (login_resp.get("page") or {}) if isinstance(login_resp, dict) else {}
+            payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+            mode = (payload.get("email_verification_mode", "") or mode or "").lower()
+            self._existing_page_type = page_type
+            self._existing_email_verification_mode = mode
+        elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
+            logger.info("预组装分支: email_otp_verification")
+        elif existing_only:
+            raise RuntimeError(
+                "prepare_otp 未进入 password/otp 分支: "
+                f"page_type={page_type or '(empty)'} continue_url={(continue_url or '')[:180]}"
+            )
+
+        if continue_url and "/email-verification" not in continue_url:
+            raise RuntimeError(
+                "prepare_otp 当前账号密码后不需要邮箱验证码，无法停在提交验证码前: "
+                f"page_type={page_type or '(empty)'} continue_url={continue_url[:180]}"
+            )
+
+        otp_sent_at = time.time()
+        resend_ok = self.kickoff_otp_delivery("protocol_prepare_otp")
+        if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
+            self.send_otp()
+            otp_sent_at = time.time()
+
+        otp_code = mail_provider.wait_for_otp(
+            email,
+            timeout=otp_timeout,
+            issued_after=otp_sent_at,
+        )
+        otp_received_at = time.time()
+
+        snapshot = self.export_protocol_snapshot(
+            phase="otp_collected",
+            auth_url=auth_url,
+            continue_url=continue_url,
+            page_type=page_type,
+            email_verification_mode=mode,
+            otp_code=str(otp_code or "").strip(),
+            otp_sent_at=otp_sent_at,
+            otp_received_at=otp_received_at,
+            proxy=str(getattr(self.config, "proxy", "") or ""),
+            proxy_meta=getattr(self.config, "proxy_meta", {}) or {},
+        )
+        if not snapshot.get("otp_code"):
+            raise RuntimeError("prepare_otp 未获取到验证码")
+        return snapshot
+
+    def run_protocol_login_submit_prepared_otp(self, snapshot: dict[str, Any], before_validate=None) -> dict[str, Any]:
+        """
+        纯协议登录拆分阶段 2：从快照恢复，只提交已保存 OTP 并保存提交后的状态。
+
+        不跟随 callback，不调用 chatgpt.com/api/auth/session。
+        """
+        self.restore_protocol_snapshot(snapshot)
+        otp_code = str(snapshot.get("otp_code") or "").strip()
+        if not otp_code:
+            raise RuntimeError("submit_prepared_otp 快照缺 otp_code")
+        if before_validate is not None:
+            before_validate(str(snapshot.get("email") or self.result.email or ""))
+        otp_resp = self.verify_otp(otp_code)
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+        page_type = self._extract_page_type(otp_resp)
+        return self.export_protocol_snapshot(
+            phase="otp_validated",
+            continue_url=continue_url,
+            page_type=page_type,
+            otp_validated_at=time.time(),
+            otp_validate_response=otp_resp if isinstance(otp_resp, dict) else {},
+            proxy=str(getattr(self.config, "proxy", "") or ""),
+            proxy_meta=getattr(self.config, "proxy_meta", {}) or {},
+        )
 
     # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
     def run_protocol_login(

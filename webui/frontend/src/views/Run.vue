@@ -340,6 +340,7 @@
             <option value="">所有 plan</option>
             <option value="plus">plus</option>
             <option value="team">team</option>
+            <option value="self_serve_business_usage_based">self_serve_business_usage_based</option>
             <option value="free">free</option>
           </select>
           <select v-model="invFilters.check" class="inv-filter-sel">
@@ -394,14 +395,18 @@
           </div>
           <div class="inventory-toolbar-actions">
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="verifySelected">验证选中</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="syncPlanSelected">更新 Plan</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unknownOrUncheckedIds.length === 0" @click="verifyAllUnknown">验证全部未检 ({{ unknownOrUncheckedIds.length }})</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="pushSelectedToCpa">推送选中→CPA</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unpushedIds.length === 0" @click="pushAllUnpushed">推送全部未推送 ({{ unpushedIds.length }})</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="downloadSelectedAuth('cpa')">下载 CPA JSON</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="downloadSelectedAuth('sub2api')">下载 Sub2API JSON</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="downloadSelectedFileCsv">下载文件 CSV</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="payOnlySelected">选中跑 pay-only</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="rtOnlySelected">选中补 RT</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="sessionOnlySelected">选中补 SESSION</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="sessionOtpPrepareSelected">选中预取验证码</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0 || status.running" @click="sessionOtpSubmitSelected">选中提交验证码</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="deleteSelected">删除选中</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="invalidIds.length === 0" @click="deleteAllInvalid">删除所有失效 ({{ invalidIds.length }})</TermBtn>
           </div>
@@ -1361,6 +1366,21 @@ function verifySelected() {
 function verifyAllUnknown() {
   runCheck(unknownOrUncheckedIds.value, "验证未检/未知");
 }
+async function syncPlanSelected() {
+  const ids = Array.from(selectedIds.value);
+  if (!ids.length) { message.warning("没有可更新的账号"); return; }
+  inventoryBusy.value = true;
+  try {
+    const r = await api.post("/inventory/accounts/sync-plan", { ids });
+    const s = r.data?.summary || {};
+    message.success(`更新 Plan 完成：ok=${s.ok || 0} refreshed=${s.refreshed || 0} unknown=${s.unknown || 0} error=${s.error || 0}`);
+    await refreshInventory();
+  } catch (e: any) {
+    message.error(`更新 Plan 失败：${e?.response?.data?.detail || e?.message || e}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
 
 function emailsForIds(ids: number[]): string[] {
   const map = new Map(inventory.value.accounts.map(a => [a.id, a.email]));
@@ -1399,6 +1419,10 @@ function _selectedEmails(): string[] {
 
 function downloadObject(filename: string, payload: any) {
   const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], { type: "application/json" });
+  downloadBlob(filename, blob);
+}
+
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -1412,12 +1436,17 @@ function downloadBase64(filename: string, base64: string, mime: string) {
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
   const blob = new Blob([bytes], { type: mime || "application/octet-stream" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadBlob(filename, blob);
+}
+
+function filenameFromDisposition(disposition: string | undefined, fallback: string): string {
+  const raw = disposition || "";
+  const utf8 = raw.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    try { return decodeURIComponent(utf8[1].replace(/"/g, "")); } catch {}
+  }
+  const plain = raw.match(/filename="?([^";]+)"?/i);
+  return plain?.[1] || fallback;
 }
 
 async function downloadSelectedAuth(format: "cpa" | "sub2api") {
@@ -1439,6 +1468,27 @@ async function downloadSelectedAuth(format: "cpa" | "sub2api") {
       warnings ? `${warnings} 个刷新失败已用本地旧 token` : "",
     ].filter(Boolean).join("，");
     message.success(`已下载 ${r.data.count} 个账号的 ${format === "cpa" ? "CPA" : "Sub2API"} JSON（${suffix}）`);
+  } catch (e: any) {
+    message.error(`下载失败：${e?.response?.data?.detail || e?.message || e}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
+
+async function downloadSelectedFileCsv() {
+  const ids = Array.from(selectedIds.value);
+  if (!ids.length) { message.warning("没有选中账号"); return; }
+  inventoryBusy.value = true;
+  try {
+    const r = await api.post<Blob>("/inventory/accounts/export-file-csv", { ids }, { responseType: "blob" });
+    const filename = filenameFromDisposition(
+      String(r.headers?.["content-disposition"] || ""),
+      `file-sub2api-cpa-${Date.now()}.csv`,
+    );
+    downloadBlob(filename, r.data);
+    const count = Number(r.headers?.["x-export-count"] || 0);
+    const skipped = Number(r.headers?.["x-export-skipped"] || 0);
+    message.success(`已下载 ${count || ids.length - skipped} 行文件 CSV${skipped ? `，跳过 ${skipped} 个` : ""}`);
   } catch (e: any) {
     message.error(`下载失败：${e?.response?.data?.detail || e?.message || e}`);
   } finally {
@@ -1549,6 +1599,76 @@ async function sessionOnlySelected() {
   }
 }
 
+async function sessionOtpPrepareSelected() {
+  const selectedEmails = _selectedEmails();
+  if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
+  const requestedBatch = form.value.mode === "batch"
+    ? Math.max(1, Number(form.value.batch || 0))
+    : selectedEmails.length;
+  const emails = selectedEmails.slice(0, Math.min(selectedEmails.length, requestedBatch));
+  const workers = Math.max(1, Number(form.value.workers || 1));
+  const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
+  const batchNote = selectedEmails.length > emails.length ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）` : "";
+  if (!confirm(`对 ${emails.length} 个选中账号预取验证码（发码、取码、保存 auth 快照，不提交验证码）？${batchNote}\n${preview}\n\nworkers=${workers}`)) return;
+  starting.value = true;
+  try {
+    await api.post("/run/start", {
+      mode: emails.length > 1 ? "batch" : "single",
+      paypal: false,
+      gopay: false,
+      pay_only: false,
+      register_only: false,
+      session_otp_prepare: true,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers,
+      register_mode: "browser",
+      target_emails: emails,
+    });
+    message.success(`已对 ${emails.length} 个账号启动预取验证码`);
+    await refreshStatus();
+    if (status.value.running) openStream();
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || "启动失败");
+  } finally {
+    starting.value = false;
+  }
+}
+
+async function sessionOtpSubmitSelected() {
+  const selectedEmails = _selectedEmails();
+  if (!selectedEmails.length) { message.warning("没有选中账号"); return; }
+  const requestedBatch = form.value.mode === "batch"
+    ? Math.max(1, Number(form.value.batch || 0))
+    : selectedEmails.length;
+  const emails = selectedEmails.slice(0, Math.min(selectedEmails.length, requestedBatch));
+  const workers = Math.max(1, Number(form.value.workers || 1));
+  const preview = emails.slice(0, 3).join(", ") + (emails.length > 3 ? `... 共 ${emails.length}` : "");
+  const batchNote = selectedEmails.length > emails.length ? `\n已按 batch N=${emails.length} 截取（选中共 ${selectedEmails.length} 个）` : "";
+  if (!confirm(`对 ${emails.length} 个选中账号提交已预取验证码（只提交 OTP，不拿 session）？${batchNote}\n${preview}\n\nworkers=${workers}`)) return;
+  starting.value = true;
+  try {
+    await api.post("/run/start", {
+      mode: emails.length > 1 ? "batch" : "single",
+      paypal: false,
+      gopay: false,
+      pay_only: false,
+      register_only: false,
+      session_otp_submit: true,
+      batch: emails.length > 1 ? emails.length : 0,
+      workers,
+      register_mode: "browser",
+      target_emails: emails,
+    });
+    message.success(`已对 ${emails.length} 个账号启动提交验证码`);
+    await refreshStatus();
+    if (status.value.running) openStream();
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || "启动失败");
+  } finally {
+    starting.value = false;
+  }
+}
+
 function deleteSelected() {
   confirmAndDelete(Array.from(selectedIds.value), "删除选中");
 }
@@ -1560,11 +1680,13 @@ function deleteAllInvalid() {
 function planLabel(p: string) {
   if (p === "team") return "team";
   if (p === "plus") return "plus";
-  return "free";
+  if (p === "free" || !p) return "free";
+  return p;
 }
 function planBadgeClass(p: string) {
   if (p === "team") return "badge-team";
   if (p === "plus") return "badge-plus";
+  if (p && p !== "free") return "badge-ok";
   return "badge-ghost";
 }
 function cpaLabel(acc: InventoryAccount) {

@@ -129,7 +129,12 @@ def _missing_paths(obj: dict, paths: list[str]) -> list[str]:
 
 def _requires_registration(req: dict) -> bool:
     mode = _text(req.get("mode")) or "single"
-    if bool(req.get("rt_only")) or bool(req.get("session_only")):
+    if (
+        bool(req.get("rt_only"))
+        or bool(req.get("session_only"))
+        or bool(req.get("session_otp_prepare"))
+        or bool(req.get("session_otp_submit"))
+    ):
         return False
     if mode == "free_register":
         return True
@@ -140,7 +145,9 @@ def _requires_registration(req: dict) -> bool:
 
 def _requires_email_otp(req: dict) -> bool:
     mode = _text(req.get("mode")) or "single"
-    if bool(req.get("rt_only")) or bool(req.get("session_only")):
+    if bool(req.get("session_otp_submit")):
+        return False
+    if bool(req.get("rt_only")) or bool(req.get("session_only")) or bool(req.get("session_otp_prepare")):
         return True
     # free_backfill_rt does not create a new mailbox, but OAuth login still
     # needs the OpenAI email OTP provider for existing accounts.
@@ -154,6 +161,8 @@ def _payment_kind(req: dict) -> str:
         or bool(req.get("register_only"))
         or bool(req.get("rt_only"))
         or bool(req.get("session_only"))
+        or bool(req.get("session_otp_prepare"))
+        or bool(req.get("session_otp_submit"))
     ):
         return "none"
     if bool(req.get("gopay")):

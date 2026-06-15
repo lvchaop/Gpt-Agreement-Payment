@@ -23,6 +23,7 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -2408,7 +2409,14 @@ def _mark_rt_only_cpa_imported(email: str, account_id: int, cpa_cfg: dict) -> bo
     if not row_id:
         print(f"[rt-only] CPA 推送成功但找不到账号 id，无法更新状态: {email}")
         return False
-    plan_tag = str((cpa_cfg or {}).get("plan_tag") or "plus").strip().lower() or "plus"
+    plan_tag = str((cpa_cfg or {}).get("plan_tag") or "").strip().lower()
+    if not plan_tag:
+        try:
+            row = get_db().get_registered_account(row_id) or {}
+            plan_tag = str(row.get("last_plan_type") or "").strip().lower()
+        except Exception:
+            plan_tag = ""
+    plan_tag = plan_tag or "plus"
     ok = get_db().update_account_check(
         row_id,
         "valid",
@@ -2419,6 +2427,75 @@ def _mark_rt_only_cpa_imported(email: str, account_id: int, cpa_cfg: dict) -> bo
         print(f"[rt-only] ✅ {email} 状态已更新: valid/{plan_tag} id={row_id}")
     else:
         print(f"[rt-only] CPA 推送成功但状态更新失败: {email} id={row_id}")
+    return ok
+
+
+def _decode_oauth_jwt_payload(token: str) -> dict:
+    parts = (token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _oauth_plan_type_from_token(token: str) -> str:
+    payload = _decode_oauth_jwt_payload(token)
+    auth = payload.get("https://api.openai.com/auth") or {}
+    if not isinstance(auth, dict):
+        return ""
+    return str(auth.get("chatgpt_plan_type") or "").strip().lower()[:80]
+
+
+def _sync_registered_account_oauth_tokens(
+    email: str,
+    *,
+    access_token: str = "",
+    id_token: str = "",
+    refresh_token: str = "",
+    message: str = "oauth token sync ok",
+) -> bool:
+    row_id = _latest_registered_account_id(email)
+    if not row_id:
+        print(f"[OAuthSync] 找不到账号行，跳过 token 回写: {email}")
+        return False
+
+    sets: list[str] = []
+    args: list[str] = []
+    if access_token:
+        sets.append("access_token = ?")
+        args.append(access_token)
+    if id_token:
+        sets.append("id_token = ?")
+        args.append(id_token)
+    if refresh_token:
+        sets.append("refresh_token = ?")
+        args.append(refresh_token)
+    if sets:
+        args.append(str(row_id))
+        try:
+            with get_db()._conn() as c:
+                c.execute(
+                    f"UPDATE registered_accounts SET {', '.join(sets)} WHERE id = ?",
+                    args,
+                )
+        except Exception as e:
+            print(f"[OAuthSync] token 回写失败: {email} id={row_id} err={e}")
+            return False
+
+    plan_type = _oauth_plan_type_from_token(access_token) or _oauth_plan_type_from_token(id_token)
+    ok = get_db().update_account_check(
+        row_id,
+        "valid",
+        message,
+        plan_type=plan_type,
+    )
+    if ok:
+        plan_msg = f" plan={plan_type}" if plan_type else ""
+        print(f"[OAuthSync] ✅ {email} token 已回写 id={row_id}{plan_msg}")
     return ok
 
 
@@ -2998,6 +3075,394 @@ def session_only_targets(cardw_config_path: str | None, target_emails: list[str]
         results.append(r)
         _count_result(r)
     print(f"\n[session-only] 完成: ok={ok} fail={fail} 共 {len(results)}")
+    return {"results": results, "ok": ok, "fail": fail}
+
+
+SESSION_OTP_SNAPSHOT_DIR = OUTPUT_DIR / "session_otp_snapshots"
+
+
+def _session_otp_slug(email: str) -> str:
+    text = _norm_email(email) or "unknown"
+    return re.sub(r"[^A-Za-z0-9_.@+-]+", "_", text).strip("._") or "unknown"
+
+
+def _session_otp_snapshot_path(email: str) -> Path:
+    return SESSION_OTP_SNAPSHOT_DIR / f"{_session_otp_slug(email)}.json"
+
+
+def _write_session_otp_snapshot(email: str, snapshot: dict) -> Path:
+    SESSION_OTP_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    target = _session_otp_snapshot_path(email)
+    tmp = target.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    payload = dict(snapshot or {})
+    payload["snapshot_path"] = str(target)
+    payload["snapshot_updated_at"] = datetime.now(timezone.utc).isoformat()
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, target)
+    return target
+
+
+def _read_session_otp_snapshot(email: str) -> dict:
+    path = _session_otp_snapshot_path(email)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"快照格式不是对象: {path}")
+    return data
+
+
+class _SessionOtpSubmitSync:
+    """Barrier for firing OTP validate requests at the same time within one wave."""
+
+    def __init__(self, size: int, *, wave: int = 1, timeout: float = 120.0):
+        self.size = max(1, int(size or 1))
+        self.wave = max(1, int(wave or 1))
+        self.timeout = max(1.0, float(timeout or 120.0))
+        self._barrier = threading.Barrier(self.size)
+        self._lock = threading.Lock()
+        self._ready = 0
+
+    def wait(self, email: str = "") -> None:
+        with self._lock:
+            self._ready += 1
+            ready = self._ready
+            print(
+                f"[session-otp-submit:sync] wave={self.wave} ready {ready}/{self.size} "
+                f"{email or ''}",
+                flush=True,
+            )
+        try:
+            rank = self._barrier.wait(timeout=self.timeout)
+            if rank == 0:
+                print(
+                    f"[session-otp-submit:sync] wave={self.wave} release {self.size} requests",
+                    flush=True,
+                )
+        except threading.BrokenBarrierError as e:
+            raise RuntimeError(
+                f"session-otp-submit sync barrier broken wave={self.wave} "
+                f"ready={ready}/{self.size} timeout={self.timeout}s"
+            ) from e
+
+
+def _session_otp_submit_sync_enabled() -> bool:
+    return str(os.getenv("SESSION_OTP_SUBMIT_SYNC", "1") or "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _session_otp_submit_sync_timeout() -> float:
+    try:
+        return max(1.0, float(os.getenv("SESSION_OTP_SUBMIT_SYNC_TIMEOUT", "120") or "120"))
+    except Exception:
+        return 120.0
+
+
+def _session_otp_effective_config(cardw_config_path: str | None, proxy_stage_plan=None) -> tuple[Path, str, str | None, ProxyStagePlan]:
+    src_cfg = Path(cardw_config_path or "") if cardw_config_path else (ROOT / "CTF-reg" / "config.paypal-proxy.json")
+    if not src_cfg.exists():
+        raise FileNotFoundError(f"缺注册配置: {src_cfg}")
+    stage_plan = ProxyStagePlan.from_obj(proxy_stage_plan)
+    effective_cfg = str(src_cfg)
+    temp_cardw = None
+    if stage_plan.has_any():
+        proxy_url = stage_plan.register or stage_plan.payment or stage_plan.checkout or ""
+        print(f"[ProxyStage] session-otp 阶段代理: {_describe_stage_plan(stage_plan)}")
+        if proxy_url:
+            temp_cardw = _rewrite_cardw_with_domain(str(src_cfg), "", proxy_url, stage_plan)
+            effective_cfg = temp_cardw
+    return src_cfg, effective_cfg, temp_cardw, stage_plan
+
+
+def _install_cardw_path() -> bool:
+    path = str(CARDW_DIR)
+    if path in sys.path:
+        return False
+    sys.path.insert(0, path)
+    return True
+
+
+def session_otp_prepare_for_email(cardw_config_path: str | None, target_email: str,
+                                  proxy_stage_plan=None) -> dict:
+    """阶段 1：登录到邮箱 OTP 已获取但不提交，保存 auth/cookie 快照。"""
+    target = _norm_email(target_email)
+    if not target:
+        return {"status": "no_email"}
+    account = get_db().find_latest_registered_account(target) or {}
+    if not account:
+        print(f"[session-otp-prepare] ⚠ DB 找不到账号: {target}")
+        return {"status": "no_account", "email": target}
+
+    temp_cardw = None
+    inserted_path = False
+    loggers = []
+    log_handler = None
+    try:
+        src_cfg, effective_cfg, temp_cardw, stage_plan = _session_otp_effective_config(
+            cardw_config_path,
+            proxy_stage_plan,
+        )
+        inserted_path = _install_cardw_path()
+        from config import Config
+        from auth_flow import AuthFlow
+        from mail_provider import MailProvider
+
+        print(
+            f"[session-otp-prepare] 启动 → email={target} "
+            f"password={'有' if account.get('password') else '无(passwordless)'} cfg={effective_cfg}",
+            flush=True,
+        )
+        loggers, log_handler = _install_session_only_logging()
+        cfg = Config.from_file(effective_cfg)
+        mail_provider = MailProvider.from_config(cfg.mail, config_path=effective_cfg)
+        snapshot = AuthFlow(cfg).run_protocol_login_prepare_otp(
+            mail_provider,
+            target,
+            account.get("password", "") or "",
+            existing_only=True,
+        )
+        snapshot["email"] = target
+        snapshot["source_config_path"] = str(src_cfg)
+        snapshot["proxy_stage_plan"] = stage_plan.to_dict() if stage_plan.has_any() else {}
+        path = _write_session_otp_snapshot(target, snapshot)
+        print(
+            f"[session-otp-prepare] ✅ {target} OTP 已获取并保存快照 "
+            f"path={path} code_len={len(str(snapshot.get('otp_code') or ''))}",
+            flush=True,
+        )
+        return {
+            "status": "otp_collected",
+            "email": target,
+            "snapshot_path": str(path),
+            "otp_code_len": len(str(snapshot.get("otp_code") or "")),
+        }
+    except Exception as e:
+        print(f"[session-otp-prepare] 异常 {target}: {type(e).__name__}: {str(e)[:240]}", flush=True)
+        return {"status": "exception", "email": target, "error": str(e)[:240]}
+    finally:
+        if log_handler is not None:
+            _remove_session_only_logging(loggers, log_handler)
+        if inserted_path:
+            try:
+                sys.path.remove(str(CARDW_DIR))
+            except ValueError:
+                pass
+        if temp_cardw and os.path.exists(temp_cardw):
+            try:
+                os.unlink(temp_cardw)
+            except Exception:
+                pass
+
+
+def session_otp_submit_for_email(cardw_config_path: str | None, target_email: str,
+                                 sync_controller: _SessionOtpSubmitSync | None = None) -> dict:
+    """阶段 2：读取已保存快照，只提交 OTP，保存提交后的 auth/cookie 快照。"""
+    target = _norm_email(target_email)
+    if not target:
+        return {"status": "no_email"}
+    inserted_path = False
+    loggers = []
+    log_handler = None
+    try:
+        snapshot = _read_session_otp_snapshot(target)
+        if _norm_email(snapshot.get("email") or "") != target:
+            return {
+                "status": "snapshot_email_mismatch",
+                "email": target,
+                "snapshot_email": snapshot.get("email"),
+            }
+        source_cfg = str(snapshot.get("source_config_path") or cardw_config_path or "")
+        src_cfg = Path(source_cfg) if source_cfg else (ROOT / "CTF-reg" / "config.paypal-proxy.json")
+        if not src_cfg.exists():
+            return {"status": "no_reg_cfg", "email": target, "config": str(src_cfg)}
+
+        inserted_path = _install_cardw_path()
+        from config import Config
+        from auth_flow import AuthFlow
+
+        cfg = Config.from_file(str(src_cfg))
+        snap_proxy = str(snapshot.get("proxy") or "").strip()
+        if snap_proxy:
+            cfg.proxy = snap_proxy
+            cfg.proxy_meta = snapshot.get("proxy_meta") if isinstance(snapshot.get("proxy_meta"), dict) else {}
+        print(
+            f"[session-otp-submit] 提交 OTP → email={target} snapshot={_session_otp_snapshot_path(target)} "
+            f"proxy={'有' if getattr(cfg, 'proxy', '') else '无'}",
+            flush=True,
+        )
+        loggers, log_handler = _install_session_only_logging()
+        updated = AuthFlow(cfg).run_protocol_login_submit_prepared_otp(
+            snapshot,
+            before_validate=sync_controller.wait if sync_controller is not None else None,
+        )
+        updated["email"] = target
+        updated["source_config_path"] = str(src_cfg)
+        updated["proxy_stage_plan"] = snapshot.get("proxy_stage_plan") or {}
+        path = _write_session_otp_snapshot(target, updated)
+        print(
+            f"[session-otp-submit] ✅ {target} OTP 已提交 "
+            f"continue_url={str(updated.get('continue_url') or '')[:120]} path={path}",
+            flush=True,
+        )
+        return {
+            "status": "otp_validated",
+            "email": target,
+            "snapshot_path": str(path),
+            "continue_url": str(updated.get("continue_url") or "")[:240],
+        }
+    except FileNotFoundError as e:
+        print(f"[session-otp-submit] 缺快照 {target}: {e}", flush=True)
+        return {"status": "no_snapshot", "email": target, "error": str(e)}
+    except Exception as e:
+        print(f"[session-otp-submit] 异常 {target}: {type(e).__name__}: {str(e)[:240]}", flush=True)
+        return {"status": "exception", "email": target, "error": str(e)[:240]}
+    finally:
+        if log_handler is not None:
+            _remove_session_only_logging(loggers, log_handler)
+        if inserted_path:
+            try:
+                sys.path.remove(str(CARDW_DIR))
+            except ValueError:
+                pass
+
+
+def _run_one_session_otp_prepare(args_tuple):
+    idx, cardw_config_path, email, kwargs = args_tuple
+    allocator = kwargs.get("proxy_stage_allocator")
+    base_plan = kwargs.get("proxy_stage_plan")
+    plan = _allocate_proxy_stage_plan(allocator, base_plan)
+    item = session_otp_prepare_for_email(cardw_config_path, email, proxy_stage_plan=plan)
+    item["target_email"] = email
+    item["index"] = idx
+    return item
+
+
+def _run_one_session_otp_submit(args_tuple):
+    idx, cardw_config_path, email, sync_controller = args_tuple
+    item = session_otp_submit_for_email(cardw_config_path, email, sync_controller=sync_controller)
+    item["target_email"] = email
+    item["index"] = idx
+    return item
+
+
+def session_otp_prepare_targets(cardw_config_path: str | None, target_emails: list[str],
+                                proxy_stage_allocator=None, proxy_stage_plan=None,
+                                workers: int = 1) -> dict:
+    target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
+    ok = 0
+    fail = 0
+
+    def _count(r: dict) -> None:
+        nonlocal ok, fail
+        if r.get("status") == "otp_collected":
+            ok += 1
+        else:
+            fail += 1
+
+    workers = max(1, int(workers or 1))
+    if workers > 1 and len(target_emails) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(workers, len(target_emails))
+        print(f"[session-otp-prepare] 并发: {len(target_emails)} accounts workers={workers}")
+        kwargs = {"proxy_stage_allocator": proxy_stage_allocator, "proxy_stage_plan": proxy_stage_plan}
+        tasks = [(idx, cardw_config_path, em, kwargs) for idx, em in enumerate(target_emails)]
+        ordered: list[dict | None] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_run_one_session_otp_prepare, task): task[0] for task in tasks}
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                item = future.result()
+                ordered[idx] = item
+                _count(item)
+                mark = "✓" if item.get("status") == "otp_collected" else "✗"
+                print(f"[session-otp-prepare] {mark} [{sum(1 for x in ordered if x)}/{len(tasks)}] {item.get('target_email')} status={item.get('status')} err={item.get('error') or ''}")
+        results = [item for item in ordered if item]
+        print(f"\n[session-otp-prepare] 完成: ok={ok} fail={fail} 共 {len(results)}")
+        return {"results": results, "ok": ok, "fail": fail}
+
+    results = []
+    for em in target_emails:
+        plan = _allocate_proxy_stage_plan(proxy_stage_allocator, proxy_stage_plan)
+        r = session_otp_prepare_for_email(cardw_config_path, em, proxy_stage_plan=plan)
+        r["target_email"] = em
+        results.append(r)
+        _count(r)
+    print(f"\n[session-otp-prepare] 完成: ok={ok} fail={fail} 共 {len(results)}")
+    return {"results": results, "ok": ok, "fail": fail}
+
+
+def session_otp_submit_targets(cardw_config_path: str | None, target_emails: list[str],
+                               workers: int = 1) -> dict:
+    target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
+    ok = 0
+    fail = 0
+
+    def _count(r: dict) -> None:
+        nonlocal ok, fail
+        if r.get("status") == "otp_validated":
+            ok += 1
+        else:
+            fail += 1
+
+    workers = max(1, int(workers or 1))
+    if workers > 1 and len(target_emails) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(workers, len(target_emails))
+        sync_enabled = _session_otp_submit_sync_enabled()
+        sync_timeout = _session_otp_submit_sync_timeout()
+        print(
+            f"[session-otp-submit] 并发: {len(target_emails)} accounts workers={workers} "
+            f"sync={'on' if sync_enabled else 'off'} timeout={sync_timeout:.0f}s"
+        )
+        tasks = [(idx, cardw_config_path, em) for idx, em in enumerate(target_emails)]
+        ordered: list[dict | None] = [None] * len(tasks)
+        waves = [
+            tasks[i:i + workers]
+            for i in range(0, len(tasks), workers)
+        ]
+        completed = 0
+        for wave_idx, wave in enumerate(waves, start=1):
+            sync_controller = (
+                _SessionOtpSubmitSync(len(wave), wave=wave_idx, timeout=sync_timeout)
+                if sync_enabled and len(wave) > 1
+                else None
+            )
+            print(
+                f"[session-otp-submit] wave={wave_idx}/{len(waves)} size={len(wave)}",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=len(wave)) as executor:
+                future_map = {
+                    executor.submit(
+                        _run_one_session_otp_submit,
+                        (idx, cfg_path, em, sync_controller),
+                    ): idx
+                    for idx, cfg_path, em in wave
+                }
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    item = future.result()
+                    ordered[idx] = item
+                    completed += 1
+                    _count(item)
+                    mark = "✓" if item.get("status") == "otp_validated" else "✗"
+                    print(
+                        f"[session-otp-submit] {mark} [{completed}/{len(tasks)}] "
+                        f"{item.get('target_email')} status={item.get('status')} "
+                        f"err={item.get('error') or ''}"
+                    )
+        results = [item for item in ordered if item]
+        print(f"\n[session-otp-submit] 完成: ok={ok} fail={fail} 共 {len(results)}")
+        return {"results": results, "ok": ok, "fail": fail}
+
+    results = []
+    for em in target_emails:
+        r = session_otp_submit_for_email(cardw_config_path, em)
+        r["target_email"] = em
+        results.append(r)
+        _count(r)
+    print(f"\n[session-otp-submit] 完成: ok={ok} fail={fail} 共 {len(results)}")
     return {"results": results, "ok": ok, "fail": fail}
 
 
@@ -4920,6 +5385,14 @@ def _cpa_import_after_team(
         id_tok = tok.get("id_token", "") or at
         rt = tok.get("refresh_token", rt) or rt
         if at:
+            _sync_registered_account_oauth_tokens(
+                email,
+                access_token=at,
+                id_token=id_tok,
+                refresh_token=rt,
+                message="rt-only cpa refresh token sync ok",
+            )
+        if at:
             try:
                 p = at.split(".")[1]
                 p += "=" * (4 - len(p) % 4)
@@ -5589,6 +6062,10 @@ def main():
     parser.add_argument("--session-only", action="store_true",
                         help="只对 --target-emails 跑已有账号协议登录：补 session_token/"
                              "access_token/cookie_header 写回 DB（不注册不付款）")
+    parser.add_argument("--session-otp-prepare", action="store_true",
+                        help="只对 --target-emails 预组装已有账号登录：发邮箱 OTP、取到验证码并保存快照，不提交验证码")
+    parser.add_argument("--session-otp-submit", action="store_true",
+                        help="只对 --target-emails 读取预组装快照并提交邮箱 OTP，不跟随 callback、不拿 session")
     parser.add_argument("--proxy-mode", default="config",
                         choices=("config", "manual", "trojan-pool"),
                         help="代理来源：config=沿用配置，manual=使用 --proxy，trojan-pool=从 Trojan 池分配")
@@ -5665,6 +6142,48 @@ def main():
         target_emails_list: list[str] = []
         if args.target_emails:
             target_emails_list = [e.strip() for e in args.target_emails.split(",") if e.strip()]
+
+        split_session_flags = [
+            bool(args.session_only),
+            bool(args.session_otp_prepare),
+            bool(args.session_otp_submit),
+            bool(args.rt_only),
+        ]
+        if sum(1 for x in split_session_flags if x) > 1:
+            print("[ERROR] --session-only / --session-otp-prepare / --session-otp-submit / --rt-only 互斥", file=sys.stderr)
+            sys.exit(2)
+
+        if args.session_otp_prepare:
+            if not target_emails_list:
+                print("[ERROR] --session-otp-prepare 必须配合 --target-emails 使用", file=sys.stderr)
+                sys.exit(2)
+            if args.batch > 0 and len(target_emails_list) > args.batch:
+                print(f"[session-otp-prepare] batch={args.batch}，从 {len(target_emails_list)} 个 target_emails 中截取前 {args.batch} 个")
+                target_emails_list = target_emails_list[:args.batch]
+            r = session_otp_prepare_targets(
+                args.cardw_config,
+                target_emails_list,
+                proxy_stage_allocator=proxy_stage_allocator,
+                proxy_stage_plan=proxy_stage_plan,
+                workers=args.workers,
+            )
+            print(f"\n结果: ok={r['ok']} fail={r['fail']}")
+            return
+
+        if args.session_otp_submit:
+            if not target_emails_list:
+                print("[ERROR] --session-otp-submit 必须配合 --target-emails 使用", file=sys.stderr)
+                sys.exit(2)
+            if args.batch > 0 and len(target_emails_list) > args.batch:
+                print(f"[session-otp-submit] batch={args.batch}，从 {len(target_emails_list)} 个 target_emails 中截取前 {args.batch} 个")
+                target_emails_list = target_emails_list[:args.batch]
+            r = session_otp_submit_targets(
+                args.cardw_config,
+                target_emails_list,
+                workers=args.workers,
+            )
+            print(f"\n结果: ok={r['ok']} fail={r['fail']}")
+            return
 
         if args.session_only:
             if args.rt_only:

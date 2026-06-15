@@ -7272,6 +7272,37 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
     tmp_profile = _tmp.mkdtemp(prefix="rt_login_")
     code_captured = {"url": ""}
 
+    def _extract_localhost_callback_url(text: str) -> str:
+        s = str(text or "").replace("&amp;", "&")
+        if "localhost:1455" not in s or "code=" not in s:
+            return ""
+        m = re.search(r"https?://localhost:1455/auth/callback\?[^\s\"'<>]+", s)
+        if not m:
+            return ""
+        url = m.group(0).rstrip(").,;")
+        code = (_parse_qs(_urlparse(url).query).get("code") or [""])[0]
+        if not code:
+            return ""
+        state = (_parse_qs(_urlparse(url).query).get("state") or [""])[0]
+        if state and "…" not in state and state != codex_state:
+            return ""
+        return url
+
+    def _capture_localhost_callback(value: str, source: str) -> bool:
+        url = _extract_localhost_callback_url(value)
+        if not url:
+            return False
+        code_captured["url"] = url
+        _log(f"      [RT] {source} 捕获 callback: code=<redacted>")
+        return True
+
+    def _redact_localhost_callback(text: str) -> str:
+        return re.sub(
+            r"https?://localhost:1455/auth/callback\?[^\s\"'<>]+",
+            "http://localhost:1455/auth/callback?code=<redacted>",
+            str(text or ""),
+        )
+
     try:
         with Camoufox(
             headless=not has_display,
@@ -7289,15 +7320,28 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             # localhost 拦截
             def _intercept(route):
                 url = route.request.url
-                if "localhost:1455" in url and "code=" in url:
-                    code_captured["url"] = url
-                    _log("      [RT] 拦截 callback: code=<redacted>")
+                _capture_localhost_callback(url, "route")
                 try:
                     route.fulfill(status=200, content_type="text/html", body="<html>OK</html>")
                 except Exception:
                     try: route.abort()
                     except Exception: pass
             page.route("http://localhost:1455/**", _intercept)
+
+            def _on_request(req):
+                try:
+                    _capture_localhost_callback(req.url, "request")
+                except Exception:
+                    pass
+
+            def _on_frame_navigated(frame):
+                try:
+                    _capture_localhost_callback(frame.url, "frame")
+                except Exception:
+                    pass
+
+            page.on("request", _on_request)
+            page.on("framenavigated", _on_frame_navigated)
 
             # [1] goto Codex authorize → 触发登录
             _log("      [RT] 打开 Codex authorize URL ...")
@@ -7330,9 +7374,52 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 _log(f"      [RT] 邮箱填写失败: {e}")
                 return ""
 
+            def _advance_login_email_page(reason: str, attempts: int = 2) -> bool:
+                """If auth.openai is still on the email confirmation page, click Continue again."""
+                advanced = False
+                for i in range(max(1, int(attempts))):
+                    cur_url = str(getattr(page, "url", "") or "")
+                    has_email = False
+                    try:
+                        has_email = bool(
+                            page.query_selector('input[type="email"]:visible')
+                            or page.query_selector('input[name="email"]:visible')
+                        )
+                    except Exception:
+                        has_email = False
+                    if "/log-in" not in cur_url or not has_email:
+                        break
+                    clicked = False
+                    for sel in ['button[type="submit"]', 'button:has-text("Continue")', '#btnNext']:
+                        try:
+                            b = page.query_selector(sel)
+                            if b and b.is_visible():
+                                try:
+                                    b.evaluate("(el) => { el.click(); return true; }")
+                                except Exception:
+                                    b.click(timeout=3000, no_wait_after=True)
+                                _log(f"      [RT] {reason}: /log-in 邮箱页补点 Continue ({i + 1}/{attempts})")
+                                clicked = True
+                                advanced = True
+                                time.sleep(3)
+                                break
+                        except Exception as e_adv:
+                            _log(f"      [RT] {reason}: 补点 Continue 异常 {sel}: {str(e_adv)[:160]}")
+                    if not clicked:
+                        break
+                    if str(getattr(page, "url", "") or "") != cur_url:
+                        break
+                return advanced
+
             # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码框就跳过到 OTP）
             try:
-                page.wait_for_selector('input[type="password"]', state="visible", timeout=20000)
+                try:
+                    page.wait_for_selector('input[type="password"]', state="visible", timeout=20000)
+                except Exception:
+                    if _advance_login_email_page("密码框等待超时", attempts=2):
+                        page.wait_for_selector('input[type="password"]', state="visible", timeout=20000)
+                    else:
+                        raise
                 pwd_input = page.query_selector('input[type="password"]:visible')
                 pwd_input.click(); time.sleep(0.3)
                 pwd_input.fill(password)
@@ -7345,7 +7432,23 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                         break
                 time.sleep(5)
             except Exception as e:
-                _log(f"      [RT] 密码框超时（passwordless 路径），跳过到 OTP 等待: {str(e)[:80]}")
+                cur_after_pwd_wait = str(getattr(page, "url", "") or "")
+                if cur_after_pwd_wait.rstrip("/") == "https://auth.openai.com/log-in":
+                    try:
+                        has_email_after_pwd_wait = bool(
+                            page.query_selector('input[type="email"]:visible')
+                            or page.query_selector('input[name="email"]:visible')
+                        )
+                    except Exception:
+                        has_email_after_pwd_wait = False
+                    if has_email_after_pwd_wait:
+                        _log(
+                            "      [RT] 密码框超时但仍停在 /log-in 邮箱页，"
+                            "登录未推进，提前结束本账号"
+                        )
+                        _safe_screenshot(page, "/tmp/rt_login_stuck_email.png")
+                        return ""
+                _log(f"      [RT] 密码框超时（passwordless/OTP 路径），跳过到 OTP 等待: {str(e)[:80]}")
                 _safe_screenshot(page, "/tmp/rt_pwd_skip.png")
 
             # [4] 处理 OTP / Turnstile / 各种中间页
@@ -7356,13 +7459,21 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             otp_fetched = False
             last_url = ""
             last_log_ts = 0.0
+            log_in_stuck_since = 0.0
             while time.time() < end:
                 if code_captured["url"]:
                     break
-                if "localhost:1455" in page.url and "code=" in page.url:
-                    code_captured["url"] = page.url
+                if _capture_localhost_callback(page.url, "page.url"):
                     break
                 cur = page.url
+                if cur.rstrip("/") == "https://auth.openai.com/log-in":
+                    if log_in_stuck_since <= 0:
+                        log_in_stuck_since = time.time()
+                    elif time.time() - log_in_stuck_since > 45:
+                        _log("      [RT] 停留 /log-in 超过 45s，判定登录推进卡住，提前结束本账号")
+                        break
+                else:
+                    log_in_stuck_since = 0.0
                 # URL 变化或每 15s 打印一次
                 now = time.time()
                 if cur != last_url or (now - last_log_ts) > 15:
@@ -7498,13 +7609,26 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                         b = page.query_selector(sel)
                         if b and b.is_visible():
                             try:
-                                b.click()
-                                _log(f"      [RT] consent 点击: {sel}")
+                                b.evaluate("(el) => { el.click(); return true; }")
+                                _log(f"      [RT] consent JS 点击: {sel}")
                                 clicked = True
-                                time.sleep(2)
+                                for _ in range(10):
+                                    if code_captured["url"] or _capture_localhost_callback(page.url, "page.url"):
+                                        break
+                                    time.sleep(0.1)
                             except Exception as e_c:
-                                _log(f"      [RT] consent 点击异常 {sel}: {e_c}")
+                                captured = _capture_localhost_callback(
+                                    str(e_c), f"consent 点击异常 {sel}"
+                                )
+                                msg = _redact_localhost_callback(str(e_c))
+                                if captured or code_captured["url"]:
+                                    _log(f"      [RT] consent 点击后已捕获 callback，忽略 Playwright 导航竞态: {sel}")
+                                    clicked = True
+                                else:
+                                    _log(f"      [RT] consent 点击异常 {sel}: {msg[:500]}")
                             break
+                    if code_captured["url"]:
+                        break
                     if not clicked:
                         # 兜底：表单 submit
                         try:
@@ -7520,6 +7644,8 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                                 time.sleep(2)
                         except Exception:
                             pass
+                    if code_captured["url"]:
+                        break
                 time.sleep(1)
 
             try:

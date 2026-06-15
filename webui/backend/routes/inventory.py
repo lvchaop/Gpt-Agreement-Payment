@@ -11,7 +11,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from ..auth import CurrentUser
@@ -132,6 +132,23 @@ def _expired_from_access_token(access_token: str) -> str:
     return datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _plan_type_from_token(token: str) -> str:
+    payload = _decode_access_token_payload(token)
+    auth = payload.get("https://api.openai.com/auth") if isinstance(payload.get("https://api.openai.com/auth"), dict) else {}
+    raw = str(auth.get("chatgpt_plan_type") or "").strip().lower()
+    if not raw:
+        return ""
+    if "team" in raw:
+        return "team"
+    if "pro" in raw and "plus" not in raw:
+        return "pro"
+    if "plus" in raw:
+        return "plus"
+    if "free" in raw:
+        return "free"
+    return raw[:80]
+
+
 def _auth_file_name(email: str, plan_tag: str) -> str:
     tag = hashlib.md5(email.encode()).hexdigest()[:8]
     return f"codex-{tag}-{email}-{plan_tag}.json"
@@ -188,6 +205,114 @@ def _refresh_auth_body(body: dict, client_id: str) -> tuple[dict, bool, str]:
     refreshed["expired"] = _expired_from_access_token(access_token)
     refreshed["last_refresh"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return refreshed, True, ""
+
+
+def _sync_plan_for_account(account: dict, client_id: str) -> dict:
+    aid = int(account.get("id") or 0)
+    email = str(account.get("email") or "").strip().lower()
+    rt = str(account.get("refresh_token") or "").strip()
+    if not rt and email:
+        rt = get_db().latest_refresh_token_for_email(email)
+
+    access_token = str(account.get("access_token") or "").strip()
+    id_token = str(account.get("id_token") or "").strip()
+    refreshed = False
+    message = ""
+
+    if rt:
+        try:
+            tok = _exchange_refresh_token(rt, client_id)
+            new_access = str(tok.get("access_token") or "").strip()
+            if new_access:
+                access_token = new_access
+                id_token = str(tok.get("id_token") or "").strip() or new_access
+                rt = str(tok.get("refresh_token") or "").strip() or rt
+                refreshed = True
+            else:
+                message = "refresh_failed: missing_access_token"
+        except Exception as e:
+            message = f"refresh_failed: {type(e).__name__}: {str(e)[:160]}"
+
+    plan_type = _plan_type_from_token(access_token) or _plan_type_from_token(id_token)
+    if not plan_type:
+        return {
+            "id": aid,
+            "email": email,
+            "status": "unknown",
+            "message": message or "no_plan_type_in_token",
+            "plan_type": "",
+            "refreshed": refreshed,
+        }
+
+    try:
+        sets: list[str] = []
+        args: list[str] = []
+        if refreshed and access_token:
+            sets.append("access_token = ?")
+            args.append(access_token)
+        if refreshed and id_token:
+            sets.append("id_token = ?")
+            args.append(id_token)
+        if refreshed and rt:
+            sets.append("refresh_token = ?")
+            args.append(rt)
+        if sets:
+            args.append(str(aid))
+            with get_db()._conn() as c:
+                c.execute(
+                    f"UPDATE registered_accounts SET {', '.join(sets)} WHERE id = ?",
+                    args,
+                )
+        get_db().update_account_check(
+            aid,
+            "valid",
+            "plan sync via refresh_token" if refreshed else "plan sync via stored token",
+            plan_type=plan_type,
+        )
+    except Exception as e:
+        return {
+            "id": aid,
+            "email": email,
+            "status": "error",
+            "message": f"db_update_failed: {type(e).__name__}: {str(e)[:160]}",
+            "plan_type": plan_type,
+            "refreshed": refreshed,
+        }
+
+    return {
+        "id": aid,
+        "email": email,
+        "status": "ok",
+        "message": "refreshed" if refreshed else "stored_token",
+        "plan_type": plan_type,
+        "refreshed": refreshed,
+    }
+
+
+def _persist_refreshed_auth_body(account_id: int, body: dict, message: str) -> None:
+    access_token = str(body.get("access_token") or "").strip()
+    id_token = str(body.get("id_token") or "").strip()
+    refresh_token = str(body.get("refresh_token") or "").strip()
+    sets: list[str] = []
+    args: list[str] = []
+    if access_token:
+        sets.append("access_token = ?")
+        args.append(access_token)
+    if id_token:
+        sets.append("id_token = ?")
+        args.append(id_token)
+    if refresh_token:
+        sets.append("refresh_token = ?")
+        args.append(refresh_token)
+    if sets:
+        args.append(str(account_id))
+        with get_db()._conn() as c:
+            c.execute(
+                f"UPDATE registered_accounts SET {', '.join(sets)} WHERE id = ?",
+                args,
+            )
+    plan_type = _plan_type_from_token(access_token) or _plan_type_from_token(id_token)
+    get_db().update_account_check(account_id, "valid", message, plan_type=plan_type)
 
 
 def _latest_inventory_plan_by_id() -> dict[int, str]:
@@ -282,6 +407,10 @@ def _build_auth_export(ids: list[int], fmt: str) -> dict:
         body, refreshed, refresh_warning = _refresh_auth_body(body, client_id)
         if refreshed:
             refreshed_count += 1
+            try:
+                _persist_refreshed_auth_body(aid, body, "auth export refresh token sync ok")
+            except Exception:
+                pass
             name = _auth_file_name(email, plan_tag)
         elif refresh_warning:
             warnings.append({"id": aid, "email": email, "reason": refresh_warning})
@@ -329,6 +458,59 @@ def _build_auth_export(ids: list[int], fmt: str) -> dict:
     }
 
 
+def _build_file_csv_export(ids: list[int]) -> tuple[str, str, dict]:
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="单次最多 500 个")
+
+    db = get_db()
+    plan_by_id = _latest_inventory_plan_by_id()
+    rows: list[str] = []
+    skipped: list[dict] = []
+    for raw_id in ids:
+        aid = int(raw_id)
+        acc = db.get_registered_account(aid)
+        if not acc:
+            skipped.append({"id": aid, "email": "", "reason": "missing"})
+            continue
+        email = str(acc.get("email") or "").strip().lower()
+        plan_tag = plan_by_id.get(aid) or str(acc.get("last_plan_type") or "free").strip() or "free"
+        name, body = _auth_body_for_account(acc, plan_tag)
+        if not (body.get("access_token") or body.get("refresh_token") or body.get("id_token")):
+            skipped.append({"id": aid, "email": email, "reason": "no_token"})
+            continue
+
+        cpa_json = _cpa_json_from_body(body, plan_tag)
+        sub2api_json = {
+            "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "proxies": [],
+            "accounts": [_sub2api_account_from_body(name, body)],
+        }
+        file_json = {
+            "type": "file",
+            "sub2api": json.dumps(sub2api_json, ensure_ascii=False, separators=(",", ":")),
+            "cpa": json.dumps(cpa_json, ensure_ascii=False, separators=(",", ":")),
+        }
+        rows.append(
+            "\t".join([
+                json.dumps(file_json, ensure_ascii=False, separators=(",", ":")),
+                "",
+                email,
+                "",
+            ])
+        )
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    text = "\n".join(rows) + ("\n" if rows else "")
+    filename = f"file-sub2api-cpa-{ts}.csv"
+    meta = {
+        "count": len(rows),
+        "skipped": skipped,
+    }
+    return filename, text, meta
+
+
 @router.get("/accounts")
 def get_accounts(user: str = CurrentUser):
     return build_accounts_inventory()
@@ -344,6 +526,31 @@ def export_auth(req: AuthExportRequest, user: str = CurrentUser):
     {exported_at, proxies, accounts:[{name, platform, type, credentials}]}.
     """
     return _build_auth_export(req.ids, req.format)
+
+
+@router.post("/accounts/export-file-csv")
+def export_file_csv(req: IdsRequest, user: str = CurrentUser):
+    """Export selected accounts as tab-separated CSV text.
+
+    Columns:
+    1. {"type":"file","sub2api":"<sub2api json string>","cpa":"<cpa json string>"}
+    2. remark (empty)
+    3. email
+    4. phone (empty)
+
+    This export intentionally uses stored local tokens only and does not refresh
+    access_token/refresh_token.
+    """
+    filename, text, meta = _build_file_csv_export(req.ids)
+    return Response(
+        content=text,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Export-Count": str(meta["count"]),
+            "X-Export-Skipped": str(len(meta["skipped"])),
+        },
+    )
 
 
 @router.post("/accounts/check")
@@ -368,6 +575,32 @@ def check_accounts(req: CheckRequest, user: str = CurrentUser):
         "plus": sum(1 for r in results if r.get("plan_type") == "plus"),
         "team": sum(1 for r in results if r.get("plan_type") == "team"),
         "pro": sum(1 for r in results if r.get("plan_type") == "pro"),
+    }
+    return {"results": results, "summary": summary}
+
+
+@router.post("/accounts/sync-plan")
+def sync_plan(req: IdsRequest, user: str = CurrentUser):
+    """Refresh selected accounts' OAuth tokens and persist JWT plan_type."""
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if len(req.ids) > 100:
+        raise HTTPException(status_code=400, detail="单次最多 100 个")
+    db = get_db()
+    client_id = _export_oauth_client_id()
+    results: list[dict] = []
+    for aid in req.ids:
+        acc = db.get_registered_account(int(aid))
+        if not acc:
+            results.append({"id": aid, "email": "", "status": "missing", "message": "account not found", "plan_type": ""})
+            continue
+        results.append(_sync_plan_for_account(acc, client_id))
+    summary = {
+        "total": len(results),
+        "ok": sum(1 for r in results if r.get("status") == "ok"),
+        "unknown": sum(1 for r in results if r.get("status") == "unknown"),
+        "error": sum(1 for r in results if r.get("status") == "error"),
+        "refreshed": sum(1 for r in results if r.get("refreshed")),
     }
     return {"results": results, "summary": summary}
 

@@ -27,6 +27,8 @@ class StartRequest(BaseModel):
     rt_only: bool = False
     rt_force: bool = False
     session_only: bool = False
+    session_otp_prepare: bool = False
+    session_otp_submit: bool = False
 
 
 class OTPRequest(BaseModel):
@@ -122,5 +124,7 @@ def preview(req: StartRequest, user: str = CurrentUser):
         rt_only=req.rt_only,
         rt_force=req.rt_force,
         session_only=req.session_only,
+        session_otp_prepare=req.session_otp_prepare,
+        session_otp_submit=req.session_otp_submit,
     )
     return {"cmd": cmd, "cmd_str": " ".join(cmd)}
