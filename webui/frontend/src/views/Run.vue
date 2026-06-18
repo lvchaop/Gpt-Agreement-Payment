@@ -395,6 +395,7 @@
           </div>
           <div class="inventory-toolbar-actions">
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="verifySelected">验证选中</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="heartbeatSelected">心跳测试</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="syncPlanSelected">更新 Plan</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unknownOrUncheckedIds.length === 0" @click="verifyAllUnknown">验证全部未检 ({{ unknownOrUncheckedIds.length }})</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="pushSelectedToCpa">推送选中→CPA</TermBtn>
@@ -644,6 +645,32 @@ interface AuthExportResponse {
   payload: any;
   archive_base64: string;
   archive_mime: string;
+}
+
+interface HeartbeatResult {
+  id: number;
+  email: string;
+  status: "ok" | "failed" | "missing" | string;
+  ok: boolean;
+  attempts?: number;
+  failed_attempt?: number;
+  http_status?: number;
+  refreshed?: boolean;
+  message?: string;
+}
+
+interface HeartbeatResponse {
+  results: HeartbeatResult[];
+  summary: {
+    total: number;
+    ok: number;
+    failed: number;
+    attempts_per_account: number;
+    model: string;
+    result_path?: string;
+  };
+  success_emails?: string[];
+  failed_emails: string[];
 }
 
 interface ConfigHealthCheck {
@@ -1366,6 +1393,51 @@ function verifySelected() {
 function verifyAllUnknown() {
   runCheck(unknownOrUncheckedIds.value, "验证未检/未知");
 }
+
+async function heartbeatSelected() {
+  const ids = Array.from(selectedIds.value);
+  if (!ids.length) { message.warning("没有选中账号"); return; }
+  const attempts = 40;
+  const workers = Math.max(1, Math.min(Number(form.value.workers || 1), 50));
+  const preview = emailsForIds(ids).slice(0, 3).join(", ") + (ids.length > 3 ? `... 共 ${ids.length}` : "");
+  if (!confirm(`对 ${ids.length} 个选中账号做心跳测试？\n每个账号按 sub2api 的 Codex Responses 测试方式发送 hi，连续 ${attempts} 次。\n任意一次失败会返回邮箱。\n\nworkers=${workers}\n${preview}`)) return;
+  inventoryBusy.value = true;
+  if (!eventSource) openStream();
+  try {
+    const r = await api.post<HeartbeatResponse>("/inventory/accounts/heartbeat", {
+      ids,
+      attempts,
+      model: "gpt-5.5",
+      timeout_s: 30,
+      max_workers: workers,
+    });
+    const s = r.data.summary || {};
+    const failed = r.data.failed_emails || [];
+    if (!failed.length) {
+      message.success(`心跳测试通过：ok=${s.ok || 0}/${s.total || ids.length}，每号 ${s.attempts_per_account || attempts} 次`);
+      return;
+    }
+    const resultPath = s.result_path ? `\n\n结果文件：${s.result_path}` : "";
+    const detail = (r.data.results || [])
+      .filter(x => !x.ok)
+      .map(x => `${x.email || `id=${x.id}`}  第${x.failed_attempt || 0}次  HTTP ${x.http_status || "-"}  ${x.message || ""}`)
+      .join("\n");
+    dialog.warning({
+      title: `心跳测试发现失败：${failed.length}/${s.total || ids.length}`,
+      content: () => h("pre", {
+        style: "max-height:520px; overflow:auto; white-space:pre-wrap; word-break:break-all; font-size:12px; line-height:1.6",
+      }, (detail || failed.join("\n")) + resultPath),
+      positiveText: "复制失败邮箱",
+      negativeText: "关闭",
+      onPositiveClick: () => copyText(failed.join("\n"), "已复制失败邮箱"),
+    });
+  } catch (e: any) {
+    message.error(`心跳测试失败：${e?.response?.data?.detail || e?.message || e}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
+
 async function syncPlanSelected() {
   const ids = Array.from(selectedIds.value);
   if (!ids.length) { message.warning("没有可更新的账号"); return; }

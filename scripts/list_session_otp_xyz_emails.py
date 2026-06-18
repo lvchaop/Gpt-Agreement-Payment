@@ -45,14 +45,19 @@ def main() -> int:
 
     snapshot_dir = Path(args.dir).expanduser()
     suffix = str(args.suffix or ".xyz").strip().lower()
-    if not suffix.startswith("."):
-        suffix = "." + suffix
+    suffix = suffix[1:] if suffix.startswith("@") else suffix
 
     emails: list[str] = []
     for path in sorted(snapshot_dir.glob("*.json")):
         email = _email_from_snapshot(path)
         domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
-        if domain.endswith(suffix):
+        if suffix.startswith("."):
+            matched = domain.endswith(suffix)
+        elif "." in suffix:
+            matched = domain == suffix or domain.endswith("." + suffix)
+        else:
+            matched = domain.endswith("." + suffix)
+        if matched:
             emails.append(email)
 
     for email in sorted(set(emails)):

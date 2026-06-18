@@ -5,11 +5,16 @@ import json
 import base64
 import hashlib
 import io
+import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections import deque
 from datetime import datetime, timezone
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -18,12 +23,17 @@ from ..auth import CurrentUser
 from ..account_inventory import build_accounts_inventory
 from ..account_validator import validate_accounts
 from ..db import get_db
+from .. import runner
 from .. import settings as s
 
 
 router = APIRouter(prefix="/api/inventory", tags=["inventory"])
 
 _DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_CHATGPT_CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+_OPENAI_DEFAULT_TEST_MODEL = "gpt-5.5"
+_OPENAI_CODEX_INSTRUCTIONS_PATH = Path(__file__).resolve().parents[1] / "assets" / "openai_codex_instructions.txt"
+_HEARTBEAT_RESULTS_DIR = s.ROOT / "output" / "heartbeat_results"
 
 
 class IdsRequest(BaseModel):
@@ -32,6 +42,13 @@ class IdsRequest(BaseModel):
 
 class CheckRequest(IdsRequest):
     timeout_s: float = 10.0
+    max_workers: int = 3
+
+
+class HeartbeatRequest(IdsRequest):
+    attempts: int = 40
+    model: str = ""
+    timeout_s: float = 30.0
     max_workers: int = 3
 
 
@@ -121,6 +138,19 @@ def _account_id_from_access_token(access_token: str) -> str:
     )
 
 
+def _chatgpt_account_id_from_access_token(access_token: str) -> str:
+    payload = _decode_access_token_payload(access_token)
+    auth = payload.get("https://api.openai.com/auth") if isinstance(payload.get("https://api.openai.com/auth"), dict) else {}
+    return str(auth.get("chatgpt_account_id") or "").strip()
+
+
+def _openai_codex_instructions() -> str:
+    try:
+        return _OPENAI_CODEX_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return "You are a helpful coding assistant."
+
+
 def _expired_from_access_token(access_token: str) -> str:
     payload = _decode_access_token_payload(access_token)
     try:
@@ -163,6 +193,154 @@ def _export_oauth_client_id() -> str:
         return _DEFAULT_CODEX_CLIENT_ID
 
 
+def _resolve_repo_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return s.ROOT / path
+
+
+def _heartbeat_proxy_controls() -> tuple[object | None, str, str]:
+    """Build proxy controls matching selected session-OTP prepare flow.
+
+    The selected OTP flow gets stage proxies from CTF-pay/config.paypal.json
+    trojan_pool and uses the register-stage URL as the effective proxy.
+    """
+    try:
+        cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        return None, "", f"read_proxy_config_failed: {type(e).__name__}: {str(e)[:120]}"
+
+    trojan_cfg = cfg.get("trojan_pool") if isinstance(cfg.get("trojan_pool"), dict) else {}
+    if trojan_cfg.get("enabled"):
+        pool_file = str(trojan_cfg.get("pool_file") or "").strip()
+        if not pool_file:
+            return None, "", "trojan_pool_enabled_but_missing_pool_file"
+        try:
+            repo_root = Path(__file__).resolve().parents[3]
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from proxy_bridge import TrojanBridgeManager  # type: ignore
+
+            manager = TrojanBridgeManager(
+                str(_resolve_repo_path(pool_file)),
+                http_start_port=int(trojan_cfg.get("http_start_port") or 18081),
+                work_dir=s.ROOT / "output" / "proxy_bridge",
+                executable=str(trojan_cfg.get("bridge_bin") or "sing-box"),
+                auto_start=True,
+            )
+            allocator = manager.allocator(
+                all_region=str(trojan_cfg.get("region_all") or ""),
+                register_region=str(trojan_cfg.get("region_register") or ""),
+                checkout_region=str(trojan_cfg.get("region_checkout") or ""),
+                payment_region=str(trojan_cfg.get("region_payment") or ""),
+            )
+            manager.ensure_started()
+            return allocator, "", ""
+        except Exception as e:
+            return None, "", f"trojan_pool_init_failed: {type(e).__name__}: {str(e)[:160]}"
+
+    proxy_url = str(cfg.get("proxy") or "").strip()
+    return None, proxy_url, ""
+
+
+def _heartbeat_proxy_for_account(proxy_allocator: object | None, fallback_proxy_url: str) -> tuple[str, dict]:
+    if proxy_allocator is None:
+        return fallback_proxy_url, {"source": "config.proxy" if fallback_proxy_url else ""}
+    plan = proxy_allocator.allocate()  # type: ignore[attr-defined]
+    proxy_url = str(
+        getattr(plan, "register", "")
+        or getattr(plan, "payment", "")
+        or getattr(plan, "checkout", "")
+        or ""
+    ).strip()
+    meta = (
+        getattr(plan, "register_meta", None)
+        or getattr(plan, "payment_meta", None)
+        or getattr(plan, "checkout_meta", None)
+        or {}
+    )
+    if not isinstance(meta, dict):
+        meta = {}
+    return proxy_url, {
+        "source": str(getattr(plan, "source", "") or ""),
+        "register_region": str(getattr(plan, "register_region", "") or ""),
+        "checkout_region": str(getattr(plan, "checkout_region", "") or ""),
+        "payment_region": str(getattr(plan, "payment_region", "") or ""),
+        "node": str(meta.get("name") or meta.get("label") or meta.get("server") or ""),
+    }
+
+
+def _heartbeat_log(line: str) -> None:
+    try:
+        runner.append_log(f"[heartbeat] {line}")
+    except Exception:
+        pass
+
+
+def _heartbeat_proxy_label(result: dict) -> str:
+    info = result.get("proxy_info") if isinstance(result.get("proxy_info"), dict) else {}
+    node = str(info.get("node") or "").strip()
+    region = str(info.get("register_region") or info.get("payment_region") or info.get("checkout_region") or "").strip()
+    source = str(info.get("source") or "").strip()
+    proxy = str(result.get("proxy") or "").strip()
+    parts = []
+    if source:
+        parts.append(source)
+    if region:
+        parts.append(region)
+    if node:
+        parts.append(node)
+    if not parts and proxy:
+        try:
+            parsed = urllib.parse.urlsplit(proxy)
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            parts.append(f"{parsed.scheme}://{host}{port}" if host else "proxy")
+        except Exception:
+            parts.append("proxy")
+    return "/".join(parts) or "-"
+
+
+def _write_heartbeat_results(payload: dict) -> str:
+    _HEARTBEAT_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = _HEARTBEAT_RESULTS_DIR / f"heartbeat-{ts}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def _mark_heartbeat_failed_rt_retryable(email: str, reason: str) -> None:
+    email = str(email or "").strip().lower()
+    if not email:
+        return
+    # rt_state=retryable requires oauth_status=transient_failed with cooldown elapsed.
+    ts = datetime.fromtimestamp(time.time() - 7 * 3600, tz=timezone.utc).isoformat()
+    get_db().set_oauth_status(email, "transient_failed", f"heartbeat_failed: {reason[:160]}", ts)
+
+
+def _mark_heartbeat_success(account_id: int, email: str, attempts: int) -> None:
+    try:
+        get_db().update_account_check(
+            int(account_id),
+            "valid",
+            f"heartbeat ok: {attempts} attempts",
+        )
+    except Exception:
+        pass
+
+
+def _mark_heartbeat_failed_check(account_id: int, reason: str) -> None:
+    try:
+        get_db().update_account_check(
+            int(account_id),
+            "unknown",
+            f"heartbeat failed: {reason[:180]}",
+        )
+    except Exception:
+        pass
+
+
 def _exchange_refresh_token(refresh_token: str, client_id: str) -> dict:
     data = urllib.parse.urlencode({
         "grant_type": "refresh_token",
@@ -183,6 +361,504 @@ def _exchange_refresh_token(refresh_token: str, client_id: str) -> dict:
     with opener.open(req, timeout=20) as r:
         tok = json.loads(r.read().decode())
     return tok if isinstance(tok, dict) else {}
+
+
+def _fresh_access_token_for_account(account: dict, client_id: str) -> tuple[str, bool, str]:
+    """Return stored access_token for model heartbeat; do not refresh RT here."""
+    access_token = str(account.get("access_token") or "").strip()
+    if access_token:
+        return access_token, False, "stored_access_token"
+    return "", False, "no_stored_access_token"
+
+
+def _post_openai_heartbeat(
+    access_token: str,
+    model: str,
+    timeout_s: float,
+    chatgpt_account_id: str = "",
+    proxy_url: str = "",
+) -> tuple[bool, str, int]:
+    """Probe selected OpenAI OAuth account the same way sub2api tests Codex accounts.
+
+    Evidence from sub2api:
+    - account_test_service.go uses https://chatgpt.com/backend-api/codex/responses
+      for OAuth accounts, not https://api.openai.com/v1/responses.
+    - processOpenAIStream only treats response.completed/response.done as success.
+    """
+    payload = json.dumps({
+        "model": model,
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+        }],
+        "stream": True,
+        "store": False,
+        "instructions": _openai_codex_instructions(),
+    }).encode()
+    req = urllib.request.Request(
+        _CHATGPT_CODEX_RESPONSES_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Host": "chatgpt.com",
+        },
+        method="POST",
+    )
+    if chatgpt_account_id:
+        req.add_header("chatgpt-account-id", chatgpt_account_id)
+    proxy_url = str(proxy_url or "").strip()
+    proxy_handler = (
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        if proxy_url
+        else urllib.request.ProxyHandler({})
+    )
+    opener = urllib.request.build_opener(proxy_handler)
+    try:
+        with opener.open(req, timeout=timeout_s) as r:
+            code = int(getattr(r, "status", 0) or 0)
+            if not (200 <= code < 300):
+                body = r.read(4096).decode(errors="replace")
+                return False, body[:240] or f"http {code}", code
+            while True:
+                raw = r.readline()
+                if not raw:
+                    return False, "Stream ended before response.completed", code
+                line = raw.decode(errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_s = line.split(":", 1)[1].strip()
+                if data_s == "[DONE]":
+                    return False, "Stream ended before response.completed", code
+                try:
+                    data = json.loads(data_s)
+                except Exception:
+                    continue
+                event_type = str(data.get("type") or "")
+                if event_type in ("response.completed", "response.done"):
+                    return True, "ok", code
+                if event_type == "response.failed":
+                    error_msg = "OpenAI response failed"
+                    response = data.get("response") if isinstance(data.get("response"), dict) else {}
+                    error = response.get("error") if isinstance(response.get("error"), dict) else {}
+                    if error.get("message"):
+                        error_msg = str(error.get("message"))
+                    return False, error_msg[:240], code
+                if event_type == "error":
+                    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+                    return False, str(error.get("message") or "Unknown error")[:240], code
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(4096).decode(errors="replace")
+        except Exception:
+            body = str(e)
+        return False, body[:240] or str(e), int(getattr(e, "code", 0) or 0)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:200]}", 0
+
+
+def _heartbeat_account(
+    account_id: int,
+    *,
+    attempts: int,
+    model: str,
+    timeout_s: float,
+    client_id: str,
+    proxy_allocator: object | None = None,
+    fallback_proxy_url: str = "",
+    proxy_init_message: str = "",
+    progress_log=None,
+) -> dict:
+    db = get_db()
+    acc = db.get_registered_account(int(account_id))
+    if not acc:
+        return {
+            "id": int(account_id),
+            "email": "",
+            "status": "missing",
+            "ok": False,
+            "failed_attempt": 0,
+            "message": "account not found",
+        }
+
+    email = str(acc.get("email") or "").strip().lower()
+    access_token, refreshed, token_msg = _fresh_access_token_for_account(acc, client_id)
+    proxy_url, proxy_info = _heartbeat_proxy_for_account(proxy_allocator, fallback_proxy_url)
+    proxy_label = _heartbeat_proxy_label({"proxy": proxy_url, "proxy_info": proxy_info})
+    if not access_token:
+        return {
+            "id": int(account_id),
+            "email": email,
+            "status": "failed",
+            "ok": False,
+            "attempts": 0,
+            "failed_attempt": 0,
+            "refreshed": refreshed,
+            "proxy": proxy_url,
+            "proxy_info": proxy_info,
+            "message": token_msg,
+        }
+
+    chatgpt_account_id = _chatgpt_account_id_from_access_token(access_token)
+    if proxy_init_message and not proxy_url:
+        return {
+            "id": int(account_id),
+            "email": email,
+            "status": "failed",
+            "ok": False,
+            "attempts": 0,
+            "failed_attempt": 0,
+            "refreshed": refreshed,
+            "chatgpt_account_id": chatgpt_account_id,
+            "proxy": proxy_url,
+            "proxy_info": proxy_info,
+            "message": proxy_init_message,
+        }
+    account_started = time.time()
+    if progress_log:
+        progress_log(f"RUN {email} start attempts={attempts} proxy={proxy_label}")
+    for i in range(1, attempts + 1):
+        should_log_attempt = i == 1 or i % 5 == 0 or i == attempts
+        if progress_log and should_log_attempt:
+            progress_log(f"TRY {email} attempt={i}/{attempts} proxy={proxy_label}")
+        ok, msg, http_status = _post_openai_heartbeat(
+            access_token,
+            model,
+            timeout_s,
+            chatgpt_account_id,
+            proxy_url,
+        )
+        if not ok:
+            if progress_log:
+                progress_log(
+                    f"FAIL {email} attempt={i}/{attempts} http={http_status or '-'} "
+                    f"elapsed={time.time() - account_started:.1f}s msg={str(msg or '')[:160]}"
+                )
+            return {
+                "id": int(account_id),
+                "email": email,
+                "status": "failed",
+                "ok": False,
+                "attempts": i,
+                "failed_attempt": i,
+                "http_status": http_status,
+                "refreshed": refreshed,
+                "chatgpt_account_id": chatgpt_account_id,
+                "proxy": proxy_url,
+                "proxy_info": proxy_info,
+                "message": msg,
+            }
+        if progress_log and should_log_attempt:
+            progress_log(
+                f"PASS {email} attempt={i}/{attempts} http={http_status or '-'} "
+                f"elapsed={time.time() - account_started:.1f}s"
+            )
+
+    return {
+        "id": int(account_id),
+        "email": email,
+        "status": "ok",
+        "ok": True,
+        "attempts": attempts,
+        "failed_attempt": 0,
+        "http_status": 200,
+        "refreshed": refreshed,
+        "chatgpt_account_id": chatgpt_account_id,
+        "proxy": proxy_url,
+        "proxy_info": proxy_info,
+        "message": token_msg or "ok",
+    }
+
+
+def _heartbeat_prepare_account(
+    account_id: int,
+    *,
+    client_id: str,
+    proxy_allocator: object | None = None,
+    fallback_proxy_url: str = "",
+    proxy_init_message: str = "",
+) -> tuple[dict | None, dict | None]:
+    db = get_db()
+    acc = db.get_registered_account(int(account_id))
+    if not acc:
+        return None, {
+            "id": int(account_id),
+            "email": "",
+            "status": "missing",
+            "ok": False,
+            "attempts": 0,
+            "failed_attempt": 0,
+            "message": "account not found",
+        }
+
+    email = str(acc.get("email") or "").strip().lower()
+    access_token, refreshed, token_msg = _fresh_access_token_for_account(acc, client_id)
+    proxy_url, proxy_info = _heartbeat_proxy_for_account(proxy_allocator, fallback_proxy_url)
+    chatgpt_account_id = _chatgpt_account_id_from_access_token(access_token) if access_token else ""
+    base = {
+        "id": int(account_id),
+        "email": email,
+        "refreshed": refreshed,
+        "chatgpt_account_id": chatgpt_account_id,
+        "proxy": proxy_url,
+        "proxy_info": proxy_info,
+        "token_msg": token_msg,
+    }
+    if not access_token:
+        return None, {
+            **base,
+            "status": "failed",
+            "ok": False,
+            "attempts": 0,
+            "failed_attempt": 0,
+            "message": token_msg,
+        }
+    if proxy_init_message and not proxy_url:
+        return None, {
+            **base,
+            "status": "failed",
+            "ok": False,
+            "attempts": 0,
+            "failed_attempt": 0,
+            "message": proxy_init_message,
+        }
+    return {
+        **base,
+        "access_token": access_token,
+        "started_at": time.time(),
+    }, None
+
+
+def _heartbeat_one_attempt(account_state: dict, attempt_no: int, *, model: str, timeout_s: float) -> dict:
+    ok, msg, http_status = _post_openai_heartbeat(
+        str(account_state.get("access_token") or ""),
+        model,
+        timeout_s,
+        str(account_state.get("chatgpt_account_id") or ""),
+        str(account_state.get("proxy") or ""),
+    )
+    return {
+        "id": int(account_state.get("id") or 0),
+        "email": str(account_state.get("email") or ""),
+        "attempt": int(attempt_no),
+        "ok": bool(ok),
+        "http_status": int(http_status or 0),
+        "message": str(msg or ""),
+    }
+
+
+def _heartbeat_accounts(ids: list[int], *, attempts: int, model: str, timeout_s: float, max_workers: int) -> dict:
+    started_at = datetime.now(timezone.utc).isoformat()
+    client_id = _export_oauth_client_id()
+    proxy_allocator, fallback_proxy_url, proxy_init_message = _heartbeat_proxy_controls()
+    results: list[dict] = []
+    workers = max(1, min(int(max_workers), len(ids)))
+    total_requests_estimate = len(ids) * attempts
+    total_requests = total_requests_estimate
+    progress = {"requests": 0, "finished": 0, "ok": 0, "failed": 0}
+    runner.begin_external_log_stream()
+    _heartbeat_log(
+        f"start total={len(ids)} attempts={attempts} requests_estimate={total_requests_estimate} "
+        f"model={model} timeout={timeout_s}s workers={workers} scheduler=request-level"
+    )
+    try:
+        if proxy_init_message:
+            _heartbeat_log(f"proxy init warning: {proxy_init_message}")
+        account_states: dict[int, dict] = {}
+        next_attempt: dict[int, int] = {}
+        completed_ids: set[int] = set()
+        id_order = [int(i) for i in ids]
+
+        for aid in id_order:
+            state, early_result = _heartbeat_prepare_account(
+                aid,
+                client_id=client_id,
+                proxy_allocator=proxy_allocator,
+                fallback_proxy_url=fallback_proxy_url,
+                proxy_init_message=proxy_init_message,
+            )
+            if early_result is not None:
+                results.append(early_result)
+                completed_ids.add(aid)
+                progress["finished"] += 1
+                progress["failed"] += 1
+                _mark_heartbeat_failed_rt_retryable(
+                    str(early_result.get("email") or ""),
+                    str(early_result.get("message") or "early_failed"),
+                )
+                _mark_heartbeat_failed_check(
+                    int(early_result.get("id") or 0),
+                    str(early_result.get("message") or "early_failed"),
+                )
+                _heartbeat_log(
+                    f"FAIL [{progress['finished']}/{len(ids)}] "
+                    f"{early_result.get('email') or 'id=' + str(early_result.get('id'))} "
+                    f"failed_attempt=0 http=- proxy={_heartbeat_proxy_label(early_result)} "
+                    f"msg={str(early_result.get('message') or '')[:180]}"
+                )
+                continue
+            if state is not None:
+                account_states[aid] = state
+                next_attempt[aid] = 1
+                _heartbeat_log(
+                    f"RUN {state.get('email')} start attempts={attempts} "
+                    f"proxy={_heartbeat_proxy_label(state)}"
+                )
+        total_requests = len(account_states) * attempts
+        _heartbeat_log(
+            f"prepared runnable_accounts={len(account_states)} early_failed={len(completed_ids)} "
+            f"requests={total_requests}"
+        )
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {}
+            ready_queue = deque(
+                aid for aid in id_order if aid in account_states and aid not in completed_ids
+            )
+
+            def submit_attempt(aid: int) -> None:
+                attempt_no = next_attempt.get(aid, 1)
+                state = account_states[aid]
+                _heartbeat_log(
+                    f"TRY {state.get('email')} attempt={attempt_no}/{attempts} "
+                    f"request={progress['requests'] + len(futures) + 1}/{total_requests} "
+                    f"proxy={_heartbeat_proxy_label(state)}"
+                )
+                fut = ex.submit(
+                    _heartbeat_one_attempt,
+                    state,
+                    attempt_no,
+                    model=model,
+                    timeout_s=timeout_s,
+                )
+                futures[fut] = (aid, attempt_no)
+
+            while ready_queue and len(futures) < workers:
+                submit_attempt(ready_queue.popleft())
+
+            while futures:
+                done, _pending = wait(set(futures.keys()), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    aid, attempt_no = futures.pop(fut)
+                    state = account_states[aid]
+                    email = str(state.get("email") or "")
+                    try:
+                        attempt_result = fut.result()
+                    except Exception as e:
+                        attempt_result = {
+                            "id": aid,
+                            "email": email,
+                            "attempt": attempt_no,
+                            "ok": False,
+                            "http_status": 0,
+                            "message": f"worker error: {type(e).__name__}: {str(e)[:180]}",
+                        }
+
+                    progress["requests"] += 1
+                    elapsed = time.time() - float(state.get("started_at") or time.time())
+                    if not attempt_result.get("ok"):
+                        result = {
+                            "id": aid,
+                            "email": email,
+                            "status": "failed",
+                            "ok": False,
+                            "attempts": attempt_no,
+                            "failed_attempt": attempt_no,
+                            "http_status": attempt_result.get("http_status") or 0,
+                            "refreshed": bool(state.get("refreshed")),
+                            "chatgpt_account_id": str(state.get("chatgpt_account_id") or ""),
+                            "proxy": str(state.get("proxy") or ""),
+                            "proxy_info": state.get("proxy_info") if isinstance(state.get("proxy_info"), dict) else {},
+                            "message": str(attempt_result.get("message") or ""),
+                        }
+                        results.append(result)
+                        completed_ids.add(aid)
+                        progress["finished"] += 1
+                        progress["failed"] += 1
+                        _mark_heartbeat_failed_rt_retryable(email, str(result.get("message") or "attempt_failed"))
+                        _mark_heartbeat_failed_check(aid, str(result.get("message") or "attempt_failed"))
+                        _heartbeat_log(
+                            f"FAIL [{progress['finished']}/{len(ids)}] {email} "
+                            f"attempt={attempt_no}/{attempts} http={result['http_status'] or '-'} "
+                            f"requests={progress['requests']}/{total_requests} "
+                            f"elapsed={elapsed:.1f}s msg={str(result.get('message') or '')[:160]}"
+                        )
+                    elif attempt_no >= attempts:
+                        result = {
+                            "id": aid,
+                            "email": email,
+                            "status": "ok",
+                            "ok": True,
+                            "attempts": attempts,
+                            "failed_attempt": 0,
+                            "http_status": attempt_result.get("http_status") or 200,
+                            "refreshed": bool(state.get("refreshed")),
+                            "chatgpt_account_id": str(state.get("chatgpt_account_id") or ""),
+                            "proxy": str(state.get("proxy") or ""),
+                            "proxy_info": state.get("proxy_info") if isinstance(state.get("proxy_info"), dict) else {},
+                            "message": str(state.get("token_msg") or "ok"),
+                        }
+                        results.append(result)
+                        completed_ids.add(aid)
+                        progress["finished"] += 1
+                        progress["ok"] += 1
+                        _mark_heartbeat_success(aid, email, attempts)
+                        _heartbeat_log(
+                            f"OK [{progress['finished']}/{len(ids)}] {email} "
+                            f"attempts={attempts} requests={progress['requests']}/{total_requests} "
+                            f"elapsed={elapsed:.1f}s proxy={_heartbeat_proxy_label(result)}"
+                        )
+                    else:
+                        next_attempt[aid] = attempt_no + 1
+                        ready_queue.append(aid)
+                        if attempt_no == 1 or attempt_no % 5 == 0:
+                            _heartbeat_log(
+                                f"PASS {email} attempt={attempt_no}/{attempts} "
+                                f"http={attempt_result.get('http_status') or '-'} "
+                                f"requests={progress['requests']}/{total_requests} elapsed={elapsed:.1f}s"
+                            )
+
+                while ready_queue and len(futures) < workers:
+                    submit_attempt(ready_queue.popleft())
+
+                _heartbeat_log(
+                    f"progress accounts={progress['finished']}/{len(ids)} "
+                    f"requests={progress['requests']}/{total_requests} "
+                    f"ok={progress['ok']} failed={progress['failed']} "
+                    f"inflight={len(futures)} queued={len(ready_queue)} "
+                    f"remaining_accounts={max(0, len(ids) - progress['finished'])}"
+                )
+
+        results.sort(key=lambda r: ids.index(int(r.get("id") or 0)) if int(r.get("id") or 0) in ids else len(ids))
+        failed = [r for r in results if not r.get("ok")]
+        succeeded = [r for r in results if r.get("ok")]
+        payload = {
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "ok": sum(1 for r in results if r.get("ok")),
+                "failed": len(failed),
+                "attempts_per_account": attempts,
+                "model": model,
+            },
+            "success_emails": [str(r.get("email") or "") for r in succeeded if r.get("email")],
+            "failed_emails": [str(r.get("email") or "") for r in failed if r.get("email")],
+        }
+        ended_at = datetime.now(timezone.utc).isoformat()
+        payload["summary"]["started_at"] = started_at
+        payload["summary"]["ended_at"] = ended_at
+        try:
+            result_path = _write_heartbeat_results(payload)
+            payload["summary"]["result_path"] = result_path
+            _heartbeat_log(
+                f"done total={len(results)} ok={payload['summary']['ok']} failed={len(failed)} result={result_path}"
+            )
+        except Exception as e:
+            _heartbeat_log(f"write result failed: {type(e).__name__}: {str(e)[:160]}")
+        return payload
+    finally:
+        runner.end_external_log_stream()
 
 
 def _refresh_auth_body(body: dict, client_id: str) -> tuple[dict, bool, str]:
@@ -577,6 +1253,27 @@ def check_accounts(req: CheckRequest, user: str = CurrentUser):
         "pro": sum(1 for r in results if r.get("plan_type") == "pro"),
     }
     return {"results": results, "summary": summary}
+
+
+@router.post("/accounts/heartbeat")
+def heartbeat_accounts(req: HeartbeatRequest, user: str = CurrentUser):
+    """For selected accounts, call ChatGPT Codex Responses with input "hi" repeatedly.
+
+    Any failed request marks that email as failed and is returned in failed_emails.
+    """
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    attempts = max(1, min(int(req.attempts or 40), 200))
+    timeout = max(2.0, min(float(req.timeout_s or 30.0), 120.0))
+    workers = max(1, min(int(req.max_workers or 3), 50))
+    model = str(req.model or "").strip() or _OPENAI_DEFAULT_TEST_MODEL
+    return _heartbeat_accounts(
+        [int(i) for i in req.ids],
+        attempts=attempts,
+        model=model,
+        timeout_s=timeout,
+        max_workers=workers,
+    )
 
 
 @router.post("/accounts/sync-plan")

@@ -126,7 +126,7 @@ class MailProvider:
         external_base_url: str = "",
         external_api_key: str = "",
         external_provider_name: str = "cloudflare_temp_mail",
-        external_request_timeout_s: int = 20,
+        external_request_timeout_s: int = 5,
         external_poll_interval_s: float = 3.0,
     ):
         self.mode = (mode or "cloudflare_kv").strip().lower()
@@ -136,7 +136,7 @@ class MailProvider:
         self.external_base_url = external_base_url
         self.external_api_key = external_api_key
         self.external_provider_name = external_provider_name or "cloudflare_temp_mail"
-        self.external_request_timeout_s = int(external_request_timeout_s or 20)
+        self.external_request_timeout_s = int(external_request_timeout_s or 5)
         self.external_poll_interval_s = float(external_poll_interval_s or 3.0)
         self._external_provider = None
         self._reuse_email: Optional[str] = None  # 兼容 register-only resume
@@ -162,7 +162,7 @@ class MailProvider:
                 or getattr(mail_cfg, "provider_name", "")
                 or "cloudflare_temp_mail"
             ),
-            external_request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 20) or 20),
+            external_request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 5) or 5),
             external_poll_interval_s=float(getattr(mail_cfg, "external_poll_interval_s", 3.0) or 3.0),
         )
 
@@ -219,6 +219,7 @@ class MailProvider:
         email_addr: str,
         timeout: int = 120,
         issued_after: Optional[float] = None,
+        max_polls: Optional[int] = None,
     ) -> str:
         """阻塞等 OTP。所有模式最终统一从 CF KV 读取。
 
@@ -236,6 +237,7 @@ class MailProvider:
                 email_addr,
                 timeout=timeout,
                 issued_after=issued_after,
+                max_polls=max_polls,
             )
 
         from cf_kv_otp_provider import CloudflareKVOtpProvider

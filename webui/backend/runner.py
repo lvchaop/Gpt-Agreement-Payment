@@ -39,6 +39,7 @@ _otp_pending: bool = False             # set when gopay.py asks/waits for OTP
 _otp_file_is_temp: bool = False
 _active_gopay_phone: str = ""          # digits-only phone for the running gopay flow
 _preserve_log_on_next_start: bool = False  # auto-loop sets True so log scrolls across iterations
+_external_log_streams = 0              # synthetic log producers outside runner.start(), e.g. heartbeat
 
 
 def _state_path() -> Path:
@@ -724,6 +725,23 @@ def append_log(line: str) -> None:
         _log_lines.append({"seq": _seq_counter, "ts": time.time(), "line": line})
         if len(_log_lines) > 3000:
             _log_lines = _log_lines[-2000:]
+
+
+def begin_external_log_stream() -> None:
+    global _external_log_streams
+    with _lock:
+        _external_log_streams += 1
+
+
+def end_external_log_stream() -> None:
+    global _external_log_streams
+    with _lock:
+        _external_log_streams = max(0, _external_log_streams - 1)
+
+
+def has_external_log_stream() -> bool:
+    with _lock:
+        return _external_log_streams > 0
 
 
 def preserve_log_on_next_start() -> None:

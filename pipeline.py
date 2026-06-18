@@ -2623,7 +2623,7 @@ def rt_only_for_email(card_config_path: str, target_email: str, proxy_stage_plan
 
     if not rt:
         fail_reason = fail_reason or "unknown"
-        if fail_reason == "account_dead":
+        if fail_reason in ("account_dead", "phone_otp_select_channel"):
             _set_account_oauth_status(target, "dead", fail_reason)
             print(f"[rt-only] ❌ {target} 未获得 refresh_token → dead ({fail_reason})")
         else:
@@ -3183,6 +3183,35 @@ def _install_cardw_path() -> bool:
     return True
 
 
+def _session_otp_warmup_external_mail_pool(cardw_config_path: str | None, label: str = "session-otp") -> None:
+    inserted_path = False
+    try:
+        src_cfg, effective_cfg, temp_cardw, _stage_plan = _session_otp_effective_config(cardw_config_path)
+        inserted_path = _install_cardw_path()
+        from config import Config
+        from mail_provider import MailProvider
+
+        cfg = Config.from_file(effective_cfg)
+        mail_provider = MailProvider.from_config(cfg.mail, config_path=effective_cfg)
+        if getattr(mail_provider, "mode", "") != "external_temp_mail":
+            return
+        print(f"[{label}] 初始化外部邮箱 HTTP 连接池 base={mail_provider.external_base_url}", flush=True)
+        mail_provider._external_mail_provider().warmup_connection_pool()
+    except Exception as e:
+        print(f"[{label}] 外部邮箱 HTTP 连接池初始化失败(忽略): {type(e).__name__}: {str(e)[:180]}", flush=True)
+    finally:
+        if inserted_path:
+            try:
+                sys.path.remove(str(CARDW_DIR))
+            except ValueError:
+                pass
+        try:
+            if 'temp_cardw' in locals() and temp_cardw and os.path.exists(temp_cardw):
+                os.unlink(temp_cardw)
+        except Exception:
+            pass
+
+
 def session_otp_prepare_for_email(cardw_config_path: str | None, target_email: str,
                                   proxy_stage_plan=None) -> dict:
     """阶段 1：登录到邮箱 OTP 已获取但不提交，保存 auth/cookie 快照。"""
@@ -3226,16 +3255,20 @@ def session_otp_prepare_for_email(cardw_config_path: str | None, target_email: s
         snapshot["source_config_path"] = str(src_cfg)
         snapshot["proxy_stage_plan"] = stage_plan.to_dict() if stage_plan.has_any() else {}
         path = _write_session_otp_snapshot(target, snapshot)
+        has_otp = bool(str(snapshot.get("otp_code") or "").strip())
+        status = "otp_collected" if has_otp else "otp_pending"
         print(
-            f"[session-otp-prepare] ✅ {target} OTP 已获取并保存快照 "
-            f"path={path} code_len={len(str(snapshot.get('otp_code') or ''))}",
+            f"[session-otp-prepare] ✅ {target} 当前环境已保存 "
+            f"status={status} path={path} code_len={len(str(snapshot.get('otp_code') or ''))} "
+            f"otp_error={str(snapshot.get('otp_error') or '')[:160]}",
             flush=True,
         )
         return {
-            "status": "otp_collected",
+            "status": status,
             "email": target,
             "snapshot_path": str(path),
             "otp_code_len": len(str(snapshot.get("otp_code") or "")),
+            "otp_error": str(snapshot.get("otp_error") or "")[:240],
         }
     except Exception as e:
         print(f"[session-otp-prepare] 异常 {target}: {type(e).__name__}: {str(e)[:240]}", flush=True)
@@ -3280,12 +3313,14 @@ def session_otp_submit_for_email(cardw_config_path: str | None, target_email: st
         inserted_path = _install_cardw_path()
         from config import Config
         from auth_flow import AuthFlow
+        from mail_provider import MailProvider
 
         cfg = Config.from_file(str(src_cfg))
         snap_proxy = str(snapshot.get("proxy") or "").strip()
         if snap_proxy:
             cfg.proxy = snap_proxy
             cfg.proxy_meta = snapshot.get("proxy_meta") if isinstance(snapshot.get("proxy_meta"), dict) else {}
+        mail_provider = MailProvider.from_config(cfg.mail, config_path=str(src_cfg))
         print(
             f"[session-otp-submit] 提交 OTP → email={target} snapshot={_session_otp_snapshot_path(target)} "
             f"proxy={'有' if getattr(cfg, 'proxy', '') else '无'}",
@@ -3295,11 +3330,25 @@ def session_otp_submit_for_email(cardw_config_path: str | None, target_email: st
         updated = AuthFlow(cfg).run_protocol_login_submit_prepared_otp(
             snapshot,
             before_validate=sync_controller.wait if sync_controller is not None else None,
+            mail_provider=mail_provider,
         )
         updated["email"] = target
         updated["source_config_path"] = str(src_cfg)
         updated["proxy_stage_plan"] = snapshot.get("proxy_stage_plan") or {}
         path = _write_session_otp_snapshot(target, updated)
+        if str(updated.get("phase") or "") == "otp_missing":
+            err = str(updated.get("otp_error") or "缺少验证码")[:240]
+            print(
+                f"[session-otp-submit] ⚠ {target} 未获取到 OTP，已保存快照 "
+                f"path={path} err={err}",
+                flush=True,
+            )
+            return {
+                "status": "otp_missing",
+                "email": target,
+                "snapshot_path": str(path),
+                "error": err,
+            }
         print(
             f"[session-otp-submit] ✅ {target} OTP 已提交 "
             f"continue_url={str(updated.get('continue_url') or '')[:120]} path={path}",
@@ -3350,12 +3399,13 @@ def session_otp_prepare_targets(cardw_config_path: str | None, target_emails: li
                                 proxy_stage_allocator=None, proxy_stage_plan=None,
                                 workers: int = 1) -> dict:
     target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
+    _session_otp_warmup_external_mail_pool(cardw_config_path, "session-otp-prepare")
     ok = 0
     fail = 0
 
     def _count(r: dict) -> None:
         nonlocal ok, fail
-        if r.get("status") == "otp_collected":
+        if r.get("status") in ("otp_collected", "otp_pending"):
             ok += 1
         else:
             fail += 1
@@ -3375,7 +3425,7 @@ def session_otp_prepare_targets(cardw_config_path: str | None, target_emails: li
                 item = future.result()
                 ordered[idx] = item
                 _count(item)
-                mark = "✓" if item.get("status") == "otp_collected" else "✗"
+                mark = "✓" if item.get("status") in ("otp_collected", "otp_pending") else "✗"
                 print(f"[session-otp-prepare] {mark} [{sum(1 for x in ordered if x)}/{len(tasks)}] {item.get('target_email')} status={item.get('status')} err={item.get('error') or ''}")
         results = [item for item in ordered if item]
         print(f"\n[session-otp-prepare] 完成: ok={ok} fail={fail} 共 {len(results)}")
@@ -3395,12 +3445,13 @@ def session_otp_prepare_targets(cardw_config_path: str | None, target_emails: li
 def session_otp_submit_targets(cardw_config_path: str | None, target_emails: list[str],
                                workers: int = 1) -> dict:
     target_emails = [(em or "").strip() for em in target_emails if (em or "").strip()]
+    _session_otp_warmup_external_mail_pool(cardw_config_path, "session-otp-submit")
     ok = 0
     fail = 0
 
     def _count(r: dict) -> None:
         nonlocal ok, fail
-        if r.get("status") == "otp_validated":
+        if r.get("status") in ("otp_validated", "otp_missing"):
             ok += 1
         else:
             fail += 1
@@ -3429,7 +3480,8 @@ def session_otp_submit_targets(cardw_config_path: str | None, target_emails: lis
                 else None
             )
             print(
-                f"[session-otp-submit] wave={wave_idx}/{len(waves)} size={len(wave)}",
+                f"[session-otp-submit] wave={wave_idx}/{len(waves)} size={len(wave)} "
+                f"sync={'on' if sync_controller is not None else 'off'}",
                 flush=True,
             )
             with ThreadPoolExecutor(max_workers=len(wave)) as executor:
@@ -3446,7 +3498,7 @@ def session_otp_submit_targets(cardw_config_path: str | None, target_emails: lis
                     ordered[idx] = item
                     completed += 1
                     _count(item)
-                    mark = "✓" if item.get("status") == "otp_validated" else "✗"
+                    mark = "✓" if item.get("status") in ("otp_validated", "otp_missing") else "✗"
                     print(
                         f"[session-otp-submit] {mark} [{completed}/{len(tasks)}] "
                         f"{item.get('target_email')} status={item.get('status')} "
@@ -3623,14 +3675,16 @@ def _password_from_email(email: str) -> str:
 def _classify_oauth_failure(log: str) -> str:
     """从 _exchange_refresh_token_with_session 的 print log 推断失败原因。
 
-    优先级：account_dead > add_phone_blocked > otp_timeout >
-    consent_failed > no_callback > unknown
+    优先级：account_dead > phone_otp_select_channel > add_phone_blocked >
+    otp_timeout > consent_failed > no_callback > unknown
     """
     if not log:
         return "unknown"
     low = log.lower()
     if "invalid_grant" in log or "no longer exists" in low or "doesn't exist" in low:
         return "account_dead"
+    if "phone-otp/select-channel" in low:
+        return "phone_otp_select_channel"
     if "/add-phone" in log and "[RT] consent" not in log:
         return "add_phone_blocked"
     if (

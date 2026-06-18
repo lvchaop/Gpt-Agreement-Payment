@@ -101,7 +101,7 @@ async def stream(user: str = CurrentUser):
             # OTP heartbeat: re-send periodically while pending
             if st.get("otp_pending"):
                 yield {"event": "otp_pending", "data": json.dumps({"pending": True})}
-            if not st["running"]:
+            if not st["running"] and not runner.has_external_log_stream():
                 # 进程已退出，再扫一次确保没遗漏，然后发 done
                 tail = runner.get_lines_since(last_seq, limit=500)
                 for entry in tail:

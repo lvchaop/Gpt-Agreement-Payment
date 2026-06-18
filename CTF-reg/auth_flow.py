@@ -108,6 +108,7 @@ class AuthFlow:
         self._last_register_password_error: str = ""
         self._last_sentinel_token: str = ""
         self._last_sentinel_so_token: str = ""
+        self._last_otp_sent_at: float = 0.0
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
             "1", "true", "yes", "on"
@@ -116,6 +117,11 @@ class AuthFlow:
         self._init_trace_dump()
         if self.config.proxy or getattr(self.config, "proxy_meta", None):
             logger.info("[proxy-trace] register %s", self._register_proxy_trace())
+
+    def _mark_otp_sent(self, label: str) -> float:
+        self._last_otp_sent_at = time.time()
+        logger.info("[otp-send-time] %s email=%s ts=%.6f", label, self.result.email, self._last_otp_sent_at)
+        return self._last_otp_sent_at
 
     def _export_cookie_jar(self) -> list[dict[str, Any]]:
         """Serialize current HTTP cookie jar with enough metadata to restore it later."""
@@ -983,6 +989,8 @@ class AuthFlow:
             otp_sent_at = time.time()
             if not self.kickoff_otp_delivery("codex_login_need_otp"):
                 self.send_otp()
+            if self._last_otp_sent_at:
+                otp_sent_at = self._last_otp_sent_at
             otp_code = mail_provider.wait_for_otp(
                 email,
                 timeout=otp_timeout,
@@ -2461,6 +2469,7 @@ class AuthFlow:
         self._trace_http("send_email_otp", resp)
         if resp.status_code != 200:
             raise RuntimeError(f"发送 OTP 失败: {resp.status_code} - {resp.text[:200]}")
+        self._mark_otp_sent("email-otp/send")
         logger.info("OTP 已发送到邮箱")
 
     def send_passwordless_otp(self, referer: str = "https://auth.openai.com/create-account/password") -> bool:
@@ -2478,6 +2487,7 @@ class AuthFlow:
         )
         self._trace_http("send_passwordless_otp", resp)
         if resp.status_code == 200:
+            self._mark_otp_sent("passwordless/send-otp")
             logger.info("passwordless OTP 已发送")
             return True
         logger.warning(f"passwordless 发码失败: {resp.status_code} - {(resp.text or '')[:220]}")
@@ -2499,6 +2509,7 @@ class AuthFlow:
         )
         self._trace_http("resend_email_otp", resp)
         if resp.status_code == 200:
+            self._mark_otp_sent("email-otp/resend")
             logger.info("OTP 已重发")
             return True
         logger.warning(f"重发 OTP 失败: {resp.status_code} - {(resp.text or '')[:200]}")
@@ -2552,10 +2563,17 @@ class AuthFlow:
             return {}
 
     # ── Step 8: 验证 OTP ──
-    def verify_otp(self, otp_code: str) -> dict:
+    def verify_otp(self, otp_code: str, before_post=None, sync_email: str = "") -> dict:
         logger.info("[7/10] 验证 OTP...")
         headers = self._common_headers("https://auth.openai.com/email-verification")
         headers["Content-Type"] = "application/json"
+        if before_post is not None:
+            before_post(str(sync_email or self.result.email or ""))
+        logger.info(
+            "[session-otp-submit:send] email=%s ts=%.6f",
+            str(sync_email or self.result.email or ""),
+            time.time(),
+        )
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/email-otp/validate",
             headers=headers,
@@ -3289,6 +3307,8 @@ class AuthFlow:
                 self.fetch_client_auth_session_dump("post_register_password_failed_new")
                 if not self.kickoff_otp_delivery("register_password_failed_fallback"):
                     self.send_otp()
+            if self._last_otp_sent_at:
+                otp_sent_at = self._last_otp_sent_at
 
             try:
                 otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
@@ -3309,6 +3329,8 @@ class AuthFlow:
                     otp_sent_at = time.time()
                     if not self.kickoff_otp_delivery("verify_otp_retry_new"):
                         self.send_otp()
+                    if self._last_otp_sent_at:
+                        otp_sent_at = self._last_otp_sent_at
                     otp_code = mail_provider.wait_for_otp(
                         email,
                         timeout=otp_timeout,
@@ -3357,6 +3379,8 @@ class AuthFlow:
                     # password/verify 后推荐使用 resend，而不是 /email-otp/send
                     otp_sent_at = time.time()
                     self.kickoff_otp_delivery("existing_login_password")
+                    if self._last_otp_sent_at:
+                        otp_sent_at = self._last_otp_sent_at
                     otp_code = mail_provider.wait_for_otp(
                         email,
                         timeout=otp_timeout,
@@ -3371,12 +3395,14 @@ class AuthFlow:
                 if need_send_otp:
                     otp_sent_at = time.time()
                     self.send_otp()
+                    if self._last_otp_sent_at:
+                        otp_sent_at = self._last_otp_sent_at
                 else:
                     # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
                     # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
                     forced_resend = self._env_flag("OTP_FORCE_RESEND", "1")
                     if forced_resend and self.kickoff_otp_delivery("existing_forced_resend"):
-                        otp_sent_at = time.time()
+                        otp_sent_at = self._last_otp_sent_at or time.time()
                         logger.info(f"已有账号验证码模式={mode}，已主动 resend OTP")
                     else:
                         # 回看短窗口，避免误读上一轮旧验证码
@@ -3395,6 +3421,8 @@ class AuthFlow:
                     otp_sent_at = time.time()
                     if not self.kickoff_otp_delivery("existing_timeout_retry"):
                         self.send_otp()
+                    if self._last_otp_sent_at:
+                        otp_sent_at = self._last_otp_sent_at
                     otp_code = mail_provider.wait_for_otp(
                         email,
                         timeout=otp_timeout,
@@ -3409,6 +3437,8 @@ class AuthFlow:
                         otp_sent_at = time.time()
                         if not self.kickoff_otp_delivery("existing_verify_retry"):
                             self.send_otp()
+                        if self._last_otp_sent_at:
+                            otp_sent_at = self._last_otp_sent_at
                         otp_code = mail_provider.wait_for_otp(
                             email,
                             timeout=otp_timeout,
@@ -3575,36 +3605,55 @@ class AuthFlow:
                 f"page_type={page_type or '(empty)'} continue_url={continue_url[:180]}"
             )
 
+        otp_code = ""
+        otp_received_at = 0.0
+        otp_error = ""
         otp_sent_at = time.time()
-        resend_ok = self.kickoff_otp_delivery("protocol_prepare_otp")
-        if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
-            self.send_otp()
-            otp_sent_at = time.time()
-
-        otp_code = mail_provider.wait_for_otp(
-            email,
-            timeout=otp_timeout,
-            issued_after=otp_sent_at,
-        )
-        otp_received_at = time.time()
+        try:
+            resend_ok = self.kickoff_otp_delivery("protocol_prepare_otp")
+            if self._last_otp_sent_at:
+                otp_sent_at = self._last_otp_sent_at
+            if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
+                self.send_otp()
+                otp_sent_at = self._last_otp_sent_at or time.time()
+        except Exception as e:
+            otp_error = f"send_otp {type(e).__name__}: {str(e)[:200]}"
+            logger.warning("prepare_otp 发码失败，仍保存当前 auth 环境: email=%s error=%s", email, otp_error)
+        try:
+            otp_code = str(mail_provider.wait_for_otp(
+                email,
+                timeout=otp_timeout,
+                issued_after=otp_sent_at,
+                max_polls=2,
+            ) or "").strip()
+            if otp_code:
+                otp_received_at = time.time()
+        except Exception as e:
+            wait_error = f"{type(e).__name__}: {str(e)[:240]}"
+            otp_error = f"{otp_error}; {wait_error}" if otp_error else wait_error
+            logger.warning("prepare_otp 未获取到验证码，仍保存当前 auth 环境: email=%s error=%s", email, otp_error)
 
         snapshot = self.export_protocol_snapshot(
-            phase="otp_collected",
+            phase="otp_collected" if otp_code else "otp_pending",
             auth_url=auth_url,
             continue_url=continue_url,
             page_type=page_type,
             email_verification_mode=mode,
-            otp_code=str(otp_code or "").strip(),
+            otp_code=otp_code,
             otp_sent_at=otp_sent_at,
             otp_received_at=otp_received_at,
+            otp_error=otp_error,
             proxy=str(getattr(self.config, "proxy", "") or ""),
             proxy_meta=getattr(self.config, "proxy_meta", {}) or {},
         )
-        if not snapshot.get("otp_code"):
-            raise RuntimeError("prepare_otp 未获取到验证码")
         return snapshot
 
-    def run_protocol_login_submit_prepared_otp(self, snapshot: dict[str, Any], before_validate=None) -> dict[str, Any]:
+    def run_protocol_login_submit_prepared_otp(
+        self,
+        snapshot: dict[str, Any],
+        before_validate=None,
+        mail_provider: Optional[MailProvider] = None,
+    ) -> dict[str, Any]:
         """
         纯协议登录拆分阶段 2：从快照恢复，只提交已保存 OTP 并保存提交后的状态。
 
@@ -3613,10 +3662,80 @@ class AuthFlow:
         self.restore_protocol_snapshot(snapshot)
         otp_code = str(snapshot.get("otp_code") or "").strip()
         if not otp_code:
-            raise RuntimeError("submit_prepared_otp 快照缺 otp_code")
-        if before_validate is not None:
-            before_validate(str(snapshot.get("email") or self.result.email or ""))
-        otp_resp = self.verify_otp(otp_code)
+            if mail_provider is None:
+                raise RuntimeError("submit_prepared_otp 快照缺 otp_code 且未提供 mail_provider")
+            email = str(snapshot.get("email") or self.result.email or "").strip()
+            if not email:
+                raise RuntimeError("submit_prepared_otp 快照缺 email，无法重新获取 OTP")
+            sync_ready_sent = False
+            if before_validate is not None:
+                before_validate(email)
+                sync_ready_sent = True
+                logger.info("[session-otp-submit:missing_otp_ready] email=%s", email)
+            try:
+                otp_timeout = max(1, int(os.getenv("SESSION_OTP_SUBMIT_MISSING_OTP_TIMEOUT", "5")))
+            except Exception:
+                otp_timeout = 5
+            try:
+                otp_max_polls = max(1, int(os.getenv("SESSION_OTP_SUBMIT_MISSING_OTP_POLLS", "1")))
+            except Exception:
+                otp_max_polls = 1
+            otp_sent_at = time.time()
+            send_error = ""
+            try:
+                if not self.kickoff_otp_delivery("protocol_submit_missing_otp"):
+                    self.send_otp()
+                if self._last_otp_sent_at:
+                    otp_sent_at = self._last_otp_sent_at
+            except Exception as e:
+                send_error = f"send_otp {type(e).__name__}: {str(e)[:200]}"
+            try:
+                otp_code = str(mail_provider.wait_for_otp(
+                    email,
+                    timeout=otp_timeout,
+                    issued_after=otp_sent_at,
+                    max_polls=otp_max_polls,
+                ) or "").strip()
+            except Exception as e:
+                wait_error = f"{type(e).__name__}: {str(e)[:240]}"
+                if before_validate is not None and not sync_ready_sent:
+                    before_validate(email)
+                logger.info("[session-otp-submit:skip_missing_otp] email=%s", email)
+                return self.export_protocol_snapshot(
+                    phase="otp_missing",
+                    continue_url=str(snapshot.get("continue_url") or ""),
+                    page_type=str(snapshot.get("page_type") or ""),
+                    otp_code="",
+                    otp_sent_at=otp_sent_at,
+                    otp_received_at=0.0,
+                    otp_error=f"{send_error}; {wait_error}" if send_error else wait_error,
+                    proxy=str(getattr(self.config, "proxy", "") or ""),
+                    proxy_meta=getattr(self.config, "proxy_meta", {}) or {},
+                )
+            if not otp_code:
+                if before_validate is not None and not sync_ready_sent:
+                    before_validate(email)
+                logger.info("[session-otp-submit:skip_missing_otp] email=%s", email)
+                return self.export_protocol_snapshot(
+                    phase="otp_missing",
+                    continue_url=str(snapshot.get("continue_url") or ""),
+                    page_type=str(snapshot.get("page_type") or ""),
+                    otp_code="",
+                    otp_sent_at=otp_sent_at,
+                    otp_received_at=0.0,
+                    otp_error=f"{send_error}; 重新获取 OTP 后仍为空" if send_error else "重新获取 OTP 后仍为空",
+                    proxy=str(getattr(self.config, "proxy", "") or ""),
+                    proxy_meta=getattr(self.config, "proxy_meta", {}) or {},
+                )
+            snapshot["otp_code"] = otp_code
+            snapshot["otp_sent_at"] = otp_sent_at
+            snapshot["otp_received_at"] = time.time()
+        email_for_sync = str(snapshot.get("email") or self.result.email or "")
+        otp_resp = self.verify_otp(
+            otp_code,
+            before_post=None if ('sync_ready_sent' in locals() and sync_ready_sent) else before_validate,
+            sync_email=email_for_sync,
+        )
         continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
         page_type = self._extract_page_type(otp_resp)
         return self.export_protocol_snapshot(
@@ -3728,6 +3847,8 @@ class AuthFlow:
                 self.register_password(email)
                 otp_sent_at = time.time()
                 self.send_otp()
+                if self._last_otp_sent_at:
+                    otp_sent_at = self._last_otp_sent_at
                 otp_code = mail_provider.wait_for_otp(
                     email,
                     timeout=otp_timeout,
@@ -3746,9 +3867,11 @@ class AuthFlow:
             # 仍需 OTP：优先 resend 获取新码
             otp_sent_at = time.time()
             resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
+            if self._last_otp_sent_at:
+                otp_sent_at = self._last_otp_sent_at
             if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
                 self.send_otp()
-                otp_sent_at = time.time()
+                otp_sent_at = self._last_otp_sent_at or time.time()
 
             otp_code = mail_provider.wait_for_otp(
                 email,
@@ -3764,6 +3887,8 @@ class AuthFlow:
                     otp_sent_at = time.time()
                     if not self.kickoff_otp_delivery("protocol_verify_retry"):
                         self.send_otp()
+                    if self._last_otp_sent_at:
+                        otp_sent_at = self._last_otp_sent_at
                     otp_code = mail_provider.wait_for_otp(
                         email,
                         timeout=otp_timeout,

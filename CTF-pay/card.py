@@ -7457,6 +7457,10 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             # 最长等 4 分钟看能不能到 localhost callback
             end = time.time() + 240
             otp_fetched = False
+            otp_submit_ts = 0.0
+            otp_retry_count = 0
+            otp_retry_max = int((mail_cfg or {}).get("rt_otp_retry_max") or 2)
+            otp_retry_wait_s = float((mail_cfg or {}).get("rt_otp_retry_wait_s") or 12)
             last_url = ""
             last_log_ts = 0.0
             log_in_stuck_since = 0.0
@@ -7466,6 +7470,9 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 if _capture_localhost_callback(page.url, "page.url"):
                     break
                 cur = page.url
+                if "/phone-otp/select-channel" in cur:
+                    _log("      [RT] phone-otp/select-channel 命中，账号需要手机号 OTP，提前判定不可使用")
+                    break
                 if cur.rstrip("/") == "https://auth.openai.com/log-in":
                     if log_in_stuck_since <= 0:
                         log_in_stuck_since = time.time()
@@ -7480,6 +7487,52 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     _log(f"      [RT] URL: {cur[:140]}")
                     last_url = cur
                     last_log_ts = now
+                if (
+                    otp_fetched
+                    and otp_submit_ts > 0
+                    and "email-verification" in cur
+                    and (now - otp_submit_ts) >= otp_retry_wait_s
+                ):
+                    if otp_retry_count >= otp_retry_max:
+                        _log(
+                            f"      [RT] OTP 提交后仍停留 email-verification，"
+                            f"已重试 {otp_retry_count}/{otp_retry_max}，提前结束"
+                        )
+                        _safe_screenshot(page, "/tmp/rt_email_verification_stuck.png")
+                        break
+                    resent = False
+                    for sel in [
+                        'button:has-text("Resend email")',
+                        'a:has-text("Resend email")',
+                        'button:has-text("Resend")',
+                        'a:has-text("Resend")',
+                        '[data-testid*="resend"]',
+                    ]:
+                        try:
+                            b = page.query_selector(sel)
+                            if b and b.is_visible():
+                                try:
+                                    b.click(timeout=3000, no_wait_after=True)
+                                except TypeError:
+                                    b.click(timeout=3000)
+                                otp_sent_ts = time.time()
+                                otp_fetched = False
+                                otp_submit_ts = 0.0
+                                otp_retry_count += 1
+                                resent = True
+                                _log(
+                                    f"      [RT] OTP 提交后仍停留 email-verification，"
+                                    f"点击重发并准备重试 ({otp_retry_count}/{otp_retry_max})"
+                                )
+                                time.sleep(2)
+                                break
+                        except Exception as e_resend:
+                            _log(f"      [RT] OTP 重发点击异常 {sel}: {str(e_resend)[:160]}")
+                    if not resent:
+                        _log("      [RT] OTP 提交后仍停留 email-verification，但未找到 Resend 按钮，提前结束")
+                        _safe_screenshot(page, "/tmp/rt_email_verification_no_resend.png")
+                        break
+                    continue
                 # OTP 页
                 if ("/email-otp" in cur or "passwordless" in cur or
                     page.query_selector('input[autocomplete="one-time-code"]') or
@@ -7518,6 +7571,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                                 if b and b.is_visible():
                                     b.click()
                                     _log("      [RT] OTP 提交")
+                                    otp_submit_ts = time.time()
                                     break
                             otp_fetched = True
                             time.sleep(3)

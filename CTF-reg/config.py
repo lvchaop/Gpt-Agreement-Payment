@@ -32,7 +32,7 @@ class MailConfig:
     # 兼容外部接口文档字段名；优先 external_provider_name，空时使用 provider_name。
     provider_name: str = ""
     external_provider_name: str = "cloudflare_temp_mail"
-    external_request_timeout_s: int = 20
+    external_request_timeout_s: int = 5
     external_poll_interval_s: float = 3.0
 
 
