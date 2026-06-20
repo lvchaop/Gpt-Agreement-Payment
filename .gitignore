@@ -64,3 +64,6 @@ Thumbs.db
 test_*.py
 !test_rt.py.example
 !webui/tests/test_*.py
+!refactor-app/tests/
+!refactor-app/tests/**/
+!refactor-app/tests/**/*.py

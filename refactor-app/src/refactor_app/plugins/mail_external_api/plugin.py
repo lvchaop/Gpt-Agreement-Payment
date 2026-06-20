@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+from refactor_app.plugins.contracts import HealthcheckResult, MailLease, OtpMessage
+from refactor_app.plugins.mail_external_api.client import (
+    ExternalMailApiClient,
+    ExternalMailApiClientConfig,
+)
+
+
+class ExternalMailApiPlugin:
+    name = "mail_external_api"
+
+    def __init__(self, client: ExternalMailApiClient) -> None:
+        self._client = client
+
+    @classmethod
+    def from_config(cls, config: ExternalMailApiClientConfig) -> ExternalMailApiPlugin:
+        return cls(ExternalMailApiClient(config))
+
+    def validate_config(self) -> None:
+        return None
+
+    def healthcheck(self) -> HealthcheckResult:
+        return HealthcheckResult(status="ok", details={"provider": "external_mail_api"})
+
+    def capabilities(self) -> list[str]:
+        return [
+            "mailbox.allocate",
+            "mailbox.poll_otp",
+            "mailbox.ensure_email",
+            "mailbox.wait_for_otp_by_email",
+            "mailbox.mark_used",
+            "mailbox.mark_failed",
+            "mailbox.release",
+        ]
+
+    def allocate_mailbox(self, *, purpose: str = "") -> MailLease:
+        return self._client.allocate_mailbox(purpose=purpose)
+
+    def poll_otp(self, *, external_lease_id: str, timeout_s: int) -> OtpMessage | None:
+        return self._client.poll_otp(external_lease_id=external_lease_id, timeout_s=timeout_s)
+
+    def ensure_email(self, *, email: str) -> dict:
+        return self._client.ensure_email(email=email)
+
+    def wait_for_otp_by_email(
+        self,
+        *,
+        email: str,
+        timeout_s: int = 180,
+        issued_after: float | None = None,
+        max_polls: int | None = None,
+    ) -> OtpMessage:
+        return self._client.wait_for_otp_by_email(
+            email=email,
+            timeout_s=timeout_s,
+            issued_after=issued_after,
+            max_polls=max_polls,
+        )
+
+    def mark_used(self, *, external_lease_id: str) -> None:
+        self._client.mark_used(external_lease_id=external_lease_id)
+
+    def mark_failed(
+        self,
+        *,
+        external_lease_id: str,
+        failure_code: str = "",
+        failure_message: str = "",
+    ) -> None:
+        self._client.mark_failed(
+            external_lease_id=external_lease_id,
+            failure_code=failure_code,
+            failure_message=failure_message,
+        )
+
+    def release(self, *, external_lease_id: str, reason: str = "") -> None:
+        self._client.release(external_lease_id=external_lease_id, reason=reason)

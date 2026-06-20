@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from refactor_app.plugins.contracts import DownstreamCodexPayload
+
+
+class DownstreamPayloadError(RuntimeError):
+    pass
+
+
+def validate_codex_payload(payload: DownstreamCodexPayload) -> None:
+    if not payload.access_token:
+        raise DownstreamPayloadError("access_token is required")
+    if not payload.refresh_token:
+        raise DownstreamPayloadError("refresh_token is required")
+    if not payload.email:
+        raise DownstreamPayloadError("email is required")
+    if not payload.account_id:
+        raise DownstreamPayloadError("account_id is required")
+    if not payload.downstream_chatgpt_account_id:
+        raise DownstreamPayloadError("downstream_chatgpt_account_id is required")
+    if payload.downstream_chatgpt_account_id != payload.token_chatgpt_account_id:
+        raise DownstreamPayloadError("token_chatgpt_account_id does not match downstream workspace")
+
+
+def codex_credentials_body(payload: DownstreamCodexPayload) -> dict:
+    validate_codex_payload(payload)
+    return {
+        "id_token": payload.id_token,
+        "access_token": payload.access_token,
+        "refresh_token": payload.refresh_token,
+        "account_id": payload.account_id,
+        "email": payload.email,
+        "last_refresh": now_iso(),
+        "expired": payload.expires_at.isoformat() if payload.expires_at else "",
+        "type": "codex",
+        "chatgpt_account_id": payload.downstream_chatgpt_account_id,
+        "chatgpt_user_id": payload.chatgpt_user_id,
+        "client_id": payload.client_id,
+        "expires_at": payload.expires_at.isoformat() if payload.expires_at else "",
+        "plan_type": payload.plan_type or payload.plan_tag,
+    }
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat()

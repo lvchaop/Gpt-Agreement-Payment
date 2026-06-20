@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import json
+from http.cookies import SimpleCookie
+from dataclasses import dataclass
+
+from .auth_flow import AuthFlow, AuthResult
+from .codex_rt import ExternalMailOtpAdapter, OtpProvider
+from .config import Config
+
+
+@dataclass(frozen=True)
+class SessionLoginResult:
+    ok: bool
+    auth_result: AuthResult
+    cookie_header: str
+    auth_cookie_header: str
+    snapshot: dict
+
+
+def acquire_chatgpt_session(
+    *,
+    email: str,
+    password: str,
+    proxy: str = "",
+    mail_provider: OtpProvider,
+    trace_dump_path: str = "",
+    skip_oauth_token_exchange: bool = True,
+) -> SessionLoginResult:
+    config = Config()
+    config.proxy = proxy or None
+    config.auth_env_flags = {
+        "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
+        "OAUTH_CODEX_RT_EXCHANGE": "0",
+        "OAUTH_SECONDARY_AUTHORIZE_EXCHANGE": "0",
+        "OAUTH_REFRESH_ONLY": "0",
+    }
+    if skip_oauth_token_exchange:
+        config.auth_env_flags["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
+    if trace_dump_path:
+        config.auth_trace_dump_enabled = True
+        config.auth_trace_dump_path = trace_dump_path
+
+    flow = AuthFlow(config)
+    adapter = ExternalMailOtpAdapter(mail_provider, ensure_before_wait=False)
+    result = flow.run_protocol_login(
+        email=email.strip().lower(),
+        password=password,
+        mail_provider=adapter,
+        existing_only=True,
+    )
+    result.cookie_header = flow._build_chatgpt_cookie_header()
+    auth_cookie_header = _cookie_header_from_session(flow, "openai.com")
+    if not auth_cookie_header and trace_dump_path:
+        auth_cookie_header = _cookie_header_from_trace_dump(trace_dump_path)
+    ok = bool(result.session_token and result.access_token)
+    return SessionLoginResult(
+        ok=ok,
+        auth_result=result,
+        cookie_header=result.cookie_header,
+        auth_cookie_header=auth_cookie_header,
+        snapshot=flow.export_protocol_snapshot(mail_events=adapter.events),
+    )
+
+
+def _cookie_header_from_session(flow: AuthFlow, domain_keyword: str) -> str:
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        cookies = list(flow.session.cookies)
+    except Exception:
+        cookies = []
+    for cookie in cookies:
+        name = str(getattr(cookie, "name", "") or "").strip()
+        value = str(getattr(cookie, "value", "") or "")
+        domain = str(getattr(cookie, "domain", "") or "").lower()
+        if not name or not value or domain_keyword not in domain or name in seen:
+            continue
+        seen.add(name)
+        pairs.append((name, value))
+    return "; ".join(f"{name}={value}" for name, value in pairs)
+
+
+def _cookie_header_from_trace_dump(trace_dump_path: str) -> str:
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        with open(trace_dump_path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                response = record.get("response") if isinstance(record, dict) else {}
+                if not isinstance(response, dict):
+                    continue
+                for raw in response.get("set_cookie_list") or []:
+                    _append_openai_cookie_from_set_cookie(pairs, seen, str(raw or ""))
+    except Exception:
+        return ""
+    return "; ".join(f"{name}={value}" for name, value in pairs)
+
+
+def _append_openai_cookie_from_set_cookie(
+    pairs: list[tuple[str, str]],
+    seen: set[str],
+    raw_set_cookie: str,
+) -> None:
+    if not raw_set_cookie:
+        return
+    raw_lc = raw_set_cookie.lower()
+    if "domain=openai.com" not in raw_lc and "domain=auth.openai.com" not in raw_lc:
+        return
+    if "max-age=0" in raw_lc or "expires=thu, 01 jan 1970" in raw_lc:
+        return
+    parsed = SimpleCookie()
+    try:
+        parsed.load(raw_set_cookie)
+    except Exception:
+        return
+    for name, morsel in parsed.items():
+        value = morsel.value
+        if not name or not value or name in seen:
+            continue
+        seen.add(name)
+        pairs.append((name, value))

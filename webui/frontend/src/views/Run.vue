@@ -396,6 +396,7 @@
           <div class="inventory-toolbar-actions">
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="verifySelected">验证选中</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="heartbeatSelected">心跳测试</TermBtn>
+            <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="acceptSelectedTeamInvite">接受选中邀请</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="syncPlanSelected">更新 Plan</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unknownOrUncheckedIds.length === 0" @click="verifyAllUnknown">验证全部未检 ({{ unknownOrUncheckedIds.length }})</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="pushSelectedToCpa">推送选中→CPA</TermBtn>
@@ -668,6 +669,32 @@ interface HeartbeatResponse {
     attempts_per_account: number;
     model: string;
     result_path?: string;
+  };
+  success_emails?: string[];
+  failed_emails: string[];
+}
+
+interface TeamInviteAcceptResult {
+  id: number;
+  email: string;
+  status: "ok" | "failed" | "prepare_failed" | "missing" | string;
+  ok: boolean;
+  http_status?: number;
+  message?: string;
+  team_account_id?: string;
+  sent_at?: string;
+}
+
+interface TeamInviteAcceptResponse {
+  results: TeamInviteAcceptResult[];
+  summary: {
+    total: number;
+    ready: number;
+    ok: number;
+    failed: number;
+    prepare_failed: number;
+    team_account_id: string;
+    workers: number;
   };
   success_emails?: string[];
   failed_emails: string[];
@@ -1433,6 +1460,50 @@ async function heartbeatSelected() {
     });
   } catch (e: any) {
     message.error(`心跳测试失败：${e?.response?.data?.detail || e?.message || e}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
+
+async function acceptSelectedTeamInvite() {
+  const ids = Array.from(selectedIds.value);
+  if (!ids.length) { message.warning("没有选中账号"); return; }
+  const teamAccountId = window.prompt("请输入 team_account_id / workspace account id", "");
+  if (!teamAccountId || !teamAccountId.trim()) return;
+  const workers = Math.max(1, Math.min(Number(form.value.workers || 1), 100));
+  const preview = emailsForIds(ids).slice(0, 5).join(", ") + (ids.length > 5 ? `... 共 ${ids.length}` : "");
+  if (!confirm(`对 ${ids.length} 个选中账号接受 Team 邀请？\nteam_account_id=${teamAccountId.trim()}\nworkers=${workers}\n\n${preview}`)) return;
+  inventoryBusy.value = true;
+  if (!eventSource) openStream();
+  try {
+    const r = await api.post<TeamInviteAcceptResponse>("/inventory/accounts/team-invite-accept", {
+      ids,
+      team_account_id: teamAccountId.trim(),
+      max_workers: workers,
+      timeout_s: 30,
+    });
+    const s = r.data.summary || {};
+    const failed = r.data.failed_emails || [];
+    await refreshInventory();
+    if (!failed.length) {
+      message.success(`接受邀请完成：ok=${s.ok || 0}/${s.total || ids.length} ready=${s.ready || 0}`);
+      return;
+    }
+    const detail = (r.data.results || [])
+      .filter(x => !x.ok)
+      .map(x => `${x.email || `id=${x.id}`}  status=${x.status}  HTTP ${x.http_status || "-"}  ${x.message || ""}`)
+      .join("\n");
+    dialog.warning({
+      title: `接受邀请有失败：ok=${s.ok || 0} failed=${failed.length} prepare_failed=${s.prepare_failed || 0}`,
+      content: () => h("pre", {
+        style: "max-height:520px; overflow:auto; white-space:pre-wrap; word-break:break-all; font-size:12px; line-height:1.6",
+      }, detail || failed.join("\n")),
+      positiveText: "复制失败邮箱",
+      negativeText: "关闭",
+      onPositiveClick: () => copyText(failed.join("\n"), "已复制失败邮箱"),
+    });
+  } catch (e: any) {
+    message.error(`接受邀请失败：${e?.response?.data?.detail || e?.message || e}`);
   } finally {
     inventoryBusy.value = false;
   }

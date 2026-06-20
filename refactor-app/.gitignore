@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.env
+
+# Frontend local/build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Runtime artifacts and local protocol/debug traces
+runtime/
+outputs/
+auth_trace_*.jsonl
+
+# Local browser/cache artifacts
+*.log
+.DS_Store

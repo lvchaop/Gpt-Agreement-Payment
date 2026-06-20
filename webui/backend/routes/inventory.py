@@ -5,7 +5,9 @@ import json
 import base64
 import hashlib
 import io
+import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -50,6 +52,12 @@ class HeartbeatRequest(IdsRequest):
     model: str = ""
     timeout_s: float = 30.0
     max_workers: int = 3
+
+
+class TeamInviteAcceptRequest(IdsRequest):
+    team_account_id: str = ""
+    max_workers: int = 20
+    timeout_s: float = 30.0
 
 
 class SaleClaimRequest(BaseModel):
@@ -278,6 +286,13 @@ def _heartbeat_log(line: str) -> None:
         pass
 
 
+def _team_accept_log(line: str) -> None:
+    try:
+        runner.append_log(f"[team-accept] {line}")
+    except Exception:
+        pass
+
+
 def _heartbeat_proxy_label(result: dict) -> str:
     info = result.get("proxy_info") if isinstance(result.get("proxy_info"), dict) else {}
     node = str(info.get("node") or "").strip()
@@ -361,6 +376,102 @@ def _exchange_refresh_token(refresh_token: str, client_id: str) -> dict:
     with opener.open(req, timeout=20) as r:
         tok = json.loads(r.read().decode())
     return tok if isinstance(tok, dict) else {}
+
+
+def _exchange_refresh_token_via_proxy(refresh_token: str, client_id: str,
+                                      timeout_s: float, proxy_url: str = "") -> dict:
+    try:
+        import curl_cffi.requests as cr
+    except Exception:
+        return _exchange_refresh_token(refresh_token, client_id)
+    session = cr.Session(impersonate="chrome136")
+    proxy_url = str(proxy_url or "").strip()
+    if proxy_url:
+        pu = proxy_url.replace("socks5://", "socks5h://")
+        session.proxies = {"http": pu, "https": pu}
+    resp = session.post(
+        "https://auth.openai.com/oauth/token",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "scope": "openid email profile offline_access",
+        },
+        timeout=timeout_s,
+    )
+    if not (200 <= int(resp.status_code or 0) < 300):
+        raise RuntimeError(f"refresh_failed http={resp.status_code} body={resp.text[:240]}")
+    try:
+        tok = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"refresh_decode_failed: {type(e).__name__}: {str(e)[:120]}") from e
+    return tok if isinstance(tok, dict) else {}
+
+
+def _team_token_claims(access_token: str) -> dict:
+    payload = _decode_access_token_payload(access_token)
+    auth = payload.get("https://api.openai.com/auth") if isinstance(payload.get("https://api.openai.com/auth"), dict) else {}
+    verified_ws_ids = auth.get("verified_ws_ids")
+    if not isinstance(verified_ws_ids, list):
+        verified_ws_ids = []
+    return {
+        "chatgpt_account_id": str(auth.get("chatgpt_account_id") or "").strip(),
+        "chatgpt_account_user_id": str(auth.get("chatgpt_account_user_id") or "").strip(),
+        "chatgpt_user_id": str(auth.get("chatgpt_user_id") or auth.get("user_id") or payload.get("sub") or "").strip(),
+        "chatgpt_plan_type": str(auth.get("chatgpt_plan_type") or "").strip(),
+        "verified_ws_ids": [str(x).strip() for x in verified_ws_ids if str(x).strip()],
+    }
+
+
+def _team_token_matches_account(access_token: str, team_account_id: str) -> tuple[bool, dict, str]:
+    expected = str(team_account_id or "").strip()
+    claims = _team_token_claims(access_token)
+    account_id = claims.get("chatgpt_account_id") or ""
+    account_user_id = claims.get("chatgpt_account_user_id") or ""
+    verified_ws_ids = claims.get("verified_ws_ids") if isinstance(claims.get("verified_ws_ids"), list) else []
+    matched = (
+        bool(expected)
+        and (
+            account_id == expected
+            or expected in verified_ws_ids
+            or account_user_id.endswith(f"__{expected}")
+        )
+    )
+    plan = claims.get("chatgpt_plan_type") or ""
+    detail = (
+        f"token_account={account_id or '-'} plan={plan or '-'} "
+        f"verified_ws_ids={len(verified_ws_ids)}"
+    )
+    return matched, claims, detail
+
+
+def _persist_account_tokens(account_id: int, body: dict) -> None:
+    access_token = str(body.get("access_token") or "").strip()
+    id_token = str(body.get("id_token") or "").strip()
+    refresh_token = str(body.get("refresh_token") or "").strip()
+    sets: list[str] = []
+    args: list[str] = []
+    if access_token:
+        sets.append("access_token = ?")
+        args.append(access_token)
+    if id_token:
+        sets.append("id_token = ?")
+        args.append(id_token)
+    if refresh_token:
+        sets.append("refresh_token = ?")
+        args.append(refresh_token)
+    if not sets:
+        return
+    args.append(str(account_id))
+    with get_db()._conn() as c:
+        c.execute(
+            f"UPDATE registered_accounts SET {', '.join(sets)} WHERE id = ?",
+            args,
+        )
 
 
 def _fresh_access_token_for_account(account: dict, client_id: str) -> tuple[str, bool, str]:
@@ -456,6 +567,423 @@ def _post_openai_heartbeat(
         return False, body[:240] or str(e), int(getattr(e, "code", 0) or 0)
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:200]}", 0
+
+
+def _post_team_invite_accept(access_token: str, team_account_id: str, device_id: str,
+                             timeout_s: float, proxy_url: str = "") -> tuple[bool, str, int]:
+    try:
+        import curl_cffi.requests as cr
+        session = cr.Session(impersonate="chrome136")
+        proxy_url = str(proxy_url or "").strip()
+        if proxy_url:
+            pu = proxy_url.replace("socks5://", "socks5h://")
+            session.proxies = {"http": pu, "https": pu}
+        resp = session.post(
+            f"https://chatgpt.com/backend-api/accounts/{team_account_id}/invites/accept",
+            headers={
+                "authorization": f"Bearer {access_token}",
+                "content-type": "application/json",
+                "accept": "*/*",
+                "origin": "https://chatgpt.com",
+                "referer": "https://chatgpt.com/",
+                "oai-device-id": device_id or "",
+            },
+            data="",
+            timeout=timeout_s,
+        )
+        return resp.status_code in (200, 201), resp.text[:500], int(resp.status_code or 0)
+    except Exception as e:
+        return False, f"request_failed: {type(e).__name__}: {str(e)[:180]}", 0
+
+
+def _record_team_invite_accept_result(account_id: int, email: str, team_account_id: str,
+                                      status: str, message: str, refresh_token: str = "") -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    ok = status == "ok"
+    try:
+        get_db().update_account_check(
+            int(account_id),
+            "valid" if ok else "unknown",
+            f"team invite accept {status}: {message[:180]}",
+            "team" if ok else "",
+        )
+    except Exception:
+        pass
+    try:
+        get_db().add_card_result({
+            "ts": now,
+            "status": "succeeded" if ok else "failed",
+            "chatgpt_email": email,
+            "email": email,
+            "session_id": f"team-accept-{int(time.time())}",
+            "channel": "manual_team_invite_accept",
+            "error": "" if ok else message[:500],
+            "refresh_token": refresh_token,
+            "team_account_id": team_account_id if ok else "",
+            "invite_permission": "accepted" if ok else f"accept_failed:{message[:160]}",
+        })
+    except Exception:
+        pass
+
+
+def _team_invite_prepare_account(account_id: int, client_id: str) -> tuple[dict | None, dict | None]:
+    acc = get_db().get_registered_account(int(account_id))
+    if not acc:
+        return None, {
+            "id": int(account_id),
+            "email": "",
+            "status": "missing",
+            "ok": False,
+            "http_status": 0,
+            "message": "account not found",
+        }
+    email = str(acc.get("email") or "").strip().lower()
+    rt = str(acc.get("refresh_token") or "").strip()
+    if not rt and email:
+        rt = get_db().latest_refresh_token_for_email(email)
+    access_token = str(acc.get("access_token") or "").strip()
+    refreshed = False
+    token_msg = "stored_access_token"
+    if rt:
+        try:
+            tok = _exchange_refresh_token(rt, client_id)
+            new_access = str(tok.get("access_token") or "").strip()
+            if new_access:
+                access_token = new_access
+                rt = str(tok.get("refresh_token") or "").strip() or rt
+                refreshed = True
+                token_msg = "refresh_token"
+        except Exception as e:
+            if not access_token:
+                return None, {
+                    "id": int(account_id),
+                    "email": email,
+                    "status": "prepare_failed",
+                    "ok": False,
+                    "http_status": 0,
+                    "message": f"refresh_failed: {type(e).__name__}: {str(e)[:180]}",
+                }
+            token_msg = f"stored_access_token_after_refresh_failed: {type(e).__name__}"
+    if not access_token:
+        return None, {
+            "id": int(account_id),
+            "email": email,
+            "status": "prepare_failed",
+            "ok": False,
+            "http_status": 0,
+            "message": "no_access_token_or_refresh_token",
+        }
+    return {
+        "id": int(account_id),
+        "email": email,
+        "access_token": access_token,
+        "refresh_token": rt,
+        "device_id": str(acc.get("device_id") or "").strip(),
+        "refreshed": refreshed,
+        "token_msg": token_msg,
+    }, None
+
+
+def _team_accept_proxy_controls() -> tuple[object | None, str, str]:
+    try:
+        cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        return None, "", f"read_proxy_config_failed: {type(e).__name__}: {str(e)[:120]}"
+
+    trojan_cfg = cfg.get("trojan_pool") if isinstance(cfg.get("trojan_pool"), dict) else {}
+    if not trojan_cfg.get("enabled"):
+        return None, "", "trojan_pool_not_enabled"
+    pool_file = str(trojan_cfg.get("pool_file") or "").strip()
+    if not pool_file:
+        return None, "", "trojan_pool_enabled_but_missing_pool_file"
+    try:
+        repo_root = Path(__file__).resolve().parents[3]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from proxy_bridge import TrojanBridgeManager  # type: ignore
+
+        manager = TrojanBridgeManager(
+            str(_resolve_repo_path(pool_file)),
+            http_start_port=int(trojan_cfg.get("http_start_port") or 18081),
+            work_dir=s.ROOT / "output" / "proxy_bridge",
+            executable=str(trojan_cfg.get("bridge_bin") or "sing-box"),
+            auto_start=True,
+        )
+        manager.ensure_started()
+        probe_timeout = float(trojan_cfg.get("probe_timeout_s") or 8.0)
+        probe_url = str(trojan_cfg.get("probe_url") or "").strip()
+        alive = manager.alive_nodes(timeout_s=probe_timeout, probe_url=probe_url)
+        if not alive:
+            return None, "", "trojan_pool_no_alive_nodes"
+        random.shuffle(alive)
+        allocator = manager.allocator(
+            all_region=str(trojan_cfg.get("region_all") or ""),
+            register_region=str(trojan_cfg.get("region_register") or ""),
+            checkout_region=str(trojan_cfg.get("region_checkout") or ""),
+            payment_region=str(trojan_cfg.get("region_payment") or ""),
+            register_nodes=alive,
+        )
+        return allocator, "", f"trojan_alive_nodes={len(alive)}/{len(manager.nodes)}"
+    except Exception as e:
+        return None, "", f"trojan_pool_init_or_probe_failed: {type(e).__name__}: {str(e)[:160]}"
+
+
+def _team_invite_accept_worker(state: dict, *, team_account_id: str, client_id: str, timeout_s: float,
+                               barrier: threading.Barrier) -> dict:
+    email = str(state.get("email") or "")
+    try:
+        _team_accept_log(f"ready {email}")
+        barrier.wait()
+    except threading.BrokenBarrierError:
+        return {
+            "id": int(state.get("id") or 0),
+            "email": email,
+            "status": "barrier_broken",
+            "ok": False,
+            "http_status": 0,
+            "message": "sync barrier broken before accept",
+        }
+    sent_at = datetime.now(timezone.utc).isoformat()
+    accept_ok, msg, http_status = _post_team_invite_accept(
+        str(state.get("access_token") or ""),
+        team_account_id,
+        str(state.get("device_id") or ""),
+        timeout_s,
+        str(state.get("proxy") or ""),
+    )
+    verify_ok = False
+    verify_msg = "accept_not_success"
+    verify_claims: dict = {}
+    refreshed_body: dict = {}
+    if accept_ok:
+        rt = str(state.get("refresh_token") or "").strip()
+        if rt:
+            for verify_attempt in range(1, 4):
+                try:
+                    refreshed_body = _exchange_refresh_token_via_proxy(
+                        rt,
+                        client_id,
+                        max(5.0, float(timeout_s or 0)),
+                        str(state.get("proxy") or ""),
+                    )
+                    rt = str(refreshed_body.get("refresh_token") or "").strip() or rt
+                    new_access = str(refreshed_body.get("access_token") or "").strip()
+                    if new_access:
+                        verify_ok, verify_claims, verify_msg = _team_token_matches_account(new_access, team_account_id)
+                        verify_msg = f"attempt={verify_attempt} {verify_msg}"
+                        if verify_ok:
+                            _persist_account_tokens(int(state.get("id") or 0), refreshed_body)
+                            plan_type = _plan_type_from_token(new_access) or _plan_type_from_token(str(refreshed_body.get("id_token") or ""))
+                            get_db().update_account_check(
+                                int(state.get("id") or 0),
+                                "valid",
+                                f"team invite accept verified: {verify_msg}",
+                                plan_type=plan_type or "team",
+                            )
+                            break
+                        verify_msg = f"accept_http_success_but_token_not_in_team: {verify_msg}"
+                    else:
+                        verify_msg = f"attempt={verify_attempt} accept_http_success_but_refresh_returned_no_access_token"
+                except Exception as e:
+                    verify_msg = (
+                        f"attempt={verify_attempt} accept_http_success_but_verify_refresh_failed: "
+                        f"{type(e).__name__}: {str(e)[:180]}"
+                    )
+                if verify_ok:
+                    break
+                if verify_attempt < 3:
+                    time.sleep(2.0)
+        else:
+            verify_ok, verify_claims, verify_msg = _team_token_matches_account(
+                str(state.get("access_token") or ""),
+                team_account_id,
+            )
+            if not verify_ok:
+                verify_msg = f"accept_http_success_but_no_refresh_token_to_verify_fresh_state: {verify_msg}"
+    final_ok = bool(accept_ok and verify_ok)
+    status = "ok" if final_ok else ("accepted_unverified" if accept_ok else "failed")
+    final_msg = str(msg or "")
+    if accept_ok:
+        final_msg = f"{final_msg[:220]} | verify={verify_msg}"
+    return {
+        "id": int(state.get("id") or 0),
+        "email": email,
+        "status": status,
+        "ok": final_ok,
+        "accept_ok": bool(accept_ok),
+        "http_status": int(http_status or 0),
+        "message": final_msg,
+        "team_account_id": team_account_id,
+        "refreshed": bool(state.get("refreshed")),
+        "token_source": str(state.get("token_msg") or ""),
+        "verify_claims": verify_claims,
+        "verify_refreshed": bool(refreshed_body.get("access_token")),
+        "sent_at": sent_at,
+        "proxy": str(state.get("proxy") or ""),
+        "proxy_info": state.get("proxy_info") if isinstance(state.get("proxy_info"), dict) else {},
+    }
+
+
+def _team_invite_accept_accounts(ids: list[int], *, team_account_id: str,
+                                 max_workers: int, timeout_s: float) -> dict:
+    started_at = datetime.now(timezone.utc).isoformat()
+    client_id = _export_oauth_client_id()
+    id_order = [int(i) for i in ids]
+    workers = max(1, min(int(max_workers), len(id_order)))
+    results: list[dict] = []
+    states: list[dict] = []
+    runner.begin_external_log_stream()
+    _team_accept_log(
+        f"start total={len(id_order)} team_account_id={team_account_id} "
+        f"workers={workers} timeout={timeout_s}s"
+    )
+    try:
+        proxy_allocator, fallback_proxy_url, proxy_init_message = _team_accept_proxy_controls()
+        if proxy_init_message:
+            _team_accept_log(f"proxy {proxy_init_message}")
+        if proxy_allocator is None and not fallback_proxy_url:
+            _team_accept_log("proxy unavailable; abort before accept")
+            return {
+                "results": [
+                    {
+                        "id": aid,
+                        "email": "",
+                        "status": "prepare_failed",
+                        "ok": False,
+                        "http_status": 0,
+                        "message": proxy_init_message or "proxy unavailable",
+                    }
+                    for aid in id_order
+                ],
+                "summary": {
+                    "total": len(id_order),
+                    "ready": 0,
+                    "ok": 0,
+                    "failed": 0,
+                    "prepare_failed": len(id_order),
+                    "team_account_id": team_account_id,
+                    "workers": workers,
+                    "started_at": started_at,
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                },
+                "success_emails": [],
+                "failed_emails": [],
+            }
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_team_invite_prepare_account, aid, client_id): aid for aid in id_order}
+            prepared = 0
+            for fut in futures:
+                aid = futures[fut]
+                try:
+                    state, early = fut.result()
+                except Exception as e:
+                    state, early = None, {
+                        "id": aid,
+                        "email": "",
+                        "status": "prepare_failed",
+                        "ok": False,
+                        "http_status": 0,
+                        "message": f"prepare worker error: {type(e).__name__}: {str(e)[:180]}",
+                    }
+                if early is not None:
+                    results.append(early)
+                    _team_accept_log(
+                        f"PREPARE_FAIL id={early.get('id')} email={early.get('email') or '-'} "
+                        f"msg={str(early.get('message') or '')[:180]}"
+                    )
+                    continue
+                if state is not None:
+                    proxy_url, proxy_info = _heartbeat_proxy_for_account(proxy_allocator, fallback_proxy_url)
+                    state["proxy"] = proxy_url
+                    state["proxy_info"] = proxy_info
+                    states.append(state)
+                    prepared += 1
+                    _team_accept_log(
+                        f"prepared {prepared}/{len(id_order)} {state.get('email')} "
+                        f"token={state.get('token_msg')} proxy={_heartbeat_proxy_label(state)}"
+                    )
+
+        _team_accept_log(
+            f"prepared_done ready={len(states)} prepare_failed={len(results)} "
+            f"sync_release_count={len(states)}"
+        )
+        if states:
+            barrier = threading.Barrier(len(states))
+            # accept 阶段必须让所有已准备账号同时进入 barrier；如果线程数小于
+            # barrier parties，会有未调度任务导致已启动线程永久等待。
+            accept_workers = len(states)
+            _team_accept_log(f"sync_barrier parties={len(states)} accept_workers={accept_workers}")
+            with ThreadPoolExecutor(max_workers=accept_workers) as ex:
+                futures = {
+                    ex.submit(
+                        _team_invite_accept_worker,
+                        state,
+                        team_account_id=team_account_id,
+                        client_id=client_id,
+                        timeout_s=timeout_s,
+                        barrier=barrier,
+                    ): state
+                    for state in states
+                }
+                for fut in futures:
+                    state = futures[fut]
+                    email = str(state.get("email") or "")
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        result = {
+                            "id": int(state.get("id") or 0),
+                            "email": email,
+                            "status": "failed",
+                            "ok": False,
+                            "http_status": 0,
+                            "team_account_id": team_account_id,
+                            "message": f"accept worker error: {type(e).__name__}: {str(e)[:180]}",
+                        }
+                    results.append(result)
+                    _record_team_invite_accept_result(
+                        int(result.get("id") or 0),
+                        str(result.get("email") or ""),
+                        team_account_id,
+                        str(result.get("status") or ("ok" if result.get("ok") else "failed")),
+                        str(result.get("message") or ""),
+                        str(state.get("refresh_token") or ""),
+                    )
+                    _team_accept_log(
+                        f"{'OK' if result.get('ok') else 'FAIL'} {result.get('email') or '-'} "
+                        f"status={result.get('status')} http={result.get('http_status') or '-'} "
+                        f"msg={str(result.get('message') or '')[:220]}"
+                    )
+
+        results.sort(
+            key=lambda r: id_order.index(int(r.get("id") or 0))
+            if int(r.get("id") or 0) in id_order else len(id_order)
+        )
+        failed = [r for r in results if not r.get("ok")]
+        succeeded = [r for r in results if r.get("ok")]
+        payload = {
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "ready": len(states),
+                "ok": len(succeeded),
+                "failed": sum(1 for r in failed if r.get("status") != "prepare_failed"),
+                "prepare_failed": sum(1 for r in results if r.get("status") in ("prepare_failed", "missing")),
+                "team_account_id": team_account_id,
+                "workers": workers,
+                "started_at": started_at,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "success_emails": [str(r.get("email") or "") for r in succeeded if r.get("email")],
+            "failed_emails": [str(r.get("email") or "") for r in failed if r.get("email")],
+        }
+        _team_accept_log(
+            f"done total={payload['summary']['total']} ok={payload['summary']['ok']} "
+            f"failed={payload['summary']['failed']} prepare_failed={payload['summary']['prepare_failed']}"
+        )
+        return payload
+    finally:
+        runner.end_external_log_stream()
 
 
 def _heartbeat_account(
@@ -1273,6 +1801,23 @@ def heartbeat_accounts(req: HeartbeatRequest, user: str = CurrentUser):
         model=model,
         timeout_s=timeout,
         max_workers=workers,
+    )
+
+
+@router.post("/accounts/team-invite-accept")
+def team_invite_accept(req: TeamInviteAcceptRequest, user: str = CurrentUser):
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    team_account_id = str(req.team_account_id or "").strip()
+    if not team_account_id:
+        raise HTTPException(status_code=400, detail="team_account_id 不能为空")
+    workers = max(1, min(int(req.max_workers or 20), 100))
+    timeout = max(5.0, min(float(req.timeout_s or 30.0), 120.0))
+    return _team_invite_accept_accounts(
+        [int(i) for i in req.ids],
+        team_account_id=team_account_id,
+        max_workers=workers,
+        timeout_s=timeout,
     )
 
 

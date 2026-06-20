@@ -129,7 +129,7 @@ class ExternalMailApiProvider:
                 or getattr(mail_cfg, "provider_name", "")
                 or "cloudflare_temp_mail"
             ),
-            request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 5) or 5),
+            request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 30) or 30),
             poll_interval_s=float(getattr(mail_cfg, "external_poll_interval_s", 3.0) or 3.0),
         )
 
@@ -364,17 +364,6 @@ class ExternalMailApiProvider:
 
             err_code = str(payload.get("code") or payload.get("error", {}).get("code") or "").strip()
             last_error = self._error_message(payload, status)
-            if (not ensured_after_missing) and self._is_missing_mailbox_error(payload, status):
-                logger.info(
-                    "[external-mail] verification-code 返回邮箱不存在，先 ensure 后继续轮询 email=%s error=%s",
-                    email,
-                    last_error,
-                )
-                self.ensure_email(email)
-                ensured_after_missing = True
-                if poll_limit and polls >= poll_limit:
-                    break
-                continue
             if status < 500 and err_code and err_code not in not_found_codes:
                 raise RuntimeError(f"verification-code 失败 email={email}: {last_error}")
 

@@ -126,7 +126,7 @@ class MailProvider:
         external_base_url: str = "",
         external_api_key: str = "",
         external_provider_name: str = "cloudflare_temp_mail",
-        external_request_timeout_s: int = 5,
+        external_request_timeout_s: int = 30,
         external_poll_interval_s: float = 3.0,
     ):
         self.mode = (mode or "cloudflare_kv").strip().lower()
@@ -136,7 +136,7 @@ class MailProvider:
         self.external_base_url = external_base_url
         self.external_api_key = external_api_key
         self.external_provider_name = external_provider_name or "cloudflare_temp_mail"
-        self.external_request_timeout_s = int(external_request_timeout_s or 5)
+        self.external_request_timeout_s = int(external_request_timeout_s or 30)
         self.external_poll_interval_s = float(external_poll_interval_s or 3.0)
         self._external_provider = None
         self._reuse_email: Optional[str] = None  # 兼容 register-only resume
@@ -162,7 +162,7 @@ class MailProvider:
                 or getattr(mail_cfg, "provider_name", "")
                 or "cloudflare_temp_mail"
             ),
-            external_request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 5) or 5),
+            external_request_timeout_s=int(getattr(mail_cfg, "external_request_timeout_s", 30) or 30),
             external_poll_interval_s=float(getattr(mail_cfg, "external_poll_interval_s", 3.0) or 3.0),
         )
 
@@ -182,8 +182,6 @@ class MailProvider:
             self._reuse_email = None
             logger.info(f"复用邮箱: {addr}")
             self.last_persona = None  # resume 路径无法回推 first/last
-            if self.mode == "external_temp_mail":
-                self._external_mail_provider().ensure_email(addr)
             return addr
         if self.mode == "imap_list":
             account = self._email_pool().reserve_next()
