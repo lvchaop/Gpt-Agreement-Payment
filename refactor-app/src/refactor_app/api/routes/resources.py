@@ -46,7 +46,7 @@ from refactor_app.infrastructure.db.models import (
 
 router = APIRouter(tags=["resources"])
 DbSession = Annotated[Session, Depends(get_db_session)]
-CODEX_BROWSER_AUTH_CONCURRENCY_LIMIT = 5
+CODEX_BROWSER_AUTH_CONCURRENCY_LIMIT = 50
 
 
 class ImportUserAccountRequest(BaseModel):
