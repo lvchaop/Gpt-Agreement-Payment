@@ -60,15 +60,15 @@ async function runMailAction(action: "poll" | "used" | "failed" | "release") {
     :loader="resourcesApi.mailLeases"
     empty-text="暂无邮箱租约。"
   >
-    <template #before>
+    <template #actions>
       <div class="grid-2 action-panels">
-        <form class="panel filter-panel action-form" @submit.prevent="allocateLease">
+        <form class="action-subcard action-form" @submit.prevent="allocateLease">
           <h3>分配邮箱租约</h3>
           <label class="field"><span>账号 ID（可选）</span><input v-model="allocate.user_account_id" class="input" /></label>
           <label class="field"><span>用途</span><input v-model="allocate.purpose" class="input" /></label>
           <button class="btn primary">创建分配任务</button>
         </form>
-        <section class="panel filter-panel action-form">
+        <section class="action-subcard action-form">
           <h3>租约生命周期</h3>
           <label class="field"><span>邮箱租约 ID</span><input v-model="lifecycle.mail_lease_id" class="input" /></label>
           <label class="field"><span>等待秒数</span><input v-model.number="lifecycle.timeout_s" class="input" type="number" min="1" /></label>
@@ -89,7 +89,7 @@ async function runMailAction(action: "poll" | "used" | "failed" | "release") {
 
 <style scoped>
 .action-panels {
-  margin-bottom: 18px;
+  width: 100%;
 }
 
 .action-form {

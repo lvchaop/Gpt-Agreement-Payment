@@ -9,11 +9,6 @@ import { useOpsStore } from "../stores/ops";
 
 const store = useOpsStore();
 const router = useRouter();
-const form = ref({
-  id: "",
-  email: "",
-  account_status: "active",
-});
 
 const columns = [
   { key: "id", label: "账号 ID", mono: true },
@@ -167,19 +162,6 @@ async function buildSelectedCredentials() {
   await router.push({ name: "job-trace", params: { jobId: result.job_id } });
 }
 
-async function submit(reload: () => Promise<void>) {
-  const result = await resourcesApi.importAccount({
-    id: form.value.id,
-    email: form.value.email,
-    account_status: form.value.account_status,
-  });
-  store.toast("账号已导入", result.user_account_id, "success");
-  form.value.id = "";
-  form.value.email = "";
-  form.value.account_status = "active";
-  await reload();
-}
-
 async function deleteAccount(row: Row, reload: () => Promise<void>) {
   const id = String(row.id || "");
   if (!id) return;
@@ -207,75 +189,87 @@ async function deleteAccount(row: Row, reload: () => Promise<void>) {
     empty-text="暂无账号。"
     @selection-change="updateSelection"
   >
-    <template #actions>
-      <label class="inline-control">
-        <span>并发 Work</span>
-        <input v-model.number="backfillConcurrency" class="input small-input" type="number" min="1" max="500" />
-      </label>
-      <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('session')">
-        补 Session
-      </button>
-      <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('rt')">
-        补 RT
-      </button>
-      <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('session_rt')">
-        补 Session + RT
-      </button>
-      <label class="inline-control">
-        <span>授权空间</span>
-        <select v-model="selectedAuthWorkspaceId" class="select workspace-select">
-          <option v-for="workspace in workspaces" :key="String(workspace.id)" :value="String(workspace.id)">
-            {{ workspace.name || workspace.external_workspace_id }} / {{ workspace.external_workspace_id }}
-          </option>
-        </select>
-      </label>
-      <label class="inline-control">
-        <span>Codex Client</span>
-        <input v-model="codexClientId" class="input workspace-select" />
-      </label>
-      <label class="inline-control">
-        <span>授权并发</span>
-        <input v-model.number="authConcurrency" class="input small-input" type="number" min="1" max="500" />
-      </label>
-      <button class="btn primary" :disabled="selectedCount === 0 || !selectedAuthWorkspaceId" @click="buildSelectedCredentials">
-        生成 Codex 授权
-      </button>
-      <label class="inline-control">
-        <span>邀请空间</span>
-        <select v-model="selectedWorkspaceId" class="select workspace-select">
-          <option v-for="workspace in workspaces" :key="String(workspace.id)" :value="String(workspace.id)">
-            {{ workspace.name || workspace.external_workspace_id }} / {{ workspace.external_workspace_id }}
-          </option>
-        </select>
-      </label>
-      <label class="inline-control">
-        <span>邀请并发</span>
-        <input v-model.number="inviteConcurrency" class="input small-input" type="number" min="1" max="500" />
-      </label>
-      <button class="btn primary" :disabled="selectedCount === 0 || !selectedWorkspaceId" @click="inviteSelectedUsers">
-        发送邀请
-      </button>
-      <span class="selected-hint">已选 {{ selectedCount }} 个账号</span>
-    </template>
-    <template #before="{ reload }">
-      <form class="panel filter-panel import-form" @submit.prevent="submit(reload)">
-        <label class="field">
-          <span>账号 ID（可选，不填自动生成）</span>
-          <input v-model="form.id" class="input" placeholder="user-account-..." />
-        </label>
-        <label class="field">
-          <span>邮箱</span>
-          <input v-model="form.email" class="input" type="email" required placeholder="name@example.com" />
-        </label>
-        <label class="field">
-          <span>账号状态</span>
-          <select v-model="form.account_status" class="select">
-            <option value="active">active</option>
-            <option value="invalid">invalid</option>
-          </select>
-        </label>
-        <button class="btn primary">导入账号</button>
-      </form>
+    <template #actionCards>
+      <section class="panel account-action-card">
+        <div class="account-action-heading">
+          <div>
+            <h2>账号认证</h2>
+            <p>对选中账号补 Session、个人 RT 或同时补齐。</p>
+          </div>
+          <span class="selected-hint">已选 {{ selectedCount }} 个账号</span>
+        </div>
+        <div class="account-action-body">
+          <label class="inline-control">
+            <span>并发 Work</span>
+            <input v-model.number="backfillConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('session')">
+            补 Session
+          </button>
+          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('rt')">
+            补 RT
+          </button>
+          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('session_rt')">
+            补 Session + RT
+          </button>
+        </div>
+      </section>
+
+      <section class="panel account-action-card">
+        <div class="account-action-heading">
+          <div>
+            <h2>Codex 授权</h2>
+            <p>使用选中账号对指定 Team Workspace 生成 Codex OAuth credential。</p>
+          </div>
+        </div>
+        <div class="account-action-body">
+          <label class="inline-control">
+            <span>授权空间</span>
+            <select v-model="selectedAuthWorkspaceId" class="select workspace-select">
+              <option v-for="workspace in workspaces" :key="String(workspace.id)" :value="String(workspace.id)">
+                {{ workspace.name || workspace.external_workspace_id }} / {{ workspace.external_workspace_id }}
+              </option>
+            </select>
+          </label>
+          <label class="inline-control">
+            <span>Codex Client</span>
+            <input v-model="codexClientId" class="input workspace-select" />
+          </label>
+          <label class="inline-control">
+            <span>授权并发</span>
+            <input v-model.number="authConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <button class="btn primary" :disabled="selectedCount === 0 || !selectedAuthWorkspaceId" @click="buildSelectedCredentials">
+            生成 Codex 授权
+          </button>
+        </div>
+      </section>
+
+      <section class="panel account-action-card">
+        <div class="account-action-heading">
+          <div>
+            <h2>空间邀请</h2>
+            <p>向指定 Team Workspace 发送邀请，接受邀请在“空间成员”页处理。</p>
+          </div>
+        </div>
+        <div class="account-action-body">
+          <label class="inline-control">
+            <span>邀请空间</span>
+            <select v-model="selectedWorkspaceId" class="select workspace-select">
+              <option v-for="workspace in workspaces" :key="String(workspace.id)" :value="String(workspace.id)">
+                {{ workspace.name || workspace.external_workspace_id }} / {{ workspace.external_workspace_id }}
+              </option>
+            </select>
+          </label>
+          <label class="inline-control">
+            <span>邀请并发</span>
+            <input v-model.number="inviteConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <button class="btn primary" :disabled="selectedCount === 0 || !selectedWorkspaceId" @click="inviteSelectedUsers">
+            发送邀请
+          </button>
+        </div>
+      </section>
     </template>
     <template #rowActions="{ row, reload }">
       <button class="btn danger" @click="deleteAccount(row, reload)">删除</button>
@@ -284,17 +278,54 @@ async function deleteAccount(row: Row, reload: () => Promise<void>) {
 </template>
 
 <style scoped>
-.import-form {
-  align-items: end;
-  display: grid;
+.account-action-card {
+  margin-bottom: 14px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.account-action-heading {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
   gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  justify-content: space-between;
+  padding: 14px 16px;
+}
+
+.account-action-heading h2 {
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.account-action-heading p {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 5px 0 0;
+}
+
+.account-action-body {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 16px 16px;
 }
 
 .selected-hint {
   color: var(--text-muted);
   font-size: 13px;
   font-weight: 800;
+}
+
+@media (max-width: 767px) {
+  .account-action-heading,
+  .account-action-body {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 </style>

@@ -70,9 +70,9 @@ async function healthcheckProxy(row: Record<string, unknown>, reload: () => Prom
     :loader="resourcesApi.proxies"
     empty-text="暂无代理。"
   >
-    <template #before>
+    <template #actions>
       <div class="grid-2 action-panels">
-        <form class="panel filter-panel action-form" @submit.prevent="submitProxyImport">
+        <form class="action-subcard action-form" @submit.prevent="submitProxyImport">
           <h3>导入 Webshare IP 池</h3>
           <p class="muted">提交后才会创建导入任务；任务会下载文本代理池并 upsert 到 proxy_inventory。</p>
           <label class="field">
@@ -89,7 +89,7 @@ async function healthcheckProxy(row: Record<string, unknown>, reload: () => Prom
             {{ isImporting ? "提交中..." : "提交导入任务" }}
           </button>
         </form>
-        <form class="panel filter-panel action-form" @submit.prevent="bindProxy">
+        <form class="action-subcard action-form" @submit.prevent="bindProxy">
           <h3>绑定账号代理</h3>
           <label class="field">
             <span>账号 ID</span>
@@ -107,7 +107,7 @@ async function healthcheckProxy(row: Record<string, unknown>, reload: () => Prom
 
 <style scoped>
 .action-panels {
-  margin-bottom: 18px;
+  width: 100%;
 }
 
 .action-form {

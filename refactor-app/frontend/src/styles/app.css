@@ -167,6 +167,14 @@ a {
   margin-bottom: 0;
 }
 
+.action-subcard {
+  background: rgba(8, 13, 25, 0.42);
+  border: 1px solid rgba(38, 50, 73, 0.72);
+  border-radius: 14px;
+  min-width: 0;
+  padding: 14px;
+}
+
 .filter-grid {
   align-items: end;
   display: grid;

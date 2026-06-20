@@ -12,7 +12,7 @@ const store = useOpsStore();
 const selectedRows = ref<Row[]>([]);
 const selectedCount = ref(0);
 const heartbeatConcurrency = ref(50);
-const reauthConcurrency = ref(5);
+const reauthConcurrency = ref(50);
 const batchName = ref("");
 
 const columns = [
@@ -124,40 +124,104 @@ async function createBatchFromSelected() {
     selectable
     @selection-change="updateSelection"
   >
-    <template #before>
-      <section class="panel filter-panel action-form">
-        <label class="field">
-          <span>心跳并发</span>
-          <input v-model.number="heartbeatConcurrency" class="input small-input" type="number" min="1" max="500" />
-        </label>
-        <button class="btn" :disabled="selectedCount === 0" @click="heartbeatSelected">
-          心跳检测选中（{{ selectedCount }}）
-        </button>
-        <label class="field">
-          <span>授权并发</span>
-          <input v-model.number="reauthConcurrency" class="input small-input" type="number" min="1" max="500" />
-        </label>
-        <button class="btn" :disabled="selectedCount === 0" @click="reauthorizeSelected">
-          重新授权选中（{{ selectedCount }}）
-        </button>
-        <label class="field batch-name">
-          <span>批次名称</span>
-          <input v-model="batchName" class="input" placeholder="可选" />
-        </label>
-        <button class="btn primary" :disabled="selectedCount === 0" @click="createBatchFromSelected">
-          用选中授权创建批次
-        </button>
+    <template #actionCards>
+      <section class="panel credential-action-card">
+        <div class="credential-action-heading">
+          <div>
+            <h2>授权维护</h2>
+            <p>对已生成的 Codex OAuth credential 做心跳检测或重新授权。</p>
+          </div>
+          <span class="selected-hint">已选 {{ selectedCount }} 条授权</span>
+        </div>
+        <div class="credential-action-body">
+          <label class="field">
+            <span>心跳并发</span>
+            <input v-model.number="heartbeatConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <button class="btn" :disabled="selectedCount === 0" @click="heartbeatSelected">
+            心跳检测选中（{{ selectedCount }}）
+          </button>
+          <label class="field">
+            <span>授权并发</span>
+            <input v-model.number="reauthConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <button class="btn" :disabled="selectedCount === 0" @click="reauthorizeSelected">
+            重新授权选中（{{ selectedCount }}）
+          </button>
+        </div>
+      </section>
+
+      <section class="panel credential-action-card">
+        <div class="credential-action-heading">
+          <div>
+            <h2>批次创建</h2>
+            <p>把同一空间下未被占用的授权记录加入一个新批次。</p>
+          </div>
+        </div>
+        <div class="credential-action-body batch-action-body">
+          <label class="field batch-name">
+            <span>批次名称</span>
+            <input v-model="batchName" class="input" placeholder="可选" />
+          </label>
+          <button class="btn primary" :disabled="selectedCount === 0" @click="createBatchFromSelected">
+            用选中授权创建批次
+          </button>
+        </div>
       </section>
     </template>
   </ResourcePage>
 </template>
 
 <style scoped>
-.action-form {
-  align-items: end;
-  display: grid;
+.credential-action-card {
+  margin-bottom: 14px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.credential-action-heading {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
   gap: 12px;
-  grid-template-columns: 120px auto 120px auto minmax(180px, 1fr) auto;
+  justify-content: space-between;
+  padding: 14px 16px;
+}
+
+.credential-action-heading h2 {
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.credential-action-heading p,
+.selected-hint {
+  color: var(--text-muted);
+}
+
+.credential-action-heading p {
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 5px 0 0;
+}
+
+.selected-hint {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.credential-action-body {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 16px 16px;
+  width: 100%;
+}
+
+.batch-action-body {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
 }
 
 .batch-name {
@@ -165,7 +229,13 @@ async function createBatchFromSelected() {
 }
 
 @media (max-width: 767px) {
-  .action-form {
+  .credential-action-heading,
+  .credential-action-body {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-action-body {
     grid-template-columns: 1fr;
   }
 }

@@ -79,8 +79,8 @@ async function acceptOne(row: Row) {
     selectable
     @selection-change="updateSelection"
   >
-    <template #before>
-      <section class="panel filter-panel membership-toolbar">
+    <template #actions>
+      <div class="membership-toolbar">
         <label class="field">
           <span>管理员邮箱</span>
           <input v-model="adminEmail" class="input" placeholder="按管理员邮箱筛选" @keyup.enter="reload" />
@@ -104,7 +104,7 @@ async function acceptOne(row: Row) {
             接受选中邀请（{{ selectedCount }}）
           </button>
         </div>
-      </section>
+      </div>
     </template>
     <template #rowActions="{ row }">
       <button class="btn small" @click="acceptOne(row)">接受邀请</button>
@@ -117,6 +117,7 @@ async function acceptOne(row: Row) {
   display: grid;
   gap: 12px;
   grid-template-columns: minmax(220px, 1fr) minmax(260px, 1fr) 120px auto;
+  width: 100%;
 }
 
 .compact-field .input {

@@ -14,8 +14,6 @@ export type AccountWorkJobResult = JobCreated & {
 
 export const resourcesApi = {
   accounts: () => getJson<Row[]>("/user-accounts"),
-  importAccount: (body: Record<string, unknown>) =>
-    postJson<{ user_account_id: string }>("/user-accounts/import", body),
   backfillSessionRt: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/user-accounts/backfill-session-rt-job", body),
   backfillSession: (body: Record<string, unknown>) =>

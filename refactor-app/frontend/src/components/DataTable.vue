@@ -136,30 +136,44 @@ function displayValue(column: Column, value: unknown) {
 <template>
   <section class="table-shell panel">
     <div class="table-tools">
-      <label class="filter-field table-search">
-        <span>搜索</span>
-        <input v-model="search" class="input" placeholder="搜索当前表格..." />
-      </label>
-      <div class="table-actions">
-        <label v-for="filter in filters ?? []" :key="filter.key" class="filter-field compact-filter">
-          <span>{{ filter.label }}</span>
-          <select v-model="filterValues[filter.key]" class="select compact">
-            <option value="">全部</option>
-            <option v-for="option in filter.options" :key="option.value" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
+      <div class="table-tool-block search-block">
+        <div class="tool-block-heading">
+          <strong>搜索条件</strong>
+          <span>只筛选当前表格数据</span>
+        </div>
+        <label class="filter-field table-search">
+          <span>关键词</span>
+          <input v-model="search" class="input" placeholder="搜索当前表格..." />
         </label>
-        <label class="filter-field compact-filter">
-          <span>每页</span>
-          <select v-model.number="pageSize" class="select compact">
-            <option :value="20">20</option>
-            <option :value="50">50</option>
-            <option :value="100">100</option>
-            <option :value="200">200</option>
-          </select>
-        </label>
-        <button class="btn" @click="emit('refresh')">刷新</button>
+        <div v-if="(filters ?? []).length > 0" class="filter-row">
+          <label v-for="filter in filters ?? []" :key="filter.key" class="filter-field compact-filter">
+            <span>{{ filter.label }}</span>
+            <select v-model="filterValues[filter.key]" class="select compact">
+              <option value="">全部</option>
+              <option v-for="option in filter.options" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="table-tool-block table-utility-block">
+        <div class="tool-block-heading">
+          <strong>表格工具</strong>
+          <span>分页和刷新</span>
+        </div>
+        <div class="table-actions">
+          <label class="filter-field compact-filter">
+            <span>每页</span>
+            <select v-model.number="pageSize" class="select compact">
+              <option :value="20">20</option>
+              <option :value="50">50</option>
+              <option :value="100">100</option>
+              <option :value="200">200</option>
+            </select>
+          </label>
+          <button class="btn" @click="emit('refresh')">刷新表格</button>
+        </div>
       </div>
     </div>
 
@@ -233,16 +247,51 @@ function displayValue(column: Column, value: unknown) {
 }
 
 .table-tools {
-  align-items: center;
   border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 10px;
-  justify-content: space-between;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
   padding: 12px;
 }
 
+.table-tool-block {
+  background: rgba(8, 13, 25, 0.42);
+  border: 1px solid rgba(38, 50, 73, 0.72);
+  border-radius: 14px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.tool-block-heading {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.tool-block-heading strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  letter-spacing: -0.01em;
+}
+
+.tool-block-heading span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .table-search {
-  width: min(100%, 340px);
+  width: min(100%, 520px);
+}
+
+.filter-row {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .table-actions,
@@ -366,8 +415,7 @@ tbody tr:hover {
 
 @media (max-width: 767px) {
   .table-tools {
-    align-items: stretch;
-    flex-direction: column;
+    grid-template-columns: 1fr;
   }
 
   .table-actions,
