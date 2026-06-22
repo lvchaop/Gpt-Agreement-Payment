@@ -7,6 +7,8 @@ import { useOpsStore } from "../stores/ops";
 
 const store = useOpsStore();
 const thresholdPercent = ref(95);
+const selectedRows = ref<Record<string, unknown>[]>([]);
+const repushing = ref(false);
 
 const columns = [
   { key: "id", label: "推送记录 ID", mono: true },
@@ -24,6 +26,10 @@ const columns = [
   { key: "error_message", label: "错误信息" },
 ];
 
+function onSelectionChange(rows: Record<string, unknown>[]) {
+  selectedRows.value = rows;
+}
+
 async function sweepUsage(reload: () => Promise<void>) {
   const result = await resourcesApi.downstreamUsageSweep({
     threshold_percent: thresholdPercent.value,
@@ -36,6 +42,34 @@ async function sweepUsage(reload: () => Promise<void>) {
   );
   await reload();
 }
+
+async function repushSelected(reload: () => Promise<void>) {
+  const ids = selectedRows.value
+    .filter((row) => String(row.push_status || "") === "pushed")
+    .map((row) => String(row.id || ""))
+    .filter(Boolean);
+  if (!ids.length) {
+    store.toast("没有可重推记录", "请先勾选推送状态为 pushed 的记录。", "warning");
+    return;
+  }
+  repushing.value = true;
+  try {
+    const result = await resourcesApi.repushDownstreamRecords({
+      downstream_push_record_ids: ids,
+      created_by: "ops-ui",
+    });
+    store.toast(
+      "重推完成",
+      `请求=${result.requested ?? ids.length} 成功=${result.succeeded ?? 0} 失败=${result.failed ?? 0} 跳过=${result.skipped ?? 0}`,
+      Number(result.failed ?? 0) > 0 ? "warning" : "success",
+    );
+    await reload();
+  } catch (err) {
+    store.toast("重推失败", String((err as Error).message ?? err), "error");
+  } finally {
+    repushing.value = false;
+  }
+}
 </script>
 
 <template>
@@ -44,9 +78,24 @@ async function sweepUsage(reload: () => Promise<void>) {
     description="CPA / Sub2API 推送结果。当前按 Codex 授权唯一记录，一条授权只能占用一个下游渠道。"
     :columns="columns"
     :loader="resourcesApi.downstream"
+    selectable
     empty-text="暂无下游推送记录。"
+    @selection-change="onSelectionChange"
   >
     <template #actionCards="{ reload }">
+      <section class="panel action-card">
+        <div class="action-heading">
+          <div>
+            <h2>成功记录重推</h2>
+            <p>只重推 push_status=pushed 的记录；不扣余额、不新增占用、不新建推送记录。</p>
+          </div>
+        </div>
+        <div class="action-row">
+          <button class="btn primary" :disabled="repushing" @click="repushSelected(reload)">
+            {{ repushing ? "重推中..." : `重推选中成功记录（${selectedRows.length}）` }}
+          </button>
+        </div>
+      </section>
       <section class="panel action-card">
         <div class="action-heading">
           <div>

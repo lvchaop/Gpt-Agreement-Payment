@@ -303,6 +303,11 @@ class AutomationDownstreamUsageCleanupRequest(BaseModel):
     threshold_percent: int = 95
 
 
+class RepushDownstreamRecordsRequest(BaseModel):
+    downstream_push_record_ids: list[str]
+    created_by: str = ""
+
+
 class CreateAutomationScheduleRequest(BaseModel):
     schedule_type: str
     enabled: bool = False
@@ -4810,6 +4815,77 @@ def list_downstream_push_records(session: DbSession) -> list[dict]:
         }
         for row, channel in rows
     ]
+
+
+@router.post("/downstream-push-records/repush")
+def repush_downstream_records(
+    req: RepushDownstreamRecordsRequest,
+    session: DbSession,
+) -> dict:
+    record_ids = [item.strip() for item in req.downstream_push_record_ids if item.strip()]
+    if not record_ids:
+        raise HTTPException(status_code=400, detail="downstream_push_record_ids is required")
+
+    now = datetime.now(UTC)
+    results: list[dict[str, Any]] = []
+    succeeded = 0
+    failed = 0
+    skipped = 0
+    for record_id in record_ids:
+        record = session.get(DownstreamCodexPushRecordModel, record_id)
+        if record is None:
+            skipped += 1
+            results.append({"record_id": record_id, "status": "skipped", "reason": "record_not_found"})
+            continue
+        if record.push_status != "pushed":
+            skipped += 1
+            results.append(
+                {
+                    "record_id": record_id,
+                    "status": "skipped",
+                    "reason": f"record_status_{record.push_status}",
+                }
+            )
+            continue
+
+        record.push_attempt_count = int(record.push_attempt_count or 0) + 1
+        record.updated_at = now
+        result = _repush_downstream_record(session=session, record=record)
+        if result.get("ok"):
+            succeeded += 1
+            record.push_status = "pushed"
+            record.usage_status = "active"
+            record.error_code = ""
+            record.error_message = ""
+            record.updated_at = datetime.now(UTC)
+            results.append(
+                {
+                    "record_id": record_id,
+                    "status": "succeeded",
+                    "downstream_external_id": record.downstream_external_id,
+                }
+            )
+        else:
+            failed += 1
+            record.error_code = str(result.get("error_code") or "downstream_repush_failed")[:200]
+            record.error_message = str(result.get("error_message") or "")[:1000]
+            record.updated_at = datetime.now(UTC)
+            results.append(
+                {
+                    "record_id": record_id,
+                    "status": "failed",
+                    "error_code": record.error_code,
+                    "error_message": record.error_message,
+                }
+            )
+    session.commit()
+    return {
+        "requested": len(record_ids),
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+    }
 
 
 @router.post("/proxies/refresh-webshare-job")

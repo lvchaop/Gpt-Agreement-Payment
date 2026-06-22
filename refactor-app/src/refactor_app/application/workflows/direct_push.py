@@ -8,7 +8,10 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from refactor_app.application.workflows.downstream import downstream_payload
+from refactor_app.application.workflows.downstream import (
+    downstream_import_chatgpt_account_id,
+    downstream_payload,
+)
 from refactor_app.infrastructure.db.models import (
     CodexOAuthCredentialModel,
     DownstreamChannelModel,
@@ -117,7 +120,10 @@ class PushCodexCredentialDirectWorkflow:
                     codex_client_id=credential.codex_client_id,
                     codex_account_id=credential.account_id,
                     codex_email=user.email,
-                    downstream_chatgpt_account_id=workspace.external_workspace_id,
+                    downstream_chatgpt_account_id=downstream_import_chatgpt_account_id(
+                        user_account_id=user.id,
+                        workspace_id=workspace.id,
+                    ),
                     token_chatgpt_account_id=credential.token_chatgpt_account_id,
                     codex_token_expires_at=credential.expires_at,
                     request_endpoint=input_.request_endpoint,

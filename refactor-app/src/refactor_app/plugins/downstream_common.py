@@ -20,8 +20,8 @@ def validate_codex_payload(payload: DownstreamCodexPayload) -> None:
         raise DownstreamPayloadError("account_id is required")
     if not payload.downstream_chatgpt_account_id:
         raise DownstreamPayloadError("downstream_chatgpt_account_id is required")
-    if payload.downstream_chatgpt_account_id != payload.token_chatgpt_account_id:
-        raise DownstreamPayloadError("token_chatgpt_account_id does not match downstream workspace")
+    if not payload.token_chatgpt_account_id:
+        raise DownstreamPayloadError("token_chatgpt_account_id is required")
 
 
 def codex_credentials_body(payload: DownstreamCodexPayload) -> dict:

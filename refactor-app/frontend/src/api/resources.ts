@@ -105,6 +105,8 @@ export const resourcesApi = {
   deleteDownstreamChannel: (id: string) =>
     deleteJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`),
   downstream: () => getJson<Row[]>("/downstream-push-records"),
+  repushDownstreamRecords: (body: Record<string, unknown>) =>
+    postJson<Row>("/downstream-push-records/repush", body),
   downstreamUsageSweep: (body: Record<string, unknown>) =>
     postJson<Row>("/automation/downstream-usage-sweep-job", body),
   automationSchedules: () => getJson<Row[]>("/automation/schedules"),

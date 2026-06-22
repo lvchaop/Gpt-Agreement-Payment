@@ -136,13 +136,20 @@ def downstream_payload(
         refresh_token=credential.refresh_token,
         email=user.email,
         account_id=credential.account_id,
-        downstream_chatgpt_account_id=workspace.external_workspace_id,
+        downstream_chatgpt_account_id=downstream_import_chatgpt_account_id(
+            user_account_id=user.id,
+            workspace_id=workspace.id,
+        ),
         token_chatgpt_account_id=credential.token_chatgpt_account_id,
         client_id=credential.codex_client_id,
         expires_at=credential.expires_at,
         plan_tag=batch_item.plan_tag if batch_item is not None else workspace.plan_type,
         plan_type=batch_item.plan_type if batch_item is not None else workspace.plan_type,
     )
+
+
+def downstream_import_chatgpt_account_id(*, user_account_id: str, workspace_id: str) -> str:
+    return f"{user_account_id}_{workspace_id}"
 
 
 def _required_repositories(uow: UnitOfWork) -> dict:
