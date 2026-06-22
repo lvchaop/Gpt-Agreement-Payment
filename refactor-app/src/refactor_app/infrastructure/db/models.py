@@ -142,6 +142,37 @@ class UserAccountAuthModel(Base):
     )
 
 
+class AccountSessionOtpSnapshotModel(Base):
+    __tablename__ = "account_session_otp_snapshots"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_account_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    source_membership_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    snapshot_status: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    otp_code_len: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    prepared_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_account_id"),
+        CheckConstraint(
+            "snapshot_status IN "
+            "('otp_collected', 'otp_pending', 'otp_validated', 'otp_missing', 'failed')"
+        ),
+        CheckConstraint("otp_code_len >= 0"),
+        Index("idx_account_session_otp_snapshots_user_account_id", "user_account_id"),
+        Index("idx_account_session_otp_snapshots_status", "snapshot_status"),
+        Index("idx_account_session_otp_snapshots_source_membership_id", "source_membership_id"),
+    )
+
+
 class MembershipModel(Base):
     __tablename__ = "user_account_team_workspace_memberships"
 
@@ -397,6 +428,28 @@ class DownstreamCodexPushRecordModel(Base):
         Index("idx_downstream_push_team_workspace_id", "team_workspace_id"),
         Index("idx_downstream_push_membership_id", "membership_id"),
         Index("idx_downstream_push_status", "downstream_provider", "push_status"),
+    )
+
+
+class DownstreamChannelModel(Base):
+    __tablename__ = "downstream_channels"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    provider_type: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    admin_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    update_existing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    timeout_s: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("provider_type IN ('sub2api', 'cpa')"),
+        CheckConstraint("timeout_s > 0"),
+        Index("idx_downstream_channels_provider_type", "provider_type"),
+        Index("idx_downstream_channels_enabled", "enabled"),
     )
 
 

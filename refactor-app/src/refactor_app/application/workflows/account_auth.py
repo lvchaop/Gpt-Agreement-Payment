@@ -40,6 +40,115 @@ class AccountAuthWorkflowError(RuntimeError):
     pass
 
 
+def ensure_account_proxy_url(
+    session_factory: Callable[[], Session],
+    user_account_id: str,
+    *,
+    bind_reason: str = "",
+    event_writer=None,
+) -> str:
+    with session_factory() as session:
+        account = session.get(UserAccountModel, user_account_id)
+        if account is None:
+            raise AccountAuthWorkflowError(f"user account not found: {user_account_id}")
+        proxy = _active_proxy(session, user_account_id)
+        if proxy is not None and _probe_proxy_alive(_proxy_url(proxy)):
+            if event_writer is not None:
+                event_writer(
+                    "account_auth.proxy_ready",
+                    "existing account proxy is alive",
+                    {"user_account_id": user_account_id, "proxy_id": proxy.id},
+                )
+            return _proxy_url(proxy)
+        if proxy is not None:
+            proxy.provider_valid = False
+            proxy.proxy_status = ProxyStatus.ERROR.value
+            proxy.last_healthcheck_at = datetime.now(UTC)
+            proxy.updated_at = datetime.now(UTC)
+            if event_writer is not None:
+                event_writer(
+                    "account_auth.proxy_dead",
+                    "existing account proxy is dead",
+                    {"user_account_id": user_account_id, "proxy_id": proxy.id},
+                    level="WARN",
+                )
+            session.commit()
+
+    while True:
+        now = datetime.now(UTC)
+        with session_factory() as session:
+            proxy = _least_bound_proxy_for_update(session)
+            if proxy is None:
+                raise AccountAuthWorkflowError("no available webshare proxy")
+            binding = session.scalars(
+                select(UserAccountProxyBindingModel)
+                .where(UserAccountProxyBindingModel.user_account_id == user_account_id)
+                .with_for_update()
+            ).first()
+            if binding is None:
+                binding = UserAccountProxyBindingModel(
+                    id=f"proxy-binding-{uuid4()}",
+                    user_account_id=user_account_id,
+                    proxy_id=proxy.id,
+                    bind_status=ProxyBindStatus.ACTIVE.value,
+                    bind_reason=bind_reason,
+                    bound_by_job_id="",
+                    bound_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(binding)
+            else:
+                binding.proxy_id = proxy.id
+                binding.bind_status = ProxyBindStatus.ACTIVE.value
+                binding.bind_reason = bind_reason
+                binding.bound_at = now
+                binding.last_error_code = ""
+                binding.updated_at = now
+            proxy.proxy_status = ProxyStatus.BOUND.value
+            proxy.updated_at = now
+            session.commit()
+            proxy_url = _proxy_url(proxy)
+            proxy_id = proxy.id
+
+        if event_writer is not None:
+            event_writer(
+                "account_auth.proxy_reassigned",
+                "account proxy reassigned",
+                {"user_account_id": user_account_id, "proxy_id": proxy_id},
+            )
+        if _probe_proxy_alive(proxy_url):
+            with session_factory() as session:
+                proxy = session.get(ProxyInventoryModel, proxy_id)
+                if proxy is not None:
+                    proxy.provider_valid = True
+                    proxy.last_healthcheck_at = datetime.now(UTC)
+                    proxy.updated_at = datetime.now(UTC)
+                session.commit()
+            if event_writer is not None:
+                event_writer(
+                    "account_auth.proxy_ready",
+                    "reassigned account proxy is alive",
+                    {"user_account_id": user_account_id, "proxy_id": proxy_id},
+                )
+            return proxy_url
+        with session_factory() as session:
+            proxy = session.get(ProxyInventoryModel, proxy_id)
+            if proxy is not None:
+                proxy.provider_valid = False
+                proxy.proxy_status = ProxyStatus.ERROR.value
+                proxy.last_healthcheck_at = datetime.now(UTC)
+                proxy.updated_at = datetime.now(UTC)
+            session.commit()
+        if event_writer is not None:
+            event_writer(
+                "account_auth.proxy_dead",
+                "reassigned account proxy is dead",
+                {"user_account_id": user_account_id, "proxy_id": proxy_id},
+                level="WARN",
+            )
+
+
 class BackfillSessionWorkflow:
     def __init__(
         self,

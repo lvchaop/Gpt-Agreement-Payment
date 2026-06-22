@@ -18,6 +18,18 @@ class SessionLoginResult:
     snapshot: dict
 
 
+@dataclass(frozen=True)
+class SessionOtpPrepareResult:
+    ok: bool
+    snapshot: dict
+
+
+@dataclass(frozen=True)
+class SessionOtpSubmitResult:
+    ok: bool
+    snapshot: dict
+
+
 def acquire_chatgpt_session(
     *,
     email: str,
@@ -60,6 +72,74 @@ def acquire_chatgpt_session(
         cookie_header=result.cookie_header,
         auth_cookie_header=auth_cookie_header,
         snapshot=flow.export_protocol_snapshot(mail_events=adapter.events),
+    )
+
+
+def prepare_chatgpt_session_otp(
+    *,
+    email: str,
+    password: str,
+    proxy: str = "",
+    mail_provider: OtpProvider,
+    trace_dump_path: str = "",
+) -> SessionOtpPrepareResult:
+    config = Config()
+    config.proxy = proxy or None
+    config.auth_env_flags = {
+        "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
+        "OAUTH_CODEX_RT_EXCHANGE": "0",
+        "OAUTH_SECONDARY_AUTHORIZE_EXCHANGE": "0",
+        "OAUTH_REFRESH_ONLY": "0",
+        "SKIP_OAUTH_TOKEN_EXCHANGE": "1",
+    }
+    if trace_dump_path:
+        config.auth_trace_dump_enabled = True
+        config.auth_trace_dump_path = trace_dump_path
+
+    flow = AuthFlow(config)
+    adapter = ExternalMailOtpAdapter(mail_provider, ensure_before_wait=False)
+    snapshot = flow.run_protocol_login_prepare_otp(
+        adapter,
+        email.strip().lower(),
+        password,
+        existing_only=True,
+    )
+    snapshot["email"] = email.strip().lower()
+    snapshot["mail_events"] = adapter.events
+    return SessionOtpPrepareResult(
+        ok=str(snapshot.get("phase") or "") in {"otp_collected", "otp_pending"},
+        snapshot=snapshot,
+    )
+
+
+def submit_prepared_chatgpt_session_otp(
+    *,
+    snapshot: dict,
+    proxy: str = "",
+    mail_provider: OtpProvider,
+    before_validate=None,
+) -> SessionOtpSubmitResult:
+    config = Config()
+    config.proxy = proxy or str(snapshot.get("proxy") or "") or None
+    config.auth_env_flags = {
+        "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
+        "OAUTH_CODEX_RT_EXCHANGE": "0",
+        "OAUTH_SECONDARY_AUTHORIZE_EXCHANGE": "0",
+        "OAUTH_REFRESH_ONLY": "0",
+        "SKIP_OAUTH_TOKEN_EXCHANGE": "1",
+    }
+    flow = AuthFlow(config)
+    adapter = ExternalMailOtpAdapter(mail_provider, ensure_before_wait=False)
+    updated = flow.run_protocol_login_submit_prepared_otp(
+        dict(snapshot),
+        before_validate=before_validate,
+        mail_provider=adapter,
+    )
+    updated["email"] = str(snapshot.get("email") or updated.get("email") or "").strip().lower()
+    updated["mail_events"] = adapter.events
+    return SessionOtpSubmitResult(
+        ok=str(updated.get("phase") or "") in {"otp_validated", "otp_missing"},
+        snapshot=updated,
     )
 
 

@@ -9,10 +9,14 @@ import { useOpsStore } from "../stores/ops";
 const store = useOpsStore();
 const adminSessionJson = ref("");
 const adminCookieHeader = ref("");
+const accountsCheckHeadersText = ref("");
 const showImportPanel = ref(false);
 const adminSessions = ref<Record<string, unknown>[]>([]);
 const adminSessionsLoading = ref(false);
 const adminSessionsError = ref("");
+const removingWorkspaceId = ref("");
+const revokingInviteWorkspaceId = ref("");
+const deletingAdminSessionId = ref("");
 
 const columns = [
   { key: "id", label: "空间 ID", mono: true, summary: 26 },
@@ -44,6 +48,7 @@ async function importAdminSession(reload: () => Promise<void>) {
   const result = await resourcesApi.importTeamAdminSession({
     raw_session_json: raw,
     cookie_header: adminCookieHeader.value,
+    accounts_check_headers_text: accountsCheckHeadersText.value,
     fetch_accounts_check: true,
   });
   store.toast(
@@ -53,6 +58,7 @@ async function importAdminSession(reload: () => Promise<void>) {
   );
   adminSessionJson.value = "";
   adminCookieHeader.value = "";
+  accountsCheckHeadersText.value = "";
   showImportPanel.value = false;
   await loadAdminSessions();
   await reload();
@@ -67,6 +73,96 @@ async function loadAdminSessions() {
     adminSessionsError.value = String((err as Error).message ?? err);
   } finally {
     adminSessionsLoading.value = false;
+  }
+}
+
+async function removeWorkspaceMembers(row: Record<string, unknown>, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  const name = String(row.name || "");
+  const externalId = String(row.external_workspace_id || "");
+  if (!id) return;
+  const confirmed = window.confirm(
+    [
+      "确认剔除这个固定空间里的远端成员？",
+      `空间名称：${name || "-"}`,
+      `外部空间 ID：${externalId || "-"}`,
+      "会跳过 account-owner / 当前管理员。",
+    ].join("\n"),
+  );
+  if (!confirmed) return;
+  removingWorkspaceId.value = id;
+  try {
+    const result = await resourcesApi.removeWorkspaceMembers(id, {
+      confirm_remove: true,
+      concurrency: 20,
+      page_size: 100,
+    });
+    store.toast(
+      "远端成员剔除完成",
+      `远端总数=${result.total_members ?? 0} 目标=${result.target_count ?? 0} 成功=${result.removed_count ?? 0} 失败=${result.failed_count ?? 0} 跳过=${result.skipped_count ?? 0}`,
+      Number(result.failed_count ?? 0) > 0 ? "warning" : "success",
+    );
+    await reload();
+  } finally {
+    removingWorkspaceId.value = "";
+  }
+}
+
+async function revokeWorkspaceInvite(row: Record<string, unknown>, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  const name = String(row.name || "");
+  if (!id) return;
+  const confirmed = window.confirm(
+    [
+      "确认撤销当前团队空间的全部远端邀请？",
+      `空间：${name || "-"}`,
+      "只调用远端撤销邀请，不修改本地成员状态。",
+    ].join("\n"),
+  );
+  if (!confirmed) return;
+  revokingInviteWorkspaceId.value = id;
+  try {
+    const result = await resourcesApi.revokeWorkspaceInvite(id, {
+      concurrency: 20,
+      page_size: 100,
+    });
+    store.toast(
+      "邀请撤销完成",
+      `邀请=${result.invite_count ?? 0} 成功=${result.revoked_count ?? 0} 失败=${result.failed_count ?? 0}`,
+      Number(result.failed_count ?? 0) > 0 ? "warning" : "success",
+    );
+    await reload();
+  } finally {
+    revokingInviteWorkspaceId.value = "";
+  }
+}
+
+async function deleteAdminSession(row: Record<string, unknown>, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  const email = String(row.admin_email || "");
+  if (!id) return;
+  const confirmed = window.confirm(
+    [
+      "确认删除这个空间管理员及其本地关联数据？",
+      `管理员邮箱：${email || "-"}`,
+      `Session ID：${id}`,
+      "会同时删除本地团队空间、空间成员关系、Codex 授权、批次、批次明细、下游推送记录。",
+      "不会删除账号、代理、邮箱租约、任务运行日志，也不会调用远端接口。",
+    ].join("\n"),
+  );
+  if (!confirmed) return;
+  deletingAdminSessionId.value = id;
+  try {
+    const result = await resourcesApi.deleteTeamAdminSession(id);
+    store.toast(
+      "空间管理员已删除",
+      `空间=${result.deleted_workspaces ?? 0} 成员=${result.deleted_memberships ?? 0} 授权=${result.deleted_credentials ?? 0} 批次=${result.deleted_batches ?? 0}`,
+      "success",
+    );
+    await loadAdminSessions();
+    await reload();
+  } finally {
+    deletingAdminSessionId.value = "";
   }
 }
 
@@ -103,6 +199,14 @@ onMounted(loadAdminSessions);
           <span>管理员 Cookie Header（可选，accounts/check 不够时填写）</span>
           <input v-model="adminCookieHeader" class="input" placeholder="__Secure-next-auth.session-token=..." />
         </label>
+        <label class="field wide">
+          <span>accounts/check 浏览器请求头（可选，粘贴 DevTools Request Headers）</span>
+          <textarea
+            v-model="accountsCheckHeadersText"
+            class="input textarea small-textarea"
+            placeholder="Request URL: https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27&#10;accept-language:&#10;zh-CN,zh;q=0.9&#10;cookie:&#10;...&#10;sec-ch-ua:&#10;...&#10;user-agent:&#10;..."
+          ></textarea>
+        </label>
         <button class="btn primary">导入管理员 Session 并解析空间</button>
       </form>
 
@@ -121,8 +225,36 @@ onMounted(loadAdminSessions);
           :error="adminSessionsError"
           empty-text="暂无空间管理员。"
           @refresh="loadAdminSessions"
-        />
+        >
+          <template #actions="{ row }">
+            <button
+              class="btn danger small"
+              :disabled="deletingAdminSessionId === String(row.id || '')"
+              @click="deleteAdminSession(row, reload)"
+            >
+              {{ deletingAdminSessionId === String(row.id || "") ? "删除中..." : "删除管理员" }}
+            </button>
+          </template>
+        </DataTable>
       </section>
+    </template>
+    <template #rowActions="{ row, reload }">
+      <div class="row-actions">
+        <button
+          class="btn small"
+          :disabled="revokingInviteWorkspaceId === String(row.id || '')"
+          @click="revokeWorkspaceInvite(row, reload)"
+        >
+          {{ revokingInviteWorkspaceId === String(row.id || "") ? "撤销中..." : "撤销邀请" }}
+        </button>
+        <button
+          class="btn danger small"
+          :disabled="removingWorkspaceId === String(row.id || '')"
+          @click="removeWorkspaceMembers(row, reload)"
+        >
+          {{ removingWorkspaceId === String(row.id || "") ? "剔除中..." : "剔除成员" }}
+        </button>
+      </div>
     </template>
   </ResourcePage>
 </template>
@@ -165,6 +297,16 @@ onMounted(loadAdminSessions);
 .textarea {
   min-height: 150px;
   resize: vertical;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.small {
+  padding: 8px 10px;
+  white-space: nowrap;
 }
 
 @media (max-width: 767px) {

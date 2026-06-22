@@ -39,6 +39,10 @@ from refactor_app.application.workflows.proxy import (
     HealthcheckProxyWorkflow,
     RefreshWebsharePoolWorkflow,
 )
+from refactor_app.application.workflows.session_otp import (
+    PrepareSessionOtpWorkflow,
+    SubmitSessionOtpWorkflow,
+)
 from refactor_app.application.workflows.workspace import (
     ImportTeamWorkspaceInput,
     ImportTeamWorkspaceWorkflow,
@@ -240,6 +244,18 @@ def register_core_handlers(
             "work_count": len(input_json.get("user_account_ids") or []),
         },
     )
+    runner.register(
+        "session_otp.prepare.bulk",
+        lambda _session, input_json: {
+            "work_count": len(input_json.get("membership_ids") or []),
+        },
+    )
+    runner.register(
+        "session_otp.submit.bulk",
+        lambda _session, input_json: {
+            "work_count": len(input_json.get("membership_ids") or []),
+        },
+    )
     runner.register_work(
         "workspace_join_batch.item",
         lambda _session, input_json: {
@@ -352,6 +368,34 @@ def register_core_handlers(
                 mail_provider=_mail_plugin(settings),
             ).run(
                 user_account_id=str(input_json["user_account_id"]),
+                run_id=str(input_json.get("_run_id") or ""),
+            )
+        },
+    )
+    runner.register_work(
+        "session_otp.prepare.account",
+        lambda _session, input_json: {
+            "user_account_id": PrepareSessionOtpWorkflow(
+                session_factory=session_factory,
+                mail_provider=_mail_plugin(settings),
+            ).run(
+                membership_id=str(input_json["membership_id"]),
+                run_id=str(input_json.get("_run_id") or ""),
+            )
+        },
+    )
+    runner.register_work(
+        "session_otp.submit.account",
+        lambda _session, input_json: {
+            "user_account_id": SubmitSessionOtpWorkflow(
+                session_factory=session_factory,
+                mail_provider=_mail_plugin(settings),
+            ).run(
+                membership_id=str(input_json["membership_id"]),
+                barrier_key=str(input_json.get("_barrier_key") or ""),
+                barrier_group=str(input_json.get("_barrier_group") or ""),
+                barrier_expected=int(input_json.get("_barrier_expected") or 0),
+                barrier_timeout_s=float(input_json.get("_barrier_timeout_s") or 120),
                 run_id=str(input_json.get("_run_id") or ""),
             )
         },

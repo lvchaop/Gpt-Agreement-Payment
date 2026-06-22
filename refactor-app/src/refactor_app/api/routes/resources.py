@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -9,7 +10,7 @@ from uuid import uuid4
 from curl_cffi import requests as curl_requests
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -26,6 +27,8 @@ from refactor_app.application.workflows.proxy import HealthcheckProxyWorkflow
 from refactor_app.config.settings import get_settings
 from refactor_app.domain.enums import AccountStatus
 from refactor_app.infrastructure.db.models import (
+    AccountSessionOtpSnapshotModel,
+    DownstreamChannelModel,
     CodexOAuthCredentialModel,
     DownstreamCodexPushRecordModel,
     ExternalMailLeaseModel,
@@ -43,6 +46,7 @@ from refactor_app.infrastructure.db.models import (
     WorkspaceJoinBatchItemModel,
     WorkspaceJoinBatchModel,
 )
+from refactor_app.plugins.openai_chatgpt.client import decode_access_token_claims
 
 router = APIRouter(tags=["resources"])
 DbSession = Annotated[Session, Depends(get_db_session)]
@@ -111,8 +115,40 @@ class BackfillSessionRtRequest(BaseModel):
 class ImportTeamAdminSessionRequest(BaseModel):
     raw_session_json: dict[str, Any]
     cookie_header: str = ""
+    accounts_check_headers_text: str = ""
     timezone_offset_min: int = -480
     fetch_accounts_check: bool = True
+
+
+class RemoveWorkspaceMembersRequest(BaseModel):
+    confirm_remove: bool = False
+    concurrency: int = 20
+    page_size: int = 100
+
+
+class RevokeWorkspaceInviteRequest(BaseModel):
+    concurrency: int = 20
+    page_size: int = 100
+
+
+class CreateDownstreamChannelRequest(BaseModel):
+    provider_type: str
+    name: str
+    base_url: str
+    admin_key: str
+    enabled: bool = True
+    update_existing: bool = False
+    timeout_s: int = 30
+
+
+class PatchDownstreamChannelRequest(BaseModel):
+    provider_type: str | None = None
+    name: str | None = None
+    base_url: str | None = None
+    admin_key: str | None = None
+    enabled: bool | None = None
+    update_existing: bool | None = None
+    timeout_s: int | None = None
 
 
 class InviteSelectedUsersRequest(BaseModel):
@@ -127,6 +163,17 @@ class AcceptMembershipInvitesRequest(BaseModel):
     membership_ids: list[str]
     created_by: str = ""
     concurrency: int = 1
+
+
+class SessionOtpMembershipRequest(BaseModel):
+    membership_ids: list[str]
+    created_by: str = ""
+    concurrency: int = 1
+
+
+class SyncWorkspaceMembersRequest(BaseModel):
+    team_workspace_id: str
+    page_size: int = 100
 
 
 @router.get("/user-accounts")
@@ -585,6 +632,14 @@ def import_team_admin_session(
     session_token = str(raw.get("sessionToken") or raw.get("session_token") or "")
     admin_email = _session_admin_email(raw, access_token)
     expires_at = _parse_datetime_or_none(str(raw.get("expires") or ""))
+    browser_headers = _parse_browser_headers_text(req.accounts_check_headers_text)
+    cookie_header_text = req.cookie_header.strip()
+    cookie_field_headers = _parse_browser_headers_text(cookie_header_text)
+    effective_cookie_header = (
+        cookie_field_headers.get("cookie")
+        or cookie_header_text
+        or browser_headers.get("cookie", "")
+    )
     now = datetime.now(UTC)
     admin_session = None
     if admin_email:
@@ -600,7 +655,7 @@ def import_team_admin_session(
             raw_session_json=raw,
             access_token=access_token,
             session_token=session_token,
-            cookie_header=req.cookie_header,
+            cookie_header=effective_cookie_header,
             expires_at=expires_at,
             imported_at=now,
             created_at=now,
@@ -611,7 +666,7 @@ def import_team_admin_session(
         admin_session.raw_session_json = raw
         admin_session.access_token = access_token
         admin_session.session_token = session_token
-        admin_session.cookie_header = req.cookie_header
+        admin_session.cookie_header = effective_cookie_header
         admin_session.expires_at = expires_at
         admin_session.imported_at = now
         admin_session.updated_at = now
@@ -621,7 +676,8 @@ def import_team_admin_session(
     if req.fetch_accounts_check:
         check_payload = _fetch_accounts_check(
             access_token=access_token,
-            cookie_header=req.cookie_header,
+            cookie_header=effective_cookie_header,
+            browser_headers=browser_headers,
             timezone_offset_min=req.timezone_offset_min,
         )
         session.add(
@@ -668,6 +724,87 @@ def list_team_admin_sessions(session: DbSession) -> list[dict]:
         }
         for row in rows
     ]
+
+
+@router.delete("/team-admin-sessions/{team_admin_session_id}")
+def delete_team_admin_session(team_admin_session_id: str, session: DbSession) -> dict:
+    admin_session = session.get(TeamAdminSessionModel, team_admin_session_id)
+    if admin_session is None:
+        raise HTTPException(status_code=404, detail="team admin session not found")
+
+    workspace_ids = session.scalars(
+        select(TeamWorkspaceModel.id).where(
+            TeamWorkspaceModel.source_admin_session_id == team_admin_session_id
+        )
+    ).all()
+
+    deleted_downstream_push_records = 0
+    deleted_batch_items = 0
+    deleted_batches = 0
+    deleted_credentials = 0
+    deleted_memberships = 0
+    deleted_workspaces = 0
+    deleted_account_checks = 0
+
+    if workspace_ids:
+        downstream_result = session.execute(
+            delete(DownstreamCodexPushRecordModel).where(
+                DownstreamCodexPushRecordModel.team_workspace_id.in_(workspace_ids)
+            )
+        )
+        deleted_downstream_push_records = downstream_result.rowcount or 0
+
+        batch_item_result = session.execute(
+            delete(WorkspaceJoinBatchItemModel).where(
+                WorkspaceJoinBatchItemModel.team_workspace_id.in_(workspace_ids)
+            )
+        )
+        deleted_batch_items = batch_item_result.rowcount or 0
+
+        batch_result = session.execute(
+            delete(WorkspaceJoinBatchModel).where(
+                WorkspaceJoinBatchModel.team_workspace_id.in_(workspace_ids)
+            )
+        )
+        deleted_batches = batch_result.rowcount or 0
+
+        credential_result = session.execute(
+            delete(CodexOAuthCredentialModel).where(
+                CodexOAuthCredentialModel.team_workspace_id.in_(workspace_ids)
+            )
+        )
+        deleted_credentials = credential_result.rowcount or 0
+
+        membership_result = session.execute(
+            delete(MembershipModel).where(MembershipModel.team_workspace_id.in_(workspace_ids))
+        )
+        deleted_memberships = membership_result.rowcount or 0
+
+        workspace_result = session.execute(
+            delete(TeamWorkspaceModel).where(TeamWorkspaceModel.id.in_(workspace_ids))
+        )
+        deleted_workspaces = workspace_result.rowcount or 0
+
+    account_check_result = session.execute(
+        delete(TeamAdminAccountCheckModel).where(
+            TeamAdminAccountCheckModel.team_admin_session_id == team_admin_session_id
+        )
+    )
+    deleted_account_checks = account_check_result.rowcount or 0
+
+    session.delete(admin_session)
+    session.commit()
+    return {
+        "team_admin_session_id": team_admin_session_id,
+        "deleted": True,
+        "deleted_workspaces": deleted_workspaces,
+        "deleted_memberships": deleted_memberships,
+        "deleted_credentials": deleted_credentials,
+        "deleted_batches": deleted_batches,
+        "deleted_batch_items": deleted_batch_items,
+        "deleted_downstream_push_records": deleted_downstream_push_records,
+        "deleted_account_checks": deleted_account_checks,
+    }
 
 
 @router.get("/team-workspaces")
@@ -738,19 +875,144 @@ def get_team_workspace(team_workspace_id: str, session: DbSession) -> dict:
     return _workspace_dict(workspace, admin_email=admin_email)
 
 
+@router.post("/team-workspaces/{team_workspace_id}/remove-members")
+def remove_team_workspace_members(
+    team_workspace_id: str,
+    req: RemoveWorkspaceMembersRequest,
+    session: DbSession,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, team_workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="team workspace not found")
+    if not workspace.source_admin_session_id:
+        raise HTTPException(status_code=400, detail="workspace missing source admin session")
+    admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+    if admin_session is None:
+        raise HTTPException(status_code=404, detail="team admin session not found")
+    if not admin_session.access_token:
+        raise HTTPException(status_code=400, detail="team admin session missing access_token")
+    if not req.confirm_remove:
+        raise HTTPException(status_code=400, detail="confirm_remove must be true")
+
+    page_size = max(1, min(int(req.page_size or 100), 200))
+    concurrency = max(1, min(int(req.concurrency or 20), 50))
+    account_id = workspace.external_workspace_id
+    self_ids = _workspace_self_user_ids(
+        session=session,
+        team_admin_session_id=admin_session.id,
+        account_id=account_id,
+    )
+    members = _fetch_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=account_id,
+        page_size=page_size,
+    )
+    targets, skipped = _split_removable_workspace_members(members, self_ids=self_ids)
+    results = _delete_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=account_id,
+        members=targets,
+        concurrency=concurrency,
+    )
+    removed_count = sum(1 for item in results if item.get("ok") is True)
+    failed_count = sum(1 for item in results if item.get("ok") is not True)
+    return {
+        "team_workspace_id": workspace.id,
+        "external_workspace_id": account_id,
+        "workspace_name": workspace.name,
+        "admin_email": admin_session.admin_email,
+        "total_members": len(members),
+        "target_count": len(targets),
+        "skipped_count": len(skipped),
+        "removed_count": removed_count,
+        "failed_count": failed_count,
+        "skipped": skipped,
+        "results": results,
+    }
+
+
+@router.post("/team-workspaces/{team_workspace_id}/revoke-invite")
+def revoke_team_workspace_invite(
+    team_workspace_id: str,
+    req: RevokeWorkspaceInviteRequest,
+    session: DbSession,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, team_workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="team workspace not found")
+    if not workspace.source_admin_session_id:
+        raise HTTPException(status_code=400, detail="workspace missing source admin session")
+    admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+    if admin_session is None:
+        raise HTTPException(status_code=404, detail="team admin session not found")
+    if not admin_session.access_token:
+        raise HTTPException(status_code=400, detail="team admin session missing access_token")
+
+    page_size = max(1, min(int(req.page_size or 100), 200))
+    concurrency = max(1, min(int(req.concurrency or 20), 50))
+    invites = _fetch_workspace_invites(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=page_size,
+    )
+    results = _revoke_workspace_invites(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        invites=invites,
+        concurrency=concurrency,
+    )
+    revoked_count = sum(1 for item in results if item.get("ok") is True)
+    failed_count = sum(1 for item in results if item.get("ok") is not True)
+    return {
+        "team_workspace_id": workspace.id,
+        "external_workspace_id": workspace.external_workspace_id,
+        "workspace_name": workspace.name,
+        "admin_email": admin_session.admin_email,
+        "invite_count": len(invites),
+        "revoked_count": revoked_count,
+        "failed_count": failed_count,
+        "results": results,
+    }
+
+
 @router.get("/memberships")
 def list_memberships(
     session: DbSession,
     admin_email: str = "",
     external_workspace_id: str = "",
+    user_email: str = "",
+    workspace: str = "",
+    membership_status: str = "",
+    has_codex_credential: str = "",
+    session_otp_status: str = "",
 ) -> list[dict]:
+    credential_exists = (
+        exists()
+        .where(CodexOAuthCredentialModel.user_account_id == MembershipModel.user_account_id)
+        .where(CodexOAuthCredentialModel.team_workspace_id == MembershipModel.team_workspace_id)
+    )
     stmt = (
-        select(MembershipModel, UserAccountModel, TeamWorkspaceModel, TeamAdminSessionModel)
+        select(
+            MembershipModel,
+            UserAccountModel,
+            TeamWorkspaceModel,
+            TeamAdminSessionModel,
+            AccountSessionOtpSnapshotModel,
+            credential_exists.label("has_codex_credential"),
+        )
         .join(UserAccountModel, UserAccountModel.id == MembershipModel.user_account_id)
         .join(TeamWorkspaceModel, TeamWorkspaceModel.id == MembershipModel.team_workspace_id)
         .outerjoin(
             TeamAdminSessionModel,
             TeamAdminSessionModel.id == TeamWorkspaceModel.source_admin_session_id,
+        )
+        .outerjoin(
+            AccountSessionOtpSnapshotModel,
+            AccountSessionOtpSnapshotModel.user_account_id == MembershipModel.user_account_id,
         )
         .order_by(MembershipModel.created_at.desc())
     )
@@ -760,6 +1022,21 @@ def list_memberships(
         stmt = stmt.where(
             TeamWorkspaceModel.external_workspace_id.ilike(f"%{external_workspace_id.strip()}%")
         )
+    if user_email:
+        stmt = stmt.where(UserAccountModel.email.ilike(f"%{user_email.strip()}%"))
+    if workspace:
+        value = f"%{workspace.strip()}%"
+        stmt = stmt.where(
+            (TeamWorkspaceModel.name.ilike(value))
+            | (TeamWorkspaceModel.id.ilike(value))
+            | (TeamWorkspaceModel.external_workspace_id.ilike(value))
+        )
+    if membership_status:
+        stmt = stmt.where(MembershipModel.membership_status == membership_status.strip())
+    if has_codex_credential in {"yes", "no"}:
+        stmt = stmt.where(credential_exists if has_codex_credential == "yes" else ~credential_exists)
+    if session_otp_status:
+        stmt = stmt.where(AccountSessionOtpSnapshotModel.snapshot_status == session_otp_status.strip())
     rows = session.execute(stmt).all()
     return [
         {
@@ -772,11 +1049,14 @@ def list_memberships(
             "workspace_plan_type": workspace.plan_type,
             "admin_email": admin_session.admin_email if admin_session is not None else "",
             "membership_status": membership.membership_status,
+            "has_codex_credential": bool(has_codex_credential),
+            "session_otp_status": otp_snapshot.snapshot_status if otp_snapshot is not None else "",
+            "session_otp_code_len": otp_snapshot.otp_code_len if otp_snapshot is not None else 0,
             "can_invite": membership.can_invite,
             "failure_code": membership.failure_code,
             "failure_message": membership.failure_message,
         }
-        for membership, account, workspace, admin_session in rows
+        for membership, account, workspace, admin_session, otp_snapshot, has_codex_credential in rows
     ]
 
 
@@ -805,6 +1085,69 @@ def create_membership_accept_invite_job(
     session: DbSession,
 ) -> dict:
     return _create_accept_invite_work_job(req=req, session=session)
+
+
+@router.post("/memberships/session-otp-prepare-job")
+def create_membership_session_otp_prepare_job(
+    req: SessionOtpMembershipRequest,
+    session: DbSession,
+) -> dict:
+    return _create_session_otp_work_job(req=req, session=session, phase="prepare")
+
+
+@router.post("/memberships/session-otp-submit-job")
+def create_membership_session_otp_submit_job(
+    req: SessionOtpMembershipRequest,
+    session: DbSession,
+) -> dict:
+    return _create_session_otp_work_job(req=req, session=session, phase="submit")
+
+
+@router.post("/memberships/sync-remote-state")
+def sync_memberships_remote_state(
+    req: SyncWorkspaceMembersRequest,
+    session: DbSession,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, req.team_workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="team workspace not found")
+    if not workspace.source_admin_session_id:
+        raise HTTPException(status_code=400, detail="workspace missing source admin session")
+    admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+    if admin_session is None:
+        raise HTTPException(status_code=404, detail="team admin session not found")
+    if not admin_session.access_token:
+        raise HTTPException(status_code=400, detail="team admin session missing access_token")
+
+    page_size = max(1, min(int(req.page_size or 100), 200))
+    remote_members = _fetch_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=page_size,
+    )
+    remote_invites = _fetch_workspace_invites(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=page_size,
+    )
+    result = _prune_workspace_memberships_by_remote_state(
+        session=session,
+        workspace=workspace,
+        remote_members=remote_members,
+        remote_invites=remote_invites,
+    )
+    session.commit()
+    return {
+        "team_workspace_id": workspace.id,
+        "external_workspace_id": workspace.external_workspace_id,
+        "workspace_name": workspace.name,
+        "admin_email": admin_session.admin_email,
+        "remote_member_count": len(remote_members),
+        "remote_invite_count": len(remote_invites),
+        **result,
+    }
 
 
 def _create_invite_work_job(*, req: InviteSelectedUsersRequest, session: Session) -> dict:
@@ -958,6 +1301,121 @@ def _create_accept_invite_work_job(
                 "_barrier_timeout_s": 30,
             },
         )
+    session.commit()
+    local_session_factory = sessionmaker(
+        bind=session.get_bind(),
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    _run_job_work_now(
+        session_factory=local_session_factory,
+        job_id=job.id,
+        concurrency=min(concurrency, len(membership_ids)),
+    )
+    summary = _work_summary(session, job.id)
+    job = session.get(JobModel, job.id)
+    if job is not None:
+        job.job_status = "succeeded" if summary["failed"] == 0 else "failed"
+        job.updated_at = datetime.now(UTC)
+    run = session.get(JobRunModel, run.id)
+    if run is not None:
+        run.run_status = (
+            "succeeded" if job is not None and job.job_status == "succeeded" else "failed"
+        )
+        run.finished_at = datetime.now(UTC)
+        run.output_json = summary
+        if run.run_status == "failed":
+            run.error_code = "work_failed"
+            run.error_message = f"failed={summary['failed']}"
+    session.commit()
+    return {
+        "job_id": job.id if job is not None else "",
+        "job_status": job.job_status if job is not None else "",
+        "run_id": run.id if run is not None else "",
+        "work_count": len(membership_ids),
+        "concurrency": concurrency,
+        **summary,
+    }
+
+
+def _create_session_otp_work_job(
+    *,
+    req: SessionOtpMembershipRequest,
+    session: Session,
+    phase: str,
+) -> dict:
+    raw_membership_ids = [item.strip() for item in req.membership_ids if item.strip()]
+    if not raw_membership_ids:
+        raise HTTPException(status_code=400, detail="membership_ids is required")
+    memberships = session.scalars(
+        select(MembershipModel).where(MembershipModel.id.in_(raw_membership_ids))
+    ).all()
+    found_ids = {row.id for row in memberships}
+    missing_ids = [item for item in raw_membership_ids if item not in found_ids]
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "some memberships not found", "membership_ids": missing_ids},
+        )
+
+    by_account: dict[str, MembershipModel] = {}
+    by_membership_id = {row.id: row for row in memberships}
+    for membership_id in raw_membership_ids:
+        membership = by_membership_id.get(membership_id)
+        if membership is None or membership.user_account_id in by_account:
+            continue
+        by_account[membership.user_account_id] = membership
+    membership_ids = [row.id for row in by_account.values()]
+    if not membership_ids:
+        raise HTTPException(status_code=400, detail="no unique memberships to process")
+
+    settings = get_settings()
+    concurrency = max(1, min(int(req.concurrency or 1), settings.worker_max_concurrency))
+    job_type = f"session_otp.{phase}.bulk"
+    work_type = f"session_otp.{phase}.account"
+    job = JobQueue(session).enqueue(
+        job_type=job_type,
+        input_json={
+            **req.model_dump(),
+            "phase": phase,
+            "deduped_membership_ids": membership_ids,
+            "deduped_count": len(membership_ids),
+        },
+        created_by=req.created_by,
+    )
+    now = datetime.now(UTC)
+    job.job_status = "running"
+    job.updated_at = now
+    run = JobRunModel(
+        id=str(uuid4()),
+        job_id=job.id,
+        run_status="running",
+        attempt=1,
+        started_at=now,
+        output_json={},
+    )
+    session.add(run)
+    work_queue = WorkQueue(session)
+    barrier_key = f"session-otp-submit:{job.id}" if phase == "submit" else ""
+    total = len(membership_ids)
+    for index, membership_id in enumerate(membership_ids):
+        barrier_group_index = index // concurrency
+        barrier_group_start = barrier_group_index * concurrency
+        barrier_group_expected = min(concurrency, total - barrier_group_start)
+        input_json = {
+            "membership_id": membership_id,
+            "_run_id": run.id,
+        }
+        if phase == "submit":
+            input_json.update(
+                {
+                    "_barrier_key": barrier_key,
+                    "_barrier_group": str(barrier_group_index),
+                    "_barrier_expected": barrier_group_expected,
+                    "_barrier_timeout_s": 120,
+                }
+            )
+        work_queue.enqueue(job_id=job.id, work_type=work_type, input_json=input_json)
     session.commit()
     local_session_factory = sessionmaker(
         bind=session.get_bind(),
@@ -1162,6 +1620,91 @@ def create_codex_heartbeat_bulk_job(
     session: DbSession,
 ) -> dict:
     return _create_codex_heartbeat_work_job(req=req, session=session)
+
+
+@router.get("/downstream-channels")
+def list_downstream_channels(session: DbSession) -> list[dict]:
+    rows = session.scalars(
+        select(DownstreamChannelModel).order_by(
+            DownstreamChannelModel.provider_type,
+            DownstreamChannelModel.name,
+        )
+    ).all()
+    return [_downstream_channel_dict(row) for row in rows]
+
+
+@router.post("/downstream-channels")
+def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSession) -> dict:
+    now = datetime.now(UTC)
+    provider_type = req.provider_type.strip()
+    if provider_type not in {"sub2api", "cpa"}:
+        raise HTTPException(status_code=400, detail="provider_type must be sub2api or cpa")
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    if not req.base_url.strip():
+        raise HTTPException(status_code=400, detail="base_url is required")
+    if not req.admin_key.strip():
+        raise HTTPException(status_code=400, detail="admin_key is required")
+    channel = DownstreamChannelModel(
+        id=f"downstream-channel-{uuid4()}",
+        provider_type=provider_type,
+        name=req.name.strip(),
+        base_url=req.base_url.strip().rstrip("/"),
+        admin_key=req.admin_key.strip(),
+        enabled=req.enabled,
+        update_existing=req.update_existing,
+        timeout_s=max(1, int(req.timeout_s or 30)),
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(channel)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="downstream channel already exists") from exc
+    return _downstream_channel_dict(channel)
+
+
+@router.patch("/downstream-channels/{channel_id}")
+def patch_downstream_channel(
+    channel_id: str,
+    req: PatchDownstreamChannelRequest,
+    session: DbSession,
+) -> dict:
+    channel = session.get(DownstreamChannelModel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="downstream channel not found")
+    if req.provider_type is not None:
+        provider_type = req.provider_type.strip()
+        if provider_type not in {"sub2api", "cpa"}:
+            raise HTTPException(status_code=400, detail="provider_type must be sub2api or cpa")
+        channel.provider_type = provider_type
+    if req.name is not None:
+        if not req.name.strip():
+            raise HTTPException(status_code=400, detail="name is required")
+        channel.name = req.name.strip()
+    if req.base_url is not None:
+        if not req.base_url.strip():
+            raise HTTPException(status_code=400, detail="base_url is required")
+        channel.base_url = req.base_url.strip().rstrip("/")
+    if req.admin_key is not None:
+        if not req.admin_key.strip():
+            raise HTTPException(status_code=400, detail="admin_key is required")
+        channel.admin_key = req.admin_key.strip()
+    if req.enabled is not None:
+        channel.enabled = req.enabled
+    if req.update_existing is not None:
+        channel.update_existing = req.update_existing
+    if req.timeout_s is not None:
+        channel.timeout_s = max(1, int(req.timeout_s or 30))
+    channel.updated_at = datetime.now(UTC)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="downstream channel already exists") from exc
+    return _downstream_channel_dict(channel)
 
 
 @router.get("/downstream-push-records")
@@ -1371,6 +1914,33 @@ def list_mail_leases(session: DbSession) -> list[dict]:
     return [{"id": row.id, "email": row.email, "lease_status": row.lease_status} for row in rows]
 
 
+def _downstream_channel_dict(channel: DownstreamChannelModel) -> dict:
+    return {
+        "id": channel.id,
+        "provider_type": channel.provider_type,
+        "name": channel.name,
+        "base_url": channel.base_url,
+        "admin_key_summary": _summarize_secret(channel.admin_key or ""),
+        "enabled": channel.enabled,
+        "update_existing": channel.update_existing,
+        "timeout_s": channel.timeout_s,
+        "last_test_status": "unknown",
+        "last_test_at": "",
+        "last_error_code": "",
+        "last_error_message": "",
+        "created_at": channel.created_at.isoformat(),
+        "updated_at": channel.updated_at.isoformat(),
+    }
+
+
+def _summarize_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-4:]}"
+
+
 def _workspace_dict(row: TeamWorkspaceModel, *, admin_email: str = "") -> dict:
     return {
         "id": row.id,
@@ -1385,19 +1955,554 @@ def _workspace_dict(row: TeamWorkspaceModel, *, admin_email: str = "") -> dict:
     }
 
 
-def _fetch_accounts_check(
+def _workspace_self_user_ids(
+    *,
+    session: Session,
+    team_admin_session_id: str,
+    account_id: str,
+) -> set[str]:
+    check = session.scalars(
+        select(TeamAdminAccountCheckModel)
+        .where(TeamAdminAccountCheckModel.team_admin_session_id == team_admin_session_id)
+        .order_by(TeamAdminAccountCheckModel.checked_at.desc())
+    ).first()
+    if check is None:
+        return set()
+    account = _workspace_account_from_check(check.raw_check_json, account_id)
+    values = {
+        str(account.get("account_owner_id") or "").strip(),
+        str(account.get("account_user_id") or "").strip(),
+        str(account.get("user_id") or "").strip(),
+    }
+    return {item for item in values if item}
+
+
+def _fetch_workspace_members(
     *,
     access_token: str,
     cookie_header: str,
-    timezone_offset_min: int,
+    account_id: str,
+    page_size: int,
+) -> list[dict[str, Any]]:
+    headers = _workspace_api_headers(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+    )
+    members: list[dict[str, Any]] = []
+    with curl_requests.Session(impersonate="chrome136") as client:
+        for offset in range(0, 100000, page_size):
+            response = client.get(
+                f"https://chatgpt.com/backend-api/accounts/{account_id}/users",
+                params={"offset": str(offset), "limit": str(page_size), "query": ""},
+                headers=headers,
+                timeout=45,
+            )
+            payload = _json_response_or_detail(response)
+            if int(response.status_code or 0) >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "workspace users list failed",
+                        "http_status": response.status_code,
+                        "body": payload,
+                    },
+                )
+            items = _list_items(payload, ("items", "users", "data"))
+            members.extend(items)
+            total = _response_total(payload)
+            if not items or len(items) < page_size or (total is not None and len(members) >= total):
+                break
+    return members
+
+
+def _fetch_workspace_invites(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+    page_size: int,
+) -> list[dict[str, Any]]:
+    headers = _workspace_api_headers(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+    )
+    invites: list[dict[str, Any]] = []
+    with curl_requests.Session(impersonate="chrome136") as client:
+        for offset in range(0, 100000, page_size):
+            response = client.get(
+                f"https://chatgpt.com/backend-api/accounts/{account_id}/invites",
+                params={"offset": str(offset), "limit": str(page_size), "query": ""},
+                headers=headers,
+                timeout=45,
+            )
+            payload = _json_response_or_detail(response)
+            if int(response.status_code or 0) >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "workspace invites list failed",
+                        "http_status": response.status_code,
+                        "body": payload,
+                    },
+                )
+            items = _list_items(payload, ("items", "invites", "data"))
+            invites.extend(items)
+            total = _response_total(payload)
+            if not items or len(items) < page_size or (total is not None and len(invites) >= total):
+                break
+    return invites
+
+
+def _split_removable_workspace_members(
+    members: list[dict[str, Any]],
+    *,
+    self_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    targets: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for member in members:
+        user_id = _workspace_member_user_id(member)
+        role = _workspace_member_role(member)
+        email = _workspace_member_email(member)
+        reason = ""
+        if not user_id:
+            reason = "missing_user_id"
+        elif user_id in self_ids or str(member.get("account_user_id") or "").strip() in self_ids:
+            reason = "self_or_current_admin"
+        elif role == "account-owner":
+            reason = "account_owner"
+        if reason:
+            skipped.append({"user_id": user_id, "email": email, "role": role, "reason": reason})
+            continue
+        targets.append(member)
+    return targets, skipped
+
+
+def _delete_workspace_members(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+    members: list[dict[str, Any]],
+    concurrency: int,
+) -> list[dict[str, Any]]:
+    if not members:
+        return []
+    headers = _workspace_api_headers(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+    )
+    max_workers = min(concurrency, len(members))
+
+    def delete_one(member: dict[str, Any]) -> dict[str, Any]:
+        user_id = _workspace_member_user_id(member)
+        email = _workspace_member_email(member)
+        role = _workspace_member_role(member)
+        try:
+            with curl_requests.Session(impersonate="chrome136") as client:
+                response = client.delete(
+                    f"https://chatgpt.com/backend-api/accounts/{account_id}/users/{user_id}",
+                    headers=headers,
+                    timeout=45,
+                )
+        except curl_requests.RequestsError as exc:
+            return {
+                "ok": False,
+                "user_id": user_id,
+                "email": email,
+                "role": role,
+                "error_code": "request_failed",
+                "error_message": str(exc),
+            }
+        payload = _json_response_or_detail(response)
+        ok = int(response.status_code or 0) < 400
+        return {
+            "ok": ok,
+            "user_id": user_id,
+            "email": email,
+            "role": role,
+            "http_status": int(response.status_code or 0),
+            "body": payload if not ok else {},
+        }
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_by_index = {
+            executor.submit(delete_one, member): index for index, member in enumerate(members)
+        }
+        ordered: dict[int, dict[str, Any]] = {}
+        for future in as_completed(future_by_index):
+            ordered[future_by_index[future]] = future.result()
+        for index in range(len(members)):
+            results.append(ordered[index])
+    return results
+
+
+def _revoke_workspace_invites(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+    invites: list[dict[str, Any]],
+    concurrency: int,
+) -> list[dict[str, Any]]:
+    if not invites:
+        return []
+    max_workers = min(concurrency, len(invites))
+
+    def revoke_one(invite: dict[str, Any]) -> dict[str, Any]:
+        email_address = _remote_invite_email(invite)
+        if not email_address:
+            return {
+                "ok": False,
+                "email_address": "",
+                "invite_id": str(invite.get("id") or ""),
+                "error_code": "missing_email_address",
+                "error_message": "invite item missing email_address",
+            }
+        return _revoke_workspace_invite(
+            access_token=access_token,
+            cookie_header=cookie_header,
+            account_id=account_id,
+            email_address=email_address,
+            invite_id=str(invite.get("id") or ""),
+        )
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_by_index = {
+            executor.submit(revoke_one, invite): index for index, invite in enumerate(invites)
+        }
+        ordered: dict[int, dict[str, Any]] = {}
+        for future in as_completed(future_by_index):
+            ordered[future_by_index[future]] = future.result()
+        for index in range(len(invites)):
+            results.append(ordered[index])
+    return results
+
+
+def _revoke_workspace_invite(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+    email_address: str,
+    invite_id: str = "",
 ) -> dict[str, Any]:
-    if not access_token:
-        raise HTTPException(status_code=400, detail="raw_session_json missing accessToken")
+    headers = _workspace_api_headers(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+    )
+    headers["content-type"] = "application/json"
+    try:
+        with curl_requests.Session(impersonate="chrome136") as client:
+            response = client.delete(
+                f"https://chatgpt.com/backend-api/accounts/{account_id}/invites",
+                headers=headers,
+                json={"email_address": email_address},
+                timeout=45,
+            )
+    except curl_requests.RequestsError as exc:
+        return {
+            "ok": False,
+            "email_address": email_address,
+            "invite_id": invite_id,
+            "error_code": "request_failed",
+            "error_message": str(exc),
+        }
+    body = _json_response_or_detail(response)
+    ok = int(response.status_code or 0) < 400
+    return {
+        "ok": ok,
+        "email_address": email_address,
+        "invite_id": invite_id,
+        "http_status": int(response.status_code or 0),
+        "body": body if not ok else {},
+    }
+
+
+def _prune_workspace_memberships_by_remote_state(
+    *,
+    session: Session,
+    workspace: TeamWorkspaceModel,
+    remote_members: list[dict[str, Any]],
+    remote_invites: list[dict[str, Any]],
+) -> dict:
+    now = datetime.now(UTC)
+    remote_user_ids: set[str] = set()
+    for member in remote_members:
+        remote_user_ids.update(_remote_user_ids(member))
+    invited_emails = {
+        _remote_invite_email(invite).strip().lower()
+        for invite in remote_invites
+        if _remote_invite_email(invite).strip()
+    }
+    if remote_members and not remote_user_ids:
+        return {
+            "remote_user_id_count": 0,
+            "remote_invite_email_count": len(invited_emails),
+            "matched_remote_member_count": 0,
+            "matched_remote_invite_count": 0,
+            "removed_local_count": 0,
+            "deleted_credential_count": 0,
+            "released_batch_item_count": 0,
+            "unbound_downstream_count": 0,
+            "delete_skipped_reason": "remote members response has no user ids; local delete skipped",
+        }
+
+    rows = session.execute(
+        select(MembershipModel, UserAccountModel, UserAccountAuthModel)
+        .join(UserAccountModel, UserAccountModel.id == MembershipModel.user_account_id)
+        .outerjoin(
+            UserAccountAuthModel,
+            UserAccountAuthModel.user_account_id == MembershipModel.user_account_id,
+        )
+        .where(MembershipModel.team_workspace_id == workspace.id)
+    ).all()
+    credentials = session.scalars(
+        select(CodexOAuthCredentialModel).where(
+            CodexOAuthCredentialModel.team_workspace_id == workspace.id
+        )
+    ).all()
+    credentials_by_account: dict[str, list[CodexOAuthCredentialModel]] = {}
+    for credential in credentials:
+        credentials_by_account.setdefault(credential.user_account_id, []).append(credential)
+
+    stale_user_account_ids: list[str] = []
+    matched_remote_member_count = 0
+    matched_remote_invite_count = 0
+    for membership, account, auth in rows:
+        local_user_ids = _local_account_remote_user_ids(
+            account=account,
+            auth=auth,
+            membership=membership,
+            credentials=credentials_by_account.get(account.id, []),
+        )
+        email = account.email.strip().lower()
+        if local_user_ids and local_user_ids & remote_user_ids:
+            matched_remote_member_count += 1
+            continue
+        if email and email in invited_emails:
+            matched_remote_invite_count += 1
+            continue
+        stale_user_account_ids.append(account.id)
+
+    removed = _delete_local_memberships_with_credentials(
+        session=session,
+        workspace_id=workspace.id,
+        user_account_ids=stale_user_account_ids,
+        now=now,
+    )
+    return {
+        "remote_user_id_count": len(remote_user_ids),
+        "remote_invite_email_count": len(invited_emails),
+        "matched_remote_member_count": matched_remote_member_count,
+        "matched_remote_invite_count": matched_remote_invite_count,
+        "removed_local_count": removed["deleted_membership_count"],
+        "deleted_credential_count": removed["deleted_credential_count"],
+        "released_batch_item_count": removed["released_batch_item_count"],
+        "unbound_downstream_count": removed["unbound_downstream_count"],
+        "delete_skipped_reason": "",
+    }
+
+
+def _delete_local_memberships_with_credentials(
+    *,
+    session: Session,
+    workspace_id: str,
+    user_account_ids: list[str],
+    now: datetime,
+) -> dict:
+    if not user_account_ids:
+        return {
+            "deleted_membership_count": 0,
+            "deleted_credential_count": 0,
+            "released_batch_item_count": 0,
+            "unbound_downstream_count": 0,
+        }
+    credential_ids = session.scalars(
+        select(CodexOAuthCredentialModel.id).where(
+            CodexOAuthCredentialModel.team_workspace_id == workspace_id,
+            CodexOAuthCredentialModel.user_account_id.in_(user_account_ids),
+        )
+    ).all()
+    unbound_downstream_count = 0
+    released_batch_item_count = session.execute(
+        update(WorkspaceJoinBatchItemModel)
+        .where(
+            WorkspaceJoinBatchItemModel.team_workspace_id == workspace_id,
+            WorkspaceJoinBatchItemModel.user_account_id.in_(user_account_ids),
+        )
+        .values(
+            batch_binding_status="released",
+            membership_id=None,
+            codex_credential_id=None,
+            updated_at=now,
+        )
+    ).rowcount
+    if credential_ids:
+        unbound_downstream_count = session.execute(
+            update(DownstreamCodexPushRecordModel)
+            .where(DownstreamCodexPushRecordModel.codex_credential_id.in_(credential_ids))
+            .values(codex_credential_id=None, membership_id=None, updated_at=now)
+        ).rowcount
+    deleted_credential_count = session.execute(
+        delete(CodexOAuthCredentialModel).where(
+            CodexOAuthCredentialModel.team_workspace_id == workspace_id,
+            CodexOAuthCredentialModel.user_account_id.in_(user_account_ids),
+        )
+    ).rowcount
+    deleted_membership_count = session.execute(
+        delete(MembershipModel).where(
+            MembershipModel.team_workspace_id == workspace_id,
+            MembershipModel.user_account_id.in_(user_account_ids),
+        )
+    ).rowcount
+    return {
+        "deleted_membership_count": int(deleted_membership_count or 0),
+        "deleted_credential_count": int(deleted_credential_count or 0),
+        "released_batch_item_count": int(released_batch_item_count or 0),
+        "unbound_downstream_count": int(unbound_downstream_count or 0),
+    }
+
+
+def _local_account_remote_user_ids(
+    *,
+    account: UserAccountModel,
+    auth: UserAccountAuthModel | None,
+    membership: MembershipModel,
+    credentials: list[CodexOAuthCredentialModel],
+) -> set[str]:
+    values = {str(account.openai_user_id or "").strip()}
+    if auth is not None:
+        values.update(_jwt_identity_user_ids(auth.access_token))
+    values.update(_jwt_identity_user_ids(membership.chatgpt_web_backend_access_token))
+    values.update(_jwt_identity_user_ids(membership.chatgpt_web_backend_id_token))
+    for credential in credentials:
+        values.add(str(credential.account_id or "").strip())
+        values.update(_jwt_identity_user_ids(credential.access_token))
+        values.update(_jwt_identity_user_ids(credential.id_token))
+    return {value for value in values if value}
+
+
+def _jwt_identity_user_ids(token: str) -> set[str]:
+    if not token or token.count(".") < 2:
+        return set()
+    try:
+        claims = decode_access_token_claims(token)
+    except Exception:
+        return set()
+    values = {str(claims.account_id or "").strip()}
+    raw = claims.raw if isinstance(claims.raw, dict) else {}
+    values.update(
+        str(raw.get(key) or "").strip()
+        for key in ("sub", "user_id", "chatgpt_user_id", "account_id")
+    )
+    auth = raw.get("https://api.openai.com/auth")
+    if isinstance(auth, dict):
+        values.update(
+            str(auth.get(key) or "").strip()
+            for key in ("chatgpt_user_id", "user_id", "account_id")
+        )
+    return {value for value in values if value}
+
+
+def _remote_user_ids(item: dict[str, Any]) -> set[str]:
+    values = {
+        str(item.get(key) or "").strip()
+        for key in ("id", "user_id", "userId", "account_user_id", "accountUserId")
+    }
+    user = item.get("user")
+    if isinstance(user, dict):
+        values.update(str(user.get(key) or "").strip() for key in ("id", "user_id", "userId"))
+    return {value for value in values if value}
+
+
+def _workspace_member_user_id(member: dict[str, Any]) -> str:
+    user = member.get("user")
+    for value in (
+        member.get("user_id"),
+        member.get("id"),
+        member.get("account_user_id"),
+        user.get("id") if isinstance(user, dict) else "",
+        user.get("user_id") if isinstance(user, dict) else "",
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _workspace_member_email(member: dict[str, Any]) -> str:
+    user = member.get("user")
+    profile = member.get("profile")
+    for value in (
+        member.get("email"),
+        user.get("email") if isinstance(user, dict) else "",
+        profile.get("email") if isinstance(profile, dict) else "",
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _workspace_member_role(member: dict[str, Any]) -> str:
+    for key in ("role", "account_user_role", "user_role"):
+        text = str(member.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _remote_invite_email(item: dict[str, Any]) -> str:
+    for key in ("email", "email_address", "emailAddress", "recipient_email"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    user = item.get("user")
+    if isinstance(user, dict):
+        return str(user.get("email") or "").strip()
+    return ""
+
+
+def _list_items(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _response_total(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("total", "total_count", "totalCount"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _workspace_api_headers(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+) -> dict[str, str]:
     headers = {
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
+        "content-type": "application/json",
+        "chatgpt-account-id": account_id,
         "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/",
+        "referer": "https://chatgpt.com/admin",
         "user-agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1406,6 +2511,156 @@ def _fetch_accounts_check(
     }
     if cookie_header:
         headers["cookie"] = cookie_header
+    return headers
+
+
+def _json_response_or_detail(response) -> Any:
+    text = str(getattr(response, "text", "") or "")
+    try:
+        return response.json() if text else {}
+    except Exception:
+        return {"body": text[:4000]}
+
+
+def _parse_browser_headers_text(value: str) -> dict[str, str]:
+    raw_value = value.strip()
+    if not raw_value:
+        return {}
+    if raw_value.startswith('"') and raw_value.endswith('"'):
+        try:
+            raw_value = str(json.loads(raw_value))
+        except json.JSONDecodeError:
+            pass
+    if "\\n" in raw_value or "\\r" in raw_value:
+        raw_value = raw_value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    allowed = {
+        "accept-language",
+        "cookie",
+        "priority",
+        "sec-ch-ua",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-platform-version",
+        "user-agent",
+    }
+    ignored = {
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "host",
+        "origin",
+        "referer",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "upgrade-insecure-requests",
+    }
+    metadata = {
+        "request url",
+        "request method",
+        "status code",
+        "remote address",
+        "referrer policy",
+    }
+    pseudo_headers = {":authority", ":method", ":path", ":scheme"}
+    known_keys = allowed | ignored | metadata | pseudo_headers
+    lines = [line.rstrip() for line in raw_value.splitlines()]
+    parsed: dict[str, str] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        index += 1
+        if not line:
+            continue
+        if ":" in line and not line.startswith(":"):
+            key, inline_value = line.split(":", 1)
+            header_value = inline_value.strip()
+        else:
+            key = line
+            header_value = ""
+        key = key.strip().lower()
+        if key.startswith(":"):
+            if index < len(lines):
+                index += 1
+            continue
+        if key in ignored or key not in allowed:
+            if not header_value and index < len(lines) and key in known_keys:
+                index += 1
+            continue
+        if not header_value and index < len(lines):
+            next_line = lines[index].strip()
+            next_key = ""
+            if ":" in next_line:
+                next_key = next_line.split(":", 1)[0].strip().lower()
+            if next_line and not next_line.startswith(":") and next_key not in known_keys:
+                header_value = next_line
+                index += 1
+        if header_value:
+            parsed[key] = header_value
+    return parsed
+
+
+def _fetch_accounts_check(
+    *,
+    access_token: str,
+    cookie_header: str,
+    browser_headers: dict[str, str] | None = None,
+    timezone_offset_min: int,
+) -> dict[str, Any]:
+    if not access_token:
+        raise HTTPException(status_code=400, detail="raw_session_json missing accessToken")
+    browser_headers = browser_headers or {}
+    headers = {
+        "accept": "*/*",
+        "accept-language": browser_headers.get("accept-language", "zh-CN,zh;q=0.9"),
+        "authorization": f"Bearer {access_token}",
+        "cookie": cookie_header,
+        "oai-client-build-number": "7646290",
+        "oai-client-version": "prod-497f333866796e100096ad083b51ca949d22e751",
+        "oai-language": "zh-CN",
+        "oai-session-id": str(uuid4()),
+        "priority": browser_headers.get("priority", "u=1, i"),
+        "referer": "https://chatgpt.com/admin/members?tab=invites",
+        "sec-ch-ua": browser_headers.get("sec-ch-ua", '"Chromium";v="135", "Not-A.Brand";v="8"'),
+        "sec-ch-ua-arch": browser_headers.get("sec-ch-ua-arch", '"arm"'),
+        "sec-ch-ua-bitness": browser_headers.get("sec-ch-ua-bitness", '"64"'),
+        "sec-ch-ua-full-version": browser_headers.get(
+            "sec-ch-ua-full-version",
+            '"135.0.7049.72"',
+        ),
+        "sec-ch-ua-full-version-list": browser_headers.get(
+            "sec-ch-ua-full-version-list",
+            '"Chromium";v="135.0.7049.72", "Not-A.Brand";v="8.0.0.0"',
+        ),
+        "sec-ch-ua-mobile": browser_headers.get("sec-ch-ua-mobile", "?0"),
+        "sec-ch-ua-model": browser_headers.get("sec-ch-ua-model", '""'),
+        "sec-ch-ua-platform": browser_headers.get("sec-ch-ua-platform", '"macOS"'),
+        "sec-ch-ua-platform-version": browser_headers.get(
+            "sec-ch-ua-platform-version",
+            '"15.6.1"',
+        ),
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": browser_headers.get(
+            "user-agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/135.0.0.0 Safari/537.36",
+        ),
+        "x-openai-target-path": "/backend-api/accounts/check/v4-2023-04-27",
+        "x-openai-target-route": "/backend-api/accounts/check/{version}",
+    }
+    if not cookie_header:
+        raise HTTPException(status_code=400, detail="team admin cookie_header is required")
     url = (
         "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
         f"?timezone_offset_min={int(timezone_offset_min)}"
@@ -1427,6 +2682,24 @@ def _fetch_accounts_check(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="accounts/check response must be object")
     return payload
+
+
+def _workspace_account_from_check(raw_check: dict[str, Any], account_id: str) -> dict[str, Any]:
+    accounts = raw_check.get("accounts")
+    if isinstance(accounts, dict):
+        node = accounts.get(account_id)
+        if isinstance(node, dict):
+            account = node.get("account")
+            if isinstance(account, dict):
+                return account
+            return node
+    for item in _find_workspace_candidates(raw_check):
+        if _workspace_external_id(item) == account_id:
+            account = item.get("account")
+            if isinstance(account, dict):
+                return account
+            return item
+    return {}
 
 
 def _extract_workspaces_from_session_and_check(

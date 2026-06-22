@@ -32,9 +32,15 @@ export const resourcesApi = {
       body,
     ),
   teamAdminSessions: () => getJson<Row[]>("/team-admin-sessions"),
+  deleteTeamAdminSession: (id: string) =>
+    deleteJson<Row>(`/team-admin-sessions/${encodeURIComponent(id)}`),
   workspaces: () => getJson<Row[]>("/team-workspaces"),
   importWorkspace: (body: Record<string, unknown>) =>
     postJson<{ team_workspace_id: string }>("/team-workspaces/import", body),
+  removeWorkspaceMembers: (id: string, body: Record<string, unknown>) =>
+    postJson<Row>(`/team-workspaces/${encodeURIComponent(id)}/remove-members`, body),
+  revokeWorkspaceInvite: (id: string, body: Record<string, unknown>) =>
+    postJson<Row>(`/team-workspaces/${encodeURIComponent(id)}/revoke-invite`, body),
   memberships: (params: Record<string, string> = {}) => {
     const query = new URLSearchParams(
       Object.entries(params).filter(([, value]) => value.trim() !== ""),
@@ -47,6 +53,12 @@ export const resourcesApi = {
     postJson<AccountWorkJobResult>("/memberships/invite-member-job", body),
   membershipAcceptInvite: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/memberships/accept-invite-job", body),
+  membershipSessionOtpPrepare: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/memberships/session-otp-prepare-job", body),
+  membershipSessionOtpSubmit: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/memberships/session-otp-submit-job", body),
+  syncMembershipRemoteState: (body: Record<string, unknown>) =>
+    postJson<Row>("/memberships/sync-remote-state", body),
   batches: () => getJson<Row[]>("/workspace-join-batches"),
   batch: (id: string) => getJson<Row>(`/workspace-join-batches/${encodeURIComponent(id)}`),
   batchItems: (id: string) =>
@@ -79,5 +91,10 @@ export const resourcesApi = {
   markMailUsed: (body: Record<string, unknown>) => postJson<JobCreated>("/mail/mark-used-job", body),
   markMailFailed: (body: Record<string, unknown>) => postJson<JobCreated>("/mail/mark-failed-job", body),
   releaseMail: (body: Record<string, unknown>) => postJson<JobCreated>("/mail/release-job", body),
+  downstreamChannels: () => getJson<Row[]>("/downstream-channels"),
+  createDownstreamChannel: (body: Record<string, unknown>) =>
+    postJson<Row>("/downstream-channels", body),
+  patchDownstreamChannel: (id: string, body: Record<string, unknown>) =>
+    patchJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`, body),
   downstream: () => getJson<Row[]>("/downstream-push-records"),
 };
