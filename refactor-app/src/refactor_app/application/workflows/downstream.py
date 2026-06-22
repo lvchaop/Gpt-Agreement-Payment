@@ -126,7 +126,7 @@ def downstream_payload(
     user: UserAccountModel,
     workspace: TeamWorkspaceModel,
     credential: CodexOAuthCredentialModel,
-    batch_item: WorkspaceJoinBatchItemModel,
+    batch_item: WorkspaceJoinBatchItemModel | None,
 ) -> DownstreamCodexPayload:
     if credential.token_chatgpt_account_id != workspace.external_workspace_id:
         raise DownstreamWorkflowError("workspace_mismatch")
@@ -140,8 +140,8 @@ def downstream_payload(
         token_chatgpt_account_id=credential.token_chatgpt_account_id,
         client_id=credential.codex_client_id,
         expires_at=credential.expires_at,
-        plan_tag=batch_item.plan_tag,
-        plan_type=batch_item.plan_type,
+        plan_tag=batch_item.plan_tag if batch_item is not None else workspace.plan_type,
+        plan_type=batch_item.plan_type if batch_item is not None else workspace.plan_type,
     )
 
 

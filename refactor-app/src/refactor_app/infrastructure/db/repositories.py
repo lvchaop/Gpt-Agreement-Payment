@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from refactor_app.infrastructure.db.models import (
     Base,
     CodexOAuthCredentialModel,
+    DownstreamChannelModel,
     DownstreamCodexPushRecordModel,
     ExternalMailLeaseModel,
     JobEventModel,
@@ -67,6 +68,9 @@ class TeamWorkspaceRepository(SqlAlchemyRepository[TeamWorkspaceModel]):
                     "name": values["name"],
                     "plan_type": values["plan_type"],
                     "seat_limit": values["seat_limit"],
+                    "seats_in_use": values.get("seats_in_use", 0),
+                    "seats_entitled": values.get("seats_entitled", 0),
+                    "last_subscription_sync_at": values.get("last_subscription_sync_at"),
                     "workspace_status": values["workspace_status"],
                     "updated_at": values["updated_at"],
                 },
@@ -137,6 +141,10 @@ class CodexOAuthCredentialRepository(SqlAlchemyRepository[CodexOAuthCredentialMo
                     "access_token": values["access_token"],
                     "id_token": values["id_token"],
                     "refresh_token": values["refresh_token"],
+                    "push_lifecycle_status": values.get(
+                        "push_lifecycle_status",
+                        CodexOAuthCredentialModel.push_lifecycle_status,
+                    ),
                     "expires_at": values["expires_at"],
                     "last_refresh_at": values["last_refresh_at"],
                     "failure_code": values["failure_code"],
@@ -157,8 +165,10 @@ class DownstreamCodexPushRecordRepository(SqlAlchemyRepository[DownstreamCodexPu
             insert(DownstreamCodexPushRecordModel)
             .values(**values)
             .on_conflict_do_update(
-                index_elements=["batch_item_id", "downstream_provider"],
+                index_elements=["codex_credential_id"],
                 set_={
+                    "batch_item_id": values.get("batch_item_id"),
+                    "downstream_channel_id": values.get("downstream_channel_id"),
                     "codex_credential_id": values["codex_credential_id"],
                     "user_account_id": values["user_account_id"],
                     "team_workspace_id": values["team_workspace_id"],
@@ -172,6 +182,10 @@ class DownstreamCodexPushRecordRepository(SqlAlchemyRepository[DownstreamCodexPu
                     "token_chatgpt_account_id": values["token_chatgpt_account_id"],
                     "codex_token_expires_at": values["codex_token_expires_at"],
                     "request_endpoint": values["request_endpoint"],
+                    "usage_percent": values.get("usage_percent", 0),
+                    "usage_status": values.get("usage_status", "unknown"),
+                    "last_usage_check_at": values.get("last_usage_check_at"),
+                    "used_at": values.get("used_at"),
                     "error_code": values["error_code"],
                     "error_message": values["error_message"],
                     "updated_at": values["updated_at"],
@@ -180,6 +194,10 @@ class DownstreamCodexPushRecordRepository(SqlAlchemyRepository[DownstreamCodexPu
             .returning(DownstreamCodexPushRecordModel)
         )
         return self.session.scalars(stmt).one()
+
+
+class DownstreamChannelRepository(SqlAlchemyRepository[DownstreamChannelModel]):
+    model = DownstreamChannelModel
 
 
 class ProxyInventoryRepository(SqlAlchemyRepository[ProxyInventoryModel]):

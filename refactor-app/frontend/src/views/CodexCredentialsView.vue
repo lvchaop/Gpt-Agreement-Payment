@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import ResourcePage from "../components/ResourcePage.vue";
@@ -13,6 +13,9 @@ const selectedRows = ref<Row[]>([]);
 const selectedCount = ref(0);
 const heartbeatConcurrency = ref(50);
 const reauthConcurrency = ref(50);
+const pushConcurrency = ref(5);
+const downstreamChannelId = ref("");
+const downstreamChannels = ref<Row[]>([]);
 const batchName = ref("");
 
 const columns = [
@@ -23,6 +26,7 @@ const columns = [
   { key: "external_workspace_id", label: "外部空间 ID", mono: true, summary: 28 },
   { key: "codex_client_id", label: "客户端", mono: true, summary: 28 },
   { key: "credential_status", label: "授权状态", badge: true },
+  { key: "push_lifecycle_status", label: "推送生命周期", badge: true },
   { key: "expires_at", label: "过期时间", summary: 30 },
   { key: "last_heartbeat_status", label: "心跳状态", badge: true },
   { key: "last_heartbeat_at", label: "最近心跳时间" },
@@ -33,6 +37,16 @@ function updateSelection(rows: Record<string, unknown>[]) {
   selectedRows.value = rows as Row[];
   selectedCount.value = rows.length;
 }
+
+onMounted(async () => {
+  try {
+    downstreamChannels.value = await resourcesApi.downstreamChannels();
+    const firstEnabled = downstreamChannels.value.find((row) => Boolean(row.enabled));
+    downstreamChannelId.value = String(firstEnabled?.id || downstreamChannels.value[0]?.id || "");
+  } catch {
+    downstreamChannels.value = [];
+  }
+});
 
 async function heartbeatSelected() {
   const ids = selectedRows.value.map((row) => String(row.id || "")).filter(Boolean);
@@ -112,6 +126,30 @@ async function createBatchFromSelected() {
   store.toast("批次已创建", result.batch_id, "success");
   await router.push(`/join-batches/${result.batch_id}`);
 }
+
+async function pushSelected() {
+  const ids = selectedRows.value.map((row) => String(row.id || "")).filter(Boolean);
+  if (!ids.length) {
+    store.toast("未选择授权", "请先勾选要推送的授权。", "warning");
+    return;
+  }
+  if (!downstreamChannelId.value) {
+    store.toast("未选择渠道", "请先选择下游渠道。", "warning");
+    return;
+  }
+  const result = await resourcesApi.pushCredentials({
+    codex_credential_ids: ids,
+    downstream_channel_id: downstreamChannelId.value,
+    created_by: "ops-ui",
+    concurrency: pushConcurrency.value,
+  });
+  store.toast(
+    "下游推送完成",
+    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
+    result.failed > 0 ? "warning" : "success",
+  );
+  await router.push(`/jobs/${result.job_id}`);
+}
 </script>
 
 <template>
@@ -165,6 +203,33 @@ async function createBatchFromSelected() {
           </label>
           <button class="btn primary" :disabled="selectedCount === 0" @click="createBatchFromSelected">
             用选中授权创建批次
+          </button>
+        </div>
+      </section>
+
+      <section class="panel credential-action-card">
+        <div class="credential-action-heading">
+          <div>
+            <h2>下游推送</h2>
+            <p>只推送心跳成功的授权；每个授权只能占用一个下游渠道名额。</p>
+          </div>
+        </div>
+        <div class="credential-action-body push-action-body">
+          <label class="field">
+            <span>下游渠道</span>
+            <select v-model="downstreamChannelId" class="input">
+              <option value="">请选择</option>
+              <option v-for="channel in downstreamChannels" :key="String(channel.id)" :value="String(channel.id)">
+                {{ channel.provider_type }} / {{ channel.name }} / 余额 {{ channel.push_balance }} / 坑位 {{ channel.remaining_active_slots }}
+              </option>
+            </select>
+          </label>
+          <label class="field">
+            <span>推送并发</span>
+            <input v-model.number="pushConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <button class="btn primary" :disabled="selectedCount === 0 || !downstreamChannelId" @click="pushSelected">
+            推送选中授权（{{ selectedCount }}）
           </button>
         </div>
       </section>
@@ -224,6 +289,12 @@ async function createBatchFromSelected() {
   grid-template-columns: minmax(220px, 1fr) auto;
 }
 
+.push-action-body {
+  align-items: end;
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 140px auto;
+}
+
 .batch-name {
   min-width: 0;
 }
@@ -236,6 +307,10 @@ async function createBatchFromSelected() {
   }
 
   .batch-action-body {
+    grid-template-columns: 1fr;
+  }
+
+  .push-action-body {
     grid-template-columns: 1fr;
   }
 }

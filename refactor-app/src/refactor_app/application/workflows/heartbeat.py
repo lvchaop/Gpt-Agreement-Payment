@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from refactor_app.application.workflows.account_auth import _active_proxy, _proxy_url
-from refactor_app.domain.enums import HeartbeatStatus
+from refactor_app.domain.enums import CredentialStatus, HeartbeatStatus
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
 from refactor_app.plugins.contracts import OpenAIChatGPTProvider
 
@@ -58,29 +58,22 @@ class HeartbeatCodexCredentialWorkflow:
                 )
                 failed_message = credential.last_heartbeat_error_message
             else:
-                current_attempt = 0
-                try:
-                    for attempt in range(1, CODEX_HEARTBEAT_ATTEMPTS + 1):
-                        current_attempt = attempt
-                        self._openai_provider.heartbeat_codex_credential(
-                            access_token=access_token,
-                            team_id=team_id,
-                            proxy_url=proxy_url,
-                            model=CODEX_HEARTBEAT_MODEL,
-                        )
-                except Exception as exc:
-                    credential.last_heartbeat_status = HeartbeatStatus.FAILED.value
-                    credential.last_heartbeat_error_code = "heartbeat_failed"
-                    credential.last_heartbeat_error_message = (
-                        f"attempt={current_attempt}/{CODEX_HEARTBEAT_ATTEMPTS}: {exc}"
-                    )[:500]
-                    failed_message = credential.last_heartbeat_error_message
-                else:
+                ok, failed_message = self._run_heartbeat_with_refresh_recovery(
+                    credential=credential,
+                    access_token=access_token,
+                    team_id=team_id,
+                    proxy_url=proxy_url,
+                )
+                if ok:
                     credential.last_heartbeat_status = HeartbeatStatus.OK.value
                     credential.last_heartbeat_error_code = ""
                     credential.last_heartbeat_error_message = (
                         f"heartbeat ok: {CODEX_HEARTBEAT_ATTEMPTS} consecutive attempts"
                     )
+                else:
+                    credential.last_heartbeat_status = HeartbeatStatus.FAILED.value
+                    credential.last_heartbeat_error_code = "heartbeat_failed"
+                    credential.last_heartbeat_error_message = failed_message[:500]
             completed_at = datetime.now(UTC)
             credential.last_heartbeat_at = completed_at
             credential.updated_at = completed_at
@@ -88,3 +81,78 @@ class HeartbeatCodexCredentialWorkflow:
         if failed_message:
             raise HeartbeatWorkflowError(failed_message)
         return credential_id
+
+    def _run_heartbeat_with_refresh_recovery(
+        self,
+        *,
+        credential,
+        access_token: str,
+        team_id: str,
+        proxy_url: str,
+    ) -> tuple[bool, str]:
+        ok, message = self._run_heartbeat_attempts(
+            access_token=access_token,
+            team_id=team_id,
+            proxy_url=proxy_url,
+        )
+        if ok or not _is_unauthorized_heartbeat_error(message):
+            return ok, message
+
+        if not credential.refresh_token:
+            return False, f"{message}; refresh skipped: missing_refresh_token"
+        try:
+            tokens = self._openai_provider.refresh_workspace_token(
+                refresh_token=credential.refresh_token,
+                external_workspace_id=team_id,
+                client_id=credential.codex_client_id,
+            )
+        except Exception as exc:
+            credential.credential_status = CredentialStatus.ERROR.value
+            credential.failure_code = type(exc).__name__[:200]
+            credential.failure_message = str(exc)[:1000]
+            return False, f"{message}; refresh failed: {type(exc).__name__}: {exc}"
+
+        now = datetime.now(UTC)
+        credential.access_token = tokens.access_token
+        credential.id_token = tokens.id_token
+        credential.refresh_token = tokens.refresh_token
+        credential.expires_at = tokens.expires_at
+        credential.last_refresh_at = now
+        credential.credential_status = CredentialStatus.ACTIVE.value
+        credential.failure_code = ""
+        credential.failure_message = ""
+        credential.updated_at = now
+        return self._run_heartbeat_attempts(
+            access_token=tokens.access_token,
+            team_id=team_id,
+            proxy_url=proxy_url,
+        )
+
+    def _run_heartbeat_attempts(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str,
+    ) -> tuple[bool, str]:
+        current_attempt = 0
+        try:
+            for attempt in range(1, CODEX_HEARTBEAT_ATTEMPTS + 1):
+                current_attempt = attempt
+                self._openai_provider.heartbeat_codex_credential(
+                    access_token=access_token,
+                    team_id=team_id,
+                    proxy_url=proxy_url,
+                    model=CODEX_HEARTBEAT_MODEL,
+                )
+        except Exception as exc:
+            return (
+                False,
+                f"attempt={current_attempt}/{CODEX_HEARTBEAT_ATTEMPTS}: {exc}",
+            )
+        return True, ""
+
+
+def _is_unauthorized_heartbeat_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return "http_status=401" in text or "http_401" in text or " 401" in text

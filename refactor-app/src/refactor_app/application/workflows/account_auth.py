@@ -639,6 +639,7 @@ class BackfillSessionWorkflow:
         auth_result = result.auth_result
         with self._session_factory() as session:
             auth = session.get(UserAccountAuthModel, user_account_id)
+            account = session.get(UserAccountModel, user_account_id)
             if auth is None:
                 raise AccountAuthWorkflowError("user_account_auth row disappeared")
             auth.session_token = _keep_existing_if_empty(
@@ -686,6 +687,14 @@ class BackfillSessionWorkflow:
             auth.last_auth_error_code = ""
             auth.last_auth_error_message = ""
             auth.updated_at = now
+            if account is not None and auth.access_token:
+                try:
+                    claims = decode_access_token_claims(auth.access_token)
+                except Exception:
+                    claims = None
+                if claims is not None and claims.chatgpt_account_user_id:
+                    account.openai_user_id = claims.chatgpt_account_user_id
+                    account.updated_at = now
             session.commit()
 
     def _has_personal_chatgpt_account_id(self, user_account_id: str) -> bool:
@@ -1028,6 +1037,7 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
         now = datetime.now(UTC)
         with self._session_factory() as session:
             auth_row = session.get(UserAccountAuthModel, user_account_id)
+            account = session.get(UserAccountModel, user_account_id)
             if auth_row is None:
                 raise AccountAuthWorkflowError("user_account_auth row disappeared")
             auth_row.refresh_token = result.refresh_token
@@ -1038,6 +1048,9 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
             auth_row.last_auth_error_code = ""
             auth_row.last_auth_error_message = ""
             auth_row.updated_at = now
+            if account is not None and claims.chatgpt_account_user_id:
+                account.openai_user_id = claims.chatgpt_account_user_id
+                account.updated_at = now
             session.commit()
 
         self._write_event(

@@ -59,6 +59,8 @@ export const resourcesApi = {
     postJson<AccountWorkJobResult>("/memberships/session-otp-submit-job", body),
   syncMembershipRemoteState: (body: Record<string, unknown>) =>
     postJson<Row>("/memberships/sync-remote-state", body),
+  workspaceFillAutomation: (body: Record<string, unknown>) =>
+    postJson<Row>("/automation/workspace-fill-job", body),
   batches: () => getJson<Row[]>("/workspace-join-batches"),
   batch: (id: string) => getJson<Row>(`/workspace-join-batches/${encodeURIComponent(id)}`),
   batchItems: (id: string) =>
@@ -76,6 +78,10 @@ export const resourcesApi = {
     postJson<JobCreated>(`/codex-credentials/${encodeURIComponent(id)}/heartbeat-job`, {}),
   heartbeatCredentials: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/codex-credentials/heartbeat-job", body),
+  pushCredentials: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/codex-credentials/push-job", body),
+  pushPendingCredentials: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/codex-credentials/push-pending-job", body),
   proxies: () => getJson<Row[]>("/proxies"),
   refreshProxies: (body: Record<string, unknown>) =>
     postJson<JobCreated>("/proxies/refresh-webshare-job", body),
@@ -96,5 +102,14 @@ export const resourcesApi = {
     postJson<Row>("/downstream-channels", body),
   patchDownstreamChannel: (id: string, body: Record<string, unknown>) =>
     patchJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`, body),
+  deleteDownstreamChannel: (id: string) =>
+    deleteJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`),
   downstream: () => getJson<Row[]>("/downstream-push-records"),
+  downstreamUsageSweep: (body: Record<string, unknown>) =>
+    postJson<Row>("/automation/downstream-usage-sweep-job", body),
+  automationSchedules: () => getJson<Row[]>("/automation/schedules"),
+  patchAutomationSchedule: (id: string, body: Record<string, unknown>) =>
+    patchJson<Row>(`/automation/schedules/${encodeURIComponent(id)}`, body),
+  runAutomationScheduleNow: (id: string) =>
+    postJson<Row>(`/automation/schedules/${encodeURIComponent(id)}/run-now`, {}),
 };

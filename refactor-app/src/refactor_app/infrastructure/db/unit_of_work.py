@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from refactor_app.infrastructure.db.repositories import (
     CodexOAuthCredentialRepository,
+    DownstreamChannelRepository,
     DownstreamCodexPushRecordRepository,
     ExternalMailLeaseRepository,
     JobEventRepository,
@@ -34,6 +35,7 @@ class UnitOfWork:
         self.workspace_join_batches: WorkspaceJoinBatchRepository | None = None
         self.workspace_join_batch_items: WorkspaceJoinBatchItemRepository | None = None
         self.codex_oauth_credentials: CodexOAuthCredentialRepository | None = None
+        self.downstream_channels: DownstreamChannelRepository | None = None
         self.downstream_codex_push_records: DownstreamCodexPushRecordRepository | None = None
         self.proxy_inventory: ProxyInventoryRepository | None = None
         self.user_account_proxy_bindings: UserAccountProxyBindingRepository | None = None
@@ -52,6 +54,7 @@ class UnitOfWork:
         self.workspace_join_batches = WorkspaceJoinBatchRepository(self.session)
         self.workspace_join_batch_items = WorkspaceJoinBatchItemRepository(self.session)
         self.codex_oauth_credentials = CodexOAuthCredentialRepository(self.session)
+        self.downstream_channels = DownstreamChannelRepository(self.session)
         self.downstream_codex_push_records = DownstreamCodexPushRecordRepository(self.session)
         self.proxy_inventory = ProxyInventoryRepository(self.session)
         self.user_account_proxy_bindings = UserAccountProxyBindingRepository(self.session)

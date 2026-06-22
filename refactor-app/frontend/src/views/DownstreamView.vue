@@ -1,26 +1,99 @@
 <script setup lang="ts">
+import { ref } from "vue";
+
 import ResourcePage from "../components/ResourcePage.vue";
 import { resourcesApi } from "../api/resources";
+import { useOpsStore } from "../stores/ops";
+
+const store = useOpsStore();
+const thresholdPercent = ref(95);
 
 const columns = [
   { key: "id", label: "推送记录 ID", mono: true },
-  { key: "batch_item_id", label: "批次明细", mono: true },
+  { key: "codex_credential_id", label: "授权 ID", mono: true, summary: 28 },
+  { key: "downstream_channel_name", label: "渠道" },
   { key: "downstream_provider", label: "下游平台", badge: true },
   { key: "push_status", label: "推送状态", badge: true },
+  { key: "push_attempt_count", label: "推送尝试" },
   { key: "downstream_external_id", label: "下游外部 ID", mono: true },
   { key: "downstream_chatgpt_account_id", label: "下游空间", mono: true },
   { key: "token_chatgpt_account_id", label: "Token 空间", mono: true },
+  { key: "usage_percent", label: "使用率" },
+  { key: "usage_status", label: "使用状态", badge: true },
   { key: "error_code", label: "错误码", badge: true },
   { key: "error_message", label: "错误信息" },
 ];
+
+async function sweepUsage(reload: () => Promise<void>) {
+  const result = await resourcesApi.downstreamUsageSweep({
+    threshold_percent: thresholdPercent.value,
+    created_by: "ops-ui",
+  });
+  store.toast(
+    "使用率扫描完成",
+    `检查=${result.checked_count ?? 0} 近阈值=${result.near_limit_count ?? 0} 来源=${result.usage_source ?? ""}`,
+    "success",
+  );
+  await reload();
+}
 </script>
 
 <template>
   <ResourcePage
     title="下游推送"
-    description="CPA / Sub2API 推送结果。同一批次 item + downstream_provider 只保留一条记录。"
+    description="CPA / Sub2API 推送结果。当前按 Codex 授权唯一记录，一条授权只能占用一个下游渠道。"
     :columns="columns"
     :loader="resourcesApi.downstream"
     empty-text="暂无下游推送记录。"
-  />
+  >
+    <template #actionCards="{ reload }">
+      <section class="panel action-card">
+        <div class="action-heading">
+          <div>
+            <h2>使用率扫描</h2>
+            <p>当前 usage 来源是 placeholder，占位返回 0%；后续接真实下游额度接口。</p>
+          </div>
+        </div>
+        <div class="action-row">
+          <label class="inline-control">
+            <span>剔除阈值百分比</span>
+            <input v-model.number="thresholdPercent" class="input small-input" type="number" min="1" max="100" />
+          </label>
+          <button class="btn" @click="sweepUsage(reload)">扫描已推送凭证</button>
+        </div>
+      </section>
+    </template>
+  </ResourcePage>
 </template>
+
+<style scoped>
+.action-card {
+  margin-bottom: 14px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.action-heading {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 16px;
+}
+
+.action-heading h2 {
+  font-size: 14px;
+  margin: 0;
+}
+
+.action-heading p {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 5px 0 0;
+}
+
+.action-row {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 16px 16px;
+}
+</style>

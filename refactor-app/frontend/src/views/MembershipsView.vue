@@ -24,6 +24,8 @@ const codexClientId = ref("app_EMoamEEZ73f0CkXaXp7hrann");
 const authConcurrency = ref(50);
 const sessionOtpConcurrency = ref(50);
 const sessionConcurrency = ref(10);
+const automationInviteConcurrency = ref(350);
+const automationWaitSeconds = ref(120);
 const workspaces = ref<Row[]>([]);
 const syncWorkspaceId = ref("");
 const syncPageSize = ref(100);
@@ -205,6 +207,36 @@ async function backfillSessionForMemberships(rows: Row[]) {
     result.failed > 0 ? "warning" : "success",
   );
   await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+}
+
+async function runWorkspaceFillAutomation(rows: Row[]) {
+  const userAccountIds = [
+    ...new Set(rows.map((row) => String(row.user_account_id || "")).filter(Boolean)),
+  ];
+  if (!userAccountIds.length) {
+    store.toast("未选择成员", "请先勾选要参与自动化的成员。", "warning");
+    return;
+  }
+  const workspaceIds = new Set(rows.map((row) => String(row.team_workspace_id || "")).filter(Boolean));
+  if (workspaceIds.size !== 1) {
+    store.toast("空间不一致", "自动化要求选中成员属于同一个团队空间。", "warning");
+    return;
+  }
+  const result = await resourcesApi.workspaceFillAutomation({
+    team_workspace_id: [...workspaceIds][0],
+    user_account_ids: userAccountIds,
+    codex_client_id: codexClientId.value.trim(),
+    created_by: "ops-ui-automation",
+    invite_concurrency: automationInviteConcurrency.value,
+    post_invite_wait_seconds: automationWaitSeconds.value,
+    sync_page_size: syncPageSize.value,
+  });
+  store.toast(
+    "空间自动化完成",
+    `邀请=${(result.invite_job as Record<string, unknown> | undefined)?.work_count ?? 0} 授权=${result.authorized_credential_count ?? 0} 失败=${result.fill_error_count ?? 0}`,
+    Number(result.fill_error_count ?? 0) > 0 ? "warning" : "success",
+  );
+  await router.push({ name: "automation-flow", query: { jobId: String(result.job_id || "") } });
 }
 
 async function acceptOne(row: Row) {
@@ -413,6 +445,29 @@ onMounted(loadWorkspaces);
           </label>
           <button class="btn danger" :disabled="!syncWorkspaceId" @click="syncRemoteState">
             同步远端成员和邀请，并剔除本地
+          </button>
+        </div>
+      </section>
+
+      <section class="panel action-card">
+        <div class="action-heading">
+          <div>
+            <h2>空间自动化</h2>
+            <p>选中同一空间成员后：批量邀请、等待、同步远端，并在该空间内随机选择 1 个账号生成待推送 Codex 授权。</p>
+          </div>
+          <span class="selected-hint">已选 {{ selectedCount }} 条</span>
+        </div>
+        <div class="action-row">
+          <label class="inline-control">
+            <span>邀请并发</span>
+            <input v-model.number="automationInviteConcurrency" class="input small-input" type="number" min="1" max="500" />
+          </label>
+          <label class="inline-control">
+            <span>邀请后等待秒</span>
+            <input v-model.number="automationWaitSeconds" class="input small-input" type="number" min="0" />
+          </label>
+          <button class="btn primary" :disabled="selectedCount === 0" @click="runWorkspaceFillAutomation(selectedRows)">
+            启动空间自动化（{{ selectedCount }}）
           </button>
         </div>
       </section>

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from socket import gethostname
+from threading import Thread
+from time import sleep
 from typing import Annotated, Any
 from uuid import uuid4
 
 from curl_cffi import requests as curl_requests
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy import delete, exists, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -23,13 +28,28 @@ from refactor_app.application.workflows.batches import (
     CreateWorkspaceBatchFromCredentialsInput,
     CreateWorkspaceBatchFromCredentialsWorkflow,
 )
+from refactor_app.application.workflows.codex_credentials import (
+    BuildCodexCredentialWorkInput,
+    BuildCodexCredentialWorkItemWorkflow,
+)
+from refactor_app.application.workflows.account_auth import _active_proxy, _proxy_url
+from refactor_app.application.workflows.direct_push import (
+    MAX_DOWNSTREAM_PUSH_ATTEMPTS,
+    _provider_from_channel,
+)
+from refactor_app.application.workflows.downstream import downstream_payload
+from refactor_app.application.workflows.heartbeat import (
+    HeartbeatCodexCredentialWorkflow,
+    _is_unauthorized_heartbeat_error,
+)
 from refactor_app.application.workflows.proxy import HealthcheckProxyWorkflow
 from refactor_app.config.settings import get_settings
-from refactor_app.domain.enums import AccountStatus
+from refactor_app.domain.enums import AccountStatus, CredentialStatus
 from refactor_app.infrastructure.db.models import (
     AccountSessionOtpSnapshotModel,
-    DownstreamChannelModel,
+    AutomationScheduleModel,
     CodexOAuthCredentialModel,
+    DownstreamChannelModel,
     DownstreamCodexPushRecordModel,
     ExternalMailLeaseModel,
     JobModel,
@@ -40,17 +60,42 @@ from refactor_app.infrastructure.db.models import (
     TeamAdminSessionModel,
     TeamWorkspaceModel,
     UserAccountAuthModel,
+    UserAccountCooldownModel,
     UserAccountModel,
     UserAccountProxyBindingModel,
     WorkItemModel,
+    WorkspaceAutomationStateModel,
+    WorkspaceOperationLockModel,
     WorkspaceJoinBatchItemModel,
     WorkspaceJoinBatchModel,
 )
+from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
+from refactor_app.plugins.mail_external_api.client import ExternalMailApiClientConfig
+from refactor_app.plugins.mail_external_api.plugin import ExternalMailApiPlugin
+from refactor_app.plugins.openai_chatgpt.client import (
+    CODEX_INSTRUCTIONS_PATH,
+    CODEX_RESPONSES_PATH,
+    OpenAIChatGPTClientConfig,
+)
 from refactor_app.plugins.openai_chatgpt.client import decode_access_token_claims
+from refactor_app.plugins.openai_chatgpt.plugin import OpenAIChatGPTPlugin
 
 router = APIRouter(tags=["resources"])
 DbSession = Annotated[Session, Depends(get_db_session)]
 CODEX_BROWSER_AUTH_CONCURRENCY_LIMIT = 50
+CODEX_USAGE_PROBE_MODEL = "gpt-5.4"
+CODEX_USAGE_PROBE_VERSION = "0.125.0"
+CODEX_USAGE_PROBE_USER_AGENT = "codex_cli_rs/0.125.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
+
+
+@dataclass(frozen=True)
+class CodexUsageProbeResult:
+    ok: bool
+    usage_percent: int = 0
+    error_code: str = ""
+    error_message: str = ""
+    unauthorized: bool = False
+    raw_headers: dict[str, str] = field(default_factory=dict)
 
 
 class ImportUserAccountRequest(BaseModel):
@@ -102,6 +147,22 @@ class HeartbeatCodexCredentialsRequest(BaseModel):
     concurrency: int = 1
 
 
+class PushCodexCredentialsRequest(BaseModel):
+    codex_credential_ids: list[str]
+    downstream_channel_id: str
+    created_by: str = ""
+    concurrency: int = 5
+    request_endpoint: str = ""
+
+
+class PushPendingCodexCredentialsRequest(BaseModel):
+    downstream_channel_id: str
+    limit: int = 1
+    created_by: str = ""
+    concurrency: int = 5
+    request_endpoint: str = ""
+
+
 class RefreshWebsharePoolRequest(BaseModel):
     download_url: str
 
@@ -139,6 +200,9 @@ class CreateDownstreamChannelRequest(BaseModel):
     enabled: bool = True
     update_existing: bool = False
     timeout_s: int = 30
+    max_push_count: int = 2
+    max_active_slots: int = 2
+    push_balance: int = 0
 
 
 class PatchDownstreamChannelRequest(BaseModel):
@@ -149,6 +213,9 @@ class PatchDownstreamChannelRequest(BaseModel):
     enabled: bool | None = None
     update_existing: bool | None = None
     timeout_s: int | None = None
+    max_push_count: int | None = None
+    max_active_slots: int | None = None
+    push_balance: int | None = None
 
 
 class InviteSelectedUsersRequest(BaseModel):
@@ -174,6 +241,81 @@ class SessionOtpMembershipRequest(BaseModel):
 class SyncWorkspaceMembersRequest(BaseModel):
     team_workspace_id: str
     page_size: int = 100
+
+
+class WorkspaceAutomationFillRequest(BaseModel):
+    team_workspace_id: str
+    user_account_ids: list[str]
+    team_admin_session_id: str = ""
+    codex_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    created_by: str = ""
+    invite_concurrency: int = 350
+    post_invite_wait_seconds: int = 120
+    sync_page_size: int = 100
+    lock_ttl_seconds: int = 1800
+
+
+class DownstreamUsageSweepRequest(BaseModel):
+    downstream_channel_id: str = ""
+    threshold_percent: int = 95
+    created_by: str = ""
+
+
+class AutomationWorkspaceInviteSyncRequest(BaseModel):
+    created_by: str = ""
+    workspace_limit: int = 20
+    workspace_concurrency: int = 4
+    invite_count: int = 350
+    invite_concurrency: int = 350
+    sync_after_seconds: int = 120
+    sync_page_size: int = 100
+
+
+class AutomationWorkspaceAuthorizeRequest(BaseModel):
+    created_by: str = ""
+    workspace_limit: int = 20
+    workspace_concurrency: int = 4
+    codex_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    sync_page_size: int = 100
+    lock_ttl_seconds: int = 1800
+    authorization_sync_wait_seconds: int = 5
+
+
+class AutomationDownstreamPushRequest(BaseModel):
+    created_by: str = ""
+    channel_limit: int = 20
+    channel_concurrency: int = 4
+    push_concurrency: int = 5
+    per_channel_limit: int = 50
+    request_endpoint: str = ""
+
+
+class AutomationCodexHeartbeatRequest(BaseModel):
+    created_by: str = ""
+    credential_limit: int = 100
+    credential_concurrency: int = 10
+
+
+class AutomationDownstreamUsageCleanupRequest(BaseModel):
+    created_by: str = ""
+    record_limit: int = 100
+    record_concurrency: int = 10
+    threshold_percent: int = 95
+
+
+class CreateAutomationScheduleRequest(BaseModel):
+    schedule_type: str
+    enabled: bool = False
+    interval_seconds: int = 60
+    config_json: dict[str, Any] = {}
+    created_by: str = ""
+
+
+class PatchAutomationScheduleRequest(BaseModel):
+    enabled: bool | None = None
+    schedule_status: str | None = None
+    interval_seconds: int | None = None
+    config_json: dict[str, Any] | None = None
 
 
 @router.get("/user-accounts")
@@ -622,6 +764,206 @@ def _create_codex_heartbeat_work_job(
     }
 
 
+def _create_codex_push_work_job(
+    *,
+    req: PushCodexCredentialsRequest,
+    session: Session,
+) -> dict:
+    credential_ids = [item.strip() for item in req.codex_credential_ids if item.strip()]
+    if not credential_ids:
+        raise HTTPException(status_code=400, detail="codex_credential_ids is required")
+    if not req.downstream_channel_id.strip():
+        raise HTTPException(status_code=400, detail="downstream_channel_id is required")
+    channel = session.get(DownstreamChannelModel, req.downstream_channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="downstream channel not found")
+    found_ids = set(
+        session.scalars(
+            select(CodexOAuthCredentialModel.id).where(
+                CodexOAuthCredentialModel.id.in_(credential_ids)
+            )
+        ).all()
+    )
+    missing_ids = [item for item in credential_ids if item not in found_ids]
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "some codex credentials not found",
+                "codex_credential_ids": missing_ids,
+            },
+        )
+
+    settings = get_settings()
+    concurrency = max(1, min(int(req.concurrency or 5), settings.worker_max_concurrency))
+    job = JobQueue(session).enqueue(
+        job_type="codex_credential.push.bulk",
+        input_json={
+            "codex_credential_ids": credential_ids,
+            "downstream_channel_id": req.downstream_channel_id,
+            "concurrency": concurrency,
+        },
+        created_by=req.created_by,
+    )
+    now = datetime.now(UTC)
+    job.job_status = "running"
+    job.updated_at = now
+    run = JobRunModel(
+        id=str(uuid4()),
+        job_id=job.id,
+        run_status="running",
+        attempt=1,
+        started_at=now,
+        output_json={},
+    )
+    session.add(run)
+    work_queue = WorkQueue(session)
+    for credential_id in credential_ids:
+        work_queue.enqueue(
+            job_id=job.id,
+            work_type="codex_credential.push.account",
+            input_json={
+                "codex_credential_id": credential_id,
+                "downstream_channel_id": req.downstream_channel_id,
+                "request_endpoint": req.request_endpoint,
+                "_run_id": run.id,
+            },
+        )
+    session.commit()
+
+    local_session_factory = sessionmaker(
+        bind=session.get_bind(),
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    _run_job_work_now(
+        session_factory=local_session_factory,
+        job_id=job.id,
+        concurrency=min(concurrency, len(credential_ids)),
+    )
+    summary = _work_summary(session, job.id)
+    job = session.get(JobModel, job.id)
+    if job is not None:
+        job.job_status = (
+            "succeeded"
+            if summary["queued"] == 0 and summary["running"] == 0 and summary["failed"] == 0
+            else "failed"
+            if summary["queued"] == 0 and summary["running"] == 0 and summary["failed"] > 0
+            else "running"
+        )
+        job.updated_at = datetime.now(UTC)
+    run = session.get(JobRunModel, run.id)
+    if run is not None:
+        run.run_status = (
+            "succeeded" if job is not None and job.job_status == "succeeded" else "failed"
+        )
+        run.finished_at = datetime.now(UTC)
+        run.output_json = summary
+        if run.run_status == "failed":
+            run.error_code = "work_failed"
+            run.error_message = (
+                f"failed={summary['failed']} queued={summary['queued']} "
+                f"running={summary['running']}"
+            )
+    session.commit()
+    return {
+        "job_id": job.id if job is not None else "",
+        "job_status": job.job_status if job is not None else "",
+        "run_id": run.id if run is not None else "",
+        "work_count": len(credential_ids),
+        "concurrency": concurrency,
+        **summary,
+    }
+
+
+def _create_pending_codex_push_work_job(
+    *,
+    req: PushPendingCodexCredentialsRequest,
+    session: Session,
+) -> dict:
+    channel = session.get(DownstreamChannelModel, req.downstream_channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="downstream channel not found")
+    limit = max(1, int(req.limit or 1))
+    credential_ids = _select_channel_push_credential_ids(
+        session=session,
+        channel=channel,
+        limit=limit,
+    )
+    if not credential_ids:
+        raise HTTPException(status_code=404, detail="no retryable failed or pending_push codex credentials found")
+    return _create_codex_push_work_job(
+        req=PushCodexCredentialsRequest(
+            codex_credential_ids=list(credential_ids),
+            downstream_channel_id=req.downstream_channel_id,
+            created_by=req.created_by,
+            concurrency=req.concurrency,
+            request_endpoint=req.request_endpoint,
+        ),
+        session=session,
+    )
+
+
+def _select_channel_push_credential_ids(
+    *,
+    session: Session,
+    channel: DownstreamChannelModel,
+    limit: int,
+    selected: set[str] | None = None,
+) -> list[str]:
+    selected_ids = selected if selected is not None else set()
+    active_slots = _active_downstream_slot_count(session, channel.id)
+    remaining_new_slots = max(0, int(channel.max_active_slots or 0) - active_slots)
+    retry_take = max(1, int(limit or 1))
+    retry_conditions = [
+        DownstreamCodexPushRecordModel.downstream_channel_id == channel.id,
+        DownstreamCodexPushRecordModel.push_status == "failed",
+        DownstreamCodexPushRecordModel.push_attempt_count < MAX_DOWNSTREAM_PUSH_ATTEMPTS,
+        CodexOAuthCredentialModel.credential_status == "active",
+        CodexOAuthCredentialModel.last_heartbeat_status == "ok",
+        CodexOAuthCredentialModel.access_token != "",
+        CodexOAuthCredentialModel.refresh_token != "",
+    ]
+    if selected_ids:
+        retry_conditions.append(~CodexOAuthCredentialModel.id.in_(selected_ids))
+    retry_ids = session.scalars(
+        select(CodexOAuthCredentialModel.id)
+        .join(
+            DownstreamCodexPushRecordModel,
+            DownstreamCodexPushRecordModel.codex_credential_id == CodexOAuthCredentialModel.id,
+        )
+        .where(*retry_conditions)
+        .order_by(DownstreamCodexPushRecordModel.updated_at.asc())
+        .limit(retry_take)
+    ).all()
+
+    chosen = [str(item) for item in retry_ids]
+    selected_ids.update(chosen)
+    pending_limit = max(0, int(limit or 1) - len(chosen))
+    pending_take = min(remaining_new_slots, pending_limit, max(0, int(channel.push_balance or 0)))
+    if pending_take <= 0:
+        return chosen
+
+    pending_conditions = [
+        CodexOAuthCredentialModel.push_lifecycle_status == "pending_push",
+        CodexOAuthCredentialModel.credential_status == "active",
+        CodexOAuthCredentialModel.last_heartbeat_status == "ok",
+        CodexOAuthCredentialModel.access_token != "",
+        CodexOAuthCredentialModel.refresh_token != "",
+    ]
+    if selected_ids:
+        pending_conditions.append(~CodexOAuthCredentialModel.id.in_(selected_ids))
+    pending_ids = session.scalars(
+        select(CodexOAuthCredentialModel.id)
+        .where(*pending_conditions)
+        .order_by(CodexOAuthCredentialModel.updated_at.asc())
+        .limit(pending_take)
+    ).all()
+    chosen.extend(str(item) for item in pending_ids)
+    selected_ids.update(str(item) for item in pending_ids)
+    return chosen
+
+
 @router.post("/team-admin-sessions/import")
 def import_team_admin_session(
     req: ImportTeamAdminSessionRequest,
@@ -693,13 +1035,20 @@ def import_team_admin_session(
     workspace_inputs = _extract_workspaces_from_session_and_check(raw, check_payload)
     upserted = []
     for item in workspace_inputs:
+        external_workspace_id = _workspace_external_id(item)
+        subscription_payload = _fetch_workspace_subscription(
+            access_token=access_token,
+            cookie_header=effective_cookie_header,
+            account_id=external_workspace_id,
+        )
         workspace = _upsert_workspace_from_admin_source(
             session=session,
             source_admin_session_id=admin_session.id,
-            item=item,
+            item={**item, "_subscription": subscription_payload},
             now=now,
         )
         if workspace is not None:
+            _ensure_workspace_automation_state(session=session, workspace_id=workspace.id)
             upserted.append(_workspace_dict(workspace, admin_email=admin_email))
     session.commit()
     return {
@@ -848,6 +1197,8 @@ def import_team_workspace(
             name=req.name,
             plan_type=req.plan_type,
             seat_limit=req.seat_limit,
+            seats_entitled=req.seat_limit,
+            seats_in_use=0,
             workspace_status=req.workspace_status,
             created_at=now,
             updated_at=now,
@@ -857,8 +1208,11 @@ def import_team_workspace(
         workspace.name = req.name
         workspace.plan_type = req.plan_type
         workspace.seat_limit = req.seat_limit
+        workspace.seats_entitled = req.seat_limit
         workspace.workspace_status = req.workspace_status
         workspace.updated_at = now
+    if workspace.workspace_status == "active":
+        _ensure_workspace_automation_state(session=session, workspace_id=workspace.id)
     session.commit()
     return {"team_workspace_id": workspace.id}
 
@@ -1148,6 +1502,2635 @@ def sync_memberships_remote_state(
         "remote_invite_count": len(remote_invites),
         **result,
     }
+
+
+@router.post("/automation/workspace-fill-job")
+def create_workspace_fill_automation_job(
+    req: WorkspaceAutomationFillRequest,
+    session: DbSession,
+) -> dict:
+    job = JobQueue(session).enqueue(
+        job_type="automation.workspace_fill",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    now = datetime.now(UTC)
+    job.job_status = "running"
+    job.updated_at = now
+    run = JobRunModel(
+        id=str(uuid4()),
+        job_id=job.id,
+        run_status="running",
+        attempt=1,
+        started_at=now,
+        output_json={},
+    )
+    session.add(run)
+    run.output_json = {
+        "stage": "queued",
+        "message": "automation workspace fill accepted; background runner starting",
+        "team_workspace_id": req.team_workspace_id,
+        "selected_account_count": len(req.user_account_ids),
+        "post_invite_wait_seconds": req.post_invite_wait_seconds,
+    }
+    session.commit()
+    session_factory = sessionmaker(
+        bind=session.get_bind(),
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    Thread(
+        target=_run_workspace_fill_automation_background,
+        kwargs={
+            "req": req,
+            "session_factory": session_factory,
+            "job_id": job.id,
+            "run_id": run.id,
+        },
+        daemon=True,
+    ).start()
+    return {
+        "job_id": job.id if job is not None else "",
+        "job_status": "running",
+        "run_id": run.id if run is not None else "",
+        "stage": "queued",
+        "message": "automation workspace fill is running in background",
+    }
+
+
+@router.post("/automation/downstream-usage-sweep-job")
+def create_downstream_usage_sweep_job(
+    req: DownstreamUsageSweepRequest,
+    session: DbSession,
+) -> dict:
+    job = JobQueue(session).enqueue(
+        job_type="automation.downstream_usage_sweep",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    now = datetime.now(UTC)
+    job.job_status = "running"
+    job.updated_at = now
+    run = JobRunModel(
+        id=str(uuid4()),
+        job_id=job.id,
+        run_status="running",
+        attempt=1,
+        started_at=now,
+        output_json={},
+    )
+    session.add(run)
+    try:
+        output = _run_downstream_usage_sweep(req=req, session=session)
+    except Exception as exc:
+        finished_at = datetime.now(UTC)
+        job.job_status = "failed"
+        job.updated_at = finished_at
+        run.run_status = "failed"
+        run.finished_at = finished_at
+        run.error_code = type(exc).__name__[:200]
+        run.error_message = str(exc)[:1000]
+        session.commit()
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+    finished_at = datetime.now(UTC)
+    job.job_status = "succeeded"
+    job.updated_at = finished_at
+    run.run_status = "succeeded"
+    run.finished_at = finished_at
+    run.output_json = output
+    session.commit()
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+@router.post("/automation/workspace-invite-sync-job")
+def create_workspace_invite_sync_job(
+    req: AutomationWorkspaceInviteSyncRequest,
+    session: DbSession,
+) -> dict:
+    job, run = _create_running_job_run(
+        session=session,
+        job_type="automation.workspace_invite_sync",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    session_factory = _session_factory_from(session)
+    output = _finish_running_job(
+        session=session,
+        job=job,
+        run=run,
+        runner=lambda: _run_workspace_invite_sync_tick(
+            req=req,
+            session_factory=session_factory,
+            job_id=job.id,
+            run_id=run.id,
+        ),
+    )
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+@router.post("/automation/workspace-authorize-job")
+def create_workspace_authorize_job(
+    req: AutomationWorkspaceAuthorizeRequest,
+    session: DbSession,
+) -> dict:
+    job, run = _create_running_job_run(
+        session=session,
+        job_type="automation.workspace_authorize",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    session_factory = _session_factory_from(session)
+    output = _finish_running_job(
+        session=session,
+        job=job,
+        run=run,
+        runner=lambda: _run_workspace_authorize_tick(
+            req=req,
+            session_factory=session_factory,
+            job_id=job.id,
+        ),
+    )
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+@router.post("/automation/downstream-push-job")
+def create_downstream_push_job(
+    req: AutomationDownstreamPushRequest,
+    session: DbSession,
+) -> dict:
+    job, run = _create_running_job_run(
+        session=session,
+        job_type="automation.downstream_push",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    session_factory = _session_factory_from(session)
+    output = _finish_running_job(
+        session=session,
+        job=job,
+        run=run,
+        runner=lambda: _run_downstream_push_tick(
+            req=req,
+            session_factory=session_factory,
+            job_id=job.id,
+            run_id=run.id,
+        ),
+    )
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+@router.post("/automation/codex-heartbeat-job")
+def create_codex_heartbeat_automation_job(
+    req: AutomationCodexHeartbeatRequest,
+    session: DbSession,
+) -> dict:
+    job, run = _create_running_job_run(
+        session=session,
+        job_type="automation.codex_heartbeat",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    session_factory = _session_factory_from(session)
+    output = _finish_running_job(
+        session=session,
+        job=job,
+        run=run,
+        runner=lambda: _run_codex_heartbeat_tick(
+            req=req,
+            session_factory=session_factory,
+        ),
+    )
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+@router.post("/automation/downstream-usage-cleanup-job")
+def create_downstream_usage_cleanup_job(
+    req: AutomationDownstreamUsageCleanupRequest,
+    session: DbSession,
+) -> dict:
+    job, run = _create_running_job_run(
+        session=session,
+        job_type="automation.downstream_usage_cleanup",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    session_factory = _session_factory_from(session)
+    output = _finish_running_job(
+        session=session,
+        job=job,
+        run=run,
+        runner=lambda: _run_downstream_usage_cleanup_tick(
+            req=req,
+            session_factory=session_factory,
+        ),
+    )
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+@router.get("/automation/schedules")
+def list_automation_schedules(session: DbSession) -> list[dict]:
+    rows = session.scalars(
+        select(AutomationScheduleModel).order_by(
+            AutomationScheduleModel.schedule_type.asc(),
+            AutomationScheduleModel.created_at.asc(),
+        )
+    ).all()
+    return [_automation_schedule_dict(row) for row in rows]
+
+
+@router.post("/automation/schedules")
+def create_automation_schedule(
+    req: CreateAutomationScheduleRequest,
+    session: DbSession,
+) -> dict:
+    now = datetime.now(UTC)
+    row = session.scalars(
+        select(AutomationScheduleModel)
+        .where(AutomationScheduleModel.schedule_type == req.schedule_type)
+        .limit(1)
+    ).first()
+    if row is None:
+        row = AutomationScheduleModel(
+            id=_fixed_automation_schedule_id(req.schedule_type),
+            schedule_type=req.schedule_type,
+            created_by=req.created_by,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    row.schedule_status = "active" if req.enabled else "paused"
+    row.enabled = req.enabled
+    row.interval_seconds = max(5, int(req.interval_seconds or 60))
+    row.config_json = req.config_json
+    row.next_run_at = now
+    row.last_error_code = ""
+    row.last_error_message = ""
+    row.updated_at = now
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _automation_schedule_dict(row)
+
+
+@router.patch("/automation/schedules/{schedule_id}")
+def patch_automation_schedule(
+    schedule_id: str,
+    req: PatchAutomationScheduleRequest,
+    session: DbSession,
+) -> dict:
+    row = session.get(AutomationScheduleModel, schedule_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="automation schedule not found")
+    if req.enabled is not None:
+        row.enabled = req.enabled
+        row.schedule_status = "active" if req.enabled else "paused"
+    if req.schedule_status is not None:
+        row.schedule_status = req.schedule_status
+        row.enabled = req.schedule_status == "active"
+    if req.interval_seconds is not None:
+        row.interval_seconds = max(5, int(req.interval_seconds or 60))
+    if req.config_json is not None:
+        row.config_json = req.config_json
+    row.next_run_at = datetime.now(UTC)
+    row.last_error_code = ""
+    row.last_error_message = ""
+    row.updated_at = datetime.now(UTC)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _automation_schedule_dict(row)
+
+
+@router.post("/automation/schedules/{schedule_id}/run-now")
+def run_automation_schedule_now(schedule_id: str, session: DbSession) -> dict:
+    row = session.get(AutomationScheduleModel, schedule_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="automation schedule not found")
+    session_factory = _session_factory_from(session)
+    locked_by = f"manual-{uuid4()}"
+    result = _execute_automation_schedule(
+        schedule_id=schedule_id,
+        session_factory=session_factory,
+        locked_by=locked_by,
+        update_next_run=False,
+        acquire_lock=True,
+    )
+    return {"schedule": _automation_schedule_dict(session.get(AutomationScheduleModel, schedule_id)), **result}
+
+
+def _run_workspace_fill_automation(
+    *,
+    req: WorkspaceAutomationFillRequest,
+    session: Session,
+    parent_job_id: str,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, req.team_workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="team workspace not found")
+    user_account_ids = [item.strip() for item in req.user_account_ids if item.strip()]
+    if not user_account_ids:
+        raise HTTPException(status_code=400, detail="user_account_ids is required")
+    active_user_account_ids = _exclude_workspace_cooldown_accounts(
+        session=session,
+        workspace_id=workspace.id,
+        user_account_ids=user_account_ids,
+    )
+    skipped_cooldown_count = len(user_account_ids) - len(active_user_account_ids)
+    if not active_user_account_ids:
+        raise HTTPException(status_code=400, detail="all selected accounts are in cooldown")
+
+    invite_summary = _create_invite_work_job(
+        req=InviteSelectedUsersRequest(
+            team_workspace_id=workspace.id,
+            user_account_ids=active_user_account_ids,
+            team_admin_session_id=req.team_admin_session_id,
+            created_by=req.created_by or "automation.workspace_fill",
+            concurrency=req.invite_concurrency,
+        ),
+        session=session,
+    )
+    _update_automation_run_output(
+        session=session,
+        job_id=parent_job_id,
+        run_id=_automation_run_id(session=session, job_id=parent_job_id),
+        patch={
+            "stage": "post_invite_wait",
+            "invite_job": invite_summary,
+            "skipped_cooldown_count": skipped_cooldown_count,
+            "selected_account_count": len(user_account_ids),
+            "active_account_count": len(active_user_account_ids),
+            "next_wait_seconds": max(0, int(req.post_invite_wait_seconds or 0)),
+        },
+    )
+    wait_seconds = max(0, int(req.post_invite_wait_seconds or 0))
+    if wait_seconds:
+        sleep(wait_seconds)
+    sync_after_invite = _sync_workspace_remote_state_inline(
+        session=session,
+        workspace_id=workspace.id,
+        page_size=req.sync_page_size,
+    )
+    _update_automation_run_output(
+        session=session,
+        job_id=parent_job_id,
+        run_id=_automation_run_id(session=session, job_id=parent_job_id),
+        patch={
+            "stage": "sync_after_invite_done",
+            "invite_job": invite_summary,
+            "sync_after_invite": sync_after_invite,
+        },
+    )
+
+    lock_acquired = _acquire_workspace_operation_lock(
+        session=session,
+        workspace_id=workspace.id,
+        lock_type="codex_fill",
+        locked_by=parent_job_id,
+        ttl_seconds=req.lock_ttl_seconds,
+    )
+    if not lock_acquired:
+        raise HTTPException(status_code=409, detail="workspace codex_fill lock is held")
+    authorized_credential_id = ""
+    selected_user_account_id = ""
+    fill_errors: list[dict[str, str]] = []
+    try:
+        workspace = session.get(TeamWorkspaceModel, workspace.id)
+        if workspace is not None:
+            remote_state = _sync_workspace_remote_state_inline(
+                session=session,
+                workspace_id=workspace.id,
+                page_size=req.sync_page_size,
+            )
+            purchased_seats = int(workspace.seats_entitled or workspace.seat_limit or 0)
+            remote_default_seat_count = int(remote_state.get("remote_default_seat_count") or 0)
+            if purchased_seats <= 0 or remote_default_seat_count < purchased_seats:
+                selected_user_account_id = _random_workspace_authorization_candidate(
+                    session=session,
+                    workspace_id=workspace.id,
+                )
+                if selected_user_account_id:
+                    session.commit()
+                    _update_automation_run_output(
+                        session=session,
+                        job_id=parent_job_id,
+                        run_id=_automation_run_id(session=session, job_id=parent_job_id),
+                        patch={
+                            "stage": "codex_authorizing",
+                            "current_user_account_id": selected_user_account_id,
+                            "authorized_credential_count": 0,
+                            "fill_error_count": 0,
+                        },
+                    )
+                    try:
+                        authorized_credential_id = BuildCodexCredentialWorkItemWorkflow(
+                            session_factory=sessionmaker(
+                                bind=session.get_bind(),
+                                autoflush=False,
+                                expire_on_commit=False,
+                            ),
+                            openai_provider=_openai_provider(),
+                            mail_provider=_mail_provider(),
+                        ).run(
+                            BuildCodexCredentialWorkInput(
+                                user_account_id=selected_user_account_id,
+                                team_workspace_id=workspace.id,
+                                codex_client_id=req.codex_client_id,
+                                force_reauthorize=False,
+                            )
+                        )
+                    except Exception as exc:
+                        fill_errors.append(
+                            {
+                                "user_account_id": selected_user_account_id,
+                                "error": f"{type(exc).__name__}: {exc}"[:1000],
+                            }
+                        )
+                        _mark_candidate_authorization_failed(
+                            session=session,
+                            workspace_id=workspace.id,
+                            user_account_id=selected_user_account_id,
+                            error=str(exc),
+                        )
+                    else:
+                        _mark_credential_pending_push(
+                            session=session,
+                            credential_id=authorized_credential_id,
+                        )
+                        session.commit()
+                        _update_automation_run_output(
+                            session=session,
+                            job_id=parent_job_id,
+                            run_id=_automation_run_id(session=session, job_id=parent_job_id),
+                            patch={
+                                "stage": "codex_authorized",
+                                "selected_user_account_id": selected_user_account_id,
+                                "authorized_credential_count": 1,
+                                "authorized_credential_id": authorized_credential_id,
+                                "authorized_credential_ids": [authorized_credential_id],
+                                "fill_error_count": 0,
+                                "fill_errors": [],
+                            },
+                        )
+    finally:
+        _release_workspace_operation_lock(
+            session=session,
+            workspace_id=req.team_workspace_id,
+            lock_type="codex_fill",
+            locked_by=parent_job_id,
+        )
+        session.commit()
+
+    final_sync = _sync_workspace_remote_state_inline(
+        session=session,
+        workspace_id=req.team_workspace_id,
+        page_size=req.sync_page_size,
+    )
+    session.commit()
+    return {
+        "team_workspace_id": req.team_workspace_id,
+        "selected_account_count": len(user_account_ids),
+        "skipped_cooldown_count": skipped_cooldown_count,
+        "invite_job": invite_summary,
+        "sync_after_invite": sync_after_invite,
+        "selected_user_account_id": selected_user_account_id,
+        "authorized_credential_count": 1 if authorized_credential_id else 0,
+        "authorized_credential_id": authorized_credential_id,
+        "authorized_credential_ids": [authorized_credential_id] if authorized_credential_id else [],
+        "fill_error_count": len(fill_errors),
+        "fill_errors": fill_errors,
+        "final_sync": final_sync,
+    }
+
+
+def _run_workspace_fill_automation_background(
+    *,
+    req: WorkspaceAutomationFillRequest,
+    session_factory,
+    job_id: str,
+    run_id: str,
+) -> None:
+    with session_factory() as session:
+        try:
+            _update_automation_run_output(
+                session=session,
+                job_id=job_id,
+                run_id=run_id,
+                patch={
+                    "stage": "running",
+                    "message": "automation started",
+                    "team_workspace_id": req.team_workspace_id,
+                    "selected_account_count": len(req.user_account_ids),
+                },
+            )
+            output = _run_workspace_fill_automation(req=req, session=session, parent_job_id=job_id)
+        except Exception as exc:
+            finished_at = datetime.now(UTC)
+            job = session.get(JobModel, job_id)
+            run = session.get(JobRunModel, run_id)
+            if job is not None:
+                job.job_status = "failed"
+                job.updated_at = finished_at
+            if run is not None:
+                run.run_status = "failed"
+                run.finished_at = finished_at
+                run.error_code = type(exc).__name__[:200]
+                run.error_message = str(exc)[:1000]
+                run.output_json = {
+                    **(run.output_json or {}),
+                    "stage": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            session.commit()
+            return
+
+        finished_at = datetime.now(UTC)
+        job = session.get(JobModel, job_id)
+        run = session.get(JobRunModel, run_id)
+        if job is not None:
+            job.job_status = "succeeded"
+            job.updated_at = finished_at
+        if run is not None:
+            run.run_status = "succeeded"
+            run.finished_at = finished_at
+            run.output_json = {**(run.output_json or {}), **output, "stage": "succeeded"}
+        session.commit()
+
+
+def _update_automation_run_output(
+    *,
+    session: Session,
+    job_id: str,
+    run_id: str,
+    patch: dict[str, Any],
+) -> None:
+    now = datetime.now(UTC)
+    job = session.get(JobModel, job_id)
+    run = session.get(JobRunModel, run_id)
+    if job is not None:
+        job.updated_at = now
+    if run is not None:
+        run.output_json = {**(run.output_json or {}), **patch, "updated_at": now.isoformat()}
+    session.commit()
+
+
+def _automation_run_id(*, session: Session, job_id: str) -> str:
+    run = session.scalars(
+        select(JobRunModel)
+        .where(JobRunModel.job_id == job_id)
+        .order_by(JobRunModel.started_at.desc())
+        .limit(1)
+    ).first()
+    return run.id if run is not None else ""
+
+
+def _run_downstream_usage_sweep(
+    *,
+    req: DownstreamUsageSweepRequest,
+    session: Session,
+) -> dict:
+    now = datetime.now(UTC)
+    threshold = max(1, min(int(req.threshold_percent or 95), 100))
+    session_factory = _session_factory_from(session)
+    stmt = select(DownstreamCodexPushRecordModel).where(
+        DownstreamCodexPushRecordModel.push_status == "pushed"
+    )
+    if req.downstream_channel_id.strip():
+        stmt = stmt.where(
+            DownstreamCodexPushRecordModel.downstream_channel_id
+            == req.downstream_channel_id.strip()
+        )
+    records = session.scalars(stmt.order_by(DownstreamCodexPushRecordModel.updated_at.asc())).all()
+    checked_count = 0
+    near_limit_count = 0
+    failed_count = 0
+    for record in records:
+        probe = _probe_downstream_record_usage_with_recovery(
+            session=session,
+            session_factory=session_factory,
+            record=record,
+            threshold=threshold,
+        )
+        if not probe.ok:
+            failed_count += 1
+            checked_count += 1
+            continue
+        usage_percent = probe.usage_percent
+        if usage_percent >= threshold:
+            near_limit_count += 1
+            remove_result = _mark_downstream_record_used_and_cooldown(
+                session=session,
+                record=record,
+                now=datetime.now(UTC),
+                reason=f"usage_percent>={threshold}",
+            )
+            if not remove_result.get("ok"):
+                near_limit_count -= 1
+        else:
+            record.usage_status = "active"
+            record.updated_at = datetime.now(UTC)
+        checked_count += 1
+    session.commit()
+    return {
+        "checked_count": checked_count,
+        "near_limit_count": near_limit_count,
+        "failed_count": failed_count,
+        "threshold_percent": threshold,
+        "usage_source": "chatgpt_codex_response_headers",
+    }
+
+
+def _probe_downstream_record_usage_with_recovery(
+    *,
+    session: Session,
+    session_factory,
+    record: DownstreamCodexPushRecordModel,
+    threshold: int,
+) -> CodexUsageProbeResult:
+    now = datetime.now(UTC)
+    result = _probe_downstream_record_usage(session=session, record=record)
+    if result.ok:
+        _apply_usage_probe_success(record=record, result=result, threshold=threshold, now=now)
+        return result
+    if not result.unauthorized:
+        _apply_usage_probe_failure(record=record, result=result, now=now)
+        return result
+
+    refresh_result = _refresh_codex_credential_access_token(session=session, record=record)
+    if not refresh_result.get("ok"):
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code=str(refresh_result.get("error_code") or "codex_token_refresh_failed"),
+            error_message=str(refresh_result.get("error_message") or ""),
+        )
+        _apply_usage_probe_failure(record=record, result=failed, now=datetime.now(UTC))
+        return failed
+
+    result = _probe_downstream_record_usage(session=session, record=record)
+    if result.ok:
+        _apply_usage_probe_success(
+            record=record,
+            result=result,
+            threshold=threshold,
+            now=datetime.now(UTC),
+        )
+        return result
+    if not result.unauthorized:
+        _apply_usage_probe_failure(record=record, result=result, now=datetime.now(UTC))
+        return result
+
+    session.commit()
+    reauthorize_result = _reauthorize_codex_credential_for_record(
+        session_factory=session_factory,
+        record=record,
+    )
+    if not reauthorize_result.get("ok"):
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code=str(reauthorize_result.get("error_code") or "codex_reauthorize_failed"),
+            error_message=str(reauthorize_result.get("error_message") or ""),
+        )
+        session.expire_all()
+        refreshed_record = session.get(DownstreamCodexPushRecordModel, record.id)
+        if refreshed_record is not None:
+            _apply_usage_probe_failure(
+                record=refreshed_record,
+                result=failed,
+                now=datetime.now(UTC),
+            )
+        return failed
+
+    session.expire_all()
+    refreshed_record = session.get(DownstreamCodexPushRecordModel, record.id)
+    if refreshed_record is None:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code="push_record_missing_after_reauthorize",
+            error_message="push record missing after codex reauthorize",
+        )
+    repush_result = _repush_downstream_record(session=session, record=refreshed_record)
+    if not repush_result.get("ok"):
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code=str(repush_result.get("error_code") or "downstream_repush_failed"),
+            error_message=str(repush_result.get("error_message") or ""),
+        )
+        _apply_usage_probe_failure(
+            record=refreshed_record,
+            result=failed,
+            now=datetime.now(UTC),
+        )
+        return failed
+
+    result = _probe_downstream_record_usage(session=session, record=refreshed_record)
+    if result.ok:
+        _apply_usage_probe_success(
+            record=refreshed_record,
+            result=result,
+            threshold=threshold,
+            now=datetime.now(UTC),
+        )
+    else:
+        _apply_usage_probe_failure(
+            record=refreshed_record,
+            result=result,
+            now=datetime.now(UTC),
+        )
+    return result
+
+
+def _probe_downstream_record_usage(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+) -> CodexUsageProbeResult:
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    if credential is None:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code="missing_codex_credential",
+            error_message="codex credential not found",
+        )
+    if not credential.access_token:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code="missing_access_token",
+            error_message="codex credential access_token is empty",
+            unauthorized=True,
+        )
+    if credential.token_chatgpt_account_id != record.token_chatgpt_account_id:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code="workspace_mismatch",
+            error_message=(
+                "credential token_chatgpt_account_id does not match push record "
+                f"expected={record.token_chatgpt_account_id} actual={credential.token_chatgpt_account_id}"
+            )[:1000],
+        )
+    settings = get_settings()
+    url = f"{settings.openai_chatgpt_base_url.rstrip('/')}{CODEX_RESPONSES_PATH}"
+    headers = _codex_usage_probe_headers(
+        access_token=credential.access_token,
+        team_id=credential.token_chatgpt_account_id,
+    )
+    body = _codex_usage_probe_body()
+    proxy = _active_proxy(session, credential.user_account_id)
+    proxy_url = _proxy_url(proxy) if proxy is not None else ""
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    try:
+        with curl_requests.Session(impersonate="chrome136", proxies=proxies) as client:
+            response = client.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=15,
+                stream=True,
+            )
+            raw_headers = _codex_usage_headers(response.headers)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            try:
+                response.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code=type(exc).__name__[:200],
+            error_message=str(exc)[:1000],
+        )
+    usage_percent = _codex_usage_percent_from_headers(raw_headers)
+    if usage_percent is not None:
+        return CodexUsageProbeResult(
+            ok=True,
+            usage_percent=usage_percent,
+            raw_headers=raw_headers,
+        )
+    if status_code == 401:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code="http_401",
+            error_message="chatgpt codex usage probe returned 401",
+            unauthorized=True,
+            raw_headers=raw_headers,
+        )
+    if status_code < 200 or status_code >= 300:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code=f"http_{status_code}",
+            error_message="chatgpt codex usage probe returned non-2xx without usage headers",
+            raw_headers=raw_headers,
+        )
+    return CodexUsageProbeResult(
+        ok=False,
+        error_code="usage_headers_missing",
+        error_message="chatgpt codex response did not include x-codex usage headers",
+        raw_headers=raw_headers,
+    )
+
+
+def _codex_usage_probe_headers(*, access_token: str, team_id: str) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "text/event-stream",
+        "OpenAI-Beta": "responses=experimental",
+        "Originator": "codex_cli_rs",
+        "Version": CODEX_USAGE_PROBE_VERSION,
+        "User-Agent": CODEX_USAGE_PROBE_USER_AGENT,
+        "chatgpt-account-id": team_id,
+    }
+
+
+def _codex_usage_probe_body() -> dict[str, Any]:
+    try:
+        instructions = CODEX_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        instructions = ""
+    return {
+        "model": CODEX_USAGE_PROBE_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            }
+        ],
+        "stream": True,
+        "store": False,
+        "instructions": instructions,
+    }
+
+
+def _codex_usage_headers(headers: Any) -> dict[str, str]:
+    keys = (
+        "x-codex-primary-used-percent",
+        "x-codex-primary-reset-after-seconds",
+        "x-codex-primary-window-minutes",
+        "x-codex-secondary-used-percent",
+        "x-codex-secondary-reset-after-seconds",
+        "x-codex-secondary-window-minutes",
+        "x-codex-primary-over-secondary-limit-percent",
+    )
+    return {key: str(headers.get(key) or "") for key in keys if str(headers.get(key) or "")}
+
+
+def _codex_usage_percent_from_headers(headers: dict[str, str]) -> int | None:
+    values: list[float] = []
+    for key in (
+        "x-codex-primary-used-percent",
+        "x-codex-secondary-used-percent",
+        "x-codex-primary-over-secondary-limit-percent",
+    ):
+        raw = headers.get(key)
+        if not raw:
+            continue
+        try:
+            values.append(float(str(raw).strip().rstrip("%")))
+        except ValueError:
+            continue
+    if not values:
+        return None
+    return max(0, min(int(round(max(values))), 100))
+
+
+def _apply_usage_probe_success(
+    *,
+    record: DownstreamCodexPushRecordModel,
+    result: CodexUsageProbeResult,
+    threshold: int,
+    now: datetime,
+) -> None:
+    record.usage_percent = result.usage_percent
+    record.usage_status = "near_limit" if result.usage_percent >= threshold else "active"
+    record.last_usage_check_at = now
+    record.error_code = ""
+    record.error_message = ""
+    record.updated_at = now
+
+
+def _apply_usage_probe_failure(
+    *,
+    record: DownstreamCodexPushRecordModel,
+    result: CodexUsageProbeResult,
+    now: datetime,
+) -> None:
+    record.usage_status = "check_failed"
+    record.last_usage_check_at = now
+    record.error_code = (result.error_code or "usage_probe_failed")[:200]
+    record.error_message = (result.error_message or "")[:1000]
+    record.updated_at = now
+
+
+def _refresh_codex_credential_access_token(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+) -> dict[str, Any]:
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    workspace = session.get(TeamWorkspaceModel, record.team_workspace_id)
+    if credential is None:
+        return {"ok": False, "error_code": "missing_codex_credential"}
+    if workspace is None:
+        return {"ok": False, "error_code": "missing_workspace"}
+    if not credential.refresh_token:
+        return {"ok": False, "error_code": "missing_refresh_token"}
+    settings = get_settings()
+    provider = OpenAIChatGPTPlugin.from_config(
+        OpenAIChatGPTClientConfig(
+            auth_base_url=settings.openai_auth_base_url,
+            chatgpt_base_url=settings.openai_chatgpt_base_url,
+            probe_path_template=settings.openai_probe_path_template,
+        )
+    )
+    try:
+        tokens = provider.refresh_workspace_token(
+            refresh_token=credential.refresh_token,
+            external_workspace_id=workspace.external_workspace_id,
+            client_id=credential.codex_client_id,
+        )
+    except Exception as exc:
+        credential.credential_status = CredentialStatus.ERROR.value
+        credential.failure_code = type(exc).__name__[:200]
+        credential.failure_message = str(exc)[:1000]
+        credential.updated_at = datetime.now(UTC)
+        return {
+            "ok": False,
+            "error_code": type(exc).__name__,
+            "error_message": str(exc),
+        }
+    now = datetime.now(UTC)
+    credential.access_token = tokens.access_token
+    credential.id_token = tokens.id_token
+    credential.refresh_token = tokens.refresh_token
+    credential.expires_at = tokens.expires_at
+    credential.last_refresh_at = now
+    credential.credential_status = CredentialStatus.ACTIVE.value
+    credential.failure_code = ""
+    credential.failure_message = ""
+    credential.updated_at = now
+    record.codex_token_expires_at = tokens.expires_at
+    record.token_chatgpt_account_id = tokens.claims.token_chatgpt_account_id
+    record.updated_at = now
+    return {"ok": True}
+
+
+def _reauthorize_codex_credential_for_record(
+    *,
+    session_factory,
+    record: DownstreamCodexPushRecordModel,
+) -> dict[str, Any]:
+    settings = get_settings()
+    workflow = BuildCodexCredentialWorkItemWorkflow(
+        session_factory=session_factory,
+        openai_provider=OpenAIChatGPTPlugin.from_config(
+            OpenAIChatGPTClientConfig(
+                auth_base_url=settings.openai_auth_base_url,
+                chatgpt_base_url=settings.openai_chatgpt_base_url,
+                probe_path_template=settings.openai_probe_path_template,
+            )
+        ),
+        mail_provider=ExternalMailApiPlugin.from_config(
+            ExternalMailApiClientConfig(
+                base_url=settings.external_mail_api_base_url,
+                api_key=settings.external_mail_api_key,
+                provider_name=settings.external_mail_provider_name,
+            )
+        ),
+    )
+    try:
+        credential_id = workflow.run(
+            BuildCodexCredentialWorkInput(
+                user_account_id=record.user_account_id,
+                team_workspace_id=record.team_workspace_id,
+                codex_client_id=record.codex_client_id,
+                force_reauthorize=True,
+            )
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_code": type(exc).__name__,
+            "error_message": str(exc),
+        }
+    return {"ok": True, "codex_credential_id": credential_id}
+
+
+def _repush_downstream_record(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+) -> dict[str, Any]:
+    if not record.downstream_channel_id:
+        return {"ok": True, "reason": "record_has_no_downstream_channel"}
+    channel = session.get(DownstreamChannelModel, record.downstream_channel_id)
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    user = session.get(UserAccountModel, record.user_account_id)
+    workspace = session.get(TeamWorkspaceModel, record.team_workspace_id)
+    if channel is None:
+        return {"ok": False, "error_code": "missing_downstream_channel"}
+    if credential is None:
+        return {"ok": False, "error_code": "missing_codex_credential"}
+    if user is None:
+        return {"ok": False, "error_code": "missing_user_account"}
+    if workspace is None:
+        return {"ok": False, "error_code": "missing_workspace"}
+    payload = downstream_payload(
+        user=user,
+        workspace=workspace,
+        credential=credential,
+        batch_item=None,
+    )
+    provider = _provider_from_channel(channel)
+    try:
+        result = provider.push_codex_credential(payload)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_code": type(exc).__name__,
+            "error_message": str(exc),
+        }
+    now = datetime.now(UTC)
+    if not result.pushed:
+        return {
+            "ok": False,
+            "error_code": result.error_code or "downstream_repush_failed",
+            "error_message": result.error_message,
+        }
+    record.downstream_external_id = result.downstream_external_id or record.downstream_external_id
+    record.codex_token_expires_at = credential.expires_at
+    record.token_chatgpt_account_id = credential.token_chatgpt_account_id
+    record.error_code = ""
+    record.error_message = ""
+    record.updated_at = now
+    return {"ok": True, "downstream_external_id": record.downstream_external_id}
+
+
+def _session_factory_from(session: Session):
+    return sessionmaker(bind=session.get_bind(), autoflush=False, expire_on_commit=False)
+
+
+def _create_running_job_run(
+    *,
+    session: Session,
+    job_type: str,
+    input_json: dict[str, Any],
+    created_by: str,
+) -> tuple[JobModel, JobRunModel]:
+    job = JobQueue(session).enqueue(job_type=job_type, input_json=input_json, created_by=created_by)
+    now = datetime.now(UTC)
+    job.job_status = "running"
+    job.updated_at = now
+    run = JobRunModel(
+        id=str(uuid4()),
+        job_id=job.id,
+        run_status="running",
+        attempt=1,
+        started_at=now,
+        output_json={},
+    )
+    session.add(run)
+    session.commit()
+    return job, run
+
+
+def _finish_running_job(
+    *,
+    session: Session,
+    job: JobModel,
+    run: JobRunModel,
+    runner,
+) -> dict:
+    try:
+        output = runner()
+    except Exception as exc:
+        finished_at = datetime.now(UTC)
+        job.job_status = "failed"
+        job.updated_at = finished_at
+        run.run_status = "failed"
+        run.finished_at = finished_at
+        run.error_code = type(exc).__name__[:200]
+        run.error_message = str(exc)[:1000]
+        run.output_json = {"error": f"{type(exc).__name__}: {exc}"}
+        session.commit()
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+    finished_at = datetime.now(UTC)
+    job.job_status = "succeeded"
+    job.updated_at = finished_at
+    run.run_status = "succeeded"
+    run.finished_at = finished_at
+    run.output_json = output
+    session.commit()
+    return output
+
+
+def _run_workspace_invite_sync_tick(
+    *,
+    req: AutomationWorkspaceInviteSyncRequest,
+    session_factory,
+    job_id: str,
+    run_id: str,
+) -> dict:
+    with session_factory() as session:
+        workspace_ids = _active_automation_workspace_ids(
+            session=session,
+            limit=req.workspace_limit,
+        )
+    concurrency = _bounded_concurrency(req.workspace_concurrency)
+    results = _parallel_map(
+        items=workspace_ids,
+        max_workers=concurrency,
+        fn=lambda workspace_id: _process_workspace_invite_sync(
+            session_factory=session_factory,
+            workspace_id=workspace_id,
+            req=req,
+            job_id=job_id,
+            run_id=run_id,
+        ),
+    )
+    return _automation_results_summary(
+        job_type="automation.workspace_invite_sync",
+        results=results,
+        concurrency=concurrency,
+    )
+
+
+def _process_workspace_invite_sync(
+    *,
+    session_factory,
+    workspace_id: str,
+    req: AutomationWorkspaceInviteSyncRequest,
+    job_id: str,
+    run_id: str,
+) -> dict:
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        workspace = session.get(TeamWorkspaceModel, workspace_id)
+        if workspace is None or workspace.workspace_status != "active":
+            return {"team_workspace_id": workspace_id, "status": "skipped", "reason": "workspace_not_active"}
+        state = _ensure_workspace_automation_state(session=session, workspace_id=workspace.id)
+        if state.automation_status != "active":
+            return {"team_workspace_id": workspace.id, "status": "skipped", "reason": state.automation_status}
+        if state.invite_status == "sent":
+            if state.last_invite_finished_at is None:
+                ready_to_sync = True
+            else:
+                ready_to_sync = now - state.last_invite_finished_at >= timedelta(
+                    seconds=max(0, int(req.sync_after_seconds or 120))
+                )
+            if not ready_to_sync:
+                return {"team_workspace_id": workspace.id, "status": "skipped", "reason": "invite_waiting"}
+            result = _sync_workspace_remote_state_inline(
+                session=session,
+                workspace_id=workspace.id,
+                page_size=req.sync_page_size,
+            )
+            state.last_sync_at = datetime.now(UTC)
+            state.updated_at = state.last_sync_at
+            session.commit()
+            return {"team_workspace_id": workspace.id, "status": "synced", **result}
+
+        account_ids = _select_invite_candidate_account_ids(
+            session=session,
+            workspace_id=workspace.id,
+            limit=max(1, int(req.invite_count or 350)),
+        )
+        if not account_ids:
+            state.automation_status = "paused"
+            state.pause_reason = "no_available_accounts"
+            state.updated_at = datetime.now(UTC)
+            session.commit()
+            return {"team_workspace_id": workspace.id, "status": "paused", "reason": "no_available_accounts"}
+
+        invite_concurrency = _bounded_concurrency(req.invite_concurrency)
+        barrier_key = f"invite:{job_id}:{workspace.id}"
+        for index, user_account_id in enumerate(account_ids):
+            group_index = index // invite_concurrency
+            group_start = group_index * invite_concurrency
+            group_expected = min(invite_concurrency, len(account_ids) - group_start)
+            WorkQueue(session).enqueue(
+                job_id=job_id,
+                work_type="membership.invite_member.account",
+                input_json={
+                    "team_workspace_id": workspace.id,
+                    "user_account_id": user_account_id,
+                    "team_admin_session_id": workspace.source_admin_session_id,
+                    "_run_id": run_id,
+                    "_barrier_key": barrier_key,
+                    "_barrier_group": str(group_index),
+                    "_barrier_expected": group_expected,
+                    "_barrier_timeout_s": 30,
+                },
+            )
+        session.commit()
+
+    _run_job_work_now(
+        session_factory=session_factory,
+        job_id=job_id,
+        concurrency=min(invite_concurrency, len(account_ids)),
+    )
+    with session_factory() as session:
+        state = _ensure_workspace_automation_state(session=session, workspace_id=workspace_id)
+        state.invite_status = "sent"
+        state.invite_job_id = job_id
+        state.last_invite_finished_at = datetime.now(UTC)
+        state.updated_at = state.last_invite_finished_at
+        session.commit()
+    return {
+        "team_workspace_id": workspace_id,
+        "status": "invited",
+        "invited_count": len(account_ids),
+        "invite_concurrency": invite_concurrency,
+    }
+
+
+def _run_workspace_authorize_tick(
+    *,
+    req: AutomationWorkspaceAuthorizeRequest,
+    session_factory,
+    job_id: str,
+) -> dict:
+    with session_factory() as session:
+        workspace_ids = _active_automation_workspace_ids(
+            session=session,
+            limit=req.workspace_limit,
+            require_invite_sent=True,
+        )
+    concurrency = _bounded_concurrency(req.workspace_concurrency)
+    results = _parallel_map(
+        items=workspace_ids,
+        max_workers=concurrency,
+        fn=lambda workspace_id: _process_workspace_authorize(
+            session_factory=session_factory,
+            workspace_id=workspace_id,
+            req=req,
+            job_id=job_id,
+        ),
+    )
+    return _automation_results_summary(
+        job_type="automation.workspace_authorize",
+        results=results,
+        concurrency=concurrency,
+    )
+
+
+def _process_workspace_authorize(
+    *,
+    session_factory,
+    workspace_id: str,
+    req: AutomationWorkspaceAuthorizeRequest,
+    job_id: str,
+) -> dict:
+    with session_factory() as session:
+        workspace = session.get(TeamWorkspaceModel, workspace_id)
+        if workspace is None or workspace.workspace_status != "active":
+            return {"team_workspace_id": workspace_id, "status": "skipped", "reason": "workspace_not_active"}
+        state = _ensure_workspace_automation_state(session=session, workspace_id=workspace.id)
+        if state.automation_status != "active" or state.invite_status != "sent":
+            return {"team_workspace_id": workspace.id, "status": "skipped", "reason": "not_ready"}
+        lock_acquired = _acquire_workspace_operation_lock(
+            session=session,
+            workspace_id=workspace_id,
+            lock_type="codex_fill",
+            locked_by=job_id,
+            ttl_seconds=req.lock_ttl_seconds,
+        )
+        if not lock_acquired:
+            return {"team_workspace_id": workspace_id, "status": "skipped", "reason": "lock_held"}
+        authorized: list[dict[str, str]] = []
+        fill_errors: list[dict[str, str]] = []
+        last_remote_state: dict[str, Any] = {}
+        authorization_attempts_left: int | None = None
+        try:
+            while True:
+                remote_state = _sync_workspace_remote_state_inline(
+                    session=session,
+                    workspace_id=workspace_id,
+                    page_size=req.sync_page_size,
+                )
+                last_remote_state = remote_state
+                state = _ensure_workspace_automation_state(session=session, workspace_id=workspace_id)
+                state.last_sync_at = datetime.now(UTC)
+                state.updated_at = state.last_sync_at
+                session.commit()
+
+                workspace = session.get(TeamWorkspaceModel, workspace_id)
+                purchased_seats = int(
+                    (workspace.seats_entitled if workspace else 0)
+                    or (workspace.seat_limit if workspace else 0)
+                    or 0
+                )
+                remote_default_seat_count = int(remote_state.get("remote_default_seat_count") or 0)
+                if authorization_attempts_left is None:
+                    authorization_attempts_left = (
+                        max(1, purchased_seats - remote_default_seat_count)
+                        if purchased_seats > 0
+                        else 1
+                    )
+                if purchased_seats > 0 and remote_default_seat_count >= purchased_seats:
+                    if authorized:
+                        return {
+                            "team_workspace_id": workspace_id,
+                            "status": "authorized",
+                            "authorized_count": len(authorized),
+                            "authorized": authorized,
+                            "fill_error_count": len(fill_errors),
+                            "fill_errors": fill_errors,
+                            "remote_default_seat_count": remote_default_seat_count,
+                            "purchased_seats": purchased_seats,
+                        }
+                    return {
+                        "team_workspace_id": workspace_id,
+                        "status": "skipped",
+                        "reason": "seats_full",
+                        "remote_member_count": int(remote_state.get("remote_member_count") or 0),
+                        "remote_default_seat_count": remote_default_seat_count,
+                        "purchased_seats": purchased_seats,
+                    }
+
+                if authorization_attempts_left <= 0 or (purchased_seats <= 0 and authorized):
+                    return {
+                        "team_workspace_id": workspace_id,
+                        "status": "authorized",
+                        "reason": "authorization_attempt_limit_reached",
+                        "authorized_count": len(authorized),
+                        "authorized": authorized,
+                        "fill_error_count": len(fill_errors),
+                        "fill_errors": fill_errors,
+                        "remote_state": last_remote_state,
+                    }
+
+                selected_user_account_id = _random_workspace_authorization_candidate(
+                    session=session,
+                    workspace_id=workspace_id,
+                )
+                if not selected_user_account_id:
+                    status = "authorized" if authorized else "skipped"
+                    return {
+                        "team_workspace_id": workspace_id,
+                        "status": status,
+                        "reason": "no_candidate",
+                        "authorized_count": len(authorized),
+                        "authorized": authorized,
+                        "fill_error_count": len(fill_errors),
+                        "fill_errors": fill_errors,
+                        "remote_state": last_remote_state,
+                    }
+                session.commit()
+                try:
+                    authorization_attempts_left -= 1
+                    credential_id = BuildCodexCredentialWorkItemWorkflow(
+                        session_factory=session_factory,
+                        openai_provider=_openai_provider(),
+                        mail_provider=_mail_provider(),
+                    ).run(
+                        BuildCodexCredentialWorkInput(
+                            user_account_id=selected_user_account_id,
+                            team_workspace_id=workspace_id,
+                            codex_client_id=req.codex_client_id,
+                            force_reauthorize=False,
+                        )
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"[:1000]
+                    remote_delete_result = _handle_candidate_authorization_failed(
+                        session=session,
+                        workspace_id=workspace_id,
+                        user_account_id=selected_user_account_id,
+                        error=str(exc),
+                    )
+                    fill_errors.append(
+                        {
+                            "user_account_id": selected_user_account_id,
+                            "error": error,
+                            "remote_delete_result": remote_delete_result,
+                        }
+                    )
+                    session.commit()
+                    if not authorized:
+                        return {
+                            "team_workspace_id": workspace_id,
+                            "status": "failed",
+                            "user_account_id": selected_user_account_id,
+                            "error": error,
+                            "remote_delete_result": remote_delete_result,
+                            "remote_state": last_remote_state,
+                        }
+                    return {
+                        "team_workspace_id": workspace_id,
+                        "status": "authorized",
+                        "reason": "stopped_after_error",
+                        "authorized_count": len(authorized),
+                        "authorized": authorized,
+                        "fill_error_count": len(fill_errors),
+                        "fill_errors": fill_errors,
+                        "remote_state": last_remote_state,
+                    }
+                _mark_credential_pending_push(session=session, credential_id=credential_id)
+                state = _ensure_workspace_automation_state(session=session, workspace_id=workspace_id)
+                state.last_authorization_at = datetime.now(UTC)
+                state.updated_at = state.last_authorization_at
+                session.commit()
+                authorized.append(
+                    {
+                        "user_account_id": selected_user_account_id,
+                        "codex_credential_id": credential_id,
+                    }
+                )
+                wait_seconds = max(0, int(req.authorization_sync_wait_seconds or 0))
+                if wait_seconds:
+                    sleep(wait_seconds)
+        finally:
+            _release_workspace_operation_lock(
+                session=session,
+                workspace_id=workspace_id,
+                lock_type="codex_fill",
+                locked_by=job_id,
+            )
+            session.commit()
+
+
+def _run_downstream_push_tick(
+    *,
+    req: AutomationDownstreamPushRequest,
+    session_factory,
+    job_id: str,
+    run_id: str,
+) -> dict:
+    with session_factory() as session:
+        retryable_failed_exists = exists().where(
+            DownstreamCodexPushRecordModel.downstream_channel_id == DownstreamChannelModel.id,
+            DownstreamCodexPushRecordModel.push_status == "failed",
+            DownstreamCodexPushRecordModel.push_attempt_count < MAX_DOWNSTREAM_PUSH_ATTEMPTS,
+        )
+        channels = session.scalars(
+            select(DownstreamChannelModel)
+            .where(
+                DownstreamChannelModel.enabled.is_(True),
+                (DownstreamChannelModel.push_balance > 0) | retryable_failed_exists,
+            )
+            .order_by(DownstreamChannelModel.updated_at.asc())
+            .limit(max(1, int(req.channel_limit or 20)))
+        ).all()
+        selected: set[str] = set()
+        work_count = 0
+        for channel in channels:
+            credential_ids = _select_channel_push_credential_ids(
+                session=session,
+                channel=channel,
+                limit=max(1, int(req.per_channel_limit or 50)),
+                selected=selected,
+            )
+            for credential_id in credential_ids:
+                selected.add(credential_id)
+                WorkQueue(session).enqueue(
+                    job_id=job_id,
+                    work_type="codex_credential.push.account",
+                    input_json={
+                        "codex_credential_id": credential_id,
+                        "downstream_channel_id": channel.id,
+                        "request_endpoint": req.request_endpoint,
+                        "_run_id": run_id,
+                    },
+                )
+                work_count += 1
+        session.commit()
+    if work_count:
+        push_workers = _bounded_concurrency(req.push_concurrency)
+        channel_workers = _bounded_concurrency(req.channel_concurrency)
+        _run_job_work_now(
+            session_factory=session_factory,
+            job_id=job_id,
+            concurrency=min(_bounded_concurrency(push_workers * channel_workers), work_count),
+        )
+    with session_factory() as session:
+        summary = _work_summary(session, job_id)
+    return {
+        "job_type": "automation.downstream_push",
+        "channel_count": len(channels),
+        "work_count": work_count,
+        "channel_concurrency": _bounded_concurrency(req.channel_concurrency),
+        "push_concurrency": _bounded_concurrency(req.push_concurrency),
+        **summary,
+    }
+
+
+def _run_codex_heartbeat_tick(
+    *,
+    req: AutomationCodexHeartbeatRequest,
+    session_factory,
+) -> dict:
+    with session_factory() as session:
+        credential_ids = session.scalars(
+            select(CodexOAuthCredentialModel.id)
+            .where(
+                CodexOAuthCredentialModel.credential_status == CredentialStatus.ACTIVE.value,
+                CodexOAuthCredentialModel.access_token != "",
+                CodexOAuthCredentialModel.refresh_token != "",
+                (CodexOAuthCredentialModel.last_heartbeat_status == "unknown")
+                | (CodexOAuthCredentialModel.last_heartbeat_at.is_(None)),
+                CodexOAuthCredentialModel.push_lifecycle_status.in_(
+                    ("none", "pending_push", "failed")
+                ),
+            )
+            .order_by(
+                CodexOAuthCredentialModel.last_heartbeat_at.asc().nullsfirst(),
+                CodexOAuthCredentialModel.updated_at.asc(),
+            )
+            .limit(max(1, int(req.credential_limit or 100)))
+        ).all()
+    concurrency = _bounded_concurrency(req.credential_concurrency)
+    results = _parallel_map(
+        items=[str(item) for item in credential_ids],
+        max_workers=concurrency,
+        fn=lambda credential_id: _process_codex_heartbeat_credential(
+            session_factory=session_factory,
+            credential_id=credential_id,
+        ),
+    )
+    return _automation_results_summary(
+        job_type="automation.codex_heartbeat",
+        results=results,
+        concurrency=concurrency,
+    )
+
+
+def _process_codex_heartbeat_credential(
+    *,
+    session_factory,
+    credential_id: str,
+) -> dict:
+    try:
+        HeartbeatCodexCredentialWorkflow(
+            session_factory=session_factory,
+            openai_provider=_openai_provider(),
+        ).run(codex_credential_id=credential_id)
+        return {"id": credential_id, "status": "active"}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:1000]
+        if not _is_unauthorized_heartbeat_error(error):
+            return {"id": credential_id, "status": "failed", "error": error}
+
+    recovery = _recover_heartbeat_credential_by_reauthorize_repush(
+        session_factory=session_factory,
+        credential_id=credential_id,
+    )
+    if not recovery.get("ok"):
+        return {
+            "id": credential_id,
+            "status": "failed",
+            "error": error,
+            "recovery": recovery,
+        }
+    try:
+        HeartbeatCodexCredentialWorkflow(
+            session_factory=session_factory,
+            openai_provider=_openai_provider(),
+        ).run(codex_credential_id=credential_id)
+        return {
+            "id": credential_id,
+            "status": "active",
+            "recovery": recovery,
+        }
+    except Exception as exc:
+        return {
+            "id": credential_id,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}"[:1000],
+            "recovery": recovery,
+        }
+
+
+def _recover_heartbeat_credential_by_reauthorize_repush(
+    *,
+    session_factory,
+    credential_id: str,
+) -> dict[str, Any]:
+    with session_factory() as session:
+        record = session.scalars(
+            select(DownstreamCodexPushRecordModel)
+            .where(
+                DownstreamCodexPushRecordModel.codex_credential_id == credential_id,
+                DownstreamCodexPushRecordModel.downstream_channel_id.is_not(None),
+                DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+            )
+            .order_by(DownstreamCodexPushRecordModel.updated_at.desc())
+        ).first()
+        if record is None:
+            return {
+                "ok": False,
+                "error_code": "heartbeat_unauthorized_without_downstream_record",
+                "error_message": "401 after access-token refresh; no downstream record to reauthorize and repush",
+            }
+        reauthorize_result = _reauthorize_codex_credential_for_record(
+            session_factory=session_factory,
+            record=record,
+        )
+        if not reauthorize_result.get("ok"):
+            return reauthorize_result
+        session.expire_all()
+        refreshed_record = session.get(DownstreamCodexPushRecordModel, record.id)
+        if refreshed_record is None:
+            return {
+                "ok": False,
+                "error_code": "push_record_missing_after_reauthorize",
+            }
+        repush_result = _repush_downstream_record(session=session, record=refreshed_record)
+        if not repush_result.get("ok"):
+            return repush_result
+        return {
+            "ok": True,
+            "reauthorize": reauthorize_result,
+            "repush": repush_result,
+        }
+
+
+def _run_downstream_usage_cleanup_tick(
+    *,
+    req: AutomationDownstreamUsageCleanupRequest,
+    session_factory,
+) -> dict:
+    threshold = max(1, min(int(req.threshold_percent or 95), 100))
+    with session_factory() as session:
+        record_ids = session.scalars(
+            select(DownstreamCodexPushRecordModel.id)
+            .where(DownstreamCodexPushRecordModel.push_status == "pushed")
+            .order_by(DownstreamCodexPushRecordModel.updated_at.asc())
+            .limit(max(1, int(req.record_limit or 100)))
+        ).all()
+    concurrency = _bounded_concurrency(req.record_concurrency)
+    results = _parallel_map(
+        items=record_ids,
+        max_workers=concurrency,
+        fn=lambda record_id: _process_downstream_usage_cleanup_record(
+            session_factory=session_factory,
+            record_id=record_id,
+            threshold=threshold,
+        ),
+    )
+    return _automation_results_summary(
+        job_type="automation.downstream_usage_cleanup",
+        results=results,
+        concurrency=concurrency,
+    )
+
+
+_AUTOMATION_SCHEDULER_STARTED = False
+
+
+def start_automation_scheduler() -> None:
+    global _AUTOMATION_SCHEDULER_STARTED
+    if _AUTOMATION_SCHEDULER_STARTED:
+        return
+    _AUTOMATION_SCHEDULER_STARTED = True
+    settings = get_settings()
+    engine = make_engine(settings)
+    session_factory = make_session_factory(engine)
+    Thread(
+        target=_automation_scheduler_loop,
+        kwargs={"session_factory": session_factory},
+        daemon=True,
+        name="automation-scheduler",
+    ).start()
+
+
+def _automation_scheduler_loop(*, session_factory) -> None:
+    scheduler_id = f"{gethostname()}-{uuid4()}"
+    while True:
+        try:
+            _run_due_automation_schedules(
+                session_factory=session_factory,
+                scheduler_id=scheduler_id,
+            )
+        except Exception:
+            pass
+        sleep(5)
+
+
+def _run_due_automation_schedules(*, session_factory, scheduler_id: str) -> None:
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        schedule_ids = session.scalars(
+            select(AutomationScheduleModel.id)
+            .where(
+                AutomationScheduleModel.enabled.is_(True),
+                AutomationScheduleModel.schedule_status == "active",
+                AutomationScheduleModel.next_run_at <= now,
+            )
+            .order_by(AutomationScheduleModel.next_run_at.asc())
+            .limit(4)
+        ).all()
+
+    for schedule_id in schedule_ids:
+        _execute_automation_schedule(
+            schedule_id=schedule_id,
+            session_factory=session_factory,
+            locked_by=scheduler_id,
+            update_next_run=True,
+            acquire_lock=True,
+        )
+
+
+def _execute_automation_schedule(
+    *,
+    schedule_id: str,
+    session_factory,
+    locked_by: str,
+    update_next_run: bool,
+    acquire_lock: bool = False,
+) -> dict:
+    with session_factory() as session:
+        stmt = select(AutomationScheduleModel).where(AutomationScheduleModel.id == schedule_id)
+        if acquire_lock:
+            stmt = stmt.with_for_update(skip_locked=True)
+        schedule = session.scalars(stmt).first()
+        if schedule is None:
+            return {"schedule_id": schedule_id, "status": "locked", "error_code": "schedule_already_running"}
+        now = datetime.now(UTC)
+        if acquire_lock and schedule.locked_by:
+            return {"schedule_id": schedule_id, "status": "locked", "error_code": "schedule_already_running"}
+        if acquire_lock:
+            schedule.locked_by = locked_by
+            schedule.locked_until = now + timedelta(hours=24)
+        schedule.last_run_at = now
+        if update_next_run:
+            schedule.next_run_at = now + timedelta(seconds=max(5, int(schedule.interval_seconds or 60)))
+        schedule.last_run_status = "running"
+        schedule.last_error_code = ""
+        schedule.last_error_message = ""
+        schedule.updated_at = now
+        session.commit()
+
+    try:
+        result = _run_automation_schedule_job(
+            schedule_id=schedule_id,
+            session_factory=session_factory,
+        )
+    except Exception as exc:
+        with session_factory() as session:
+            schedule = session.get(AutomationScheduleModel, schedule_id)
+            if schedule is not None:
+                schedule.last_run_status = "failed"
+                schedule.schedule_status = "error"
+                schedule.enabled = False
+                if schedule.locked_by == locked_by:
+                    schedule.locked_by = ""
+                    schedule.locked_until = None
+                schedule.last_error_code = type(exc).__name__[:200]
+                schedule.last_error_message = str(exc)[:1000]
+                schedule.updated_at = datetime.now(UTC)
+                session.commit()
+        return {
+            "schedule_id": schedule_id,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}"[:1000],
+        }
+
+    with session_factory() as session:
+        schedule = session.get(AutomationScheduleModel, schedule_id)
+        if schedule is not None:
+            schedule.last_job_id = str(result.get("job_id") or "")
+            schedule.last_run_status = str(result.get("job_status") or "succeeded")
+            if schedule.locked_by == locked_by:
+                schedule.locked_by = ""
+                schedule.locked_until = None
+            schedule.last_error_code = ""
+            schedule.last_error_message = ""
+            schedule.updated_at = datetime.now(UTC)
+            session.commit()
+    return {"schedule_id": schedule_id, "status": "succeeded", **result}
+
+
+def _run_automation_schedule_job(*, schedule_id: str, session_factory) -> dict:
+    with session_factory() as session:
+        schedule = session.get(AutomationScheduleModel, schedule_id)
+        if schedule is None:
+            raise RuntimeError("automation schedule not found")
+        schedule_type = schedule.schedule_type
+        config = dict(schedule.config_json or {})
+        config["created_by"] = config.get("created_by") or f"scheduler:{schedule.id}"
+        if schedule_type == "automation.workspace_invite_sync":
+            req = AutomationWorkspaceInviteSyncRequest(**config)
+            job, run = _create_running_job_run(
+                session=session,
+                job_type=schedule_type,
+                input_json=req.model_dump(),
+                created_by=req.created_by,
+            )
+            output = _finish_running_job(
+                session=session,
+                job=job,
+                run=run,
+                runner=lambda: _run_workspace_invite_sync_tick(
+                    req=req,
+                    session_factory=session_factory,
+                    job_id=job.id,
+                    run_id=run.id,
+                ),
+            )
+        elif schedule_type == "automation.workspace_authorize":
+            req = AutomationWorkspaceAuthorizeRequest(**config)
+            job, run = _create_running_job_run(
+                session=session,
+                job_type=schedule_type,
+                input_json=req.model_dump(),
+                created_by=req.created_by,
+            )
+            output = _finish_running_job(
+                session=session,
+                job=job,
+                run=run,
+                runner=lambda: _run_workspace_authorize_tick(
+                    req=req,
+                    session_factory=session_factory,
+                    job_id=job.id,
+                ),
+            )
+        elif schedule_type == "automation.downstream_push":
+            req = AutomationDownstreamPushRequest(**config)
+            job, run = _create_running_job_run(
+                session=session,
+                job_type=schedule_type,
+                input_json=req.model_dump(),
+                created_by=req.created_by,
+            )
+            output = _finish_running_job(
+                session=session,
+                job=job,
+                run=run,
+                runner=lambda: _run_downstream_push_tick(
+                    req=req,
+                    session_factory=session_factory,
+                    job_id=job.id,
+                    run_id=run.id,
+                ),
+            )
+        elif schedule_type == "automation.codex_heartbeat":
+            req = AutomationCodexHeartbeatRequest(**config)
+            job, run = _create_running_job_run(
+                session=session,
+                job_type=schedule_type,
+                input_json=req.model_dump(),
+                created_by=req.created_by,
+            )
+            output = _finish_running_job(
+                session=session,
+                job=job,
+                run=run,
+                runner=lambda: _run_codex_heartbeat_tick(
+                    req=req,
+                    session_factory=session_factory,
+                ),
+            )
+        elif schedule_type == "automation.downstream_usage_cleanup":
+            req = AutomationDownstreamUsageCleanupRequest(**config)
+            job, run = _create_running_job_run(
+                session=session,
+                job_type=schedule_type,
+                input_json=req.model_dump(),
+                created_by=req.created_by,
+            )
+            output = _finish_running_job(
+                session=session,
+                job=job,
+                run=run,
+                runner=lambda: _run_downstream_usage_cleanup_tick(
+                    req=req,
+                    session_factory=session_factory,
+                ),
+            )
+        else:
+            raise RuntimeError(f"unsupported automation schedule type: {schedule_type}")
+        return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
+def _process_downstream_usage_cleanup_record(
+    *,
+    session_factory,
+    record_id: str,
+    threshold: int,
+) -> dict:
+    with session_factory() as session:
+        record = session.get(DownstreamCodexPushRecordModel, record_id)
+        if record is None or record.push_status != "pushed":
+            return {"record_id": record_id, "status": "skipped", "reason": "record_not_pushed"}
+        probe = _probe_downstream_record_usage_with_recovery(
+            session=session,
+            session_factory=session_factory,
+            record=record,
+            threshold=threshold,
+        )
+        if not probe.ok:
+            session.commit()
+            return {
+                "record_id": record_id,
+                "status": "failed",
+                "reason": probe.error_code or "usage_probe_failed",
+                "usage_percent": record.usage_percent,
+                "threshold_percent": threshold,
+            }
+        usage_percent = probe.usage_percent
+        if usage_percent >= threshold:
+            now = datetime.now(UTC)
+            remove_result = _mark_downstream_record_used_and_cooldown(
+                session=session,
+                record=record,
+                now=now,
+                reason=f"usage_percent>={threshold}",
+            )
+            if not remove_result.get("ok"):
+                session.commit()
+                return {
+                    "record_id": record_id,
+                    "status": "failed",
+                    "reason": remove_result.get("error_code") or "remote_remove_failed",
+                    "usage_percent": usage_percent,
+                    "threshold_percent": threshold,
+                }
+            state = session.get(WorkspaceAutomationStateModel, record.team_workspace_id)
+            if state is not None:
+                state.last_usage_cleanup_at = now
+                state.updated_at = now
+            session.commit()
+            return {
+                "record_id": record_id,
+                "status": "used",
+                "usage_percent": usage_percent,
+                "threshold_percent": threshold,
+            }
+        session.commit()
+        return {
+            "record_id": record_id,
+            "status": "active",
+            "usage_percent": usage_percent,
+            "threshold_percent": threshold,
+        }
+
+
+def _active_automation_workspace_ids(
+    *,
+    session: Session,
+    limit: int,
+    require_invite_sent: bool = False,
+) -> list[str]:
+    _ensure_workspace_automation_states_for_active_workspaces(session=session)
+    stmt = (
+        select(TeamWorkspaceModel.id)
+        .join(
+            WorkspaceAutomationStateModel,
+            WorkspaceAutomationStateModel.team_workspace_id == TeamWorkspaceModel.id,
+        )
+        .where(
+            TeamWorkspaceModel.workspace_status == "active",
+            WorkspaceAutomationStateModel.automation_status == "active",
+        )
+        .order_by(TeamWorkspaceModel.updated_at.asc())
+        .limit(max(1, int(limit or 20)))
+    )
+    if require_invite_sent:
+        stmt = stmt.where(WorkspaceAutomationStateModel.invite_status == "sent")
+    return list(session.scalars(stmt).all())
+
+
+def _ensure_workspace_automation_states_for_active_workspaces(*, session: Session) -> None:
+    rows = session.scalars(
+        select(TeamWorkspaceModel.id).where(TeamWorkspaceModel.workspace_status == "active")
+    ).all()
+    for workspace_id in rows:
+        _ensure_workspace_automation_state(session=session, workspace_id=workspace_id)
+    session.commit()
+
+
+def _ensure_workspace_automation_state(
+    *,
+    session: Session,
+    workspace_id: str,
+) -> WorkspaceAutomationStateModel:
+    state = session.get(WorkspaceAutomationStateModel, workspace_id)
+    if state is not None:
+        return state
+    now = datetime.now(UTC)
+    state = WorkspaceAutomationStateModel(
+        team_workspace_id=workspace_id,
+        automation_status="active",
+        invite_status="not_sent",
+        invite_job_id="",
+        pause_reason="",
+        last_error_code="",
+        last_error_message="",
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(state)
+    session.flush()
+    return state
+
+
+def _select_invite_candidate_account_ids(
+    *,
+    session: Session,
+    workspace_id: str,
+    limit: int,
+) -> list[str]:
+    now = datetime.now(UTC)
+    existing_membership = (
+        select(MembershipModel.user_account_id)
+        .where(MembershipModel.team_workspace_id == workspace_id)
+        .subquery()
+    )
+    cooldown = (
+        select(UserAccountCooldownModel.user_account_id)
+        .where(
+            UserAccountCooldownModel.team_workspace_id == workspace_id,
+            UserAccountCooldownModel.cooldown_until > now,
+        )
+        .subquery()
+    )
+    return list(
+        session.scalars(
+            select(UserAccountModel.id)
+            .join(UserAccountAuthModel, UserAccountAuthModel.user_account_id == UserAccountModel.id)
+            .where(
+                UserAccountModel.account_status == "active",
+                UserAccountAuthModel.refresh_token != "",
+                UserAccountAuthModel.refresh_token_status == "active",
+                UserAccountAuthModel.session_status == "active",
+                (
+                    (UserAccountAuthModel.session_token != "")
+                    | (UserAccountAuthModel.cookie_header != "")
+                    | (UserAccountAuthModel.auth_cookie_header != "")
+                ),
+                ~UserAccountModel.id.in_(select(existing_membership.c.user_account_id)),
+                ~UserAccountModel.id.in_(select(cooldown.c.user_account_id)),
+            )
+            .order_by(UserAccountModel.updated_at.asc())
+            .limit(max(1, int(limit or 350)))
+        ).all()
+    )
+
+
+def _parallel_map(*, items: list[str], max_workers: int, fn) -> list[dict]:
+    if not items:
+        return []
+    workers = max(1, min(max_workers, len(items)))
+    if workers <= 1:
+        return [_call_automation_item(fn=fn, item=item) for item in items]
+    ordered: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_call_automation_item, fn=fn, item=item): index for index, item in enumerate(items)}
+        for future in as_completed(futures):
+            ordered[futures[future]] = future.result()
+    return [ordered[index] for index in range(len(items))]
+
+
+def _call_automation_item(*, fn, item: str) -> dict:
+    try:
+        return fn(item)
+    except Exception as exc:
+        return {
+            "id": item,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}"[:1000],
+        }
+
+
+def _automation_results_summary(
+    *,
+    job_type: str,
+    results: list[dict],
+    concurrency: int,
+) -> dict:
+    return {
+        "job_type": job_type,
+        "item_count": len(results),
+        "concurrency": concurrency,
+        "succeeded": sum(1 for item in results if item.get("status") in {"synced", "invited", "authorized", "used", "active"}),
+        "skipped": sum(1 for item in results if item.get("status") == "skipped"),
+        "paused": sum(1 for item in results if item.get("status") == "paused"),
+        "failed": sum(1 for item in results if item.get("status") == "failed"),
+        "results": results,
+    }
+
+
+def _bounded_concurrency(value: int) -> int:
+    settings = get_settings()
+    return max(1, min(int(value or 1), settings.worker_max_concurrency))
+
+
+def _active_downstream_slot_count(session: Session, downstream_channel_id: str) -> int:
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(DownstreamCodexPushRecordModel)
+            .where(
+                DownstreamCodexPushRecordModel.downstream_channel_id == downstream_channel_id,
+                DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+            )
+        )
+        or 0
+    )
+
+
+def _mark_downstream_record_used_and_cooldown(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+    now: datetime,
+    reason: str,
+) -> dict:
+    remove_result = _remove_remote_member_for_push_record(session=session, record=record)
+    if not remove_result.get("ok"):
+        record.usage_status = "check_failed"
+        record.error_code = str(remove_result.get("error_code") or "remote_remove_failed")[:200]
+        record.error_message = str(remove_result.get("error_message") or remove_result)[:1000]
+        record.updated_at = now
+        return remove_result
+
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    record.push_status = "used"
+    record.usage_status = "used"
+    record.used_at = now
+    record.updated_at = now
+    if credential is not None:
+        credential.push_lifecycle_status = "used"
+        credential.updated_at = now
+    channel = session.get(DownstreamChannelModel, record.downstream_channel_id)
+    if channel is not None:
+        channel.used_count += 1
+        channel.updated_at = now
+    cooldown_until = datetime.fromtimestamp(now.timestamp() + 72 * 3600, tz=UTC)
+    existing = session.scalars(
+        select(UserAccountCooldownModel).where(
+            UserAccountCooldownModel.user_account_id == record.user_account_id,
+            UserAccountCooldownModel.team_workspace_id == record.team_workspace_id,
+            UserAccountCooldownModel.cooldown_type == "post_usage_remove",
+        )
+    ).first()
+    if existing is None:
+        existing = UserAccountCooldownModel(
+            id=f"user-account-cooldown-{uuid4()}",
+            user_account_id=record.user_account_id,
+            team_workspace_id=record.team_workspace_id,
+            cooldown_type="post_usage_remove",
+            cooldown_until=cooldown_until,
+            reason=reason,
+            source_push_record_id=record.id,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(existing)
+    else:
+        existing.cooldown_until = cooldown_until
+        existing.reason = reason
+        existing.source_push_record_id = record.id
+        existing.updated_at = now
+    session.execute(
+        delete(MembershipModel).where(
+            MembershipModel.user_account_id == record.user_account_id,
+            MembershipModel.team_workspace_id == record.team_workspace_id,
+        )
+    )
+    return remove_result
+
+
+def _remove_remote_member_for_account(
+    *,
+    session: Session,
+    workspace_id: str,
+    user_account_id: str,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, workspace_id)
+    account = session.get(UserAccountModel, user_account_id)
+    auth = session.get(UserAccountAuthModel, user_account_id)
+    if workspace is None or account is None:
+        return {"ok": False, "error_code": "missing_workspace_or_account"}
+    if not workspace.source_admin_session_id:
+        return {"ok": False, "error_code": "workspace_missing_admin_session"}
+    admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+    if admin_session is None or not admin_session.access_token:
+        return {"ok": False, "error_code": "admin_session_missing_access_token"}
+
+    membership = session.scalars(
+        select(MembershipModel).where(
+            MembershipModel.user_account_id == user_account_id,
+            MembershipModel.team_workspace_id == workspace_id,
+        )
+    ).first()
+    if membership is None:
+        membership = MembershipModel(
+            id="",
+            user_account_id=user_account_id,
+            team_workspace_id=workspace_id,
+            membership_status="unknown",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    credentials = session.scalars(
+        select(CodexOAuthCredentialModel).where(
+            CodexOAuthCredentialModel.user_account_id == user_account_id,
+            CodexOAuthCredentialModel.team_workspace_id == workspace_id,
+        )
+    ).all()
+    local_ids = _local_account_remote_user_ids(
+        account=account,
+        auth=auth,
+        membership=membership,
+        credentials=list(credentials),
+    )
+    if not local_ids:
+        return {"ok": False, "error_code": "missing_local_openai_user_id"}
+
+    remote_members = _fetch_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=100,
+    )
+    target_members = [
+        member
+        for member in remote_members
+        if _remote_user_ids(member) & local_ids
+    ]
+    if not target_members:
+        return {
+            "ok": False,
+            "error_code": "remote_member_not_found",
+            "local_user_ids": sorted(local_ids),
+        }
+    return _delete_and_confirm_workspace_member(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        member=target_members[0],
+    )
+
+
+def _delete_and_confirm_workspace_member(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+    member: dict[str, Any],
+) -> dict:
+    results = _delete_workspace_members(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+        members=[member],
+        concurrency=1,
+    )
+    delete_result = results[0] if results else {"ok": False, "error_code": "delete_not_attempted"}
+    if not delete_result.get("ok"):
+        return delete_result
+    deleted_user_id = str(delete_result.get("user_id") or "").strip()
+    confirm_members = _fetch_workspace_members(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+        page_size=100,
+    )
+    still_exists = any(
+        deleted_user_id and deleted_user_id in _remote_user_ids(remote_member)
+        for remote_member in confirm_members
+    )
+    if still_exists:
+        return {
+            **delete_result,
+            "ok": False,
+            "error_code": "remote_member_still_exists",
+            "error_message": "delete returned success but member is still present in remote members list",
+        }
+    return {**delete_result, "confirmed_removed": True}
+
+
+def _remove_remote_member_for_push_record(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, record.team_workspace_id)
+    account = session.get(UserAccountModel, record.user_account_id)
+    auth = session.get(UserAccountAuthModel, record.user_account_id)
+    if workspace is None or account is None:
+        return {"ok": False, "error_code": "missing_workspace_or_account"}
+    if not workspace.source_admin_session_id:
+        return {"ok": False, "error_code": "workspace_missing_admin_session"}
+    admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+    if admin_session is None or not admin_session.access_token:
+        return {"ok": False, "error_code": "admin_session_missing_access_token"}
+    remote_members = _fetch_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=100,
+    )
+    credentials = []
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    if credential is not None:
+        credentials.append(credential)
+    membership = session.scalars(
+        select(MembershipModel).where(
+            MembershipModel.user_account_id == record.user_account_id,
+            MembershipModel.team_workspace_id == record.team_workspace_id,
+        )
+    ).first()
+    if membership is None:
+        membership = MembershipModel(
+            id="",
+            user_account_id=record.user_account_id,
+            team_workspace_id=record.team_workspace_id,
+            membership_status="unknown",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    local_ids = _local_account_remote_user_ids(
+        account=account,
+        auth=auth,
+        membership=membership,
+        credentials=credentials,
+    )
+    target_members = [
+        member
+        for member in remote_members
+        if local_ids and (_remote_user_ids(member) & local_ids)
+    ]
+    if not target_members:
+        return {"ok": False, "error_code": "remote_member_not_found"}
+    results = _delete_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        members=target_members[:1],
+        concurrency=1,
+    )
+    delete_result = results[0] if results else {"ok": False, "error_code": "delete_not_attempted"}
+    if not delete_result.get("ok"):
+        return delete_result
+    deleted_user_id = str(delete_result.get("user_id") or "").strip()
+    confirm_members = _fetch_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=100,
+    )
+    still_exists = any(
+        deleted_user_id and deleted_user_id in _remote_user_ids(member)
+        for member in confirm_members
+    )
+    if still_exists:
+        return {
+            **delete_result,
+            "ok": False,
+            "error_code": "remote_member_still_exists",
+            "error_message": "delete returned success but member is still present in remote members list",
+        }
+    return {**delete_result, "confirmed_removed": True}
+
+
+def _sync_workspace_remote_state_inline(
+    *,
+    session: Session,
+    workspace_id: str,
+    page_size: int,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="team workspace not found")
+    if not workspace.source_admin_session_id:
+        raise HTTPException(status_code=400, detail="workspace missing source admin session")
+    admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+    if admin_session is None:
+        raise HTTPException(status_code=404, detail="team admin session not found")
+    if not admin_session.access_token:
+        raise HTTPException(status_code=400, detail="team admin session missing access_token")
+    safe_page_size = max(1, min(int(page_size or 100), 200))
+    remote_members = _fetch_workspace_members(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=safe_page_size,
+    )
+    remote_invites = _fetch_workspace_invites(
+        access_token=admin_session.access_token,
+        cookie_header=admin_session.cookie_header,
+        account_id=workspace.external_workspace_id,
+        page_size=safe_page_size,
+    )
+    remote_default_seat_count = _workspace_default_seat_count(remote_members)
+    workspace.seats_in_use = remote_default_seat_count
+    workspace.updated_at = datetime.now(UTC)
+    result = _prune_workspace_memberships_by_remote_state(
+        session=session,
+        workspace=workspace,
+        remote_members=remote_members,
+        remote_invites=remote_invites,
+    )
+    return {
+        "team_workspace_id": workspace.id,
+        "external_workspace_id": workspace.external_workspace_id,
+        "remote_member_count": len(remote_members),
+        "remote_default_seat_count": remote_default_seat_count,
+        "remote_invite_count": len(remote_invites),
+        **result,
+    }
+
+
+def _workspace_default_seat_count(remote_members: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for member in remote_members
+        if str(member.get("seat_type") or "").strip().lower() == "default"
+    )
+
+
+def _exclude_workspace_cooldown_accounts(
+    *,
+    session: Session,
+    workspace_id: str,
+    user_account_ids: list[str],
+) -> list[str]:
+    now = datetime.now(UTC)
+    cooldown_ids = set(
+        session.scalars(
+            select(UserAccountCooldownModel.user_account_id).where(
+                UserAccountCooldownModel.team_workspace_id == workspace_id,
+                UserAccountCooldownModel.user_account_id.in_(user_account_ids),
+                UserAccountCooldownModel.cooldown_until > now,
+            )
+        ).all()
+    )
+    return [item for item in user_account_ids if item not in cooldown_ids]
+
+
+def _random_workspace_authorization_candidate(
+    *,
+    session: Session,
+    workspace_id: str,
+) -> str:
+    now = datetime.now(UTC)
+    cooldown_subquery = (
+        select(UserAccountCooldownModel.user_account_id)
+        .where(
+            UserAccountCooldownModel.team_workspace_id == workspace_id,
+            UserAccountCooldownModel.cooldown_until > now,
+        )
+        .subquery()
+    )
+    rows = session.execute(
+        select(MembershipModel.user_account_id, CodexOAuthCredentialModel.id)
+        .join(
+            UserAccountModel,
+            UserAccountModel.id == MembershipModel.user_account_id,
+        )
+        .join(
+            UserAccountAuthModel,
+            UserAccountAuthModel.user_account_id == MembershipModel.user_account_id,
+        )
+        .outerjoin(
+            CodexOAuthCredentialModel,
+            (CodexOAuthCredentialModel.user_account_id == MembershipModel.user_account_id)
+            & (CodexOAuthCredentialModel.team_workspace_id == MembershipModel.team_workspace_id)
+            & (CodexOAuthCredentialModel.push_lifecycle_status.in_(("pending_push", "pushing", "pushed", "used"))),
+        )
+        .where(
+            MembershipModel.team_workspace_id == workspace_id,
+            UserAccountModel.account_status == AccountStatus.ACTIVE.value,
+            ~MembershipModel.user_account_id.in_(select(cooldown_subquery.c.user_account_id)),
+            UserAccountAuthModel.password != "",
+            CodexOAuthCredentialModel.id.is_(None),
+        )
+    ).all()
+    candidates = [str(user_account_id) for user_account_id, credential_id in rows if not credential_id]
+    return random.choice(candidates) if candidates else ""
+
+
+def _mark_credential_pending_push(*, session: Session, credential_id: str) -> None:
+    credential = session.get(CodexOAuthCredentialModel, credential_id)
+    if credential is None:
+        return
+    if credential.push_lifecycle_status not in {"pushing", "pushed", "used"}:
+        credential.push_lifecycle_status = "pending_push"
+        credential.updated_at = datetime.now(UTC)
+
+
+def _handle_candidate_authorization_failed(
+    *,
+    session: Session,
+    workspace_id: str,
+    user_account_id: str,
+    error: str,
+) -> dict:
+    invalidated = False
+    if _is_phone_verification_required_error(error):
+        account = session.get(UserAccountModel, user_account_id)
+        if account is not None:
+            account.account_status = AccountStatus.INVALID.value
+            account.updated_at = datetime.now(UTC)
+            invalidated = True
+    membership = session.scalars(
+        select(MembershipModel).where(
+            MembershipModel.team_workspace_id == workspace_id,
+            MembershipModel.user_account_id == user_account_id,
+        )
+    ).first()
+    if membership is not None:
+        membership.failure_code = "codex_authorization_failed"
+        membership.failure_message = error[:1000]
+        membership.updated_at = datetime.now(UTC)
+    session.commit()
+    remote_delete_result = _remove_remote_member_for_account(
+        session=session,
+        workspace_id=workspace_id,
+        user_account_id=user_account_id,
+    )
+    return {
+        "account_invalidated": invalidated,
+        "remote_delete": remote_delete_result,
+    }
+
+
+def _is_phone_verification_required_error(error: str) -> bool:
+    text_value = str(error or "")
+    return (
+        "phone_verification_required" in text_value
+        or "phone-otp/select-channel" in text_value
+        or "add-phone" in text_value
+        or "phone-number" in text_value
+    )
+
+
+def _acquire_workspace_operation_lock(
+    *,
+    session: Session,
+    workspace_id: str,
+    lock_type: str,
+    locked_by: str,
+    ttl_seconds: int,
+) -> bool:
+    now = datetime.now(UTC)
+    lock = session.scalars(
+        select(WorkspaceOperationLockModel)
+        .where(
+            WorkspaceOperationLockModel.team_workspace_id == workspace_id,
+            WorkspaceOperationLockModel.lock_type == lock_type,
+        )
+        .with_for_update()
+    ).first()
+    locked_until = datetime.fromtimestamp(now.timestamp() + max(60, int(ttl_seconds or 1800)), tz=UTC)
+    if lock is not None and lock.locked_until > now and lock.locked_by != locked_by:
+        session.rollback()
+        return False
+    if lock is None:
+        lock = WorkspaceOperationLockModel(
+            team_workspace_id=workspace_id,
+            lock_type=lock_type,
+            locked_by=locked_by,
+            locked_until=locked_until,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(lock)
+    else:
+        lock.locked_by = locked_by
+        lock.locked_until = locked_until
+        lock.updated_at = now
+    session.commit()
+    return True
+
+
+def _release_workspace_operation_lock(
+    *,
+    session: Session,
+    workspace_id: str,
+    lock_type: str,
+    locked_by: str,
+) -> None:
+    lock = session.get(WorkspaceOperationLockModel, (workspace_id, lock_type))
+    if lock is not None and lock.locked_by == locked_by:
+        session.delete(lock)
+
+
+def _openai_provider() -> OpenAIChatGPTPlugin:
+    settings = get_settings()
+    return OpenAIChatGPTPlugin.from_config(
+        OpenAIChatGPTClientConfig(
+            auth_base_url=settings.openai_auth_base_url,
+            chatgpt_base_url=settings.openai_chatgpt_base_url,
+            probe_path_template=settings.openai_probe_path_template,
+        )
+    )
+
+
+def _mail_provider() -> ExternalMailApiPlugin:
+    settings = get_settings()
+    return ExternalMailApiPlugin.from_config(
+        ExternalMailApiClientConfig(
+            base_url=settings.external_mail_api_base_url,
+            api_key=settings.external_mail_api_key,
+            provider_name=settings.external_mail_provider_name,
+        )
+    )
 
 
 def _create_invite_work_job(*, req: InviteSelectedUsersRequest, session: Session) -> dict:
@@ -1589,6 +4572,7 @@ def list_codex_credentials(session: DbSession) -> list[dict]:
             "external_workspace_id": workspace.external_workspace_id,
             "codex_client_id": credential.codex_client_id,
             "credential_status": credential.credential_status,
+            "push_lifecycle_status": credential.push_lifecycle_status,
             "token_chatgpt_account_id": credential.token_chatgpt_account_id,
             "expires_at": credential.expires_at.isoformat() if credential.expires_at else "",
             "last_heartbeat_status": credential.last_heartbeat_status,
@@ -1622,6 +4606,22 @@ def create_codex_heartbeat_bulk_job(
     return _create_codex_heartbeat_work_job(req=req, session=session)
 
 
+@router.post("/codex-credentials/push-job")
+def create_codex_push_bulk_job(
+    req: PushCodexCredentialsRequest,
+    session: DbSession,
+) -> dict:
+    return _create_codex_push_work_job(req=req, session=session)
+
+
+@router.post("/codex-credentials/push-pending-job")
+def create_pending_codex_push_job(
+    req: PushPendingCodexCredentialsRequest,
+    session: DbSession,
+) -> dict:
+    return _create_pending_codex_push_work_job(req=req, session=session)
+
+
 @router.get("/downstream-channels")
 def list_downstream_channels(session: DbSession) -> list[dict]:
     rows = session.scalars(
@@ -1630,7 +4630,7 @@ def list_downstream_channels(session: DbSession) -> list[dict]:
             DownstreamChannelModel.name,
         )
     ).all()
-    return [_downstream_channel_dict(row) for row in rows]
+    return [_downstream_channel_dict(row, session=session) for row in rows]
 
 
 @router.post("/downstream-channels")
@@ -1654,6 +4654,9 @@ def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSe
         enabled=req.enabled,
         update_existing=req.update_existing,
         timeout_s=max(1, int(req.timeout_s or 30)),
+        max_push_count=max(0, int(req.max_push_count or 0)),
+        max_active_slots=max(0, int(req.max_active_slots)),
+        push_balance=max(0, int(req.push_balance or 0)),
         created_at=now,
         updated_at=now,
     )
@@ -1663,7 +4666,7 @@ def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSe
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail="downstream channel already exists") from exc
-    return _downstream_channel_dict(channel)
+    return _downstream_channel_dict(channel, session=session)
 
 
 @router.patch("/downstream-channels/{channel_id}")
@@ -1698,19 +4701,86 @@ def patch_downstream_channel(
         channel.update_existing = req.update_existing
     if req.timeout_s is not None:
         channel.timeout_s = max(1, int(req.timeout_s or 30))
+    if req.max_push_count is not None:
+        channel.max_push_count = max(0, int(req.max_push_count or 0))
+    if req.max_active_slots is not None:
+        channel.max_active_slots = max(0, int(req.max_active_slots or 0))
+    if req.push_balance is not None:
+        channel.push_balance = max(0, int(req.push_balance or 0))
     channel.updated_at = datetime.now(UTC)
     try:
         session.commit()
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail="downstream channel already exists") from exc
-    return _downstream_channel_dict(channel)
+    return _downstream_channel_dict(channel, session=session)
+
+
+@router.delete("/downstream-channels/{channel_id}")
+def delete_downstream_channel(channel_id: str, session: DbSession) -> dict:
+    channel = session.get(DownstreamChannelModel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="downstream channel not found")
+
+    active_push_count = session.scalar(
+        select(func.count())
+        .select_from(DownstreamCodexPushRecordModel)
+            .where(
+                DownstreamCodexPushRecordModel.downstream_channel_id == channel_id,
+                DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+            )
+    ) or 0
+    if active_push_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"channel has {active_push_count} active pushed/pushing/failed records; delete after usage cleanup or retry release",
+        )
+
+    legacy_allocation_count = session.scalar(
+        text(
+            """
+            SELECT count(*)
+            FROM downstream_credential_allocations
+            WHERE downstream_channel_id = :channel_id
+              AND allocation_status <> 'released'
+            """
+        ),
+        {"channel_id": channel_id},
+    ) or 0
+    if legacy_allocation_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"channel has {legacy_allocation_count} legacy allocations; release them before delete",
+        )
+
+    detached_push_record_count = session.scalar(
+        select(func.count())
+        .select_from(DownstreamCodexPushRecordModel)
+        .where(DownstreamCodexPushRecordModel.downstream_channel_id == channel_id)
+    ) or 0
+
+    session.delete(channel)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="downstream channel is still referenced") from exc
+    return {
+        "id": channel_id,
+        "deleted": True,
+        "detached_push_records_count": detached_push_record_count,
+    }
 
 
 @router.get("/downstream-push-records")
 def list_downstream_push_records(session: DbSession) -> list[dict]:
-    rows = session.scalars(
-        select(DownstreamCodexPushRecordModel).order_by(
+    rows = session.execute(
+        select(DownstreamCodexPushRecordModel, DownstreamChannelModel)
+        .outerjoin(
+            DownstreamChannelModel,
+            DownstreamChannelModel.id == DownstreamCodexPushRecordModel.downstream_channel_id,
+        )
+        .order_by(
             DownstreamCodexPushRecordModel.created_at.desc()
         )
     ).all()
@@ -1718,12 +4788,27 @@ def list_downstream_push_records(session: DbSession) -> list[dict]:
         {
             "id": row.id,
             "batch_item_id": row.batch_item_id,
+            "codex_credential_id": row.codex_credential_id,
+            "downstream_channel_id": row.downstream_channel_id,
+            "downstream_channel_name": channel.name if channel is not None else "",
             "downstream_provider": row.downstream_provider,
             "push_status": row.push_status,
+            "downstream_external_id": row.downstream_external_id,
             "downstream_chatgpt_account_id": row.downstream_chatgpt_account_id,
             "token_chatgpt_account_id": row.token_chatgpt_account_id,
+            "push_attempt_count": row.push_attempt_count,
+            "usage_percent": row.usage_percent,
+            "usage_status": row.usage_status,
+            "last_usage_check_at": row.last_usage_check_at.isoformat()
+            if row.last_usage_check_at
+            else "",
+            "used_at": row.used_at.isoformat() if row.used_at else "",
+            "error_code": row.error_code,
+            "error_message": row.error_message,
+            "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
         }
-        for row in rows
+        for row, channel in rows
     ]
 
 
@@ -1914,7 +4999,10 @@ def list_mail_leases(session: DbSession) -> list[dict]:
     return [{"id": row.id, "email": row.email, "lease_status": row.lease_status} for row in rows]
 
 
-def _downstream_channel_dict(channel: DownstreamChannelModel) -> dict:
+def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Session | None = None) -> dict:
+    active_slots = _active_downstream_slot_count(session, channel.id) if session is not None else 0
+    remaining_slots = max(0, int(channel.max_active_slots or 0) - active_slots)
+    remaining_balance = max(0, int(channel.push_balance or 0))
     return {
         "id": channel.id,
         "provider_type": channel.provider_type,
@@ -1924,6 +5012,16 @@ def _downstream_channel_dict(channel: DownstreamChannelModel) -> dict:
         "enabled": channel.enabled,
         "update_existing": channel.update_existing,
         "timeout_s": channel.timeout_s,
+        "max_push_count": channel.max_push_count,
+        "max_active_slots": channel.max_active_slots,
+        "active_slot_count": active_slots,
+        "remaining_active_slots": remaining_slots,
+        "push_balance": channel.push_balance,
+        "claimed_push_count": channel.claimed_push_count,
+        "pushed_count": channel.pushed_count,
+        "failed_push_count": channel.failed_push_count,
+        "used_count": channel.used_count,
+        "remaining_push_count": min(remaining_slots, remaining_balance),
         "last_test_status": "unknown",
         "last_test_at": "",
         "last_error_code": "",
@@ -1941,6 +5039,44 @@ def _summarize_secret(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+def _automation_schedule_dict(row: AutomationScheduleModel | None) -> dict:
+    if row is None:
+        return {}
+    return {
+        "id": row.id,
+        "schedule_type": row.schedule_type,
+        "schedule_status": row.schedule_status,
+        "enabled": row.enabled,
+        "interval_seconds": row.interval_seconds,
+        "config_json": row.config_json,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else "",
+        "next_run_at": row.next_run_at.isoformat() if row.next_run_at else "",
+        "last_job_id": row.last_job_id,
+        "last_run_status": row.last_run_status,
+        "locked_by": row.locked_by,
+        "locked_until": row.locked_until.isoformat() if row.locked_until else "",
+        "last_error_code": row.last_error_code,
+        "last_error_message": row.last_error_message,
+        "created_by": row.created_by,
+        "created_at": row.created_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+    }
+
+
+def _fixed_automation_schedule_id(schedule_type: str) -> str:
+    mapping = {
+        "automation.workspace_invite_sync": "automation-schedule-workspace-invite-sync",
+        "automation.workspace_authorize": "automation-schedule-workspace-authorize",
+        "automation.codex_heartbeat": "automation-schedule-codex-heartbeat",
+        "automation.downstream_push": "automation-schedule-downstream-push",
+        "automation.downstream_usage_cleanup": "automation-schedule-downstream-usage-cleanup",
+    }
+    schedule_id = mapping.get(schedule_type)
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail=f"unsupported automation schedule type: {schedule_type}")
+    return schedule_id
+
+
 def _workspace_dict(row: TeamWorkspaceModel, *, admin_email: str = "") -> dict:
     return {
         "id": row.id,
@@ -1949,6 +5085,11 @@ def _workspace_dict(row: TeamWorkspaceModel, *, admin_email: str = "") -> dict:
         "name": row.name,
         "plan_type": row.plan_type,
         "seat_limit": row.seat_limit,
+        "seats_in_use": row.seats_in_use,
+        "seats_entitled": row.seats_entitled,
+        "last_subscription_sync_at": row.last_subscription_sync_at.isoformat()
+        if row.last_subscription_sync_at
+        else "",
         "workspace_status": row.workspace_status,
         "source_admin_session_id": row.source_admin_session_id,
         "admin_email": admin_email,
@@ -2271,23 +5412,41 @@ def _prune_workspace_memberships_by_remote_state(
     credentials_by_account: dict[str, list[CodexOAuthCredentialModel]] = {}
     for credential in credentials:
         credentials_by_account.setdefault(credential.user_account_id, []).append(credential)
+    remote_members_by_user_id: dict[str, dict[str, Any]] = {}
+    for member in remote_members:
+        for remote_user_id in _remote_user_ids(member):
+            remote_members_by_user_id.setdefault(remote_user_id, member)
 
     stale_user_account_ids: list[str] = []
     matched_remote_member_count = 0
     matched_remote_invite_count = 0
+    protected_credential_member_count = 0
     for membership, account, auth in rows:
+        account_credentials = credentials_by_account.get(account.id, [])
         local_user_ids = _local_account_remote_user_ids(
             account=account,
             auth=auth,
             membership=membership,
-            credentials=credentials_by_account.get(account.id, []),
+            credentials=account_credentials,
         )
         email = account.email.strip().lower()
-        if local_user_ids and local_user_ids & remote_user_ids:
+        matched_user_ids = local_user_ids & remote_user_ids
+        if matched_user_ids:
+            matched_remote_member = remote_members_by_user_id.get(sorted(matched_user_ids)[0])
+            if matched_remote_member is not None:
+                _write_membership_remote_snapshot(
+                    membership=membership,
+                    account=account,
+                    member=matched_remote_member,
+                    now=now,
+                )
             matched_remote_member_count += 1
             continue
         if email and email in invited_emails:
             matched_remote_invite_count += 1
+            continue
+        if account_credentials:
+            protected_credential_member_count += 1
             continue
         stale_user_account_ids.append(account.id)
 
@@ -2302,6 +5461,7 @@ def _prune_workspace_memberships_by_remote_state(
         "remote_invite_email_count": len(invited_emails),
         "matched_remote_member_count": matched_remote_member_count,
         "matched_remote_invite_count": matched_remote_invite_count,
+        "protected_credential_member_count": protected_credential_member_count,
         "removed_local_count": removed["deleted_membership_count"],
         "deleted_credential_count": removed["deleted_credential_count"],
         "released_batch_item_count": removed["released_batch_item_count"],
@@ -2331,6 +5491,36 @@ def _delete_local_memberships_with_credentials(
         )
     ).all()
     unbound_downstream_count = 0
+    protected_credential_ids: set[str] = set()
+    if credential_ids:
+        protected_credential_ids = set(
+            session.scalars(
+                select(DownstreamCodexPushRecordModel.codex_credential_id).where(
+                    DownstreamCodexPushRecordModel.codex_credential_id.in_(credential_ids)
+                )
+            ).all()
+        )
+        if protected_credential_ids:
+            unbound_downstream_count = session.execute(
+                update(DownstreamCodexPushRecordModel)
+                .where(
+                    DownstreamCodexPushRecordModel.codex_credential_id.in_(
+                        protected_credential_ids
+                    ),
+                    DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed")),
+                )
+                .values(
+                    push_status="used",
+                    usage_status="used",
+                    used_at=now,
+                    updated_at=now,
+                )
+            ).rowcount
+            session.execute(
+                update(CodexOAuthCredentialModel)
+                .where(CodexOAuthCredentialModel.id.in_(protected_credential_ids))
+                .values(push_lifecycle_status="used", updated_at=now)
+            )
     released_batch_item_count = session.execute(
         update(WorkspaceJoinBatchItemModel)
         .where(
@@ -2344,18 +5534,15 @@ def _delete_local_memberships_with_credentials(
             updated_at=now,
         )
     ).rowcount
-    if credential_ids:
-        unbound_downstream_count = session.execute(
-            update(DownstreamCodexPushRecordModel)
-            .where(DownstreamCodexPushRecordModel.codex_credential_id.in_(credential_ids))
-            .values(codex_credential_id=None, membership_id=None, updated_at=now)
-        ).rowcount
-    deleted_credential_count = session.execute(
-        delete(CodexOAuthCredentialModel).where(
-            CodexOAuthCredentialModel.team_workspace_id == workspace_id,
-            CodexOAuthCredentialModel.user_account_id.in_(user_account_ids),
+    delete_credentials_stmt = delete(CodexOAuthCredentialModel).where(
+        CodexOAuthCredentialModel.team_workspace_id == workspace_id,
+        CodexOAuthCredentialModel.user_account_id.in_(user_account_ids),
+    )
+    if protected_credential_ids:
+        delete_credentials_stmt = delete_credentials_stmt.where(
+            ~CodexOAuthCredentialModel.id.in_(protected_credential_ids)
         )
-    ).rowcount
+    deleted_credential_count = session.execute(delete_credentials_stmt).rowcount
     deleted_membership_count = session.execute(
         delete(MembershipModel).where(
             MembershipModel.team_workspace_id == workspace_id,
@@ -2377,7 +5564,11 @@ def _local_account_remote_user_ids(
     membership: MembershipModel,
     credentials: list[CodexOAuthCredentialModel],
 ) -> set[str]:
-    values = {str(account.openai_user_id or "").strip()}
+    values = {
+        str(account.openai_user_id or "").strip(),
+        str(membership.remote_user_id or "").strip(),
+        str(membership.remote_account_user_id or "").strip(),
+    }
     if auth is not None:
         values.update(_jwt_identity_user_ids(auth.access_token))
     values.update(_jwt_identity_user_ids(membership.chatgpt_web_backend_access_token))
@@ -2386,7 +5577,7 @@ def _local_account_remote_user_ids(
         values.add(str(credential.account_id or "").strip())
         values.update(_jwt_identity_user_ids(credential.access_token))
         values.update(_jwt_identity_user_ids(credential.id_token))
-    return {value for value in values if value}
+    return _stable_openai_user_ids(values)
 
 
 def _jwt_identity_user_ids(token: str) -> set[str]:
@@ -2396,7 +5587,10 @@ def _jwt_identity_user_ids(token: str) -> set[str]:
         claims = decode_access_token_claims(token)
     except Exception:
         return set()
-    values = {str(claims.account_id or "").strip()}
+    values = {
+        str(claims.account_id or "").strip(),
+        str(claims.chatgpt_account_user_id or "").strip(),
+    }
     raw = claims.raw if isinstance(claims.raw, dict) else {}
     values.update(
         str(raw.get(key) or "").strip()
@@ -2406,20 +5600,41 @@ def _jwt_identity_user_ids(token: str) -> set[str]:
     if isinstance(auth, dict):
         values.update(
             str(auth.get(key) or "").strip()
-            for key in ("chatgpt_user_id", "user_id", "account_id")
+            for key in ("chatgpt_account_user_id", "chatgpt_user_id", "user_id", "account_id")
         )
-    return {value for value in values if value}
+    return _stable_openai_user_ids(values)
+
+
+def _write_membership_remote_snapshot(
+    *,
+    membership: MembershipModel,
+    account: UserAccountModel,
+    member: dict[str, Any],
+    now: datetime,
+) -> None:
+    remote_user_id = _workspace_member_user_id(member)
+    remote_account_user_id = str(member.get("account_user_id") or member.get("accountUserId") or "").strip()
+    if remote_user_id:
+        membership.remote_user_id = remote_user_id
+        if not account.openai_user_id:
+            account.openai_user_id = remote_user_id
+            account.updated_at = now
+    membership.remote_account_user_id = remote_account_user_id
+    membership.remote_seat_type = str(member.get("seat_type") or "").strip()
+    membership.remote_role = str(member.get("role") or "").strip()
+    membership.remote_synced_at = now
+    membership.updated_at = now
 
 
 def _remote_user_ids(item: dict[str, Any]) -> set[str]:
-    values = {
-        str(item.get(key) or "").strip()
-        for key in ("id", "user_id", "userId", "account_user_id", "accountUserId")
-    }
+    values = set()
+    for key in ("id", "user_id", "userId", "account_user_id", "accountUserId"):
+        values.update(_openai_user_id_candidates(item.get(key)))
     user = item.get("user")
     if isinstance(user, dict):
-        values.update(str(user.get(key) or "").strip() for key in ("id", "user_id", "userId"))
-    return {value for value in values if value}
+        for key in ("id", "user_id", "userId"):
+            values.update(_openai_user_id_candidates(user.get(key)))
+    return _stable_openai_user_ids(values)
 
 
 def _workspace_member_user_id(member: dict[str, Any]) -> str:
@@ -2427,14 +5642,34 @@ def _workspace_member_user_id(member: dict[str, Any]) -> str:
     for value in (
         member.get("user_id"),
         member.get("id"),
-        member.get("account_user_id"),
         user.get("id") if isinstance(user, dict) else "",
         user.get("user_id") if isinstance(user, dict) else "",
+        member.get("account_user_id"),
+        member.get("accountUserId"),
     ):
-        text = str(value or "").strip()
-        if text:
-            return text
+        user_ids = _stable_openai_user_ids(_openai_user_id_candidates(value))
+        if user_ids:
+            return sorted(user_ids)[0]
     return ""
+
+
+def _stable_openai_user_ids(values: set[str] | list[str]) -> set[str]:
+    result: set[str] = set()
+    for value in values:
+        result.update(_openai_user_id_candidates(value))
+    return {value for value in result if value.startswith("user-") and "__" not in value}
+
+
+def _openai_user_id_candidates(value: object) -> set[str]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    values = {text}
+    if "__" in text:
+        prefix = text.split("__", 1)[0].strip()
+        if prefix:
+            values.add(prefix)
+    return values
 
 
 def _workspace_member_email(member: dict[str, Any]) -> str:
@@ -2684,6 +5919,48 @@ def _fetch_accounts_check(
     return payload
 
 
+def _fetch_workspace_subscription(
+    *,
+    access_token: str,
+    cookie_header: str,
+    account_id: str,
+) -> dict[str, Any]:
+    if not account_id:
+        return {}
+    headers = _workspace_api_headers(
+        access_token=access_token,
+        cookie_header=cookie_header,
+        account_id=account_id,
+    )
+    try:
+        with curl_requests.Session(impersonate="chrome136") as client:
+            response = client.get(
+                "https://chatgpt.com/backend-api/subscriptions",
+                params={"account_id": account_id},
+                headers=headers,
+                timeout=30,
+            )
+    except curl_requests.RequestsError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"workspace subscription request failed: {exc}",
+        ) from exc
+    payload = _json_response_or_detail(response)
+    if int(response.status_code or 0) >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "workspace subscription failed",
+                "account_id": account_id,
+                "http_status": response.status_code,
+                "body": payload,
+            },
+        )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="workspace subscription response must be object")
+    return payload
+
+
 def _workspace_account_from_check(raw_check: dict[str, Any], account_id: str) -> dict[str, Any]:
     accounts = raw_check.get("accounts")
     if isinstance(accounts, dict):
@@ -2777,8 +6054,30 @@ def _upsert_workspace_from_admin_source(
         or item.get("displayName")
         or external_id
     )
-    plan_type = str(item.get("plan_type") or item.get("planType") or item.get("plan") or "")
-    seat_limit = _safe_int(item.get("seat_limit") or item.get("seatLimit") or 0)
+    subscription = item.get("_subscription")
+    subscription = subscription if isinstance(subscription, dict) else {}
+    plan_type = str(
+        subscription.get("plan_type")
+        or subscription.get("planType")
+        or item.get("plan_type")
+        or item.get("planType")
+        or item.get("plan")
+        or ""
+    )
+    seat_limit = _safe_int(
+        subscription.get("seats_entitled")
+        or subscription.get("seatsEntitled")
+        or item.get("seat_limit")
+        or item.get("seatLimit")
+        or 0
+    )
+    seats_in_use = _safe_int(
+        subscription.get("seats_in_use")
+        or subscription.get("seatsInUse")
+        or item.get("seats_in_use")
+        or item.get("seatsInUse")
+        or 0
+    )
     workspace = session.scalars(
         select(TeamWorkspaceModel).where(
             TeamWorkspaceModel.provider == "openai_chatgpt",
@@ -2793,9 +6092,12 @@ def _upsert_workspace_from_admin_source(
             name=name,
             plan_type=plan_type,
             seat_limit=seat_limit,
+            seats_in_use=seats_in_use,
+            seats_entitled=seat_limit,
             workspace_status="active",
             source_admin_session_id=source_admin_session_id,
             raw_workspace_json=item,
+            last_subscription_sync_at=now if subscription else None,
             created_at=now,
             updated_at=now,
         )
@@ -2804,9 +6106,12 @@ def _upsert_workspace_from_admin_source(
         workspace.name = name
         workspace.plan_type = plan_type
         workspace.seat_limit = seat_limit
+        workspace.seats_in_use = seats_in_use
+        workspace.seats_entitled = seat_limit
         workspace.workspace_status = "active"
         workspace.source_admin_session_id = source_admin_session_id
         workspace.raw_workspace_json = item
+        workspace.last_subscription_sync_at = now if subscription else workspace.last_subscription_sync_at
         workspace.updated_at = now
     return workspace
 

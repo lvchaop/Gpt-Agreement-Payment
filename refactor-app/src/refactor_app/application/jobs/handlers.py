@@ -21,6 +21,10 @@ from refactor_app.application.workflows.codex_credentials import (
     BuildCodexCredentialWorkInput,
     BuildCodexCredentialWorkItemWorkflow,
 )
+from refactor_app.application.workflows.direct_push import (
+    PushCodexCredentialDirectInput,
+    PushCodexCredentialDirectWorkflow,
+)
 from refactor_app.application.workflows.heartbeat import HeartbeatCodexCredentialWorkflow
 from refactor_app.application.workflows.mail import (
     AllocateMailLeaseWorkflow,
@@ -227,6 +231,12 @@ def register_core_handlers(
         },
     )
     runner.register(
+        "codex_credential.push.bulk",
+        lambda _session, input_json: {
+            "work_count": len(input_json.get("codex_credential_ids") or []),
+        },
+    )
+    runner.register(
         "account.backfill_session_rt",
         lambda _session, input_json: {
             "work_count": len(input_json.get("user_account_ids") or []),
@@ -298,6 +308,20 @@ def register_core_handlers(
                 session_factory=session_factory,
                 openai_provider=_openai_plugin(settings),
             ).run(codex_credential_id=str(input_json["codex_credential_id"]))
+        },
+    )
+    runner.register_work(
+        "codex_credential.push.account",
+        lambda _session, input_json: {
+            "downstream_push_record_id": PushCodexCredentialDirectWorkflow(
+                session_factory=session_factory,
+            ).run(
+                PushCodexCredentialDirectInput(
+                    codex_credential_id=str(input_json["codex_credential_id"]),
+                    downstream_channel_id=str(input_json["downstream_channel_id"]),
+                    request_endpoint=str(input_json.get("request_endpoint") or ""),
+                )
+            )
         },
     )
     runner.register_work(

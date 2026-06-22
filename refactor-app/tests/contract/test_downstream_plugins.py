@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import httpx
@@ -45,11 +46,10 @@ def test_cpa_payload_builder_preserves_workspace_chatgpt_account_id() -> None:
 
 def test_sub2api_payload_builder_sets_update_existing_false_by_default() -> None:
     body = build_sub2api_import_payload(sample_payload())
-    credentials = body["accounts"][0]["credentials"]
+    credentials = json.loads(body["content"])
 
     assert body["update_existing"] is False
-    assert body["accounts"][0]["platform"] == "openai"
-    assert body["accounts"][0]["type"] == "oauth"
+    assert body["name"] == "codex-user@example.test-team.json"
     assert credentials["chatgpt_account_id"] == "workspace-1"
     assert credentials["chatgpt_user_id"] == "chatgpt-user-1"
     assert credentials["client_id"] == "client-1"
@@ -96,7 +96,9 @@ def test_sub2api_client_posts_codex_session_import() -> None:
         assert request.headers["Authorization"] == "Bearer admin-key"
         body = request.read()
         assert b'"update_existing":false' in body
-        assert b'"chatgpt_account_id":"workspace-1"' in body
+        payload = json.loads(body)
+        content = json.loads(payload["content"])
+        assert content["chatgpt_account_id"] == "workspace-1"
         return httpx.Response(200, json={"id": "sub2api-account-1"})
 
     plugin: DownstreamProvider = Sub2ApiDownstreamPlugin(

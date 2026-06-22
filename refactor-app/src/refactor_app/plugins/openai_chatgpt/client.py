@@ -281,6 +281,7 @@ def decode_access_token_claims(access_token: str) -> TokenClaims:
             or payload.get("sub")
             or ""
         ),
+        chatgpt_account_user_id=str(auth_claim.get("chatgpt_account_user_id") or ""),
         raw=payload,
     )
 

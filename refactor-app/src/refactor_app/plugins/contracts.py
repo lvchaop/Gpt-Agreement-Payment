@@ -78,6 +78,7 @@ class MailProvider(PluginContract, Protocol):
 class TokenClaims:
     token_chatgpt_account_id: str
     account_id: str = ""
+    chatgpt_account_user_id: str = ""
     raw: dict = field(default_factory=dict)
 
 

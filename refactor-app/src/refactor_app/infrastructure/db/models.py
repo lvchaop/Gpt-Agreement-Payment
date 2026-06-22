@@ -43,9 +43,12 @@ class TeamWorkspaceModel(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     plan_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
     seat_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seats_in_use: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seats_entitled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     workspace_status: Mapped[str] = mapped_column(Text, nullable=False)
     source_admin_session_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     raw_workspace_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    last_subscription_sync_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
@@ -53,11 +56,41 @@ class TeamWorkspaceModel(Base):
     __table_args__ = (
         CheckConstraint("provider = 'openai_chatgpt'"),
         CheckConstraint("seat_limit >= 0"),
+        CheckConstraint("seats_in_use >= 0"),
+        CheckConstraint("seats_entitled >= 0"),
         CheckConstraint(
             "workspace_status IN ('unknown', 'active', 'disabled', 'expired', 'error')"
         ),
         UniqueConstraint("provider", "external_workspace_id"),
         Index("idx_team_workspaces_status", "workspace_status"),
+    )
+
+
+class WorkspaceAutomationStateModel(Base):
+    __tablename__ = "workspace_automation_states"
+
+    team_workspace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    automation_status: Mapped[str] = mapped_column(Text, nullable=False, default="paused")
+    invite_status: Mapped[str] = mapped_column(Text, nullable=False, default="not_sent")
+    invite_job_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_invite_finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_authorization_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_push_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_usage_cleanup_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    pause_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("automation_status IN ('active', 'paused', 'stopped', 'error')"),
+        CheckConstraint("invite_status IN ('not_sent', 'sent')"),
+        Index("idx_workspace_automation_states_status", "automation_status", "invite_status"),
+        Index("idx_workspace_automation_states_last_invite", "last_invite_finished_at"),
     )
 
 
@@ -190,6 +223,11 @@ class MembershipModel(Base):
     invite_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     seat_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
     can_invite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    remote_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_account_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_seat_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_role: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_synced_at: Mapped[datetime | None] = mapped_column(nullable=True)
     chatgpt_web_backend_access_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     chatgpt_web_backend_id_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     chatgpt_web_backend_access_token_expires_at: Mapped[datetime | None] = mapped_column(
@@ -358,6 +396,7 @@ class CodexOAuthCredentialModel(Base):
     access_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     id_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     refresh_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    push_lifecycle_status: Mapped[str] = mapped_column(Text, nullable=False, default="none")
     expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_refresh_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -374,6 +413,10 @@ class CodexOAuthCredentialModel(Base):
         CheckConstraint(
             "credential_status IN ('active', 'expired', 'refreshing', 'invalid', 'error')"
         ),
+        CheckConstraint(
+            "push_lifecycle_status IN "
+            "('none', 'pending_push', 'pushing', 'pushed', 'used', 'failed', 'blocked')"
+        ),
         CheckConstraint("last_heartbeat_status IN ('unknown', 'ok', 'failed', 'skipped', 'error')"),
         Index("idx_codex_credentials_user_account_id", "user_account_id"),
         Index("idx_codex_credentials_team_workspace_id", "team_workspace_id"),
@@ -388,11 +431,14 @@ class DownstreamCodexPushRecordModel(Base):
     __tablename__ = "downstream_codex_push_records"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
-    batch_item_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("workspace_join_batch_items.id", ondelete="CASCADE"), nullable=False
+    batch_item_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("workspace_join_batch_items.id", ondelete="CASCADE")
     )
-    codex_credential_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("codex_oauth_credentials.id", ondelete="SET NULL")
+    codex_credential_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("codex_oauth_credentials.id", ondelete="CASCADE"), nullable=False
+    )
+    downstream_channel_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("downstream_channels.id", ondelete="SET NULL")
     )
     user_account_id: Mapped[str] = mapped_column(
         Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
@@ -413,17 +459,26 @@ class DownstreamCodexPushRecordModel(Base):
     token_chatgpt_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     codex_token_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     request_endpoint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    push_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usage_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usage_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    last_usage_check_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(nullable=True)
     error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("batch_item_id", "downstream_provider"),
+        UniqueConstraint("codex_credential_id"),
         CheckConstraint("downstream_provider IN ('cpa', 'sub2api')"),
-        CheckConstraint("push_status IN ('pending', 'pushed', 'failed', 'skipped')"),
+        CheckConstraint("push_status IN ('pending', 'pushing', 'pushed', 'failed', 'skipped', 'used')"),
+        CheckConstraint("push_attempt_count >= 0"),
+        CheckConstraint("usage_status IN ('unknown', 'active', 'near_limit', 'used', 'check_failed')"),
+        CheckConstraint("usage_percent >= 0 AND usage_percent <= 100"),
         Index("idx_downstream_push_batch_item_id", "batch_item_id"),
         Index("idx_downstream_push_codex_credential_id", "codex_credential_id"),
+        Index("idx_downstream_push_channel_id", "downstream_channel_id"),
         Index("idx_downstream_push_user_account_id", "user_account_id"),
         Index("idx_downstream_push_team_workspace_id", "team_workspace_id"),
         Index("idx_downstream_push_membership_id", "membership_id"),
@@ -442,14 +497,71 @@ class DownstreamChannelModel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     update_existing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     timeout_s: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    max_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    max_active_slots: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    push_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claimed_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pushed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    used_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
         CheckConstraint("provider_type IN ('sub2api', 'cpa')"),
         CheckConstraint("timeout_s > 0"),
+        CheckConstraint("max_push_count >= 0"),
+        CheckConstraint("max_active_slots >= 0"),
+        CheckConstraint("push_balance >= 0"),
+        CheckConstraint("claimed_push_count >= 0"),
+        CheckConstraint("pushed_count >= 0"),
+        CheckConstraint("failed_push_count >= 0"),
+        CheckConstraint("used_count >= 0"),
         Index("idx_downstream_channels_provider_type", "provider_type"),
         Index("idx_downstream_channels_enabled", "enabled"),
+    )
+
+
+class UserAccountCooldownModel(Base):
+    __tablename__ = "user_account_cooldowns"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_account_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    team_workspace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    cooldown_type: Mapped[str] = mapped_column(Text, nullable=False)
+    cooldown_until: Mapped[datetime] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source_push_record_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_account_id", "team_workspace_id", "cooldown_type"),
+        CheckConstraint("cooldown_type IN ('post_usage_remove')"),
+        Index("idx_user_account_cooldowns_account_workspace", "user_account_id", "team_workspace_id"),
+        Index("idx_user_account_cooldowns_until", "cooldown_until"),
+    )
+
+
+class WorkspaceOperationLockModel(Base):
+    __tablename__ = "workspace_operation_locks"
+
+    team_workspace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    lock_type: Mapped[str] = mapped_column(Text, primary_key=True)
+    locked_by: Mapped[str] = mapped_column(Text, nullable=False)
+    locked_until: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("lock_type IN ('codex_fill', 'workspace_mutation')"),
+        Index("idx_workspace_operation_locks_until", "locked_until"),
     )
 
 
@@ -559,6 +671,45 @@ class JobModel(Base):
         CheckConstraint("job_status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')"),
         Index("idx_jobs_status_priority", "job_status", "priority", "created_at"),
         Index("idx_jobs_type", "type"),
+    )
+
+
+class AutomationScheduleModel(Base):
+    __tablename__ = "automation_schedules"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    schedule_type: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule_status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    last_run_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_job_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_run_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    locked_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    locked_until: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("schedule_type"),
+        CheckConstraint(
+            "schedule_type IN ("
+            "'automation.workspace_invite_sync', "
+            "'automation.workspace_authorize', "
+            "'automation.codex_heartbeat', "
+            "'automation.downstream_push', "
+            "'automation.downstream_usage_cleanup'"
+            ")"
+        ),
+        CheckConstraint("schedule_status IN ('active', 'paused', 'error')"),
+        CheckConstraint("interval_seconds >= 5"),
+        Index("idx_automation_schedules_due", "enabled", "schedule_status", "next_run_at"),
+        Index("idx_automation_schedules_type", "schedule_type"),
     )
 
 

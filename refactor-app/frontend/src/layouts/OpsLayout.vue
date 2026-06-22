@@ -9,6 +9,8 @@ const store = useOpsStore();
 const nav = [
   { to: "/", label: "总览" },
   { to: "/jobs", label: "任务" },
+  { to: "/automation-scheduler", label: "自动化调度" },
+  { to: "/automation-flow", label: "自动化流水" },
   { to: "/accounts", label: "账号" },
   { to: "/team-workspaces", label: "团队空间" },
   { to: "/memberships", label: "空间成员" },
@@ -16,6 +18,7 @@ const nav = [
   { to: "/codex-credentials", label: "Codex 授权" },
   { to: "/proxy", label: "代理" },
   { to: "/mail", label: "邮箱" },
+  { to: "/downstream-channels", label: "下游渠道" },
   { to: "/downstream", label: "下游推送" },
 ];
 </script>

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { useRouter } from "vue-router";
 
 import type { Column } from "../components/DataTable.vue";
 import ResourcePage from "../components/ResourcePage.vue";
@@ -7,6 +8,9 @@ import { resourcesApi, type Row } from "../api/resources";
 import { useOpsStore } from "../stores/ops";
 
 const store = useOpsStore();
+const router = useRouter();
+const pendingPushLimit = ref(1);
+const pendingPushConcurrency = ref(5);
 const form = ref({
   provider_type: "sub2api",
   name: "",
@@ -15,6 +19,8 @@ const form = ref({
   enabled: true,
   update_existing: true,
   timeout_s: 30,
+  max_active_slots: 2,
+  push_balance: 0,
 });
 
 const columns: Column[] = [
@@ -25,6 +31,15 @@ const columns: Column[] = [
   { key: "enabled", label: "启用", badge: true },
   { key: "update_existing", label: "更新已有", badge: true },
   { key: "timeout_s", label: "超时" },
+  { key: "max_active_slots", label: "同时占用上限" },
+  { key: "active_slot_count", label: "当前占用" },
+  { key: "remaining_active_slots", label: "剩余坑位" },
+  { key: "push_balance", label: "推送余额" },
+  { key: "remaining_push_count", label: "本轮可推" },
+  { key: "claimed_push_count", label: "已消耗余额" },
+  { key: "pushed_count", label: "成功" },
+  { key: "failed_push_count", label: "失败" },
+  { key: "used_count", label: "已使用" },
   { key: "updated_at", label: "更新时间", mono: true, summary: 28 },
 ];
 
@@ -58,6 +73,45 @@ async function toggleEnabled(row: Row, reload: () => Promise<void>) {
     await reload();
   } catch (err) {
     store.toast("更新失败", String((err as Error).message ?? err), "error");
+  }
+}
+
+async function pushPending(row: Row) {
+  const id = String(row.id || "");
+  if (!id) return;
+  try {
+    const result = await resourcesApi.pushPendingCredentials({
+      downstream_channel_id: id,
+      limit: pendingPushLimit.value,
+      concurrency: pendingPushConcurrency.value,
+      created_by: "ops-ui-channel",
+    });
+    store.toast(
+      "待推送凭证已推送",
+      `work=${result.work_count} 成功=${result.succeeded} 失败=${result.failed}`,
+      result.failed > 0 ? "warning" : "success",
+    );
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("推送失败", String((err as Error).message ?? err), "error");
+  }
+}
+
+async function deleteChannel(row: Row, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  if (!id) return;
+  const name = String(row.name || id);
+  if (!window.confirm(`确认删除下游渠道：${name}？`)) return;
+  try {
+    const result = await resourcesApi.deleteDownstreamChannel(id);
+    store.toast(
+      "渠道已删除",
+      `已解绑推送记录 ${String(result.detached_push_records_count ?? 0)} 条`,
+      "success",
+    );
+    await reload();
+  } catch (err) {
+    store.toast("删除失败", String((err as Error).message ?? err), "error");
   }
 }
 
@@ -101,6 +155,14 @@ async function toggleEnabled(row: Row, reload: () => Promise<void>) {
             <span>超时秒</span>
             <input v-model.number="form.timeout_s" type="number" min="1" />
           </label>
+          <label>
+            <span>同时占用上限</span>
+            <input v-model.number="form.max_active_slots" type="number" min="0" />
+          </label>
+          <label>
+            <span>推送余额</span>
+            <input v-model.number="form.push_balance" type="number" min="0" />
+          </label>
           <label class="check">
             <input v-model="form.enabled" type="checkbox" />
             <span>启用</span>
@@ -112,10 +174,32 @@ async function toggleEnabled(row: Row, reload: () => Promise<void>) {
           <button class="btn primary" @click="createChannel(reload)">新增渠道</button>
         </div>
       </div>
+      <div class="action-card">
+        <div>
+          <h2>待推送处理</h2>
+          <p>推送需要同时满足：还有推送余额、当前占用小于同时占用上限。开始推送即消耗余额。</p>
+        </div>
+        <div class="form-grid">
+          <label>
+            <span>默认推送数量</span>
+            <input v-model.number="pendingPushLimit" type="number" min="1" />
+          </label>
+          <label>
+            <span>默认并发</span>
+            <input v-model.number="pendingPushConcurrency" type="number" min="1" max="500" />
+          </label>
+        </div>
+      </div>
     </template>
     <template #rowActions="{ row, reload }">
       <button class="btn compact-action" @click="toggleEnabled(row, reload)">
         {{ row.enabled ? "禁用" : "启用" }}
+      </button>
+      <button class="btn compact-action primary" @click="pushPending(row)">
+        推送待推送
+      </button>
+      <button class="btn compact-action danger" @click="deleteChannel(row, reload)">
+        删除
       </button>
     </template>
   </ResourcePage>

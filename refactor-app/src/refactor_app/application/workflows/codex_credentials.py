@@ -7,16 +7,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from refactor_app.application.workflows.account_auth import _active_proxy, _proxy_url
 from refactor_app.domain.enums import CredentialStatus
+from refactor_app.infrastructure.db.models import MembershipModel
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
 from refactor_app.plugins.contracts import OpenAIChatGPTProvider
 from refactor_app.plugins.mail_external_api.plugin import ExternalMailApiPlugin
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
     acquire_codex_rt_with_browser_login,
-    acquire_codex_rt_with_existing_browser_session,
 )
 
 
@@ -71,8 +72,8 @@ class BuildCodexCredentialWorkflow:
                 raise CodexCredentialWorkflowError("missing_user_account")
             if auth is None:
                 raise CodexCredentialWorkflowError("missing_auth")
-            if not (auth.cookie_header or auth.auth_cookie_header):
-                raise CodexCredentialWorkflowError("missing_session_cookie")
+            if not auth.password:
+                raise CodexCredentialWorkflowError("missing_password")
             if workspace is None or not workspace.external_workspace_id:
                 raise CodexCredentialWorkflowError("missing_workspace")
 
@@ -92,26 +93,15 @@ class BuildCodexCredentialWorkflow:
                 return existing.id
 
         proxy_url = self._active_proxy_url(input_.user_account_id)
-        result = acquire_codex_rt_with_existing_browser_session(
-            cookie_header=auth.cookie_header or "",
-            auth_cookie_header=auth.auth_cookie_header or "",
+        result = acquire_codex_rt_with_browser_login(
+            email=user.email,
+            password=auth.password,
+            mail_provider=self._mail_provider,
             proxy=proxy_url,
             codex_client_id=input_.codex_client_id,
             target_workspace_id=workspace.external_workspace_id,
             target_workspace_name=workspace.name,
         )
-        if not result.ok:
-            if not auth.password:
-                raise CodexCredentialWorkflowError(_result_error(result))
-            result = acquire_codex_rt_with_browser_login(
-                email=user.email,
-                password=auth.password,
-                mail_provider=self._mail_provider,
-                proxy=proxy_url,
-                codex_client_id=input_.codex_client_id,
-                target_workspace_id=workspace.external_workspace_id,
-                target_workspace_name=workspace.name,
-            )
         if not result.ok:
             raise CodexCredentialWorkflowError(_result_error(result))
         if not result.access_token:
@@ -127,6 +117,9 @@ class BuildCodexCredentialWorkflow:
         expires_at = _jwt_expires_at(result.access_token)
         now = datetime.now(UTC)
         with UnitOfWork(self._session_factory) as uow:
+            current_user = uow.user_accounts.get(input_.user_account_id)
+            if current_user is None:
+                raise CodexCredentialWorkflowError("missing_user_account")
             credential = uow.codex_oauth_credentials.upsert_from_values(
                 {
                     "id": f"codex-credential-{uuid4()}",
@@ -147,6 +140,22 @@ class BuildCodexCredentialWorkflow:
                     "updated_at": now,
                 }
             )
+            membership = uow.session.scalars(
+                select(MembershipModel).where(
+                    MembershipModel.user_account_id == input_.user_account_id,
+                    MembershipModel.team_workspace_id == input_.team_workspace_id,
+                )
+            ).first()
+            if membership is not None and claims.chatgpt_account_user_id:
+                membership.remote_user_id = claims.chatgpt_account_user_id
+                membership.remote_synced_at = now
+                membership.updated_at = now
+            if (
+                current_user.openai_user_id != claims.chatgpt_account_user_id
+                and claims.chatgpt_account_user_id
+            ):
+                current_user.openai_user_id = claims.chatgpt_account_user_id
+                current_user.updated_at = now
             return credential.id
 
     def _active_proxy_url(self, user_account_id: str) -> str:
