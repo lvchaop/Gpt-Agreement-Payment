@@ -206,7 +206,7 @@ class OpenAIChatGPTClient:
             proxy_url=proxy_url,
             stream=True,
         )
-        _assert_codex_stream_completed(response)
+        _assert_codex_heartbeat_http_ok(response)
         return {"status": "ok", "token_chatgpt_account_id": claims.token_chatgpt_account_id}
 
     def _chatgpt_post(
@@ -359,7 +359,7 @@ def _codex_responses_headers(*, access_token: str, team_id: str) -> dict[str, st
     }
 
 
-def _assert_codex_stream_completed(response) -> None:
+def _assert_codex_heartbeat_http_ok(response) -> None:
     try:
         status_code = int(getattr(response, "status_code", 0) or 0)
         if not (200 <= status_code < 300):
@@ -367,42 +367,6 @@ def _assert_codex_stream_completed(response) -> None:
             raise OpenAIChatGPTClientError(
                 f"codex heartbeat failed: http_status={status_code} body_snippet={body[:500]}"
             )
-        for raw in response.iter_lines():
-            if not raw:
-                continue
-            line = (
-                raw.decode(errors="replace").strip()
-                if isinstance(raw, bytes)
-                else str(raw).strip()
-            )
-            if not line.startswith("data:"):
-                continue
-            data_s = line.split(":", 1)[1].strip()
-            if data_s == "[DONE]":
-                raise OpenAIChatGPTClientError("codex stream ended before response.completed")
-            try:
-                data = json.loads(data_s)
-            except json.JSONDecodeError:
-                continue
-            event_type = str(data.get("type") or "")
-            if event_type in ("response.completed", "response.done"):
-                return
-            if event_type == "response.failed":
-                response_body = (
-                    data.get("response") if isinstance(data.get("response"), dict) else {}
-                )
-                error = (
-                    response_body.get("error")
-                    if isinstance(response_body.get("error"), dict)
-                    else {}
-                )
-                message = str(error.get("message") or "OpenAI response failed")
-                raise OpenAIChatGPTClientError(message[:500])
-            if event_type == "error":
-                error = data.get("error") if isinstance(data.get("error"), dict) else {}
-                message = str(error.get("message") or "Unknown error")
-                raise OpenAIChatGPTClientError(message[:500])
-        raise OpenAIChatGPTClientError("codex stream ended before response.completed")
     finally:
         close = getattr(response, "close", None)
         if callable(close):

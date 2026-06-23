@@ -52,6 +52,7 @@ from refactor_app.infrastructure.db.models import (
     DownstreamChannelModel,
     DownstreamCodexPushRecordModel,
     ExternalMailLeaseModel,
+    JobEventModel,
     JobModel,
     JobRunModel,
     MembershipModel,
@@ -301,6 +302,15 @@ class AutomationDownstreamUsageCleanupRequest(BaseModel):
     record_limit: int = 100
     record_concurrency: int = 10
     threshold_percent: int = 95
+
+
+class MonitorDownstreamUsageProbeRequest(BaseModel):
+    downstream_push_record_ids: list[str] = []
+    downstream_channel_id: str = ""
+    limit: int = 100
+    concurrency: int = 5
+    threshold_percent: int = 95
+    persist_result: bool = True
 
 
 class RepushDownstreamRecordsRequest(BaseModel):
@@ -1743,6 +1753,117 @@ def list_automation_schedules(session: DbSession) -> list[dict]:
     return [_automation_schedule_dict(row) for row in rows]
 
 
+@router.get("/automation/monitor/jobs")
+def get_automation_monitor_jobs(session: DbSession) -> dict:
+    schedules = session.scalars(
+        select(AutomationScheduleModel).order_by(
+            AutomationScheduleModel.schedule_type.asc(),
+            AutomationScheduleModel.created_at.asc(),
+        )
+    ).all()
+    return {"items": [_automation_monitor_job_dict(session=session, schedule=row) for row in schedules]}
+
+
+@router.get("/automation/monitor/job-console")
+def get_automation_monitor_job_console(
+    session: DbSession,
+    schedule_type: str = "",
+    job_id: str = "",
+    run_id: str = "",
+    level: str = "",
+    limit: int = 1000,
+    max_bytes: int = 524288,
+) -> dict:
+    safe_limit = max(1, min(int(limit or 1000), 5000))
+    safe_max_bytes = max(4096, min(int(max_bytes or 524288), 2 * 1024 * 1024))
+    stmt = select(JobEventModel, JobRunModel, JobModel).join(
+        JobRunModel,
+        JobRunModel.id == JobEventModel.run_id,
+    ).join(
+        JobModel,
+        JobModel.id == JobRunModel.job_id,
+    )
+    if run_id.strip():
+        stmt = stmt.where(JobEventModel.run_id == run_id.strip())
+    if job_id.strip():
+        stmt = stmt.where(JobModel.id == job_id.strip())
+    if schedule_type.strip():
+        stmt = stmt.where(JobModel.type == schedule_type.strip())
+    if level.strip() and level.strip().upper() != "ALL":
+        stmt = stmt.where(JobEventModel.level == level.strip().upper())
+    rows = session.execute(stmt.order_by(JobEventModel.ts.desc()).limit(safe_limit)).all()
+    items = [
+        _automation_console_event_dict(event=event, run=run, job=job)
+        for event, run, job in reversed(rows)
+    ]
+    limited_items, returned_bytes, truncated = _limit_console_items_by_bytes(
+        items=items,
+        max_bytes=safe_max_bytes,
+    )
+    return {
+        "items": limited_items,
+        "truncated": truncated,
+        "returned_count": len(limited_items),
+        "returned_bytes": returned_bytes,
+        "max_bytes": safe_max_bytes,
+        "limit": safe_limit,
+    }
+
+
+@router.post("/automation/monitor/downstream-usage-probe")
+def probe_monitor_downstream_usage(
+    req: MonitorDownstreamUsageProbeRequest,
+    session: DbSession,
+) -> dict:
+    return _run_monitor_downstream_usage_probe(req=req, session=session)
+
+
+@router.get("/automation/monitor/downstream-usage")
+def list_monitor_downstream_usage(
+    session: DbSession,
+    downstream_channel_id: str = "",
+    usage_status: str = "",
+    provider_type: str = "",
+    q: str = "",
+    limit: int = 500,
+) -> dict:
+    stmt = select(DownstreamCodexPushRecordModel).where(
+        DownstreamCodexPushRecordModel.push_status == "pushed",
+    )
+    if downstream_channel_id.strip():
+        stmt = stmt.where(DownstreamCodexPushRecordModel.downstream_channel_id == downstream_channel_id.strip())
+    if usage_status.strip():
+        stmt = stmt.where(DownstreamCodexPushRecordModel.usage_status == usage_status.strip())
+    if provider_type.strip():
+        stmt = stmt.where(DownstreamCodexPushRecordModel.downstream_provider == provider_type.strip())
+    rows = session.scalars(
+        stmt.order_by(DownstreamCodexPushRecordModel.updated_at.desc()).limit(
+            max(1, min(int(limit or 500), 2000))
+        )
+    ).all()
+    items = [_monitor_usage_record_dict(session=session, record=row) for row in rows]
+    query = q.strip().lower()
+    if query:
+        items = [
+            item for item in items
+            if query in " ".join(str(item.get(key) or "").lower() for key in (
+                "id",
+                "codex_credential_id",
+                "user_account_id",
+                "email",
+                "team_workspace_id",
+                "workspace_name",
+                "external_workspace_id",
+                "downstream_channel_name",
+                "error_code",
+            ))
+        ]
+    return {
+        "summary": _monitor_usage_summary(items),
+        "items": items,
+    }
+
+
 @router.post("/automation/schedules")
 def create_automation_schedule(
     req: CreateAutomationScheduleRequest,
@@ -2145,6 +2266,141 @@ def _run_downstream_usage_sweep(
         "failed_count": failed_count,
         "threshold_percent": threshold,
         "usage_source": "chatgpt_codex_response_headers",
+    }
+
+
+def _run_monitor_downstream_usage_probe(
+    *,
+    req: MonitorDownstreamUsageProbeRequest,
+    session: Session,
+) -> dict:
+    threshold = max(1, min(int(req.threshold_percent or 95), 100))
+    requested_ids = [item.strip() for item in req.downstream_push_record_ids if item.strip()]
+    stmt = select(DownstreamCodexPushRecordModel.id).where(
+        DownstreamCodexPushRecordModel.push_status == "pushed",
+    )
+    if requested_ids:
+        stmt = stmt.where(DownstreamCodexPushRecordModel.id.in_(requested_ids))
+    if req.downstream_channel_id.strip():
+        stmt = stmt.where(
+            DownstreamCodexPushRecordModel.downstream_channel_id == req.downstream_channel_id.strip()
+        )
+    record_ids = [
+        str(item)
+        for item in session.scalars(
+            stmt.order_by(DownstreamCodexPushRecordModel.updated_at.asc()).limit(
+                max(1, min(int(req.limit or 100), 1000))
+            )
+        ).all()
+    ]
+    session_factory = _session_factory_from(session)
+    concurrency = _bounded_concurrency(req.concurrency)
+    items = _parallel_map(
+        items=record_ids,
+        max_workers=concurrency,
+        fn=lambda record_id: _probe_monitor_downstream_usage_record(
+            session_factory=session_factory,
+            record_id=record_id,
+            threshold=threshold,
+            persist_result=req.persist_result,
+        ),
+    )
+    return {
+        "checked": len(items),
+        "succeeded": sum(1 for item in items if item.get("probe_ok")),
+        "failed": sum(1 for item in items if not item.get("probe_ok")),
+        "threshold_percent": threshold,
+        "concurrency": concurrency,
+        "persist_result": req.persist_result,
+        "items": items,
+    }
+
+
+def _probe_monitor_downstream_usage_record(
+    *,
+    session_factory,
+    record_id: str,
+    threshold: int,
+    persist_result: bool,
+) -> dict:
+    with session_factory() as session:
+        record = session.get(DownstreamCodexPushRecordModel, record_id)
+        if record is None or record.push_status != "pushed":
+            return {
+                "id": record_id,
+                "probe_ok": False,
+                "probe_error_code": "record_not_pushed",
+                "probe_error_message": "downstream push record not found or not pushed",
+            }
+        probe = _probe_downstream_record_usage(session=session, record=record)
+        if persist_result:
+            if probe.ok:
+                _apply_usage_probe_success(
+                    record=record,
+                    result=probe,
+                    threshold=threshold,
+                    now=datetime.now(UTC),
+                )
+            else:
+                _apply_usage_probe_failure(
+                    record=record,
+                    result=probe,
+                    now=datetime.now(UTC),
+                )
+            session.commit()
+            session.refresh(record)
+        item = _monitor_usage_record_dict(session=session, record=record)
+        item.update(
+            {
+                "probe_ok": probe.ok,
+                "probe_error_code": probe.error_code,
+                "probe_error_message": probe.error_message,
+                "raw_headers": probe.raw_headers,
+            }
+        )
+        return item
+
+
+def _monitor_usage_record_dict(*, session: Session, record: DownstreamCodexPushRecordModel) -> dict:
+    channel = session.get(DownstreamChannelModel, record.downstream_channel_id) if record.downstream_channel_id else None
+    user = session.get(UserAccountModel, record.user_account_id)
+    workspace = session.get(TeamWorkspaceModel, record.team_workspace_id)
+    return {
+        "id": record.id,
+        "codex_credential_id": record.codex_credential_id,
+        "user_account_id": record.user_account_id,
+        "email": user.email if user is not None else "",
+        "team_workspace_id": record.team_workspace_id,
+        "workspace_name": workspace.name if workspace is not None else "",
+        "external_workspace_id": workspace.external_workspace_id if workspace is not None else "",
+        "downstream_channel_id": record.downstream_channel_id,
+        "downstream_channel_name": channel.name if channel is not None else "",
+        "downstream_provider": record.downstream_provider,
+        "push_status": record.push_status,
+        "usage_percent": record.usage_percent,
+        "usage_status": record.usage_status,
+        "last_usage_check_at": record.last_usage_check_at.isoformat() if record.last_usage_check_at else "",
+        "downstream_chatgpt_account_id": record.downstream_chatgpt_account_id,
+        "token_chatgpt_account_id": record.token_chatgpt_account_id,
+        "push_attempt_count": record.push_attempt_count,
+        "error_code": record.error_code,
+        "error_message": record.error_message,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
+
+
+def _monitor_usage_summary(items: list[dict]) -> dict:
+    return {
+        "total": len(items),
+        "active": sum(1 for item in items if item.get("usage_status") == "active"),
+        "near_limit": sum(1 for item in items if item.get("usage_status") == "near_limit"),
+        "check_failed": sum(1 for item in items if item.get("usage_status") == "check_failed"),
+        "unknown": sum(1 for item in items if item.get("usage_status") == "unknown"),
+        "used": sum(1 for item in items if item.get("usage_status") == "used"),
+        "below_80": sum(1 for item in items if int(item.get("usage_percent") or 0) < 80),
+        "between_80_94": sum(1 for item in items if 80 <= int(item.get("usage_percent") or 0) < 95),
+        "gte_95": sum(1 for item in items if int(item.get("usage_percent") or 0) >= 95),
     }
 
 
@@ -5258,6 +5514,97 @@ def _automation_schedule_dict(row: AutomationScheduleModel | None) -> dict:
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
     }
+
+
+def _automation_monitor_job_dict(*, session: Session, schedule: AutomationScheduleModel) -> dict:
+    job = session.get(JobModel, schedule.last_job_id) if schedule.last_job_id else None
+    run = None
+    if job is not None:
+        run = session.scalars(
+            select(JobRunModel)
+            .where(JobRunModel.job_id == job.id)
+            .order_by(JobRunModel.started_at.desc().nullslast())
+            .limit(1)
+        ).first()
+    work_summary = (
+        _work_summary(session, job.id)
+        if job is not None
+        else {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
+    )
+    output = run.output_json if run is not None and isinstance(run.output_json, dict) else {}
+    started_at = run.started_at if run is not None else None
+    finished_at = run.finished_at if run is not None else None
+    duration_ms = (
+        int((finished_at - started_at).total_seconds() * 1000)
+        if started_at is not None and finished_at is not None
+        else 0
+    )
+    return {
+        **_automation_schedule_dict(schedule),
+        "last_job_status": job.job_status if job is not None else "",
+        "last_run_id": run.id if run is not None else "",
+        "last_started_at": started_at.isoformat() if started_at else "",
+        "last_finished_at": finished_at.isoformat() if finished_at else "",
+        "duration_ms": duration_ms,
+        "item_count": int(output.get("item_count") or output.get("work_count") or sum(work_summary.values())),
+        "succeeded": int(output.get("succeeded") or work_summary["succeeded"]),
+        "failed": int(output.get("failed") or work_summary["failed"]),
+        "skipped": int(output.get("skipped") or 0),
+        "paused": int(output.get("paused") or 0),
+        "queued": work_summary["queued"],
+        "running": work_summary["running"],
+        "cancelled": work_summary["cancelled"],
+        "output_json": output,
+    }
+
+
+def _automation_console_event_dict(
+    *,
+    event: JobEventModel,
+    run: JobRunModel,
+    job: JobModel,
+) -> dict:
+    data_json = event.data_json if isinstance(event.data_json, dict) else {}
+    return {
+        "id": event.id,
+        "job_id": job.id,
+        "job_type": job.type,
+        "run_id": run.id,
+        "ts": event.ts.isoformat(),
+        "level": event.level,
+        "event_type": event.event_type,
+        "message": event.message,
+        "data_json": data_json,
+        "data_summary": _summarize_json(data_json, max_chars=500),
+    }
+
+
+def _limit_console_items_by_bytes(*, items: list[dict], max_bytes: int) -> tuple[list[dict], int, bool]:
+    selected: list[dict] = []
+    total = 0
+    truncated = False
+    for item in reversed(items):
+        encoded_size = len(json.dumps(item, ensure_ascii=False, default=str).encode("utf-8"))
+        if selected and total + encoded_size > max_bytes:
+            truncated = True
+            break
+        if encoded_size > max_bytes:
+            compact = {**item, "data_json": {}, "data_summary": item.get("data_summary", "")}
+            encoded_size = len(json.dumps(compact, ensure_ascii=False, default=str).encode("utf-8"))
+            item = compact
+        selected.append(item)
+        total += encoded_size
+    selected.reverse()
+    return selected, total, truncated or len(selected) < len(items)
+
+
+def _summarize_json(value: Any, *, max_chars: int) -> str:
+    if value in ({}, [], "", None):
+        return ""
+    text_value = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text_value) <= max_chars:
+        return text_value
+    return f"{text_value[:max_chars]}..."
 
 
 def _fixed_automation_schedule_id(schedule_type: str) -> str:

@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 
 import AccountsView from "../views/AccountsView.vue";
 import AutomationFlowView from "../views/AutomationFlowView.vue";
+import AutomationMonitorView from "../views/AutomationMonitorView.vue";
 import AutomationSchedulerView from "../views/AutomationSchedulerView.vue";
 import BatchDetailView from "../views/BatchDetailView.vue";
 import CodexCredentialsView from "../views/CodexCredentialsView.vue";
@@ -23,6 +24,7 @@ export const router = createRouter({
     { path: "/jobs", component: JobsView, name: "jobs" },
     { path: "/jobs/:jobId", component: JobTraceView, name: "job-trace" },
     { path: "/automation-scheduler", component: AutomationSchedulerView, name: "automation-scheduler" },
+    { path: "/automation-monitor", component: AutomationMonitorView, name: "automation-monitor" },
     { path: "/automation-flow", component: AutomationFlowView, name: "automation-flow" },
     { path: "/accounts", component: AccountsView, name: "accounts" },
     { path: "/team-workspaces", component: TeamWorkspacesView, name: "team-workspaces" },

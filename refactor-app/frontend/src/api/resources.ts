@@ -114,4 +114,30 @@ export const resourcesApi = {
     patchJson<Row>(`/automation/schedules/${encodeURIComponent(id)}`, body),
   runAutomationScheduleNow: (id: string) =>
     postJson<Row>(`/automation/schedules/${encodeURIComponent(id)}/run-now`, {}),
+  automationMonitorJobs: () => getJson<{ items: Row[] }>("/automation/monitor/jobs"),
+  automationMonitorConsole: (params: Record<string, string | number> = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => String(value).trim() !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return getJson<{ items: Row[]; truncated: boolean; returned_count: number; returned_bytes: number; max_bytes: number }>(
+      `/automation/monitor/job-console${query ? `?${query}` : ""}`,
+    );
+  },
+  automationMonitorDownstreamUsage: (params: Record<string, string | number> = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => String(value).trim() !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return getJson<{ summary: Row; items: Row[] }>(
+      `/automation/monitor/downstream-usage${query ? `?${query}` : ""}`,
+    );
+  },
+  automationMonitorDownstreamUsageProbe: (body: Record<string, unknown>) =>
+    postJson<{ checked: number; succeeded: number; failed: number; items: Row[] }>(
+      "/automation/monitor/downstream-usage-probe",
+      body,
+    ),
 };

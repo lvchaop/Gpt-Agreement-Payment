@@ -10,6 +10,7 @@ const nav = [
   { to: "/", label: "总览" },
   { to: "/jobs", label: "任务" },
   { to: "/automation-scheduler", label: "自动化调度" },
+  { to: "/automation-monitor", label: "自动化监控" },
   { to: "/automation-flow", label: "自动化流水" },
   { to: "/accounts", label: "账号" },
   { to: "/team-workspaces", label: "团队空间" },
