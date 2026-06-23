@@ -135,7 +135,7 @@ class ExternalMailApiClient:
             min_message_ts = 0.0
             since_minutes = 10
             if issued_after:
-                min_message_ts = max(0.0, float(issued_after) - 30.0)
+                min_message_ts = max(0.0, float(issued_after) - 60.0)
                 elapsed_from_threshold = max(0.0, time() - min_message_ts)
                 since_minutes = max(1, int(math.ceil(elapsed_from_threshold / 60.0)) + 1)
 

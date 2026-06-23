@@ -2486,6 +2486,21 @@ def _reauthorize_codex_credential_for_record(
     session_factory,
     record: DownstreamCodexPushRecordModel,
 ) -> dict[str, Any]:
+    return _reauthorize_codex_credential(
+        session_factory=session_factory,
+        user_account_id=record.user_account_id,
+        team_workspace_id=record.team_workspace_id,
+        codex_client_id=record.codex_client_id,
+    )
+
+
+def _reauthorize_codex_credential(
+    *,
+    session_factory,
+    user_account_id: str,
+    team_workspace_id: str,
+    codex_client_id: str,
+) -> dict[str, Any]:
     settings = get_settings()
     workflow = BuildCodexCredentialWorkItemWorkflow(
         session_factory=session_factory,
@@ -2507,9 +2522,9 @@ def _reauthorize_codex_credential_for_record(
     try:
         credential_id = workflow.run(
             BuildCodexCredentialWorkInput(
-                user_account_id=record.user_account_id,
-                team_workspace_id=record.team_workspace_id,
-                codex_client_id=record.codex_client_id,
+                user_account_id=user_account_id,
+                team_workspace_id=team_workspace_id,
+                codex_client_id=codex_client_id,
                 force_reauthorize=True,
             )
         )
@@ -3030,10 +3045,14 @@ def _run_codex_heartbeat_tick(
         credential_ids = session.scalars(
             select(CodexOAuthCredentialModel.id)
             .where(
-                CodexOAuthCredentialModel.credential_status == CredentialStatus.ACTIVE.value,
+                CodexOAuthCredentialModel.credential_status.in_(
+                    (CredentialStatus.ACTIVE.value, CredentialStatus.ERROR.value)
+                ),
                 CodexOAuthCredentialModel.access_token != "",
                 CodexOAuthCredentialModel.refresh_token != "",
-                (CodexOAuthCredentialModel.last_heartbeat_status == "unknown")
+                CodexOAuthCredentialModel.last_heartbeat_status.in_(
+                    ("unknown", "failed", "error")
+                )
                 | (CodexOAuthCredentialModel.last_heartbeat_at.is_(None)),
                 CodexOAuthCredentialModel.push_lifecycle_status.in_(
                     ("none", "pending_push", "failed")
@@ -3113,6 +3132,13 @@ def _recover_heartbeat_credential_by_reauthorize_repush(
     credential_id: str,
 ) -> dict[str, Any]:
     with session_factory() as session:
+        credential = session.get(CodexOAuthCredentialModel, credential_id)
+        if credential is None:
+            return {
+                "ok": False,
+                "error_code": "credential_not_found",
+                "error_message": f"codex credential not found: {credential_id}",
+            }
         record = session.scalars(
             select(DownstreamCodexPushRecordModel)
             .where(
@@ -3122,18 +3148,34 @@ def _recover_heartbeat_credential_by_reauthorize_repush(
             )
             .order_by(DownstreamCodexPushRecordModel.updated_at.desc())
         ).first()
-        if record is None:
-            return {
-                "ok": False,
-                "error_code": "heartbeat_unauthorized_without_downstream_record",
-                "error_message": "401 after access-token refresh; no downstream record to reauthorize and repush",
-            }
-        reauthorize_result = _reauthorize_codex_credential_for_record(
+        reauthorize_result = _reauthorize_codex_credential(
             session_factory=session_factory,
-            record=record,
+            user_account_id=credential.user_account_id,
+            team_workspace_id=credential.team_workspace_id,
+            codex_client_id=credential.codex_client_id,
         )
         if not reauthorize_result.get("ok"):
+            if _is_phone_verification_required_error(
+                str(reauthorize_result.get("error_message") or "")
+            ):
+                cleanup_result = _handle_authorization_phone_verification_failed(
+                    session=session,
+                    workspace_id=credential.team_workspace_id,
+                    user_account_id=credential.user_account_id,
+                    error=str(reauthorize_result.get("error_message") or ""),
+                    sync_after_seconds=5,
+                )
+                return {
+                    **reauthorize_result,
+                    "phone_verification_cleanup": cleanup_result,
+                }
             return reauthorize_result
+        if record is None:
+            return {
+                "ok": True,
+                "reauthorize": reauthorize_result,
+                "repush": {"ok": True, "skipped": True, "reason": "no_downstream_record"},
+            }
         session.expire_all()
         refreshed_record = session.get(DownstreamCodexPushRecordModel, record.id)
         if refreshed_record is None:
@@ -3544,6 +3586,11 @@ def _select_invite_candidate_account_ids(
         .where(MembershipModel.team_workspace_id == workspace_id)
         .subquery()
     )
+    other_workspace_membership = (
+        select(MembershipModel.user_account_id)
+        .where(MembershipModel.team_workspace_id != workspace_id)
+        .subquery()
+    )
     cooldown = (
         select(UserAccountCooldownModel.user_account_id)
         .where(
@@ -3567,6 +3614,7 @@ def _select_invite_candidate_account_ids(
                     | (UserAccountAuthModel.auth_cookie_header != "")
                 ),
                 ~UserAccountModel.id.in_(select(existing_membership.c.user_account_id)),
+                ~UserAccountModel.id.in_(select(other_workspace_membership.c.user_account_id)),
                 ~UserAccountModel.id.in_(select(cooldown.c.user_account_id)),
             )
             .order_by(UserAccountModel.updated_at.asc())
@@ -3982,6 +4030,11 @@ def _random_workspace_authorization_candidate(
         )
         .subquery()
     )
+    other_workspace_membership = (
+        select(MembershipModel.user_account_id)
+        .where(MembershipModel.team_workspace_id != workspace_id)
+        .subquery()
+    )
     rows = session.execute(
         select(MembershipModel.user_account_id, CodexOAuthCredentialModel.id)
         .join(
@@ -4002,6 +4055,7 @@ def _random_workspace_authorization_candidate(
             MembershipModel.team_workspace_id == workspace_id,
             UserAccountModel.account_status == AccountStatus.ACTIVE.value,
             ~MembershipModel.user_account_id.in_(select(cooldown_subquery.c.user_account_id)),
+            ~MembershipModel.user_account_id.in_(select(other_workspace_membership.c.user_account_id)),
             UserAccountAuthModel.password != "",
             CodexOAuthCredentialModel.id.is_(None),
         )
@@ -4026,13 +4080,14 @@ def _handle_candidate_authorization_failed(
     user_account_id: str,
     error: str,
 ) -> dict:
-    invalidated = False
     if _is_phone_verification_required_error(error):
-        account = session.get(UserAccountModel, user_account_id)
-        if account is not None:
-            account.account_status = AccountStatus.INVALID.value
-            account.updated_at = datetime.now(UTC)
-            invalidated = True
+        return _handle_authorization_phone_verification_failed(
+            session=session,
+            workspace_id=workspace_id,
+            user_account_id=user_account_id,
+            error=error,
+            sync_after_seconds=5,
+        )
     membership = session.scalars(
         select(MembershipModel).where(
             MembershipModel.team_workspace_id == workspace_id,
@@ -4050,8 +4105,74 @@ def _handle_candidate_authorization_failed(
         user_account_id=user_account_id,
     )
     return {
+        "account_invalidated": False,
+        "remote_delete": remote_delete_result,
+    }
+
+
+def _handle_authorization_phone_verification_failed(
+    *,
+    session: Session,
+    workspace_id: str,
+    user_account_id: str,
+    error: str,
+    sync_after_seconds: int,
+) -> dict:
+    now = datetime.now(UTC)
+    account = session.get(UserAccountModel, user_account_id)
+    invalidated = False
+    if account is not None:
+        account.account_status = AccountStatus.INVALID.value
+        account.updated_at = now
+        invalidated = True
+    membership = session.scalars(
+        select(MembershipModel).where(
+            MembershipModel.team_workspace_id == workspace_id,
+            MembershipModel.user_account_id == user_account_id,
+        )
+    ).first()
+    if membership is not None:
+        membership.failure_code = "codex_authorization_phone_verification_required"
+        membership.failure_message = error[:1000]
+        membership.updated_at = now
+    session.commit()
+
+    remote_delete_result = _remove_remote_member_for_account(
+        session=session,
+        workspace_id=workspace_id,
+        user_account_id=user_account_id,
+    )
+    sync_result: dict[str, Any] = {}
+    local_prune_result: dict[str, Any] = {}
+    if max(0, int(sync_after_seconds or 0)):
+        sleep(max(0, int(sync_after_seconds or 0)))
+    try:
+        sync_result = _sync_workspace_remote_state_inline(
+            session=session,
+            workspace_id=workspace_id,
+            page_size=100,
+        )
+        session.commit()
+    except Exception as exc:
+        sync_result = {
+            "ok": False,
+            "error_code": type(exc).__name__,
+            "error_message": str(exc)[:1000],
+        }
+
+    if remote_delete_result.get("ok") or remote_delete_result.get("error_code") == "remote_member_not_found":
+        local_prune_result = _delete_local_memberships_with_credentials(
+            session=session,
+            workspace_id=workspace_id,
+            user_account_ids=[user_account_id],
+            now=datetime.now(UTC),
+        )
+        session.commit()
+    return {
         "account_invalidated": invalidated,
         "remote_delete": remote_delete_result,
+        "post_delete_sync": sync_result,
+        "local_prune": local_prune_result,
     }
 
 

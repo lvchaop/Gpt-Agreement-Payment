@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import httpx
 
 from refactor_app.plugins.contracts import DownstreamCodexPayload, DownstreamPushResult
-from refactor_app.plugins.downstream_common import codex_credentials_body, validate_codex_payload
+from refactor_app.plugins.downstream_common import validate_codex_payload
 
 
 class CpaClientError(RuntimeError):
@@ -67,9 +69,20 @@ class CpaClient:
 def build_cpa_auth_file(payload: DownstreamCodexPayload) -> tuple[str, dict]:
     validate_codex_payload(payload)
     plan_tag = payload.plan_tag or payload.plan_type or "team"
-    name = f"ChatGPT_{plan_tag}_{payload.email}"
-    body = codex_credentials_body(payload)
-    body["token_source"] = f"ChatGPT_{plan_tag}"
+    tag = hashlib.md5(payload.email.encode()).hexdigest()[:8]
+    name = f"codex-{tag}-{payload.email}-{plan_tag}.json"
+    body = {
+        "id_token": payload.id_token,
+        "access_token": payload.access_token,
+        "refresh_token": payload.refresh_token,
+        "account_id": payload.account_id,
+        "email": payload.email,
+        "last_refresh": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expired": payload.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if payload.expires_at
+        else "",
+        "type": "codex",
+    }
     return name, body
 
 
