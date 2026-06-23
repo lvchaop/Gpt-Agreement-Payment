@@ -102,6 +102,8 @@ export const resourcesApi = {
     postJson<Row>("/downstream-channels", body),
   patchDownstreamChannel: (id: string, body: Record<string, unknown>) =>
     patchJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`, body),
+  addDownstreamChannelBalance: (id: string, body: Record<string, unknown>) =>
+    postJson<Row>(`/downstream-channels/${encodeURIComponent(id)}/add-balance`, body),
   deleteDownstreamChannel: (id: string) =>
     deleteJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`),
   downstream: () => getJson<Row[]>("/downstream-push-records"),

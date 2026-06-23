@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 
 import type { Column } from "../components/DataTable.vue";
@@ -11,6 +11,7 @@ const store = useOpsStore();
 const router = useRouter();
 const pendingPushLimit = ref(1);
 const pendingPushConcurrency = ref(5);
+const balanceAmounts = ref<Record<string, number>>({});
 const form = ref({
   provider_type: "sub2api",
   name: "",
@@ -19,9 +20,27 @@ const form = ref({
   enabled: true,
   update_existing: true,
   timeout_s: 30,
-  max_active_slots: 2,
+  max_active_slots: 1,
   push_balance: 0,
 });
+const isLocalSub2api = computed(() => form.value.provider_type === "local_sub2api");
+const addressLabel = computed(() => (isLocalSub2api.value ? "输出目录" : "地址"));
+const addressPlaceholder = computed(() =>
+  isLocalSub2api.value
+    ? "留空使用 runtime/local-sub2api"
+    : "https://...",
+);
+const secretLabel = computed(() => (isLocalSub2api.value ? "密钥（不需要）" : "密钥"));
+const secretPlaceholder = computed(() => (isLocalSub2api.value ? "本地推送无需填写" : "admin key"));
+
+watch(
+  () => form.value.provider_type,
+  (providerType) => {
+    if (providerType === "local_sub2api") {
+      form.value.admin_key = "";
+    }
+  },
+);
 
 const columns: Column[] = [
   { key: "id", label: "渠道 ID", mono: true, summary: 26 },
@@ -32,6 +51,7 @@ const columns: Column[] = [
   { key: "update_existing", label: "更新已有", badge: true },
   { key: "timeout_s", label: "超时" },
   { key: "max_active_slots", label: "同时占用上限" },
+  { key: "allowed_active_slots", label: "当前开放坑位" },
   { key: "active_slot_count", label: "当前占用" },
   { key: "remaining_active_slots", label: "剩余坑位" },
   { key: "push_balance", label: "推送余额" },
@@ -48,8 +68,13 @@ async function loader() {
 }
 
 async function createChannel(reload: () => Promise<void>) {
-  if (!form.value.name.trim() || !form.value.base_url.trim() || !form.value.admin_key.trim()) {
-    store.toast("参数不完整", "名称、地址、密钥都需要填写。", "warning");
+  const local = form.value.provider_type === "local_sub2api";
+  if (!form.value.name.trim() || (!local && (!form.value.base_url.trim() || !form.value.admin_key.trim()))) {
+    store.toast(
+      "参数不完整",
+      local ? "本地推送只需要填写名称。" : "名称、地址、密钥都需要填写。",
+      "warning",
+    );
     return;
   }
   try {
@@ -73,6 +98,28 @@ async function toggleEnabled(row: Row, reload: () => Promise<void>) {
     await reload();
   } catch (err) {
     store.toast("更新失败", String((err as Error).message ?? err), "error");
+  }
+}
+
+async function addBalance(row: Row, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  if (!id) return;
+  const amount = Number(balanceAmounts.value[id] || 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    store.toast("参数错误", "添加余额必须大于 0。", "warning");
+    return;
+  }
+  try {
+    const result = await resourcesApi.addDownstreamChannelBalance(id, { amount });
+    store.toast(
+      "余额已添加",
+      `${String(row.name || id)} 当前余额=${String(result.push_balance ?? "")}`,
+      "success",
+    );
+    balanceAmounts.value[id] = 0;
+    await reload();
+  } catch (err) {
+    store.toast("添加余额失败", String((err as Error).message ?? err), "error");
   }
 }
 
@@ -120,7 +167,7 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
 <template>
   <ResourcePage
     title="下游渠道"
-    description="维护 sub2api / CPA 推送渠道配置。"
+    description="维护 sub2api / CPA / 本地 sub2api 文件推送渠道配置。"
     :columns="columns"
     :loader="loader"
     empty-text="暂无下游渠道。"
@@ -137,6 +184,7 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
             <select v-model="form.provider_type">
               <option value="sub2api">sub2api</option>
               <option value="cpa">CPA</option>
+              <option value="local_sub2api">本地 sub2api 文件</option>
             </select>
           </label>
           <label>
@@ -144,12 +192,12 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
             <input v-model="form.name" placeholder="渠道名称" />
           </label>
           <label>
-            <span>地址</span>
-            <input v-model="form.base_url" placeholder="https://..." />
+            <span>{{ addressLabel }}</span>
+            <input v-model="form.base_url" :placeholder="addressPlaceholder" />
           </label>
           <label>
-            <span>密钥</span>
-            <input v-model="form.admin_key" placeholder="admin key" />
+            <span>{{ secretLabel }}</span>
+            <input v-model="form.admin_key" :disabled="isLocalSub2api" :placeholder="secretPlaceholder" />
           </label>
           <label>
             <span>超时秒</span>
@@ -192,6 +240,18 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
       </div>
     </template>
     <template #rowActions="{ row, reload }">
+      <div class="inline-balance">
+        <input
+          v-model.number="balanceAmounts[String(row.id || '')]"
+          class="compact-number"
+          type="number"
+          min="1"
+          placeholder="余额"
+        />
+        <button class="btn compact-action" @click="addBalance(row, reload)">
+          加余额
+        </button>
+      </div>
       <button class="btn compact-action" @click="toggleEnabled(row, reload)">
         {{ row.enabled ? "禁用" : "启用" }}
       </button>
@@ -252,5 +312,17 @@ label span {
 .compact-action {
   min-height: 30px;
   padding: 0 10px;
+}
+
+.inline-balance {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+}
+
+.compact-number {
+  min-height: 30px;
+  padding: 0 8px;
+  width: 82px;
 }
 </style>

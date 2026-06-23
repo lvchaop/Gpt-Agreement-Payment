@@ -38,6 +38,7 @@ const usageLimit = ref(500);
 const probeLimit = ref(100);
 const probeConcurrency = ref(5);
 const probing = ref(false);
+const initializedDefaultJob = ref(false);
 let pollTimer: number | undefined;
 
 const jobLabels: Record<string, string> = {
@@ -133,7 +134,8 @@ function selectJob(row: Row) {
 async function loadJobs() {
   const result = await resourcesApi.automationMonitorJobs();
   jobs.value = result.items || [];
-  if (!selectedScheduleType.value && jobs.value[0]) {
+  if (!initializedDefaultJob.value && !selectedScheduleType.value && jobs.value[0]) {
+    initializedDefaultJob.value = true;
     selectJob(jobs.value[0]);
   }
 }
@@ -286,11 +288,11 @@ onBeforeUnmount(() => {
     <div class="job-grid">
       <article
         v-for="row in sortedJobs"
-        :key="String(row.id)"
-        class="panel job-card"
-        :class="{ selected: selectedJobId && selectedJobId === row.last_job_id }"
-        @click="selectJob(row)"
-      >
+	        :key="String(row.id)"
+	        class="panel job-card"
+	        :class="{ selected: selectedScheduleType === row.schedule_type }"
+	        @click="selectJob(row)"
+	      >
         <div class="job-head">
           <div>
             <h3>{{ labelOf(row.schedule_type) }}</h3>

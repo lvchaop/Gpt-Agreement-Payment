@@ -161,3 +161,4 @@ class EventLevel(StrEnum):
 class DownstreamProvider(StrEnum):
     CPA = "cpa"
     SUB2API = "sub2api"
+    LOCAL_SUB2API = "local_sub2api"

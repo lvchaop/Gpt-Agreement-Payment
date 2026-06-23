@@ -471,7 +471,7 @@ class DownstreamCodexPushRecordModel(Base):
 
     __table_args__ = (
         UniqueConstraint("codex_credential_id"),
-        CheckConstraint("downstream_provider IN ('cpa', 'sub2api')"),
+        CheckConstraint("downstream_provider IN ('cpa', 'sub2api', 'local_sub2api')"),
         CheckConstraint("push_status IN ('pending', 'pushing', 'pushed', 'failed', 'skipped', 'used')"),
         CheckConstraint("push_attempt_count >= 0"),
         CheckConstraint("usage_status IN ('unknown', 'active', 'near_limit', 'used', 'check_failed')"),
@@ -508,7 +508,7 @@ class DownstreamChannelModel(Base):
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
-        CheckConstraint("provider_type IN ('sub2api', 'cpa')"),
+        CheckConstraint("provider_type IN ('sub2api', 'cpa', 'local_sub2api')"),
         CheckConstraint("timeout_s > 0"),
         CheckConstraint("max_push_count >= 0"),
         CheckConstraint("max_active_slots >= 0"),

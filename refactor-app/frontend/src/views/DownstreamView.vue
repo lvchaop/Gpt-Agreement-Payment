@@ -17,14 +17,37 @@ const columns = [
   { key: "downstream_provider", label: "下游平台", badge: true },
   { key: "push_status", label: "推送状态", badge: true },
   { key: "push_attempt_count", label: "推送尝试" },
+  { key: "usage_display", label: "使用额度" },
+  { key: "usage_status", label: "额度状态", badge: true },
+  { key: "last_usage_check_display", label: "额度检查时间" },
+  { key: "used_at_display", label: "使用完成时间" },
   { key: "downstream_external_id", label: "下游外部 ID", mono: true },
   { key: "downstream_chatgpt_account_id", label: "下游空间", mono: true },
   { key: "token_chatgpt_account_id", label: "Token 空间", mono: true },
-  { key: "usage_percent", label: "使用率" },
-  { key: "usage_status", label: "使用状态", badge: true },
   { key: "error_code", label: "错误码", badge: true },
   { key: "error_message", label: "错误信息" },
 ];
+
+function formatDateTime(value: unknown) {
+  const text = String(value || "");
+  if (!text) return "";
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return text;
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+async function loadDownstreamRows() {
+  const rows = await resourcesApi.downstream();
+  return rows.map((row) => {
+    const usagePercent = Number(row.usage_percent ?? 0);
+    return {
+      ...row,
+      usage_display: `${Number.isFinite(usagePercent) ? usagePercent : 0}%`,
+      last_usage_check_display: formatDateTime(row.last_usage_check_at),
+      used_at_display: formatDateTime(row.used_at),
+    };
+  });
+}
 
 function onSelectionChange(rows: Record<string, unknown>[]) {
   selectedRows.value = rows;
@@ -77,7 +100,7 @@ async function repushSelected(reload: () => Promise<void>) {
     title="下游推送"
     description="CPA / Sub2API 推送结果。当前按 Codex 授权唯一记录，一条授权只能占用一个下游渠道。"
     :columns="columns"
-    :loader="resourcesApi.downstream"
+    :loader="loadDownstreamRows"
     selectable
     empty-text="暂无下游推送记录。"
     @selection-change="onSelectionChange"

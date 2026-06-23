@@ -285,6 +285,8 @@ def acquire_codex_rt_with_browser_login(
     otp_sent_at = time.time()
     otp_fetched = False
     otp_submit_at = 0.0
+    otp_retry_count = 0
+    otp_retry_max = 2
 
     def capture(value: str) -> bool:
         url = _extract_callback_url(value, expected_state=state)
@@ -351,6 +353,17 @@ def acquire_codex_rt_with_browser_login(
                     )
 
                 if _is_otp_page(page, final_url):
+                    if not _has_otp_input(page):
+                        if _click_otp_retry_control(page):
+                            otp_sent_at = time.time()
+                            otp_fetched = False
+                            otp_submit_at = 0.0
+                            otp_retry_count += 1
+                            time.sleep(2)
+                            continue
+                        if _is_email_verification_url(final_url):
+                            time.sleep(1)
+                            continue
                     if not otp_fetched:
                         otp = mail_provider.wait_for_otp_by_email(
                             email=email.strip().lower(),
@@ -366,10 +379,22 @@ def acquire_codex_rt_with_browser_login(
                                 final_url=final_url,
                             )
                         if not _fill_otp(page, code):
+                            if _click_otp_retry_control(page) and otp_retry_count < otp_retry_max:
+                                otp_sent_at = time.time()
+                                otp_fetched = False
+                                otp_submit_at = 0.0
+                                otp_retry_count += 1
+                                time.sleep(2)
+                                continue
+                            diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_otp_input_not_found")
                             return CodexBrowserRtResult(
                                 ok=False,
                                 failure_code="otp_input_not_found",
-                                failure_message="检测到 OTP 页面但未找到可填写的验证码输入框",
+                                failure_message=_callback_not_captured_message(
+                                    "检测到 OTP 页面但未找到可填写的验证码输入框",
+                                    final_url,
+                                    diagnostics["message"],
+                                ),
                                 final_url=final_url,
                             )
                         _click_first_visible(
@@ -385,18 +410,34 @@ def acquire_codex_rt_with_browser_login(
                         time.sleep(3)
                         continue
                     if otp_submit_at and time.time() - otp_submit_at > 30:
-                        _click_first_visible(
-                            page,
-                            [
-                                'button:has-text("Resend email")',
-                                'a:has-text("Resend email")',
-                                'button:has-text("Resend")',
-                                'a:has-text("Resend")',
-                            ],
-                        )
+                        if otp_retry_count >= otp_retry_max:
+                            diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_otp_stuck")
+                            return CodexBrowserRtResult(
+                                ok=False,
+                                failure_code="otp_verification_stuck",
+                                failure_message=_callback_not_captured_message(
+                                    "OTP 提交后仍停留 email-verification",
+                                    final_url,
+                                    diagnostics["message"],
+                                ),
+                                final_url=final_url,
+                            )
+                        if not _click_otp_retry_control(page):
+                            diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_otp_no_retry")
+                            return CodexBrowserRtResult(
+                                ok=False,
+                                failure_code="otp_retry_control_not_found",
+                                failure_message=_callback_not_captured_message(
+                                    "OTP 提交后仍停留 email-verification，但未找到 Resend/Try again",
+                                    final_url,
+                                    diagnostics["message"],
+                                ),
+                                final_url=final_url,
+                            )
                         otp_sent_at = time.time()
                         otp_fetched = False
                         otp_submit_at = 0.0
+                        otp_retry_count += 1
                         time.sleep(2)
                         continue
 
@@ -570,8 +611,22 @@ def _submit_password_if_visible(page, password: str) -> bool:
 
 
 def _is_otp_page(page, current_url: str) -> bool:
-    if "email-verification" in current_url or "email-otp" in current_url or "passwordless" in current_url:
+    if _has_otp_input(page):
         return True
+    if _has_otp_retry_control(page):
+        return True
+    if "email-otp" in current_url or "passwordless" in current_url:
+        return True
+    if _is_email_verification_url(current_url):
+        return True
+    return False
+
+
+def _is_email_verification_url(current_url: str) -> bool:
+    return "email-verification" in str(current_url or "")
+
+
+def _has_otp_input(page) -> bool:
     try:
         if page.query_selector('input[autocomplete="one-time-code"]:visible'):
             return True
@@ -583,6 +638,42 @@ def _is_otp_page(page, current_url: str) -> bool:
         return len(digit_inputs or []) >= 4
     except Exception:
         return False
+
+
+def _has_otp_retry_control(page) -> bool:
+    return _find_first_visible(
+        page,
+        [
+            'button:has-text("Resend email")',
+            'a:has-text("Resend email")',
+            'button:has-text("Resend")',
+            'a:has-text("Resend")',
+            'button:has-text("Try again")',
+            'a:has-text("Try again")',
+            'button:has-text("Retry")',
+            'a:has-text("Retry")',
+            '[data-testid*="resend"]',
+            '[data-testid*="retry"]',
+        ],
+    ) is not None
+
+
+def _click_otp_retry_control(page) -> bool:
+    return _click_first_visible(
+        page,
+        [
+            'button:has-text("Resend email")',
+            'a:has-text("Resend email")',
+            'button:has-text("Resend")',
+            'a:has-text("Resend")',
+            'button:has-text("Try again")',
+            'a:has-text("Try again")',
+            'button:has-text("Retry")',
+            'a:has-text("Retry")',
+            '[data-testid*="resend"]',
+            '[data-testid*="retry"]',
+        ],
+    )
 
 
 def _fill_otp(page, code: str) -> bool:
@@ -635,18 +726,25 @@ def _is_workspace_or_consent_page(current_url: str) -> bool:
 
 
 def _click_first_visible(page, selectors: list[str]) -> bool:
+    button = _find_first_visible(page, selectors)
+    if not button:
+        return False
+    try:
+        button.evaluate("(el) => { el.click(); return true; }")
+    except Exception:
+        button.click(timeout=3000, no_wait_after=True)
+    return True
+
+
+def _find_first_visible(page, selectors: list[str]):
     for selector in selectors:
         try:
             button = page.query_selector(selector)
             if button and button.is_visible():
-                try:
-                    button.evaluate("(el) => { el.click(); return true; }")
-                except Exception:
-                    button.click(timeout=3000, no_wait_after=True)
-                return True
+                return button
         except Exception:
             continue
-    return False
+    return None
 
 
 def _callback_not_captured_message(prefix: str, final_url: str, diagnostics: str = "") -> str:

@@ -22,6 +22,8 @@ from refactor_app.infrastructure.db.models import (
 )
 from refactor_app.plugins.downstream_cpa.client import CpaClientConfig
 from refactor_app.plugins.downstream_cpa.plugin import CpaDownstreamPlugin
+from refactor_app.plugins.downstream_local_sub2api.client import LocalSub2ApiClientConfig
+from refactor_app.plugins.downstream_local_sub2api.plugin import LocalSub2ApiDownstreamPlugin
 from refactor_app.plugins.downstream_sub2api.client import Sub2ApiClientConfig
 from refactor_app.plugins.downstream_sub2api.plugin import Sub2ApiDownstreamPlugin
 
@@ -83,7 +85,8 @@ class PushCodexCredentialDirectWorkflow:
             if not is_retry and channel.push_balance <= 0:
                 raise DirectPushWorkflowError("downstream_channel_balance_exhausted")
             active_slots = _active_downstream_slot_count(session, channel.id)
-            if (not is_retry) and active_slots >= channel.max_active_slots:
+            allowed_slots = _allowed_downstream_active_slots(session, channel)
+            if (not is_retry) and active_slots >= allowed_slots:
                 raise DirectPushWorkflowError("downstream_channel_active_slots_exhausted")
 
             user = session.get(UserAccountModel, credential.user_account_id)
@@ -246,6 +249,7 @@ def _apply_push_failure(
     message = (error_message or "")[:1000]
     attempts = int(record.push_attempt_count or 0)
     if attempts >= MAX_DOWNSTREAM_PUSH_ATTEMPTS:
+        _refund_skipped_push_quota(record=record, channel=channel, finished_at=finished_at)
         record.downstream_channel_id = None
         record.push_status = "skipped"
         record.error_code = "push_retry_exhausted_released"
@@ -271,6 +275,23 @@ def _apply_push_failure(
     if channel is not None:
         channel.failed_push_count += 1
         channel.updated_at = finished_at
+
+
+def _refund_skipped_push_quota(
+    *,
+    record: DownstreamCodexPushRecordModel,
+    channel: DownstreamChannelModel | None,
+    finished_at: datetime,
+) -> None:
+    if channel is None:
+        return
+    if record.downstream_channel_id != channel.id:
+        return
+    if record.push_status not in {"pushing", "pushed", "failed"}:
+        return
+    channel.push_balance = max(0, int(channel.push_balance or 0)) + 1
+    channel.claimed_push_count = max(0, int(channel.claimed_push_count or 0) - 1)
+    channel.updated_at = finished_at
 
 
 def _validate_pushable(
@@ -313,6 +334,25 @@ def _active_downstream_slot_count(session: Session, downstream_channel_id: str) 
     )
 
 
+def _allowed_downstream_active_slots(session: Session, channel: DownstreamChannelModel) -> int:
+    max_slots = max(0, int(channel.max_active_slots or 0))
+    if max_slots <= 0:
+        return 0
+    high_usage_count = int(
+        session.scalar(
+            select(func.count())
+            .select_from(DownstreamCodexPushRecordModel)
+            .where(
+                DownstreamCodexPushRecordModel.downstream_channel_id == channel.id,
+                DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+                DownstreamCodexPushRecordModel.usage_percent >= 70,
+            )
+        )
+        or 0
+    )
+    return min(max_slots, 1 + high_usage_count)
+
+
 def _provider_from_channel(channel: DownstreamChannelModel):
     if channel.provider_type == "sub2api":
         return Sub2ApiDownstreamPlugin.from_config(
@@ -329,6 +369,13 @@ def _provider_from_channel(channel: DownstreamChannelModel):
                 base_url=channel.base_url,
                 admin_key=channel.admin_key,
                 timeout_s=channel.timeout_s,
+            )
+        )
+    if channel.provider_type == "local_sub2api":
+        return LocalSub2ApiDownstreamPlugin.from_config(
+            LocalSub2ApiClientConfig(
+                output_dir=channel.base_url,
+                update_existing=channel.update_existing,
             )
         )
     raise DirectPushWorkflowError(f"unsupported_downstream_provider: {channel.provider_type}")

@@ -6,6 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from socket import gethostname
 from threading import Thread
 from time import sleep
@@ -87,6 +88,7 @@ CODEX_BROWSER_AUTH_CONCURRENCY_LIMIT = 50
 CODEX_USAGE_PROBE_MODEL = "gpt-5.4"
 CODEX_USAGE_PROBE_VERSION = "0.125.0"
 CODEX_USAGE_PROBE_USER_AGENT = "codex_cli_rs/0.125.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
+DOWNSTREAM_PROVIDER_TYPES = {"sub2api", "cpa", "local_sub2api"}
 
 
 @dataclass(frozen=True)
@@ -202,7 +204,7 @@ class CreateDownstreamChannelRequest(BaseModel):
     update_existing: bool = False
     timeout_s: int = 30
     max_push_count: int = 2
-    max_active_slots: int = 2
+    max_active_slots: int = 1
     push_balance: int = 0
 
 
@@ -217,6 +219,10 @@ class PatchDownstreamChannelRequest(BaseModel):
     max_push_count: int | None = None
     max_active_slots: int | None = None
     push_balance: int | None = None
+
+
+class AddDownstreamChannelBalanceRequest(BaseModel):
+    amount: int
 
 
 class InviteSelectedUsersRequest(BaseModel):
@@ -928,7 +934,8 @@ def _select_channel_push_credential_ids(
 ) -> list[str]:
     selected_ids = selected if selected is not None else set()
     active_slots = _active_downstream_slot_count(session, channel.id)
-    remaining_new_slots = max(0, int(channel.max_active_slots or 0) - active_slots)
+    allowed_slots = _allowed_downstream_active_slots(session=session, channel=channel)
+    remaining_new_slots = max(0, allowed_slots - active_slots)
     retry_take = max(1, int(limit or 1))
     retry_conditions = [
         DownstreamCodexPushRecordModel.downstream_channel_id == channel.id,
@@ -977,6 +984,25 @@ def _select_channel_push_credential_ids(
     chosen.extend(str(item) for item in pending_ids)
     selected_ids.update(str(item) for item in pending_ids)
     return chosen
+
+
+def _allowed_downstream_active_slots(*, session: Session, channel: DownstreamChannelModel) -> int:
+    max_slots = max(0, int(channel.max_active_slots or 0))
+    if max_slots <= 0:
+        return 0
+    high_usage_count = int(
+        session.scalar(
+            select(func.count())
+            .select_from(DownstreamCodexPushRecordModel)
+            .where(
+                DownstreamCodexPushRecordModel.downstream_channel_id == channel.id,
+                DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+                DownstreamCodexPushRecordModel.usage_percent >= 70,
+            )
+        )
+        or 0
+    )
+    return min(max_slots, 1 + high_usage_count)
 
 
 @router.post("/team-admin-sessions/import")
@@ -1796,6 +1822,15 @@ def get_automation_monitor_job_console(
         _automation_console_event_dict(event=event, run=run, job=job)
         for event, run, job in reversed(rows)
     ]
+    if not items:
+        items = _automation_console_fallback_items(
+            session=session,
+            schedule_type=schedule_type,
+            job_id=job_id,
+            run_id=run_id,
+            level=level,
+            limit=safe_limit,
+        )
     limited_items, returned_bytes, truncated = _limit_console_items_by_bytes(
         items=items,
         max_bytes=safe_max_bytes,
@@ -2422,13 +2457,29 @@ def _probe_downstream_record_usage_with_recovery(
 
     refresh_result = _refresh_codex_credential_access_token(session=session, record=record)
     if not refresh_result.get("ok"):
-        failed = CodexUsageProbeResult(
-            ok=False,
-            error_code=str(refresh_result.get("error_code") or "codex_token_refresh_failed"),
-            error_message=str(refresh_result.get("error_message") or ""),
+        refresh_error_code = str(refresh_result.get("error_code") or "codex_token_refresh_failed")
+        refresh_error_message = str(refresh_result.get("error_message") or "")
+        if not _is_usage_refresh_unauthorized_error(refresh_error_code, refresh_error_message):
+            failed = CodexUsageProbeResult(
+                ok=False,
+                error_code=refresh_error_code,
+                error_message=refresh_error_message,
+            )
+            _apply_usage_probe_failure(record=record, result=failed, now=datetime.now(UTC))
+            return failed
+        session.commit()
+        reauthorize_result = _reauthorize_codex_credential_for_record(
+            session_factory=session_factory,
+            record=record,
         )
-        _apply_usage_probe_failure(record=record, result=failed, now=datetime.now(UTC))
-        return failed
+        return _handle_usage_reauthorize_result(
+            session=session,
+            record=record,
+            reauthorize_result=reauthorize_result,
+            threshold=threshold,
+            fallback_error_code="codex_token_refresh_unauthorized",
+            fallback_error_message=refresh_error_message,
+        )
 
     result = _probe_downstream_record_usage(session=session, record=record)
     if result.ok:
@@ -2448,20 +2499,65 @@ def _probe_downstream_record_usage_with_recovery(
         session_factory=session_factory,
         record=record,
     )
+    return _handle_usage_reauthorize_result(
+        session=session,
+        record=record,
+        reauthorize_result=reauthorize_result,
+        threshold=threshold,
+        fallback_error_code="codex_reauthorize_failed",
+        fallback_error_message="",
+    )
+
+
+def _is_usage_refresh_unauthorized_error(error_code: str, error_message: str) -> bool:
+    text_value = f"{error_code} {error_message}".lower()
+    return "401" in text_value or "unauthor" in text_value
+
+
+def _handle_usage_reauthorize_result(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+    reauthorize_result: dict[str, Any],
+    threshold: int,
+    fallback_error_code: str,
+    fallback_error_message: str,
+) -> CodexUsageProbeResult:
     if not reauthorize_result.get("ok"):
-        failed = CodexUsageProbeResult(
-            ok=False,
-            error_code=str(reauthorize_result.get("error_code") or "codex_reauthorize_failed"),
-            error_message=str(reauthorize_result.get("error_message") or ""),
-        )
+        error_code = str(reauthorize_result.get("error_code") or fallback_error_code)
+        error_message = str(reauthorize_result.get("error_message") or fallback_error_message)
         session.expire_all()
         refreshed_record = session.get(DownstreamCodexPushRecordModel, record.id)
         if refreshed_record is not None:
+            cleanup_result = None
+            if _is_phone_verification_required_error(error_message):
+                cleanup_result = _handle_authorization_phone_verification_failed(
+                    session=session,
+                    workspace_id=refreshed_record.team_workspace_id,
+                    user_account_id=refreshed_record.user_account_id,
+                    error=error_message,
+                    sync_after_seconds=5,
+                )
+                error_code = "codex_reauthorize_phone_verification_required"
+                error_message = (
+                    f"{error_message}; phone_verification_cleanup={cleanup_result}"
+                )[:1000]
+            failed = CodexUsageProbeResult(
+                ok=False,
+                error_code=error_code,
+                error_message=error_message,
+            )
             _apply_usage_probe_failure(
                 record=refreshed_record,
                 result=failed,
                 now=datetime.now(UTC),
             )
+            return failed
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code=error_code,
+            error_message=error_message,
+        )
         return failed
 
     session.expire_all()
@@ -2892,10 +2988,14 @@ def _finish_running_job(
         session.commit()
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
     finished_at = datetime.now(UTC)
-    job.job_status = "succeeded"
+    output_failed = int(output.get("failed") or 0) if isinstance(output, dict) else 0
+    job.job_status = "failed" if output_failed > 0 else "succeeded"
     job.updated_at = finished_at
-    run.run_status = "succeeded"
+    run.run_status = job.job_status
     run.finished_at = finished_at
+    if output_failed > 0:
+        run.error_code = "partial_failure"
+        run.error_message = f"{output_failed} item(s) failed"
     run.output_json = output
     session.commit()
     return output
@@ -3551,11 +3651,18 @@ def _execute_automation_schedule(
         if schedule is None:
             return {"schedule_id": schedule_id, "status": "locked", "error_code": "schedule_already_running"}
         now = datetime.now(UTC)
-        if acquire_lock and schedule.locked_by:
+        if acquire_lock and schedule.locked_by and (
+            schedule.locked_until is None or schedule.locked_until > now
+        ):
             return {"schedule_id": schedule_id, "status": "locked", "error_code": "schedule_already_running"}
+        if acquire_lock and schedule.locked_by:
+            schedule.locked_by = ""
+            schedule.locked_until = None
         if acquire_lock:
             schedule.locked_by = locked_by
-            schedule.locked_until = now + timedelta(hours=24)
+            schedule.locked_until = now + timedelta(
+                seconds=max(300, min(1800, int(schedule.interval_seconds or 60) * 2))
+            )
         schedule.last_run_at = now
         if update_next_run:
             schedule.next_run_at = now + timedelta(seconds=max(5, int(schedule.interval_seconds or 60)))
@@ -3718,6 +3825,14 @@ def _process_downstream_usage_cleanup_record(
         record = session.get(DownstreamCodexPushRecordModel, record_id)
         if record is None or record.push_status != "pushed":
             return {"record_id": record_id, "status": "skipped", "reason": "record_not_pushed"}
+        if record.downstream_provider == "local_sub2api":
+            return {
+                "record_id": record_id,
+                "status": "skipped",
+                "reason": "local_sub2api_no_remote_usage",
+                "usage_percent": record.usage_percent,
+                "threshold_percent": threshold,
+            }
         probe = _probe_downstream_record_usage_with_recovery(
             session=session,
             session_factory=session_factory,
@@ -4422,6 +4537,7 @@ def _handle_authorization_phone_verification_failed(
             workspace_id=workspace_id,
             user_account_ids=[user_account_id],
             now=datetime.now(UTC),
+            mark_protected_downstream_used=False,
         )
         session.commit()
     return {
@@ -5019,20 +5135,22 @@ def list_downstream_channels(session: DbSession) -> list[dict]:
 def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSession) -> dict:
     now = datetime.now(UTC)
     provider_type = req.provider_type.strip()
-    if provider_type not in {"sub2api", "cpa"}:
-        raise HTTPException(status_code=400, detail="provider_type must be sub2api or cpa")
+    if provider_type not in DOWNSTREAM_PROVIDER_TYPES:
+        raise HTTPException(status_code=400, detail="provider_type must be sub2api, cpa or local_sub2api")
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
-    if not req.base_url.strip():
+    base_url = _downstream_channel_base_url(provider_type, req.base_url)
+    admin_key = req.admin_key.strip()
+    if provider_type != "local_sub2api" and not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
-    if not req.admin_key.strip():
+    if provider_type != "local_sub2api" and not admin_key:
         raise HTTPException(status_code=400, detail="admin_key is required")
     channel = DownstreamChannelModel(
         id=f"downstream-channel-{uuid4()}",
         provider_type=provider_type,
         name=req.name.strip(),
-        base_url=req.base_url.strip().rstrip("/"),
-        admin_key=req.admin_key.strip(),
+        base_url=base_url,
+        admin_key=admin_key,
         enabled=req.enabled,
         update_existing=req.update_existing,
         timeout_s=max(1, int(req.timeout_s or 30)),
@@ -5062,19 +5180,22 @@ def patch_downstream_channel(
         raise HTTPException(status_code=404, detail="downstream channel not found")
     if req.provider_type is not None:
         provider_type = req.provider_type.strip()
-        if provider_type not in {"sub2api", "cpa"}:
-            raise HTTPException(status_code=400, detail="provider_type must be sub2api or cpa")
+        if provider_type not in DOWNSTREAM_PROVIDER_TYPES:
+            raise HTTPException(status_code=400, detail="provider_type must be sub2api, cpa or local_sub2api")
         channel.provider_type = provider_type
+        if provider_type == "local_sub2api" and _looks_like_url(channel.base_url):
+            channel.base_url = _local_sub2api_output_dir()
     if req.name is not None:
         if not req.name.strip():
             raise HTTPException(status_code=400, detail="name is required")
         channel.name = req.name.strip()
     if req.base_url is not None:
-        if not req.base_url.strip():
+        base_url = _downstream_channel_base_url(channel.provider_type, req.base_url)
+        if channel.provider_type != "local_sub2api" and not base_url:
             raise HTTPException(status_code=400, detail="base_url is required")
-        channel.base_url = req.base_url.strip().rstrip("/")
+        channel.base_url = base_url
     if req.admin_key is not None:
-        if not req.admin_key.strip():
+        if channel.provider_type != "local_sub2api" and not req.admin_key.strip():
             raise HTTPException(status_code=400, detail="admin_key is required")
         channel.admin_key = req.admin_key.strip()
     if req.enabled is not None:
@@ -5095,6 +5216,24 @@ def patch_downstream_channel(
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail="downstream channel already exists") from exc
+    return _downstream_channel_dict(channel, session=session)
+
+
+@router.post("/downstream-channels/{channel_id}/add-balance")
+def add_downstream_channel_balance(
+    channel_id: str,
+    req: AddDownstreamChannelBalanceRequest,
+    session: DbSession,
+) -> dict:
+    amount = int(req.amount or 0)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="amount must be greater than 0")
+    channel = session.get(DownstreamChannelModel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="downstream channel not found")
+    channel.push_balance = max(0, int(channel.push_balance or 0)) + amount
+    channel.updated_at = datetime.now(UTC)
+    session.commit()
     return _downstream_channel_dict(channel, session=session)
 
 
@@ -5454,7 +5593,12 @@ def list_mail_leases(session: DbSession) -> list[dict]:
 
 def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Session | None = None) -> dict:
     active_slots = _active_downstream_slot_count(session, channel.id) if session is not None else 0
-    remaining_slots = max(0, int(channel.max_active_slots or 0) - active_slots)
+    allowed_slots = (
+        _allowed_downstream_active_slots(session=session, channel=channel)
+        if session is not None
+        else max(0, int(channel.max_active_slots or 0))
+    )
+    remaining_slots = max(0, allowed_slots - active_slots)
     remaining_balance = max(0, int(channel.push_balance or 0))
     return {
         "id": channel.id,
@@ -5467,6 +5611,7 @@ def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Sessio
         "timeout_s": channel.timeout_s,
         "max_push_count": channel.max_push_count,
         "max_active_slots": channel.max_active_slots,
+        "allowed_active_slots": allowed_slots,
         "active_slot_count": active_slots,
         "remaining_active_slots": remaining_slots,
         "push_balance": channel.push_balance,
@@ -5482,6 +5627,22 @@ def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Sessio
         "created_at": channel.created_at.isoformat(),
         "updated_at": channel.updated_at.isoformat(),
     }
+
+
+def _downstream_channel_base_url(provider_type: str, value: str) -> str:
+    text_value = str(value or "").strip()
+    if provider_type == "local_sub2api":
+        return text_value or _local_sub2api_output_dir()
+    return text_value.rstrip("/")
+
+
+def _local_sub2api_output_dir() -> str:
+    return str((Path.cwd() / "runtime" / "local-sub2api").resolve())
+
+
+def _looks_like_url(value: str) -> bool:
+    text_value = str(value or "").strip().lower()
+    return text_value.startswith("http://") or text_value.startswith("https://")
 
 
 def _summarize_secret(value: str) -> str:
@@ -5577,6 +5738,63 @@ def _automation_console_event_dict(
         "data_json": data_json,
         "data_summary": _summarize_json(data_json, max_chars=500),
     }
+
+
+def _automation_console_fallback_items(
+    *,
+    session: Session,
+    schedule_type: str,
+    job_id: str,
+    run_id: str,
+    level: str,
+    limit: int,
+) -> list[dict]:
+    if level.strip() and level.strip().upper() not in {"ALL", "INFO"}:
+        return []
+    stmt = select(JobRunModel, JobModel).join(JobModel, JobModel.id == JobRunModel.job_id)
+    if run_id.strip():
+        stmt = stmt.where(JobRunModel.id == run_id.strip())
+    if job_id.strip():
+        stmt = stmt.where(JobModel.id == job_id.strip())
+    if schedule_type.strip():
+        stmt = stmt.where(JobModel.type == schedule_type.strip())
+    rows = session.execute(
+        stmt.order_by(JobRunModel.started_at.desc().nullslast()).limit(max(1, min(limit, 100)))
+    ).all()
+    items: list[dict] = []
+    for run, job in reversed(rows):
+        output_json = run.output_json if isinstance(run.output_json, dict) else {}
+        output_failed = int(output_json.get("failed") or 0)
+        level_value = "ERROR" if run.run_status == "failed" or output_failed > 0 else "INFO"
+        message = (
+            f"job {job.type} completed with {output_failed} failed item(s); no job_events were recorded for this run"
+            if output_failed > 0
+            else f"job {job.type} {run.run_status}; no job_events were recorded for this run"
+        )
+        data_json = {
+            "run_status": run.run_status,
+            "attempt": run.attempt,
+            "started_at": run.started_at.isoformat() if run.started_at else "",
+            "finished_at": run.finished_at.isoformat() if run.finished_at else "",
+            "error_code": run.error_code,
+            "error_message": run.error_message,
+            "output_json": output_json,
+        }
+        items.append(
+            {
+                "id": f"fallback-{run.id}",
+                "job_id": job.id,
+                "job_type": job.type,
+                "run_id": run.id,
+                "ts": (run.finished_at or run.started_at or datetime.now(UTC)).isoformat(),
+                "level": level_value,
+                "event_type": "job.run_summary",
+                "message": message,
+                "data_json": data_json,
+                "data_summary": _summarize_json(data_json, max_chars=500),
+            }
+        )
+    return items
 
 
 def _limit_console_items_by_bytes(*, items: list[dict], max_bytes: int) -> tuple[list[dict], int, bool]:
@@ -6020,6 +6238,7 @@ def _delete_local_memberships_with_credentials(
     workspace_id: str,
     user_account_ids: list[str],
     now: datetime,
+    mark_protected_downstream_used: bool = True,
 ) -> dict:
     if not user_account_ids:
         return {
@@ -6044,7 +6263,7 @@ def _delete_local_memberships_with_credentials(
                 )
             ).all()
         )
-        if protected_credential_ids:
+        if protected_credential_ids and mark_protected_downstream_used:
             unbound_downstream_count = session.execute(
                 update(DownstreamCodexPushRecordModel)
                 .where(
@@ -6065,6 +6284,50 @@ def _delete_local_memberships_with_credentials(
                 .where(CodexOAuthCredentialModel.id.in_(protected_credential_ids))
                 .values(push_lifecycle_status="used", updated_at=now)
             )
+        elif protected_credential_ids:
+            records_to_release = session.scalars(
+                select(DownstreamCodexPushRecordModel).where(
+                    DownstreamCodexPushRecordModel.codex_credential_id.in_(
+                        protected_credential_ids
+                    ),
+                    DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+                )
+            ).all()
+            unbound_downstream_count = len(records_to_release)
+            used_credential_ids: set[str] = set()
+            blocked_credential_ids: set[str] = set()
+            for record in records_to_release:
+                if int(record.usage_percent or 0) >= 60:
+                    record.push_status = "used"
+                    record.usage_status = "used"
+                    record.used_at = now
+                    used_credential_ids.add(record.codex_credential_id)
+                    record.error_code = "credential_invalidated_phone_verification_required"
+                    record.error_message = (
+                        "marked used after phone verification failure because usage_percent>=60"
+                    )
+                else:
+                    _refund_skipped_downstream_quota(session=session, record=record, now=now)
+                    record.push_status = "skipped"
+                    record.usage_status = "check_failed"
+                    blocked_credential_ids.add(record.codex_credential_id)
+                    record.error_code = "credential_invalidated_phone_verification_required"
+                    record.error_message = (
+                        "marked invalid after phone verification failure because usage_percent<60"
+                    )
+                record.updated_at = now
+            if used_credential_ids:
+                session.execute(
+                    update(CodexOAuthCredentialModel)
+                    .where(CodexOAuthCredentialModel.id.in_(used_credential_ids))
+                    .values(push_lifecycle_status="used", updated_at=now)
+                )
+            if blocked_credential_ids:
+                session.execute(
+                    update(CodexOAuthCredentialModel)
+                    .where(CodexOAuthCredentialModel.id.in_(blocked_credential_ids))
+                    .values(push_lifecycle_status="blocked", updated_at=now)
+                )
     released_batch_item_count = session.execute(
         update(WorkspaceJoinBatchItemModel)
         .where(
@@ -6099,6 +6362,24 @@ def _delete_local_memberships_with_credentials(
         "released_batch_item_count": int(released_batch_item_count or 0),
         "unbound_downstream_count": int(unbound_downstream_count or 0),
     }
+
+
+def _refund_skipped_downstream_quota(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+    now: datetime,
+) -> None:
+    if record.downstream_channel_id is None:
+        return
+    if record.push_status not in {"pushing", "pushed", "failed"}:
+        return
+    channel = session.get(DownstreamChannelModel, record.downstream_channel_id)
+    if channel is None:
+        return
+    channel.push_balance = max(0, int(channel.push_balance or 0)) + 1
+    channel.claimed_push_count = max(0, int(channel.claimed_push_count or 0) - 1)
+    channel.updated_at = now
 
 
 def _local_account_remote_user_ids(
