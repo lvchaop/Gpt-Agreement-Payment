@@ -88,7 +88,8 @@ CODEX_BROWSER_AUTH_CONCURRENCY_LIMIT = 50
 CODEX_USAGE_PROBE_MODEL = "gpt-5.4"
 CODEX_USAGE_PROBE_VERSION = "0.125.0"
 CODEX_USAGE_PROBE_USER_AGENT = "codex_cli_rs/0.125.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
-DOWNSTREAM_PROVIDER_TYPES = {"sub2api", "cpa", "local_sub2api"}
+DOWNSTREAM_PROVIDER_TYPES = {"sub2api", "cpa", "local_sub2api", "custom_http"}
+CUSTOM_HTTP_PAYLOAD_TYPES = {"sub2api", "cpa"}
 
 
 @dataclass(frozen=True)
@@ -199,7 +200,10 @@ class CreateDownstreamChannelRequest(BaseModel):
     provider_type: str
     name: str
     base_url: str
-    admin_key: str
+    admin_key: str = ""
+    custom_payload_type: str = ""
+    custom_auth_header_name: str = ""
+    custom_auth_header_value: str = ""
     enabled: bool = True
     update_existing: bool = False
     timeout_s: int = 30
@@ -213,6 +217,9 @@ class PatchDownstreamChannelRequest(BaseModel):
     name: str | None = None
     base_url: str | None = None
     admin_key: str | None = None
+    custom_payload_type: str | None = None
+    custom_auth_header_name: str | None = None
+    custom_auth_header_value: str | None = None
     enabled: bool | None = None
     update_existing: bool | None = None
     timeout_s: int | None = None
@@ -5136,21 +5143,37 @@ def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSe
     now = datetime.now(UTC)
     provider_type = req.provider_type.strip()
     if provider_type not in DOWNSTREAM_PROVIDER_TYPES:
-        raise HTTPException(status_code=400, detail="provider_type must be sub2api, cpa or local_sub2api")
+        raise HTTPException(status_code=400, detail="provider_type must be sub2api, cpa, local_sub2api or custom_http")
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
     base_url = _downstream_channel_base_url(provider_type, req.base_url)
     admin_key = req.admin_key.strip()
+    custom_payload_type = req.custom_payload_type.strip()
+    custom_auth_header_name = req.custom_auth_header_name.strip()
+    custom_auth_header_value = req.custom_auth_header_value.strip()
     if provider_type != "local_sub2api" and not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
-    if provider_type != "local_sub2api" and not admin_key:
+    if provider_type in {"sub2api", "cpa"} and not admin_key:
         raise HTTPException(status_code=400, detail="admin_key is required")
+    if provider_type == "custom_http":
+        if custom_payload_type not in CUSTOM_HTTP_PAYLOAD_TYPES:
+            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api or cpa")
+        if bool(custom_auth_header_name) != bool(custom_auth_header_value):
+            raise HTTPException(status_code=400, detail="custom auth header name/value must be both set or both empty")
+        admin_key = ""
+    else:
+        custom_payload_type = ""
+        custom_auth_header_name = ""
+        custom_auth_header_value = ""
     channel = DownstreamChannelModel(
         id=f"downstream-channel-{uuid4()}",
         provider_type=provider_type,
         name=req.name.strip(),
         base_url=base_url,
         admin_key=admin_key,
+        custom_payload_type=custom_payload_type,
+        custom_auth_header_name=custom_auth_header_name,
+        custom_auth_header_value=custom_auth_header_value,
         enabled=req.enabled,
         update_existing=req.update_existing,
         timeout_s=max(1, int(req.timeout_s or 30)),
@@ -5181,10 +5204,16 @@ def patch_downstream_channel(
     if req.provider_type is not None:
         provider_type = req.provider_type.strip()
         if provider_type not in DOWNSTREAM_PROVIDER_TYPES:
-            raise HTTPException(status_code=400, detail="provider_type must be sub2api, cpa or local_sub2api")
+            raise HTTPException(status_code=400, detail="provider_type must be sub2api, cpa, local_sub2api or custom_http")
         channel.provider_type = provider_type
         if provider_type == "local_sub2api" and _looks_like_url(channel.base_url):
             channel.base_url = _local_sub2api_output_dir()
+        if provider_type != "custom_http":
+            channel.custom_payload_type = ""
+            channel.custom_auth_header_name = ""
+            channel.custom_auth_header_value = ""
+        if provider_type == "custom_http":
+            channel.admin_key = ""
     if req.name is not None:
         if not req.name.strip():
             raise HTTPException(status_code=400, detail="name is required")
@@ -5195,9 +5224,27 @@ def patch_downstream_channel(
             raise HTTPException(status_code=400, detail="base_url is required")
         channel.base_url = base_url
     if req.admin_key is not None:
-        if channel.provider_type != "local_sub2api" and not req.admin_key.strip():
+        if channel.provider_type in {"sub2api", "cpa"} and not req.admin_key.strip():
             raise HTTPException(status_code=400, detail="admin_key is required")
-        channel.admin_key = req.admin_key.strip()
+        channel.admin_key = "" if channel.provider_type == "custom_http" else req.admin_key.strip()
+    if req.custom_payload_type is not None:
+        value = req.custom_payload_type.strip()
+        if channel.provider_type == "custom_http" and value not in CUSTOM_HTTP_PAYLOAD_TYPES:
+            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api or cpa")
+        channel.custom_payload_type = value if channel.provider_type == "custom_http" else ""
+    if req.custom_auth_header_name is not None:
+        channel.custom_auth_header_name = (
+            req.custom_auth_header_name.strip() if channel.provider_type == "custom_http" else ""
+        )
+    if req.custom_auth_header_value is not None:
+        channel.custom_auth_header_value = (
+            req.custom_auth_header_value.strip() if channel.provider_type == "custom_http" else ""
+        )
+    if channel.provider_type == "custom_http":
+        if channel.custom_payload_type not in CUSTOM_HTTP_PAYLOAD_TYPES:
+            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api or cpa")
+        if bool(channel.custom_auth_header_name) != bool(channel.custom_auth_header_value):
+            raise HTTPException(status_code=400, detail="custom auth header name/value must be both set or both empty")
     if req.enabled is not None:
         channel.enabled = req.enabled
     if req.update_existing is not None:
@@ -5606,6 +5653,9 @@ def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Sessio
         "name": channel.name,
         "base_url": channel.base_url,
         "admin_key_summary": _summarize_secret(channel.admin_key or ""),
+        "custom_payload_type": channel.custom_payload_type,
+        "custom_auth_header_name": channel.custom_auth_header_name,
+        "custom_auth_header_value_summary": _summarize_secret(channel.custom_auth_header_value or ""),
         "enabled": channel.enabled,
         "update_existing": channel.update_existing,
         "timeout_s": channel.timeout_s,

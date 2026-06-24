@@ -22,6 +22,8 @@ from refactor_app.infrastructure.db.models import (
 )
 from refactor_app.plugins.downstream_cpa.client import CpaClientConfig
 from refactor_app.plugins.downstream_cpa.plugin import CpaDownstreamPlugin
+from refactor_app.plugins.downstream_custom_http.client import CustomHttpClientConfig
+from refactor_app.plugins.downstream_custom_http.plugin import CustomHttpDownstreamPlugin
 from refactor_app.plugins.downstream_local_sub2api.client import LocalSub2ApiClientConfig
 from refactor_app.plugins.downstream_local_sub2api.plugin import LocalSub2ApiDownstreamPlugin
 from refactor_app.plugins.downstream_sub2api.client import Sub2ApiClientConfig
@@ -376,6 +378,16 @@ def _provider_from_channel(channel: DownstreamChannelModel):
             LocalSub2ApiClientConfig(
                 output_dir=channel.base_url,
                 update_existing=channel.update_existing,
+            )
+        )
+    if channel.provider_type == "custom_http":
+        return CustomHttpDownstreamPlugin.from_config(
+            CustomHttpClientConfig(
+                url=channel.base_url,
+                auth_header_name=channel.custom_auth_header_name,
+                auth_header_value=channel.custom_auth_header_value,
+                payload_type=channel.custom_payload_type,
+                timeout_s=channel.timeout_s,
             )
         )
     raise DirectPushWorkflowError(f"unsupported_downstream_provider: {channel.provider_type}")

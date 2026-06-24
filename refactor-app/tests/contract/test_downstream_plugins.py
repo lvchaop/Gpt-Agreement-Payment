@@ -8,6 +8,12 @@ import httpx
 from refactor_app.plugins.contracts import DownstreamCodexPayload, DownstreamProvider
 from refactor_app.plugins.downstream_cpa import CpaClient, CpaClientConfig, CpaDownstreamPlugin
 from refactor_app.plugins.downstream_cpa.client import build_cpa_auth_file
+from refactor_app.plugins.downstream_custom_http.client import (
+    CustomHttpClient,
+    CustomHttpClientConfig,
+    build_custom_http_payload,
+)
+from refactor_app.plugins.downstream_custom_http.plugin import CustomHttpDownstreamPlugin
 from refactor_app.plugins.downstream_sub2api import (
     Sub2ApiClient,
     Sub2ApiClientConfig,
@@ -53,6 +59,16 @@ def test_sub2api_payload_builder_sets_update_existing_false_by_default() -> None
     assert credentials["chatgpt_account_id"] == "workspace-1"
     assert credentials["chatgpt_user_id"] == "chatgpt-user-1"
     assert credentials["client_id"] == "client-1"
+
+
+def test_custom_http_sub2api_payload_is_raw_credentials_json() -> None:
+    body = build_custom_http_payload(sample_payload(), payload_type="sub2api")
+
+    assert "content" not in body
+    assert "name" not in body
+    assert body["type"] == "codex"
+    assert body["chatgpt_account_id"] == "workspace-1"
+    assert body["refresh_token"] == "rt-1"
 
 
 def test_cpa_client_posts_management_auth_file() -> None:
@@ -116,4 +132,37 @@ def test_sub2api_client_posts_codex_session_import() -> None:
 
     assert result.pushed is True
     assert result.downstream_external_id == "sub2api-account-1"
+    assert len(requests) == 1
+
+
+def test_custom_http_client_posts_full_url_with_custom_header() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert str(request.url) == "https://custom.example.test/push"
+        assert request.headers["x-api-key"] == "secret-1"
+        body = json.loads(request.read())
+        assert body["chatgpt_account_id"] == "workspace-1"
+        assert body["refresh_token"] == "rt-1"
+        assert "content" not in body
+        return httpx.Response(200, json={"id": "custom-1"})
+
+    plugin: DownstreamProvider = CustomHttpDownstreamPlugin(
+        CustomHttpClient(
+            CustomHttpClientConfig(
+                url="https://custom.example.test/push",
+                auth_header_name="x-api-key",
+                auth_header_value="secret-1",
+                payload_type="sub2api",
+            ),
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+
+    result = plugin.push_codex_credential(sample_payload())
+
+    assert result.pushed is True
+    assert result.downstream_external_id == "custom-1"
     assert len(requests) == 1

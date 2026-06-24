@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -43,16 +44,25 @@ def health() -> None:
 
 @db_app.command("migrate")
 def migrate() -> None:
-    sql_path = Path(__file__).resolve().parents[3] / "migrations" / "sql" / "001_initial_schema.sql"
+    sql_dir = Path(__file__).resolve().parents[3] / "migrations" / "sql"
+    sql_paths = sorted(sql_dir.glob("*.sql"))
     engine = make_engine(Settings())
-    with engine.begin() as connection:
-        exists = connection.execute(
+    with engine.connect() as connection:
+        has_base_schema = connection.execute(
             text("SELECT to_regclass('public.user_accounts') IS NOT NULL")
         ).scalar_one()
-        if exists:
-            typer.echo("already_applied")
-            return
-        connection.execute(text(sql_path.read_text()))
+    for sql_path in sql_paths:
+        if has_base_schema and sql_path.name == "001_initial_schema.sql":
+            typer.echo(f"skip {sql_path.name}")
+            continue
+        connection = engine.raw_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql_path.read_text())
+            connection.commit()
+        finally:
+            connection.close()
+        typer.echo(f"applied {sql_path.name}")
     typer.echo("ok")
 
 
@@ -88,11 +98,15 @@ def _run_worker_loop(session_factory, settings: Settings, once: bool) -> list[st
     while True:
         job_id = runner.run_one()
         if job_id is None:
-            results.append("no_job")
-            return results
+            if once:
+                results.append("no_job")
+                return results
+            time.sleep(1)
+            continue
+        if not once:
+            continue
         results.append(job_id)
-        if once:
-            return results
+        return results
 
 
 @job_app.command("enqueue")

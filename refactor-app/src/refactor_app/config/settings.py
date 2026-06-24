@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     external_mail_api_base_url: str = ""
     external_mail_api_key: str = ""
     external_mail_provider_name: str = "cloudflare_temp_mail"
+    web_login_password: str = ""
 
     model_config = SettingsConfigDict(env_prefix="REFACTOR_APP_", env_file=".env")
 
