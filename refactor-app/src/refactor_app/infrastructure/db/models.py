@@ -500,6 +500,8 @@ class DownstreamChannelModel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     update_existing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     timeout_s: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    sub2api_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sub2api_group_ids: Mapped[str] = mapped_column(Text, nullable=False, default="")
     max_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     max_active_slots: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     push_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -512,8 +514,9 @@ class DownstreamChannelModel(Base):
 
     __table_args__ = (
         CheckConstraint("provider_type IN ('sub2api', 'cpa', 'local_sub2api', 'custom_http')"),
-        CheckConstraint("custom_payload_type IN ('', 'sub2api', 'cpa')"),
+        CheckConstraint("custom_payload_type IN ('', 'sub2api', 'sub2api_admin_accounts', 'cpa')"),
         CheckConstraint("timeout_s > 0"),
+        CheckConstraint("sub2api_concurrency >= 0"),
         CheckConstraint("max_push_count >= 0"),
         CheckConstraint("max_active_slots >= 0"),
         CheckConstraint("push_balance >= 0"),

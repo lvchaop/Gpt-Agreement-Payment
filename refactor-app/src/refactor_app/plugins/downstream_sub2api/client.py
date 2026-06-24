@@ -19,6 +19,8 @@ class Sub2ApiClientConfig:
     admin_key: str
     timeout_s: float = 30.0
     update_existing: bool = False
+    concurrency: int = 0
+    group_ids: tuple[int, ...] = ()
 
     def validate(self) -> None:
         if not self.base_url:
@@ -45,7 +47,12 @@ class Sub2ApiClient:
         )
 
     def push_codex_credential(self, payload: DownstreamCodexPayload) -> DownstreamPushResult:
-        body = build_sub2api_import_payload(payload, update_existing=self._config.update_existing)
+        body = build_sub2api_import_payload(
+            payload,
+            update_existing=self._config.update_existing,
+            concurrency=self._config.concurrency,
+            group_ids=self._config.group_ids,
+        )
         response = self._client.post("/api/v1/admin/accounts/import/codex-session", json=body)
         raw = _safe_json(response)
         import_error = _sub2api_import_error(raw)
@@ -66,14 +73,21 @@ def build_sub2api_import_payload(
     payload: DownstreamCodexPayload,
     *,
     update_existing: bool = False,
+    concurrency: int = 0,
+    group_ids: tuple[int, ...] = (),
 ) -> dict:
     validate_codex_payload(payload)
     credentials = codex_credentials_body(payload)
-    return {
+    body = {
         "content": json.dumps(credentials, ensure_ascii=False, separators=(",", ":")),
         "name": f"codex-{payload.email}-{payload.plan_type or payload.plan_tag or 'team'}.json",
         "update_existing": update_existing,
     }
+    if concurrency > 0:
+        body["concurrency"] = int(concurrency)
+    if group_ids:
+        body["group_ids"] = [int(group_id) for group_id in group_ids]
+    return body
 
 
 def _safe_json(response: httpx.Response) -> dict:

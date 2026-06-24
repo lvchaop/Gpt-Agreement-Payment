@@ -93,7 +93,7 @@ CODEX_USAGE_PROBE_MODEL = "gpt-5.4"
 CODEX_USAGE_PROBE_VERSION = "0.125.0"
 CODEX_USAGE_PROBE_USER_AGENT = "codex_cli_rs/0.125.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
 DOWNSTREAM_PROVIDER_TYPES = {"sub2api", "cpa", "local_sub2api", "custom_http"}
-CUSTOM_HTTP_PAYLOAD_TYPES = {"sub2api", "cpa"}
+CUSTOM_HTTP_PAYLOAD_TYPES = {"sub2api", "sub2api_admin_accounts", "cpa"}
 
 
 @dataclass(frozen=True)
@@ -211,6 +211,8 @@ class CreateDownstreamChannelRequest(BaseModel):
     enabled: bool = True
     update_existing: bool = False
     timeout_s: int = 30
+    sub2api_concurrency: int = 0
+    sub2api_group_ids: str = ""
     max_push_count: int = 2
     max_active_slots: int = 1
     push_balance: int = 0
@@ -227,6 +229,8 @@ class PatchDownstreamChannelRequest(BaseModel):
     enabled: bool | None = None
     update_existing: bool | None = None
     timeout_s: int | None = None
+    sub2api_concurrency: int | None = None
+    sub2api_group_ids: str | None = None
     max_push_count: int | None = None
     max_active_slots: int | None = None
     push_balance: int | None = None
@@ -5200,13 +5204,15 @@ def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSe
     custom_payload_type = req.custom_payload_type.strip()
     custom_auth_header_name = req.custom_auth_header_name.strip()
     custom_auth_header_value = req.custom_auth_header_value.strip()
+    sub2api_concurrency = max(0, int(req.sub2api_concurrency or 0))
+    sub2api_group_ids = _normalize_downstream_group_ids(req.sub2api_group_ids)
     if provider_type != "local_sub2api" and not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
     if provider_type in {"sub2api", "cpa"} and not admin_key:
         raise HTTPException(status_code=400, detail="admin_key is required")
     if provider_type == "custom_http":
         if custom_payload_type not in CUSTOM_HTTP_PAYLOAD_TYPES:
-            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api or cpa")
+            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api, sub2api_admin_accounts or cpa")
         if bool(custom_auth_header_name) != bool(custom_auth_header_value):
             raise HTTPException(status_code=400, detail="custom auth header name/value must be both set or both empty")
         admin_key = ""
@@ -5226,6 +5232,8 @@ def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSe
         enabled=req.enabled,
         update_existing=req.update_existing,
         timeout_s=max(1, int(req.timeout_s or 30)),
+        sub2api_concurrency=sub2api_concurrency,
+        sub2api_group_ids=sub2api_group_ids,
         max_push_count=max(0, int(req.max_push_count or 0)),
         max_active_slots=max(0, int(req.max_active_slots)),
         push_balance=max(0, int(req.push_balance or 0)),
@@ -5279,7 +5287,7 @@ def patch_downstream_channel(
     if req.custom_payload_type is not None:
         value = req.custom_payload_type.strip()
         if channel.provider_type == "custom_http" and value not in CUSTOM_HTTP_PAYLOAD_TYPES:
-            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api or cpa")
+            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api, sub2api_admin_accounts or cpa")
         channel.custom_payload_type = value if channel.provider_type == "custom_http" else ""
     if req.custom_auth_header_name is not None:
         channel.custom_auth_header_name = (
@@ -5291,7 +5299,7 @@ def patch_downstream_channel(
         )
     if channel.provider_type == "custom_http":
         if channel.custom_payload_type not in CUSTOM_HTTP_PAYLOAD_TYPES:
-            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api or cpa")
+            raise HTTPException(status_code=400, detail="custom_payload_type must be sub2api, sub2api_admin_accounts or cpa")
         if bool(channel.custom_auth_header_name) != bool(channel.custom_auth_header_value):
             raise HTTPException(status_code=400, detail="custom auth header name/value must be both set or both empty")
     if req.enabled is not None:
@@ -5300,6 +5308,10 @@ def patch_downstream_channel(
         channel.update_existing = req.update_existing
     if req.timeout_s is not None:
         channel.timeout_s = max(1, int(req.timeout_s or 30))
+    if req.sub2api_concurrency is not None:
+        channel.sub2api_concurrency = max(0, int(req.sub2api_concurrency or 0))
+    if req.sub2api_group_ids is not None:
+        channel.sub2api_group_ids = _normalize_downstream_group_ids(req.sub2api_group_ids)
     if req.max_push_count is not None:
         channel.max_push_count = max(0, int(req.max_push_count or 0))
     if req.max_active_slots is not None:
@@ -5708,6 +5720,8 @@ def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Sessio
         "enabled": channel.enabled,
         "update_existing": channel.update_existing,
         "timeout_s": channel.timeout_s,
+        "sub2api_concurrency": channel.sub2api_concurrency,
+        "sub2api_group_ids": channel.sub2api_group_ids,
         "max_push_count": channel.max_push_count,
         "max_active_slots": channel.max_active_slots,
         "allowed_active_slots": allowed_slots,
@@ -5733,6 +5747,22 @@ def _downstream_channel_base_url(provider_type: str, value: str) -> str:
     if provider_type == "local_sub2api":
         return text_value or _local_sub2api_output_dir()
     return text_value.rstrip("/")
+
+
+def _normalize_downstream_group_ids(value: str) -> str:
+    group_ids: list[str] = []
+    for part in str(value or "").replace("\n", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            group_id = int(item)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="sub2api_group_ids must be comma separated integers") from exc
+        if group_id <= 0:
+            raise HTTPException(status_code=400, detail="sub2api_group_ids must be positive integers")
+        group_ids.append(str(group_id))
+    return ",".join(dict.fromkeys(group_ids))
 
 
 def _local_sub2api_output_dir() -> str:

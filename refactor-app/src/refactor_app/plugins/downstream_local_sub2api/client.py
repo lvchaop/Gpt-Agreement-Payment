@@ -18,6 +18,8 @@ class LocalSub2ApiClientError(RuntimeError):
 class LocalSub2ApiClientConfig:
     output_dir: str
     update_existing: bool = False
+    concurrency: int = 0
+    group_ids: tuple[int, ...] = ()
 
     def effective_output_dir(self) -> Path:
         value = str(self.output_dir or "").strip()
@@ -37,6 +39,8 @@ class LocalSub2ApiClient:
             body = build_sub2api_import_payload(
                 payload,
                 update_existing=self._config.update_existing,
+                concurrency=self._config.concurrency,
+                group_ids=self._config.group_ids,
             )
             body["proxies"] = []
             path = output_dir / _local_sub2api_filename(payload)

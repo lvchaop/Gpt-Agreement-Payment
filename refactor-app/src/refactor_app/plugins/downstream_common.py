@@ -26,6 +26,7 @@ def validate_codex_payload(payload: DownstreamCodexPayload) -> None:
 
 def codex_credentials_body(payload: DownstreamCodexPayload) -> dict:
     validate_codex_payload(payload)
+    expires_at = int(payload.expires_at.timestamp()) if payload.expires_at else None
     return {
         "id_token": payload.id_token,
         "access_token": payload.access_token,
@@ -33,12 +34,12 @@ def codex_credentials_body(payload: DownstreamCodexPayload) -> dict:
         "account_id": payload.account_id,
         "email": payload.email,
         "last_refresh": now_iso(),
-        "expired": payload.expires_at.isoformat() if payload.expires_at else "",
+        "expired": expires_at,
         "type": "codex",
         "chatgpt_account_id": payload.downstream_chatgpt_account_id,
         "chatgpt_user_id": payload.chatgpt_user_id,
         "client_id": payload.client_id,
-        "expires_at": payload.expires_at.isoformat() if payload.expires_at else "",
+        "expires_at": expires_at,
         "plan_type": payload.plan_type or payload.plan_tag,
     }
 

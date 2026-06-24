@@ -19,7 +19,7 @@ ALTER TABLE downstream_channels
 
 ALTER TABLE downstream_channels
   ADD CONSTRAINT downstream_channels_custom_payload_type_check
-  CHECK (custom_payload_type IN ('', 'sub2api', 'cpa'));
+  CHECK (custom_payload_type IN ('', 'sub2api', 'sub2api_admin_accounts', 'cpa'));
 
 ALTER TABLE downstream_codex_push_records
   DROP CONSTRAINT IF EXISTS downstream_codex_push_records_downstream_provider_check;

@@ -151,8 +151,8 @@ class PushCodexCredentialDirectWorkflow:
                 record.updated_at = now
             session.commit()
 
-        provider = _provider_from_channel(channel)
         try:
+            provider = _provider_from_channel(channel)
             result = provider.push_codex_credential(payload)
         except Exception as exc:
             _mark_push_failed(
@@ -182,6 +182,8 @@ class PushCodexCredentialDirectWorkflow:
                 record.error_message = ""
                 if credential is not None:
                     credential.push_lifecycle_status = "pushed"
+                    credential.failure_code = ""
+                    credential.failure_message = ""
                     credential.updated_at = finished_at
                 if channel is not None:
                     channel.pushed_count += 1
@@ -363,6 +365,8 @@ def _provider_from_channel(channel: DownstreamChannelModel):
                 admin_key=channel.admin_key,
                 timeout_s=channel.timeout_s,
                 update_existing=channel.update_existing,
+                concurrency=channel.sub2api_concurrency,
+                group_ids=_parse_downstream_group_ids(channel.sub2api_group_ids),
             )
         )
     if channel.provider_type == "cpa":
@@ -378,6 +382,8 @@ def _provider_from_channel(channel: DownstreamChannelModel):
             LocalSub2ApiClientConfig(
                 output_dir=channel.base_url,
                 update_existing=channel.update_existing,
+                concurrency=channel.sub2api_concurrency,
+                group_ids=_parse_downstream_group_ids(channel.sub2api_group_ids),
             )
         )
     if channel.provider_type == "custom_http":
@@ -388,6 +394,20 @@ def _provider_from_channel(channel: DownstreamChannelModel):
                 auth_header_value=channel.custom_auth_header_value,
                 payload_type=channel.custom_payload_type,
                 timeout_s=channel.timeout_s,
+                sub2api_concurrency=channel.sub2api_concurrency,
+                sub2api_group_ids=_parse_downstream_group_ids(channel.sub2api_group_ids),
             )
         )
     raise DirectPushWorkflowError(f"unsupported_downstream_provider: {channel.provider_type}")
+
+
+def _parse_downstream_group_ids(value: str) -> tuple[int, ...]:
+    group_ids: list[int] = []
+    for part in str(value or "").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        group_id = int(item)
+        if group_id > 0:
+            group_ids.append(group_id)
+    return tuple(group_ids)

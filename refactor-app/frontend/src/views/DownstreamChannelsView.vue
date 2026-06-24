@@ -25,6 +25,8 @@ const form = ref({
   enabled: true,
   update_existing: true,
   timeout_s: 30,
+  sub2api_concurrency: 0,
+  sub2api_group_ids: "",
   max_active_slots: 1,
   push_balance: 0,
 });
@@ -39,6 +41,8 @@ const editForm = ref({
   enabled: true,
   update_existing: true,
   timeout_s: 30,
+  sub2api_concurrency: 0,
+  sub2api_group_ids: "",
   max_active_slots: 1,
 });
 const isLocalSub2api = computed(() => form.value.provider_type === "local_sub2api");
@@ -115,6 +119,8 @@ const columns: Column[] = [
   { key: "enabled", label: "启用", badge: true },
   { key: "update_existing", label: "更新已有", badge: true },
   { key: "timeout_s", label: "超时" },
+  { key: "sub2api_concurrency", label: "sub2api 并发" },
+  { key: "sub2api_group_ids", label: "sub2api 分组" },
   { key: "max_active_slots", label: "同时占用上限" },
   { key: "allowed_active_slots", label: "当前开放坑位" },
   { key: "active_slot_count", label: "当前占用" },
@@ -139,7 +145,7 @@ async function createChannel(reload: () => Promise<void>) {
     !form.value.name.trim()
     || (!local && !form.value.base_url.trim())
     || (!local && !custom && !form.value.admin_key.trim())
-    || (custom && !["sub2api", "cpa"].includes(form.value.custom_payload_type))
+    || (custom && !["sub2api", "sub2api_admin_accounts", "cpa"].includes(form.value.custom_payload_type))
     || (custom && Boolean(form.value.custom_auth_header_name.trim()) !== Boolean(form.value.custom_auth_header_value.trim()))
   ) {
     store.toast(
@@ -161,6 +167,8 @@ async function createChannel(reload: () => Promise<void>) {
     form.value.admin_key = "";
     form.value.custom_auth_header_name = "";
     form.value.custom_auth_header_value = "";
+    form.value.sub2api_concurrency = 0;
+    form.value.sub2api_group_ids = "";
     await reload();
   } catch (err) {
     store.toast("创建失败", String((err as Error).message ?? err), "error");
@@ -192,6 +200,8 @@ function openEditChannel(row: Row) {
     enabled: Boolean(row.enabled),
     update_existing: Boolean(row.update_existing),
     timeout_s: Number(row.timeout_s || 30),
+    sub2api_concurrency: Number(row.sub2api_concurrency || 0),
+    sub2api_group_ids: String(row.sub2api_group_ids || ""),
     max_active_slots: Number(row.max_active_slots || 0),
   };
 }
@@ -230,8 +240,8 @@ async function saveEditChannel(reload: () => Promise<void>) {
     store.toast("参数不完整", "本地渠道改为远端渠道时必须填写密钥。", "warning");
     return;
   }
-  if (nextCustom && !["sub2api", "cpa"].includes(editForm.value.custom_payload_type)) {
-    store.toast("参数不完整", "自定义接口必须选择 sub2api 或 CPA JSON。", "warning");
+  if (nextCustom && !["sub2api", "sub2api_admin_accounts", "cpa"].includes(editForm.value.custom_payload_type)) {
+    store.toast("参数不完整", "自定义接口必须选择 sub2api raw、sub2api /api/v1/admin/accounts 或 CPA JSON。", "warning");
     return;
   }
   if (nextCustom && !authHeaderName && authHeaderValue) {
@@ -252,6 +262,8 @@ async function saveEditChannel(reload: () => Promise<void>) {
     enabled: editForm.value.enabled,
     update_existing: editForm.value.update_existing,
     timeout_s: Number(editForm.value.timeout_s || 30),
+    sub2api_concurrency: Number(editForm.value.sub2api_concurrency || 0),
+    sub2api_group_ids: editForm.value.sub2api_group_ids,
     max_active_slots: Number(editForm.value.max_active_slots || 0),
   };
   if (nextLocal || nextCustom) {
@@ -401,12 +413,13 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
 
           <section v-if="isCustomHttp" class="mini-section accent-section">
             <h3>自定义接口</h3>
-            <p>sub2api 格式推送 raw 授权 JSON，也就是原 content 里的内容；CPA 格式推送 CPA auth file JSON。</p>
+            <p>sub2api 授权 JSON 保持 raw content；sub2api /api/v1/admin/accounts 会包装成 CreateAccountRequest；CPA 推 CPA auth file JSON。</p>
             <div class="form-grid">
               <label>
                 <span>推送 JSON 类型</span>
                 <select v-model="form.custom_payload_type">
                   <option value="sub2api">sub2api 授权 JSON</option>
+                  <option value="sub2api_admin_accounts">sub2api /api/v1/admin/accounts</option>
                   <option value="cpa">CPA 授权 JSON</option>
                 </select>
               </label>
@@ -435,6 +448,19 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
               <label>
                 <span>推送余额</span>
                 <input v-model.number="form.push_balance" type="number" min="0" />
+              </label>
+              <label>
+                <span>sub2api 账号并发</span>
+                <input
+                  v-model.number="form.sub2api_concurrency"
+                  type="number"
+                  min="0"
+                  placeholder="0 表示使用下游默认"
+                />
+              </label>
+              <label>
+                <span>sub2api 分组 ID</span>
+                <input v-model="form.sub2api_group_ids" placeholder="多个用英文逗号分隔，例如 1,2,3" />
               </label>
               <label class="check">
                 <input v-model="form.enabled" type="checkbox" />
@@ -539,13 +565,14 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
               <section v-if="isEditingCustomHttp" class="edit-section accent-section">
                 <div class="section-title">
                   <h3>自定义接口</h3>
-                  <p>sub2api 推 raw 授权 JSON；CPA 推 CPA auth file JSON。认证头名称和值同时留空表示不加认证头。</p>
+                  <p>sub2api 授权 JSON 保持 raw content；sub2api /api/v1/admin/accounts 会包装成 CreateAccountRequest；CPA 推 CPA auth file JSON。</p>
                 </div>
                 <div class="edit-grid">
                   <label>
                     <span>推送 JSON 类型</span>
                     <select v-model="editForm.custom_payload_type" class="input">
                       <option value="sub2api">sub2api 授权 JSON</option>
+                      <option value="sub2api_admin_accounts">sub2api /api/v1/admin/accounts</option>
                       <option value="cpa">CPA 授权 JSON</option>
                     </select>
                   </label>
@@ -581,6 +608,24 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
                   <label>
                     <span>同时占用上限</span>
                     <input v-model.number="editForm.max_active_slots" class="input" type="number" min="0" />
+                  </label>
+                  <label>
+                    <span>sub2api 账号并发</span>
+                    <input
+                      v-model.number="editForm.sub2api_concurrency"
+                      class="input"
+                      type="number"
+                      min="0"
+                      placeholder="0 表示使用下游默认"
+                    />
+                  </label>
+                  <label>
+                    <span>sub2api 分组 ID</span>
+                    <input
+                      v-model="editForm.sub2api_group_ids"
+                      class="input"
+                      placeholder="多个用英文逗号分隔，例如 1,2,3"
+                    />
                   </label>
                   <label class="check edit-check">
                     <input v-model="editForm.enabled" type="checkbox" />
