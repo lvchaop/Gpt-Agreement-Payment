@@ -15,6 +15,7 @@ from typing import Any
 REPO = Path("/Users/chaopenglv/data/me/Gpt-Agreement-Payment")
 BOOTSTRAP_TOOL = REPO / "tools/probe_human_fresh_bootstrap.py"
 LIVE_PROBE = REPO / "tools/probe_human_collector_live.py"
+DECODE_TOOL = REPO / "tools/decode_bundle_payload_with_marker.py"
 JS_TRACE = REPO / "output/outlook_browser/js_internal_trace_s00ld1lglrw0_1781191381.jsonl"
 RUNTIME_TRACE = REPO / "output/outlook_browser/runtime_trace_s00ld1lglrw0_1781191381.jsonl"
 FRESH_BUNDLE = REPO / "output/protocol_reverse/fresh_bundle_probe/fresh_bundle_probe_d2eae322-65b6-11f1-8553-62666cc2b93d_1781198172.json"
@@ -82,7 +83,13 @@ def runtime_request(line_no: int) -> dict[str, Any]:
 
 
 def parse_form_body(body: str) -> dict[str, str]:
-    return dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+    out: dict[str, str] = {}
+    for part in body.split("&"):
+        if not part:
+            continue
+        key, sep, value = part.partition("=")
+        out[urllib.parse.unquote(key)] = urllib.parse.unquote(value if sep else "")
+    return out
 
 
 def replace_strings(value: Any, replacements: dict[str, str]) -> Any:
@@ -141,6 +148,26 @@ def px_activity(activities: list[dict[str, Any]]) -> dict[str, Any]:
     raise RuntimeError("PX561 activity not found")
 
 
+def px_stack_from_probe(path: Path) -> str:
+    doc = read_json(path)
+    material = doc.get("material") or {}
+    meta = material.get("meta") or {}
+    dec = load_module(DECODE_TOOL, "decode_bundle_payload_with_marker")
+    form = dec.parse_form(str(material.get("body") or ""))
+    marker = str(meta.get("marker") or "")
+    payload_uuid = str(meta.get("payloadUuid") or form.get("uuid") or "")
+    if not marker or not payload_uuid or not form.get("payload"):
+        raise RuntimeError(f"stack probe lacks marker/payload uuid/payload: {path}")
+    decoded = dec.decode_payload(form["payload"], marker, payload_uuid)
+    activities = decoded.get("json")
+    if not isinstance(activities, list):
+        raise RuntimeError(f"stack probe payload did not decode to activity list: {path}: {decoded.get('jsonError')}")
+    stack = (px_activity(activities).get("d") or {}).get("W0shQR0nJHc=")
+    if not stack:
+        raise RuntimeError(f"stack probe decoded PX561 lacks W0shQR0nJHc=: {path}")
+    return str(stack)
+
+
 def build_material(
     *,
     send: bool,
@@ -169,6 +196,7 @@ def build_material(
     payload_source: str = "built",
     pc_source: str = "computed",
     body_source: str = "built",
+    stack_probe: Path | None = None,
 ) -> dict[str, Any]:
     boot = load_module(BOOTSTRAP_TOOL, "probe_human_fresh_bootstrap")
     live = load_module(LIVE_PROBE, "probe_human_collector_live")
@@ -221,13 +249,22 @@ def build_material(
     px = px_activity(activities)
     px_d = px["d"]
     original_px_d = px_activity(original_activities).get("d") or {}
+    stack_value_source = "fresh-built"
     if stack_source == "template" and original_px_stack is not None:
         px_d["W0shQR0nJHc="] = original_px_stack
+        stack_value_source = "template"
+    elif stack_source == "fresh-probe":
+        if stack_probe is None:
+            raise RuntimeError("--stack-source fresh-probe requires --stack-probe")
+        px_d["W0shQR0nJHc="] = px_stack_from_probe(stack_probe)
+        stack_value_source = str(stack_probe)
     elif stack_source != "fresh":
         raise RuntimeError(f"unsupported stack source: {stack_source}")
     if inner_uuid_source == "template" and original_px_d.get("FUFvS1Mga38=") is not None:
         px_d["FUFvS1Mga38="] = original_px_d["FUFvS1Mga38="]
-    elif inner_uuid_source != "fresh":
+    elif inner_uuid_source == "fresh":
+        px_d["FUFvS1Mga38="] = state["uuid"]
+    else:
         raise RuntimeError(f"unsupported inner uuid source: {inner_uuid_source}")
     old_tail = {k: px_d.get(k) for k in ["OSkIb39DDA==", "TBR9Ugl7emA=", "Bzt2fUFRcw==", "AEAxBkUsPjQ=", "fyNOZTpPQF4="]}
     if tail_source == "fresh":
@@ -359,6 +396,8 @@ def build_material(
             "bztSource": bzt_source,
             "bztValueArg": bzt_value,
             "stackSource": stack_source,
+            "stackValueSource": stack_value_source,
+            "stackProbe": str(stack_probe) if stack_probe else None,
             "tailSource": tail_source,
             "innerUuidSource": inner_uuid_source,
             "nonPxActivitySource": non_px_activity_source,
@@ -429,7 +468,7 @@ def main() -> int:
     parser.add_argument("--pow-json", type=Path, default=FRESH_POW)
     parser.add_argument("--nq-json", type=Path, default=FRESH_NQ)
     parser.add_argument("--ng-nq-json", type=Path, default=FRESH_NG_NQ)
-    parser.add_argument("--stack-source", choices=["fresh", "template"], default="fresh")
+    parser.add_argument("--stack-source", choices=["fresh", "template", "fresh-probe"], default="fresh")
     parser.add_argument("--tail-source", choices=["fresh", "template"], default="fresh")
     parser.add_argument("--inner-uuid-source", choices=["fresh", "template"], default="fresh")
     parser.add_argument("--non-px-activity-source", choices=["fresh", "template"], default="fresh")
@@ -440,6 +479,7 @@ def main() -> int:
     parser.add_argument("--payload-source", choices=["built", "template-exact"], default="built")
     parser.add_argument("--pc-source", choices=["computed", "template-exact"], default="computed")
     parser.add_argument("--body-source", choices=["built", "template-exact"], default="built")
+    parser.add_argument("--stack-probe", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
     args = parser.parse_args()
     live = load_module(LIVE_PROBE, "probe_human_collector_live")
@@ -471,6 +511,7 @@ def main() -> int:
         payload_source=args.payload_source,
         pc_source=args.pc_source,
         body_source=args.body_source,
+        stack_probe=args.stack_probe,
     )
     result: dict[str, Any] = {"startedAt": started, "sent": bool(args.send), "material": material}
     if args.send:

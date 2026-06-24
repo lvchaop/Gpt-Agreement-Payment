@@ -69,6 +69,7 @@ def build_material(px: Any, *, template_line: int, seq: str, rsc: str, runtime_l
         payload_source=args.payload_source,
         pc_source=args.pc_source,
         body_source=args.body_source,
+        stack_probe=args.stack_probe,
     )
 
 
@@ -243,7 +244,35 @@ def send_h2_pair(
         send_body(stream6, body6)
         sock.sendall(conn.data_to_send())
 
-        if h2_body_order == "seq6-body-first":
+        if h2_body_order == "seq6-response-before-seq5-body":
+            deadline = time.time() + timeout
+            while stream6 not in response_done:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError("h2 pair timed out waiting for seq6 before seq5 body")
+                sock.settimeout(remaining)
+                data = sock.recv(65535)
+                if not data:
+                    break
+                events = conn.receive_data(data)
+                for event in events:
+                    sid = getattr(event, "stream_id", None)
+                    if sid not in streams:
+                        continue
+                    if isinstance(event, h2.events.ResponseReceived):
+                        response_headers[sid] = list(event.headers)
+                    elif isinstance(event, h2.events.DataReceived):
+                        response_body.setdefault(sid, bytearray()).extend(event.data)
+                        conn.acknowledge_received_data(event.flow_controlled_length, sid)
+                    elif isinstance(event, h2.events.StreamEnded):
+                        response_done.add(sid)
+                        results[streams[sid]]["endedAt"] = time.time()
+                out = conn.data_to_send()
+                if out:
+                    sock.sendall(out)
+            send_body(stream5, body5)
+            sock.sendall(conn.data_to_send())
+        elif h2_body_order == "seq6-body-first":
             send_body(stream5, body5)
             sock.sendall(conn.data_to_send())
         elif h2_body_order != "normal":
@@ -304,7 +333,7 @@ def main() -> int:
     parser.add_argument("--gap-seconds", type=float, default=0.1816)
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--transport", choices=["https-threads", "h2-single-session"], default="https-threads")
-    parser.add_argument("--h2-body-order", choices=["normal", "seq6-body-first"], default="normal")
+    parser.add_argument("--h2-body-order", choices=["normal", "seq6-body-first", "seq6-response-before-seq5-body"], default="normal")
     parser.add_argument("--include-proxy-authorization", action="store_true")
     parser.add_argument("--header-mode", choices=["safe", "runtime-exact"], default="safe")
     parser.add_argument("--aeax-source", choices=["template", "offline-ng"], default="template")
@@ -315,7 +344,8 @@ def main() -> int:
     parser.add_argument("--pow-json", type=Path, required=True)
     parser.add_argument("--nq-json", type=Path, required=True)
     parser.add_argument("--ng-nq-json", type=Path, required=True)
-    parser.add_argument("--stack-source", choices=["fresh", "template"], default="template")
+    parser.add_argument("--stack-source", choices=["fresh", "template", "fresh-probe"], default="template")
+    parser.add_argument("--stack-probe", type=Path, default=None)
     parser.add_argument("--tail-source", choices=["fresh", "template"], default="template")
     parser.add_argument("--inner-uuid-source", choices=["fresh", "template"], default="template")
     parser.add_argument("--non-px-activity-source", choices=["fresh", "template"], default="template")
@@ -373,6 +403,8 @@ def main() -> int:
             "bodySource": args.body_source,
             "seq6ActivitySource": args.seq6_activity_source,
             "h2BodyOrder": args.h2_body_order,
+            "stackSource": args.stack_source,
+            "stackProbe": str(args.stack_probe) if args.stack_probe else None,
         },
         "results": results,
         "checks": {

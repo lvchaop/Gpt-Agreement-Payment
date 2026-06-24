@@ -53,6 +53,18 @@ def collector_request_build_summary() -> dict[str, Any]:
     }
 
 
+def collector_request_build_exact_coverage_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/collector_request_build_exact_coverage_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "s00BeaconLine1007Evidence": audit.get("s00BeaconLine1007Evidence"),
+        "conclusion": audit.get("conclusion"),
+    }
+
+
 def px561_constructor_summary() -> dict[str, Any]:
     path = PROTO / "px561_constructor/px561_pow_tail_constructor_audit.json"
     audit = load_json(path) or {}
@@ -927,6 +939,34 @@ def s00_line933_state_window_summary() -> dict[str, Any]:
     }
 
 
+def s00_seq6_to_seq5_success_bridge_window_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/s00_seq6_to_seq5_success_bridge_window_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "runtimeLineRange": (((audit.get("window") or {}).get("runtimeLineRange"))),
+        "collectorDecodeLineRange": (((audit.get("window") or {}).get("collectorDecodeLineRange"))),
+        "runtime": (((audit.get("window") or {}).get("runtime"))),
+        "parentMessages": [
+            {
+                key: row.get(key)
+                for key in ["line", "wall_t", "eventOrigin", "name", "expires"]
+            }
+            for row in (((audit.get("window") or {}).get("parentMessages")) or [])
+        ],
+        "correlations": [
+            {
+                key: row.get(key)
+                for key in ["name", "collectorLine", "partIndex", "parentLine", "valueMatch", "handler"]
+            }
+            for row in (((audit.get("window") or {}).get("correlations")) or [])
+        ],
+        "conclusion": audit.get("conclusion"),
+    }
+
+
 def seq6_response_first_control_summary() -> dict[str, Any]:
     path = PROTO / "goal_audit/seq6_response_first_control_audit.json"
     audit = load_json(path) or {}
@@ -1079,6 +1119,687 @@ def h2_fresh_tail_strongest_control_summary() -> dict[str, Any]:
     }
 
 
+def h2_inner_uuid_binding_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/h2_inner_uuid_binding_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "directChecks": audit.get("directChecks"),
+        "delayAfterPreCaptchaHead": audit.get("delayAfterPreCaptchaHead"),
+        "comboChecks": audit.get("comboChecks"),
+        "timing": audit.get("timing"),
+        "seq5Sources": audit.get("seq5Sources"),
+        "activityEvidence": audit.get("activityEvidence"),
+        "seq5": {
+            "status": ((audit.get("seq5") or {}).get("status")),
+            "transport": ((audit.get("seq5") or {}).get("transport")),
+            "handlers": ((audit.get("seq5") or {}).get("handlers")),
+            "successParts": ((audit.get("seq5") or {}).get("successParts")),
+        },
+        "seq6": {
+            "status": ((audit.get("seq6") or {}).get("status")),
+            "transport": ((audit.get("seq6") or {}).get("transport")),
+            "handlers": ((audit.get("seq6") or {}).get("handlers")),
+            "successParts": ((audit.get("seq6") or {}).get("successParts")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def h2_fresh_tail_only_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/h2_fresh_tail_only_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "directChecks": audit.get("directChecks"),
+        "delayAfterPreCaptchaHead": audit.get("delayAfterPreCaptchaHead"),
+        "comboChecks": audit.get("comboChecks"),
+        "timing": audit.get("timing"),
+        "seq5Sources": audit.get("seq5Sources"),
+        "activityEvidence": audit.get("activityEvidence"),
+        "seq5": {
+            "status": ((audit.get("seq5") or {}).get("status")),
+            "transport": ((audit.get("seq5") or {}).get("transport")),
+            "handlers": ((audit.get("seq5") or {}).get("handlers")),
+            "successParts": ((audit.get("seq5") or {}).get("successParts")),
+        },
+        "seq6": {
+            "status": ((audit.get("seq6") or {}).get("status")),
+            "transport": ((audit.get("seq6") or {}).get("transport")),
+            "handlers": ((audit.get("seq6") or {}).get("handlers")),
+            "successParts": ((audit.get("seq6") or {}).get("successParts")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def h2_fresh_tail_inner_uuid_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/h2_fresh_tail_inner_uuid_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "directChecks": audit.get("directChecks"),
+        "delayAfterPreCaptchaHead": audit.get("delayAfterPreCaptchaHead"),
+        "comboChecks": audit.get("comboChecks"),
+        "timing": audit.get("timing"),
+        "seq5Sources": audit.get("seq5Sources"),
+        "activityEvidence": audit.get("activityEvidence"),
+        "seq5": {
+            "status": ((audit.get("seq5") or {}).get("status")),
+            "transport": ((audit.get("seq5") or {}).get("transport")),
+            "handlers": ((audit.get("seq5") or {}).get("handlers")),
+            "successParts": ((audit.get("seq5") or {}).get("successParts")),
+        },
+        "seq6": {
+            "status": ((audit.get("seq6") or {}).get("status")),
+            "transport": ((audit.get("seq6") or {}).get("transport")),
+            "handlers": ((audit.get("seq6") or {}).get("handlers")),
+            "successParts": ((audit.get("seq6") or {}).get("successParts")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def h2_fresh_stack_only_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/h2_fresh_stack_only_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "directChecks": audit.get("directChecks"),
+        "delayAfterPreCaptchaHead": audit.get("delayAfterPreCaptchaHead"),
+        "comboChecks": audit.get("comboChecks"),
+        "timing": audit.get("timing"),
+        "seq5Sources": audit.get("seq5Sources"),
+        "activityEvidence": audit.get("activityEvidence"),
+        "seq5": {
+            "status": ((audit.get("seq5") or {}).get("status")),
+            "transport": ((audit.get("seq5") or {}).get("transport")),
+            "handlers": ((audit.get("seq5") or {}).get("handlers")),
+            "successParts": ((audit.get("seq5") or {}).get("successParts")),
+        },
+        "seq6": {
+            "status": ((audit.get("seq6") or {}).get("status")),
+            "transport": ((audit.get("seq6") or {}).get("transport")),
+            "handlers": ((audit.get("seq6") or {}).get("handlers")),
+            "successParts": ((audit.get("seq6") or {}).get("successParts")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def h2_seq6_response_before_seq5_body_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/h2_seq6_response_before_seq5_body_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "directChecks": audit.get("directChecks"),
+        "comboChecks": audit.get("comboChecks"),
+        "comboInputs": {
+            key: ((audit.get("comboInputs") or {}).get(key))
+            for key in ["h2BodyOrder", "stackSource", "tailSource", "innerUuidSource", "nonPxActivitySource"]
+        },
+        "timing": audit.get("timing"),
+        "seq5": {
+            "status": ((audit.get("seq5") or {}).get("status")),
+            "transport": ((audit.get("seq5") or {}).get("transport")),
+            "handlers": ((audit.get("seq5") or {}).get("handlers")),
+            "successParts": ((audit.get("seq5") or {}).get("successParts")),
+        },
+        "seq6": {
+            "status": ((audit.get("seq6") or {}).get("status")),
+            "transport": ((audit.get("seq6") or {}).get("transport")),
+            "handlers": ((audit.get("seq6") or {}).get("handlers")),
+            "successParts": ((audit.get("seq6") or {}).get("successParts")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def first_failure_overlap_probe_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/first_failure_overlap_probe_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "derivedChecks": audit.get("derivedChecks"),
+        "inputs": audit.get("inputs"),
+        "timing": audit.get("timing"),
+        "seq2": audit.get("seq2"),
+        "seq3": audit.get("seq3"),
+        "s00Reference": audit.get("s00Reference"),
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def forced_first_failure_response_order_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/forced_first_failure_response_order_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "attemptChecks": audit.get("attemptChecks"),
+        "overlap": audit.get("overlap"),
+        "seq4": audit.get("seq4"),
+        "combo": {
+            "checks": ((audit.get("combo") or {}).get("checks")),
+            "timing": ((audit.get("combo") or {}).get("timing")),
+            "seq5": ((audit.get("combo") or {}).get("seq5")),
+            "seq6": ((audit.get("combo") or {}).get("seq6")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def forced_overlap_encoded_decoded_boundary_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/forced_overlap_encoded_decoded_boundary_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "seq5": {
+            "formDiffKeys": ((audit.get("seq5") or {}).get("formDiffKeys")),
+            "payloadEqual": ((audit.get("seq5") or {}).get("payloadEqual")),
+            "pcEqual": ((audit.get("seq5") or {}).get("pcEqual")),
+            "bodyEqual": ((audit.get("seq5") or {}).get("bodyEqual")),
+            "activityCompare": ((audit.get("seq5") or {}).get("activityCompare")),
+        },
+        "seq6": {
+            "formDiffKeys": ((audit.get("seq6") or {}).get("formDiffKeys")),
+            "payloadEqual": ((audit.get("seq6") or {}).get("payloadEqual")),
+            "pcEqual": ((audit.get("seq6") or {}).get("pcEqual")),
+            "bodyEqual": ((audit.get("seq6") or {}).get("bodyEqual")),
+            "activityCompare": ((audit.get("seq6") or {}).get("activityCompare")),
+        },
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def forced_overlap_template_final_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/forced_overlap_template_final_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "attemptChecks": audit.get("attemptChecks"),
+        "overlap": audit.get("overlap"),
+        "finalCombo": audit.get("finalCombo"),
+        "boundaryChecks": audit.get("boundaryChecks"),
+        "boundarySeq5": audit.get("boundarySeq5"),
+        "boundarySeq6": audit.get("boundarySeq6"),
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def forced_overlap_payload_pc_split_control_summary() -> dict[str, Any]:
+    path = PROTO / "goal_audit/forced_overlap_payload_pc_split_control_audit.json"
+    audit = load_json(path) or {}
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "checks": audit.get("checks"),
+        "attemptChecks": audit.get("attemptChecks"),
+        "finalComboChecks": audit.get("finalComboChecks"),
+        "seq5Response": audit.get("seq5Response"),
+        "seq5Material": audit.get("seq5Material"),
+        "boundaryChecks": audit.get("boundaryChecks"),
+        "boundarySeq5": audit.get("boundarySeq5"),
+        "conclusion": audit.get("conclusion"),
+    }
+
+
+def hypothesis_reframe_summary() -> dict[str, Any]:
+    base = PROTO / "hypothesis_reframe"
+    paths = {
+        "collectorToRiskConsumptionChain": base / "collector_to_risk_consumption_chain.json",
+        "singleTransitionCandidateMatrix": base / "single_transition_candidate_matrix.json",
+        "coupledBoundaryReductionPlan": base / "coupled_boundary_reduction_plan.json",
+        "outerSessionTupleFactorization": base / "outer_session_tuple_factorization.json",
+        "encoderAxisEquivalence": base / "encoder_axis_equivalence.json",
+        "serverExpectedStateObservableProxy": base / "server_expected_state_observable_proxy.json",
+        "serverInternalGapEvidenceInventory": base / "server_internal_gap_evidence_inventory.json",
+        "crossSampleServerStateProxyMatrix": base / "cross_sample_server_state_proxy_matrix.json",
+        "historicalProbeResponseClassMatrix": base / "historical_probe_response_class_matrix.json",
+        "unminedLocalEvidenceSourceAudit": base / "unmined_local_evidence_source_audit.json",
+        "highValueUnminedEvidenceTriage": base / "high_value_unmined_evidence_triage.json",
+        "jsInternalEventTaxonomy": base / "js_internal_event_taxonomy.json",
+        "jsInternalCandidateReduction": base / "js_internal_candidate_reduction.json",
+        "actionableFrontierAudit": base / "actionable_frontier_audit.json",
+        "serverInternalUnobservedStateFinalGap": base / "server_internal_unobserved_state_final_gap.json",
+        "pureProtocolCompletionRequirementsAudit": base / "pure_protocol_completion_requirements_audit.json",
+        "goalCompletionVerifier": PROTO / "goal_audit/pure_protocol_goal_completion_verifier.json",
+        "phase3ProposalEvidenceTriage": base / "phase3_proposal_evidence_triage.json",
+        "phase3EvidenceEntranceCoverage": base / "phase3_evidence_entrance_coverage_audit.json",
+        "phase3RawEvidenceEntrance": base / "phase3_raw_evidence_entrance_audit.json",
+        "phase3RawTraceCrosswalk": base / "phase3_raw_trace_crosswalk_audit.json",
+        "traceClassifierRawCoverageGap": base / "trace_classifier_raw_coverage_gap_audit.json",
+        "remainingBoundaryProposalGate": base / "remaining_boundary_proposal_gate_audit.json",
+        "localTraceEvidenceFreshness": base / "local_trace_evidence_freshness_audit.json",
+        "unclassifiedTraceSignalReduction": base / "unclassified_trace_signal_reduction_audit.json",
+        "browserSuccessChainClassificationBacklog": base / "browser_success_chain_classification_backlog.json",
+        "browserSuccessChainServerVisibleDiff": base / "browser_success_chain_server_visible_diff_audit.json",
+        "browserSuccessPayloadPcSessionLineage": base / "browser_success_payload_pc_session_lineage_audit.json",
+        "collectorResponseHandlerValueLineage": base / "collector_response_handler_value_lineage_audit.json",
+        "downstreamSuccessWithoutCollectorDecode": base / "downstream_success_without_collector_decode_audit.json",
+        "collectorMaterialOnlyResponseClass": base / "collector_material_only_response_class_audit.json",
+        "lowValueUnclassifiedTraceClosure": base / "low_value_unclassified_trace_closure_audit.json",
+        "unclassifiedTraceClassClosureLedger": base / "unclassified_trace_class_closure_ledger.json",
+        "hypothesisReframeStatus": base / "hypothesis_reframe_status.json",
+        "s00RiskVerifyMaterialGap": base / "s00_risk_verify_material_gap.json",
+        "bridgeToPayloadContextAudit": base / "bridge_to_payload_context_audit.json",
+        "browserContextToServerStateProxyAudit": base / "browser_context_to_server_state_proxy_audit.json",
+        "browserContextStaticGapInventory": base / "browser_context_static_gap_inventory.json",
+        "postStaticContextTerminalGapAudit": base / "post_static_context_terminal_gap_audit.json",
+        "currentRouteAuthorityAudit": base / "current_route_authority_audit.json",
+        "recursiveEvidenceBlindspotAudit": base / "recursive_evidence_blindspot_audit.json",
+    }
+    docs = {name: load_json(path) or {} for name, path in paths.items()}
+    matrix = docs["singleTransitionCandidateMatrix"]
+    chain = docs["collectorToRiskConsumptionChain"]
+    reduction = docs["coupledBoundaryReductionPlan"]
+    outer_tuple = docs["outerSessionTupleFactorization"]
+    encoder_axis = docs["encoderAxisEquivalence"]
+    server_proxy = docs["serverExpectedStateObservableProxy"]
+    gap_inventory = docs["serverInternalGapEvidenceInventory"]
+    cross_sample = docs["crossSampleServerStateProxyMatrix"]
+    historical_probe = docs["historicalProbeResponseClassMatrix"]
+    unmined = docs["unminedLocalEvidenceSourceAudit"]
+    triage = docs["highValueUnminedEvidenceTriage"]
+    js_taxonomy = docs["jsInternalEventTaxonomy"]
+    js_reduction = docs["jsInternalCandidateReduction"]
+    frontier = docs["actionableFrontierAudit"]
+    final_gap = docs["serverInternalUnobservedStateFinalGap"]
+    completion_requirements = docs["pureProtocolCompletionRequirementsAudit"]
+    goal_completion_verifier = docs["goalCompletionVerifier"]
+    phase3_triage = docs["phase3ProposalEvidenceTriage"]
+    phase3_entrance = docs["phase3EvidenceEntranceCoverage"]
+    phase3_raw = docs["phase3RawEvidenceEntrance"]
+    phase3_crosswalk = docs["phase3RawTraceCrosswalk"]
+    trace_classifier_gap = docs["traceClassifierRawCoverageGap"]
+    remaining_boundary_gate = docs["remainingBoundaryProposalGate"]
+    local_trace_freshness = docs["localTraceEvidenceFreshness"]
+    unclassified_trace_reduction = docs["unclassifiedTraceSignalReduction"]
+    browser_success_backlog = docs["browserSuccessChainClassificationBacklog"]
+    browser_success_diff = docs["browserSuccessChainServerVisibleDiff"]
+    payload_pc_session_lineage = docs["browserSuccessPayloadPcSessionLineage"]
+    collector_handler_value_lineage = docs["collectorResponseHandlerValueLineage"]
+    downstream_without_collector = docs["downstreamSuccessWithoutCollectorDecode"]
+    collector_material_only_response = docs["collectorMaterialOnlyResponseClass"]
+    low_value_closure = docs["lowValueUnclassifiedTraceClosure"]
+    trace_class_ledger = docs["unclassifiedTraceClassClosureLedger"]
+    reframe_status = docs["hypothesisReframeStatus"]
+    risk_gap = docs["s00RiskVerifyMaterialGap"]
+    browser_context_proxy = docs["browserContextToServerStateProxyAudit"]
+    browser_context_static = docs["browserContextStaticGapInventory"]
+    post_static_context_terminal = docs["postStaticContextTerminalGapAudit"]
+    current_route_authority = docs["currentRouteAuthorityAudit"]
+    recursive_blindspot = docs["recursiveEvidenceBlindspotAudit"]
+    candidates = matrix.get("candidates") or []
+    return {
+        "paths": {name: str(path.resolve()) for name, path in paths.items()},
+        "exists": {name: path.exists() for name, path in paths.items()},
+        "s00RiskVerifyMaterialChecks": risk_gap.get("checks"),
+        "browserContextToServerStateProxyChecks": browser_context_proxy.get("checks"),
+        "browserContextToServerStateProxyDecision": browser_context_proxy.get("decision"),
+        "browserContextStaticGapInventoryChecks": browser_context_static.get("checks"),
+        "browserContextStaticGapInventoryDecision": browser_context_static.get("decision"),
+        "postStaticContextTerminalGapChecks": post_static_context_terminal.get("checks"),
+        "postStaticContextTerminalGapDecision": post_static_context_terminal.get("decision"),
+        "currentRouteAuthorityChecks": current_route_authority.get("checks"),
+        "currentRouteAuthorityDecision": current_route_authority.get("decision"),
+        "recursiveEvidenceBlindspotChecks": recursive_blindspot.get("checks"),
+        "recursiveEvidenceBlindspotDecision": recursive_blindspot.get("decision"),
+        "collectorToRiskChecks": chain.get("checks"),
+        "singleTransitionSummary": matrix.get("summary"),
+        "singleTransitionChecks": matrix.get("checks"),
+        "singleTransitionDecision": matrix.get("decision"),
+        "coupledBoundaryReductionChecks": reduction.get("checks"),
+        "coupledBoundaryReductionDecision": reduction.get("decision"),
+        "outerSessionTupleFactorizationSummary": outer_tuple.get("summary"),
+        "outerSessionTupleFactorizationChecks": outer_tuple.get("checks"),
+        "outerSessionTupleFactorizationDecision": outer_tuple.get("decision"),
+        "encoderAxisEquivalenceSummary": encoder_axis.get("summary"),
+        "encoderAxisEquivalenceChecks": encoder_axis.get("checks"),
+        "encoderAxisEquivalenceDecision": encoder_axis.get("decision"),
+        "serverExpectedStateObservableProxyChecks": server_proxy.get("checks"),
+        "serverExpectedStateObservableProxyDecision": server_proxy.get("decision"),
+        "serverInternalGapEvidenceInventoryChecks": gap_inventory.get("checks"),
+        "serverInternalGapEvidenceInventoryDecision": gap_inventory.get("decision"),
+        "crossSampleServerStateProxyMatrixChecks": cross_sample.get("checks"),
+        "crossSampleServerStateProxyMatrixDecision": cross_sample.get("decision"),
+        "historicalProbeResponseClassMatrixChecks": historical_probe.get("checks"),
+        "historicalProbeResponseClassMatrixDecision": historical_probe.get("decision"),
+        "unminedLocalEvidenceSourceAuditChecks": unmined.get("checks"),
+        "unminedLocalEvidenceSourceAuditDecision": unmined.get("decision"),
+        "highValueUnminedEvidenceTriageChecks": triage.get("checks"),
+        "highValueUnminedEvidenceTriageDecision": triage.get("decision"),
+        "jsInternalEventTaxonomyChecks": js_taxonomy.get("checks"),
+        "jsInternalEventTaxonomyDecision": js_taxonomy.get("decision"),
+        "jsInternalCandidateReductionChecks": js_reduction.get("checks"),
+        "jsInternalCandidateReductionDecision": js_reduction.get("decision"),
+        "actionableFrontierAuditChecks": frontier.get("checks"),
+        "actionableFrontierAuditDecision": frontier.get("decision"),
+        "serverInternalUnobservedStateFinalGapChecks": final_gap.get("checks"),
+        "serverInternalUnobservedStateFinalGapDecision": final_gap.get("decision"),
+        "pureProtocolCompletionRequirementsAuditChecks": completion_requirements.get("checks"),
+        "pureProtocolCompletionRequirementsAuditDecision": completion_requirements.get("decision"),
+        "goalCompletionVerifierChecks": goal_completion_verifier.get("checks"),
+        "goalCompletionVerifierDecision": goal_completion_verifier.get("decision"),
+        "phase3ProposalEvidenceTriageChecks": phase3_triage.get("checks"),
+        "phase3ProposalEvidenceTriageDecision": phase3_triage.get("decision"),
+        "phase3EvidenceEntranceCoverageChecks": phase3_entrance.get("checks"),
+        "phase3EvidenceEntranceCoverageDecision": phase3_entrance.get("decision"),
+        "phase3RawEvidenceEntranceChecks": phase3_raw.get("checks"),
+        "phase3RawEvidenceEntranceDecision": phase3_raw.get("decision"),
+        "phase3RawTraceCrosswalkChecks": phase3_crosswalk.get("checks"),
+        "phase3RawTraceCrosswalkDecision": phase3_crosswalk.get("decision"),
+        "traceClassifierRawCoverageGapChecks": trace_classifier_gap.get("checks"),
+        "traceClassifierRawCoverageGapDecision": trace_classifier_gap.get("decision"),
+        "remainingBoundaryProposalGateChecks": remaining_boundary_gate.get("checks"),
+        "remainingBoundaryProposalGateDecision": remaining_boundary_gate.get("decision"),
+        "localTraceEvidenceFreshnessChecks": local_trace_freshness.get("checks"),
+        "localTraceEvidenceFreshnessDecision": local_trace_freshness.get("decision"),
+        "unclassifiedTraceSignalReductionChecks": unclassified_trace_reduction.get("checks"),
+        "unclassifiedTraceSignalReductionDecision": unclassified_trace_reduction.get("decision"),
+        "browserSuccessChainClassificationBacklogChecks": browser_success_backlog.get("checks"),
+        "browserSuccessChainClassificationBacklogDecision": browser_success_backlog.get("decision"),
+        "browserSuccessChainServerVisibleDiffChecks": browser_success_diff.get("checks"),
+        "browserSuccessChainServerVisibleDiffDecision": browser_success_diff.get("decision"),
+        "browserSuccessPayloadPcSessionLineageChecks": payload_pc_session_lineage.get("checks"),
+        "browserSuccessPayloadPcSessionLineageDecision": payload_pc_session_lineage.get("decision"),
+        "collectorResponseHandlerValueLineageChecks": collector_handler_value_lineage.get("checks"),
+        "collectorResponseHandlerValueLineageDecision": collector_handler_value_lineage.get("decision"),
+        "downstreamSuccessWithoutCollectorDecodeChecks": downstream_without_collector.get("checks"),
+        "downstreamSuccessWithoutCollectorDecodeDecision": downstream_without_collector.get("decision"),
+        "collectorMaterialOnlyResponseClassChecks": collector_material_only_response.get("checks"),
+        "collectorMaterialOnlyResponseClassDecision": collector_material_only_response.get("decision"),
+        "lowValueUnclassifiedTraceClosureChecks": low_value_closure.get("checks"),
+        "lowValueUnclassifiedTraceClosureDecision": low_value_closure.get("decision"),
+        "unclassifiedTraceClassClosureLedgerChecks": trace_class_ledger.get("checks"),
+        "unclassifiedTraceClassClosureLedgerDecision": trace_class_ledger.get("decision"),
+        "hypothesisReframeStatusChecks": reframe_status.get("checks"),
+        "hypothesisReframeStatusDecision": reframe_status.get("currentDecision"),
+        "candidateStatuses": [
+            {
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "readyForFreshExperiment": row.get("readyForFreshExperiment"),
+                "reason": row.get("reason"),
+            }
+            for row in candidates
+        ],
+        "conclusion": (
+            "Hypothesis reframe proves the downstream chain accepted line933 -> collector line948 success -> "
+            "risk/verify state=continue -> CreateAccount redirect, but the single-transition matrix finds zero "
+            "fresh-session-ready candidates. The coupled-boundary reduction plan defines offline-only tracks for "
+            "C4 outer/session tuple, C5 encoder binding, and C6 server expected state. T1 outer-session factorization keeps "
+            "C4 coupled with zero ready groups. T2 encoder-axis equivalence keeps C5 as an independent 2x2 markerSource/pcUuidSource family. "
+            "T3 finds omittedPreAcceptTransitionCount=0 and no replayable client representation for C6. "
+            "The server-internal gap evidence inventory counts local material for the next offline pass "
+            "(runtimeTraceCount=157, jsTraceCount=36, collectorDecodeCount=17, cookieTimelineCount=11, multiSurfaceBrowserRunCount=10) "
+            "and cross_sample_server_state_proxy_matrix evaluates 14 classifier samples: 4 full_success, 10 non-full-success, "
+            "10 multi-surface samples, candidateClientVisibleProxyCount=0. "
+            "historical_probe_response_class_matrix then evaluates 30 direct attempts, 5 first-failure-overlap attempts, "
+            "38 seq5/seq6 combo probes, and 55 PX561 diffs: direct/overlap attempts all reach bundle POW, "
+            "but historical no-browser oIIoIooo|0 count is 0 and seq5 oIIoIooo|-1 count is 32. "
+            "unmined_local_evidence_source_audit found 34 high-value directories outside the previous final gap and 14 success-signal files; "
+            "high_value_unmined_evidence_triage classified replayableFreshNoBrowserSuccessEvidenceCount=0. "
+            "js_internal_event_taxonomy found 8 apparent non-outcome JS separators, but js_internal_candidate_reduction maps them to POW handlers, cookie/config flags, or outcome handling, with replayableClientTransitionCandidateCount=0. "
+            "actionable_frontier_audit scanned 44 nextArtifact references and found actionableMissingArtifactCount=0, with terminal authority next steps null. "
+            "server_internal_unobserved_state_final_gap sets allLocalProxySearchesNegative=true and goalComplete=false. "
+            "browser_context_to_server_state_proxy_audit then maps 33 pre-accept browser context messages against line922/line933: "
+            "the block uuid/vid are already represented in the collector form, _px3 bridge is represented in payload while cookie-header controls are negative, "
+            "and post-success Microsoft messages are downstream; promotedSingleTransitionCandidateCount=0. "
+            "browser_context_static_gap_inventory then reduces static context producers: 8 PX561 static producers are identified and all 8 are already equal in fresh line922, with staticProducerPromotedCount=0 and allStaticContextGapsReduced=true. "
+            "post_static_context_terminal_gap_audit closes the C5/context/static/reset branches with promotedSingleTransitionCandidateCount=0. "
+            "current_route_authority_audit marks the older coherent encoder ready artifacts as stale because the authorized live probe has executed and closed no-success. "
+            "recursive_evidence_blindspot_audit then scans 70 nested JSON artifacts and finds extractedSeq5Seq6SuccessSignalCount=0, unclassifiedRecursiveSuccessSignalCount=0, and replayableFreshNoBrowserSuccessEvidenceCount=0. "
+            "pure_protocol_completion_requirements_audit maps the final seven completion requirements and leaves 4 blocking requirements, "
+            "verify_pure_protocol_goal_completion.py adds a strict final completion verifier and currently keeps completionVerified=false. "
+            "phase3_proposal_evidence_triage scans current proposal/intake sources and recursive ready/promoted signals and currently finds proposalWorthyEvidenceCount=0. "
+            "phase3_evidence_entrance_coverage_audit verifies current local evidence entrances are covered and currently finds uncoveredEntranceRowCount=0. "
+            "phase3_raw_evidence_entrance_audit scans raw output outside protocol_reverse and phase3_raw_trace_crosswalk_audit maps all unindexed browser success-token traces back to protocol_reverse references. "
+            "trace_classifier_raw_coverage_gap_audit records that raw browser success-token traces are referenced but not auto-appended to classifier v2 without equivalent trace_classification artifacts. "
+            "with fresh pure-protocol collector HUMAN success missing. "
+            "Current evidence still forbids a fresh network experiment; remaining gap is collector server-internal or unobserved expected state."
+        ),
+    }
+
+
+def reset_transport_ip_hypothesis_summary() -> dict[str, Any]:
+    base = PROTO / "reset_plan"
+    paths = {
+        "resetSamplingManifest": base / "reset_sampling_manifest.json",
+        "resetSamplingMatrix": base / "reset_sampling_matrix.json",
+        "resetStateMachine": base / "reset_state_machine.json",
+        "webshareProxyAuthGapAudit": base / "webshare_proxy_auth_gap_audit.json",
+        "resetTransportIpHypothesisAudit": base / "reset_transport_ip_hypothesis_audit.json",
+        "resetFinalResponseClassAudit": base / "reset_final_response_class_audit.json",
+        "resetCookieMutationAudit": base / "reset_cookie_mutation_audit.json",
+        "resetSingleTransitionCandidates": base / "reset_single_transition_candidates.json",
+        "resetSamplingCoverageAudit": base / "reset_sampling_coverage_audit.json",
+        "resetBrowserSamplingRunnerPlan": base / "reset_browser_sampling_runner_plan.json",
+        "resetBrowserSamplingRunnerAudit": base / "reset_browser_sampling_runner_audit.json",
+        "resetNewHookAxisPlan": base / "reset_new_hook_axis_plan.json",
+        "resetHookFeatureCandidateReduction": base / "reset_hook_feature_candidate_reduction.json",
+        "resetRuntimeJsEventTaxonomy": base / "reset_runtime_js_event_taxonomy.json",
+        "resetRuntimeJsCandidateReduction": base / "reset_runtime_js_candidate_reduction.json",
+        "resetCollectorHandlerSurfaceAudit": base / "reset_collector_handler_surface_audit.json",
+        "resetUnobservedLifecycleSurfaceAudit": base / "reset_unobserved_lifecycle_surface_audit.json",
+        "resetRouteBValueTaxonomyAudit": base / "reset_route_b_value_taxonomy_audit.json",
+        "resetRouteBInstrumentationControlAudit": base / "reset_route_b_instrumentation_control_audit.json",
+        "resetOneCollectorSurfaceAudit": base / "reset_onecollector_surface_audit.json",
+        "resetTerminalBoundaryAudit": base / "reset_terminal_boundary_audit.json",
+        "methodologicalTerminalBoundaryAudit": base / "methodological_terminal_boundary_audit.json",
+        "nextEvidenceEntranceAudit": base / "next_evidence_entrance_audit.json",
+        "encoderVariantTerminalAudit": PROTO / "hypothesis_reframe/encoder_variant_terminal_audit.json",
+    }
+    docs = {name: load_json(path) or {} for name, path in paths.items()}
+    return {
+        "paths": {name: str(path.resolve()) for name, path in paths.items()},
+        "exists": {name: path.exists() for name, path in paths.items()},
+        "samplingManifestChecks": docs["resetSamplingManifest"].get("checks"),
+        "samplingManifestDecision": docs["resetSamplingManifest"].get("decision"),
+        "samplingMatrixChecks": docs["resetSamplingMatrix"].get("checks"),
+        "samplingMatrixDecision": docs["resetSamplingMatrix"].get("decision"),
+        "stateMachineChecks": docs["resetStateMachine"].get("checks"),
+        "stateMachineDecision": docs["resetStateMachine"].get("decision"),
+        "webshareProxyAuthGapChecks": docs["webshareProxyAuthGapAudit"].get("checks"),
+        "webshareProxyAuthGapDecision": docs["webshareProxyAuthGapAudit"].get("decision"),
+        "transportIpChecks": docs["resetTransportIpHypothesisAudit"].get("checks"),
+        "transportIpDecision": docs["resetTransportIpHypothesisAudit"].get("decision"),
+        "finalResponseClassChecks": docs["resetFinalResponseClassAudit"].get("checks"),
+        "finalResponseClassDecision": docs["resetFinalResponseClassAudit"].get("decision"),
+        "resetCookieMutationChecks": docs["resetCookieMutationAudit"].get("checks"),
+        "resetCookieMutationDecision": docs["resetCookieMutationAudit"].get("decision"),
+        "singleTransitionCandidateChecks": docs["resetSingleTransitionCandidates"].get("checks"),
+        "singleTransitionCandidateDecision": docs["resetSingleTransitionCandidates"].get("decision"),
+        "samplingCoverageChecks": docs["resetSamplingCoverageAudit"].get("checks"),
+        "samplingCoverageDecision": docs["resetSamplingCoverageAudit"].get("decision"),
+        "browserSamplingRunnerPlanChecks": docs["resetBrowserSamplingRunnerPlan"].get("checks"),
+        "browserSamplingRunnerPlanDecision": docs["resetBrowserSamplingRunnerPlan"].get("decision"),
+        "browserSamplingRunnerAuditChecks": docs["resetBrowserSamplingRunnerAudit"].get("checks"),
+        "browserSamplingRunnerAuditDecision": docs["resetBrowserSamplingRunnerAudit"].get("decision"),
+        "resetNewHookAxisPlanChecks": docs["resetNewHookAxisPlan"].get("checks"),
+        "resetNewHookAxisPlanDecision": docs["resetNewHookAxisPlan"].get("decision"),
+        "resetHookFeatureCandidateReductionChecks": docs["resetHookFeatureCandidateReduction"].get("checks"),
+        "resetHookFeatureCandidateReductionDecision": docs["resetHookFeatureCandidateReduction"].get("decision"),
+        "resetRuntimeJsEventTaxonomyChecks": docs["resetRuntimeJsEventTaxonomy"].get("checks"),
+        "resetRuntimeJsEventTaxonomyDecision": docs["resetRuntimeJsEventTaxonomy"].get("decision"),
+        "resetRuntimeJsCandidateReductionChecks": docs["resetRuntimeJsCandidateReduction"].get("checks"),
+        "resetRuntimeJsCandidateReductionDecision": docs["resetRuntimeJsCandidateReduction"].get("decision"),
+        "resetCollectorHandlerSurfaceAuditChecks": docs["resetCollectorHandlerSurfaceAudit"].get("checks"),
+        "resetCollectorHandlerSurfaceAuditDecision": docs["resetCollectorHandlerSurfaceAudit"].get("decision"),
+        "resetUnobservedLifecycleSurfaceAuditChecks": docs["resetUnobservedLifecycleSurfaceAudit"].get("checks"),
+        "resetUnobservedLifecycleSurfaceAuditDecision": docs["resetUnobservedLifecycleSurfaceAudit"].get("decision"),
+        "resetRouteBValueTaxonomyAuditChecks": docs["resetRouteBValueTaxonomyAudit"].get("checks"),
+        "resetRouteBValueTaxonomyAuditDecision": docs["resetRouteBValueTaxonomyAudit"].get("decision"),
+        "resetRouteBInstrumentationControlAuditChecks": docs["resetRouteBInstrumentationControlAudit"].get("checks"),
+        "resetRouteBInstrumentationControlAuditDecision": docs["resetRouteBInstrumentationControlAudit"].get("decision"),
+        "resetOneCollectorSurfaceAuditChecks": docs["resetOneCollectorSurfaceAudit"].get("checks"),
+        "resetOneCollectorSurfaceAuditDecision": docs["resetOneCollectorSurfaceAudit"].get("decision"),
+        "resetTerminalBoundaryChecks": docs["resetTerminalBoundaryAudit"].get("checks"),
+        "resetTerminalBoundaryDecision": docs["resetTerminalBoundaryAudit"].get("decision"),
+        "methodologicalTerminalBoundaryChecks": docs["methodologicalTerminalBoundaryAudit"].get("checks"),
+        "methodologicalTerminalBoundaryDecision": docs["methodologicalTerminalBoundaryAudit"].get("decision"),
+        "nextEvidenceEntranceChecks": docs["nextEvidenceEntranceAudit"].get("checks"),
+        "nextEvidenceEntranceDecision": docs["nextEvidenceEntranceAudit"].get("decision"),
+        "encoderVariantTerminalChecks": docs["encoderVariantTerminalAudit"].get("checks"),
+        "encoderVariantTerminalDecision": docs["encoderVariantTerminalAudit"].get("decision"),
+        "conclusion": (
+            "Reset sampling corrected the Webshare username/session shape, implemented browser Webshare sampling, and produced complete reset coverage. "
+            "The current matrix contains 4 counted browser success reset samples, 4 counted browser failure reset samples, 6 pure-protocol Webshare reset rows, and 2 pure-protocol direct reset rows. "
+            "Valid pure-protocol Webshare and direct samples reach final seq5/seq6, and none produces collector success. "
+            "reset_final_response_class_audit shows all valid final pure-protocol responses share the same class: seq5 oIIoIooo|-1 with _px3/_pxde updates and seq6 no outcome handler. "
+            "reset_cookie_mutation_audit replays those decoded handlers offline and proves the jar receives _px3/_pxde updates, with seq6 overwriting seq5 values, but still has no oIIoIooo|0 success event and no complete risk/verify success-cookie candidate. "
+            "reset_single_transition_candidates completes Phase 4 reduction and currently has singleTransitionCandidateCount=0, so Phase 5 fresh-session experiments remain gated off. "
+            "reset_sampling_coverage_audit now shows browserResetCoverageComplete=true, pureProtocolResetCoverageComplete=true, and allResetCoverageComplete=true. "
+            "reset_new_hook_axis_plan shows missingObservedHookCount=0, missingContrastHookCount=0, notInstrumentedHookCount=0, and recommendedAxisCount=0. "
+            "reset_hook_feature_candidate_reduction reduces the remaining success-only worker/wasm/pow_worker hook features and promotes none of them to a single transition candidate. "
+            "reset_runtime_js_event_taxonomy finds 194 coarse correlated runtime/JS candidate surfaces, including 62 strong JS contrast candidates; "
+            "reset_runtime_js_candidate_reduction classifies all 194 as event-bus, response-handler, WASM/crypto, worker/POW, sendBeacon, or network surfaces and promotes 0, with unclassifiedReductionCount=0. "
+            "reset_collector_handler_surface_audit splits the largest response-handler bucket into cookie/config/POW/score/state handler surfaces and promotes 0, with unclassifiedHandlerSurfaceCount=0. "
+            "reset_unobserved_lifecycle_surface_audit finds 3 static-reachable hook recommendations (pxMobileData native bridge, OfflineAudioContext fingerprint, serviceWorker/caches token surface), but marks them as evidence-gathering hooks only. "
+            "reset_route_b_value_taxonomy_audit compares the new Route B JS traces at value/sequence level and finds success-only hsprotect lineage, but promotes 0 because the contrast is not instrumentation-controlled. "
+            "reset_route_b_instrumentation_control_audit shows patch_apply=1 has 3 browser successLike samples and 0 failure samples, while the only failure is patch_apply=0; therefore the applied JS patch cannot be treated as passive observer evidence and no pure-protocol transition is promoted. "
+            "reset_onecollector_surface_audit then refines the only network surface: OneCollector appears in 3 browser success samples, 0 failure samples, and in all 3 success rows occurs after the accepted downstream chain, so it is Microsoft telemetry rather than a HUMAN pre-accept transition. "
+            "reset_terminal_boundary_audit consolidates the current reset route-B decision: noCurrentRouteToPhase5=true while end_to_end_pure_protocol_poc remains missing. "
+            "methodological_terminal_boundary_audit consolidates Routes A/B/C as closed with allRoutesClosed=true, readyForFreshExperiment=false, and goalComplete=false. "
+            "next_evidence_entrance_audit re-evaluates old inventory entrances and reset methodological routes, finding allKnownLocalEvidenceEntrancesClosed=true. "
+            "encoder_variant_terminal_audit closes the remaining C5 encoder family for current evidence: exact-payload variants were eliminated by prior controls, and the only coherent untested variant was run once in a fresh Webshare session and returned {do:[]} with no collector success. "
+            "The earlier 3 malformed Webshare rows are classified separately as proxy CONNECT 407 and are not HUMAN evidence. "
+            "Current reset evidence does not support transport/IP alone as a sufficient success axis and does not authorize Phase 5 without new client-visible transition evidence."
+        ),
+    }
+
+
+def current_terminal_decision_summary() -> dict[str, Any]:
+    paths = {
+        "hypothesisPlanCoverageAudit": PROTO / "hypothesis_reframe/hypothesis_plan_coverage_audit.json",
+        "collectorServerExpectedStateBoundaryAudit": PROTO / "hypothesis_reframe/collector_server_expected_state_boundary_audit.json",
+        "promotedTransitionCandidateIntake": PROTO / "hypothesis_reframe/promoted_transition_candidate_intake.json",
+        "minimalPromotedTransitionExperiment": PROTO / "hypothesis_reframe/minimal_promoted_transition_experiment.json",
+        "finalPureProtocolReplayAudit": PROTO / "goal_audit/final_pure_protocol_replay_audit.json",
+        "evidenceGateChainAudit": PROTO / "goal_audit/pure_protocol_evidence_gate_chain_audit.json",
+        "evidenceManifest": PROTO / "goal_audit/pure_protocol_evidence_manifest.json",
+        "evidenceManifestVerify": PROTO / "goal_audit/pure_protocol_evidence_manifest_verify.json",
+        "goalCompletionVerifier": PROTO / "goal_audit/pure_protocol_goal_completion_verifier.json",
+        "candidateProposalsLint": PROTO / "hypothesis_reframe/promoted_transition_candidate_proposals_lint.json",
+        "phase3ProposalEvidenceTriage": PROTO / "hypothesis_reframe/phase3_proposal_evidence_triage.json",
+        "phase3EvidenceEntranceCoverage": PROTO / "hypothesis_reframe/phase3_evidence_entrance_coverage_audit.json",
+        "phase3RawEvidenceEntrance": PROTO / "hypothesis_reframe/phase3_raw_evidence_entrance_audit.json",
+        "phase3RawTraceCrosswalk": PROTO / "hypothesis_reframe/phase3_raw_trace_crosswalk_audit.json",
+        "traceClassifierRawCoverageGap": PROTO / "hypothesis_reframe/trace_classifier_raw_coverage_gap_audit.json",
+        "remainingBoundaryProposalGate": PROTO / "hypothesis_reframe/remaining_boundary_proposal_gate_audit.json",
+        "localTraceEvidenceFreshness": PROTO / "hypothesis_reframe/local_trace_evidence_freshness_audit.json",
+        "unclassifiedTraceSignalReduction": PROTO / "hypothesis_reframe/unclassified_trace_signal_reduction_audit.json",
+        "browserSuccessChainClassificationBacklog": PROTO / "hypothesis_reframe/browser_success_chain_classification_backlog.json",
+        "browserSuccessChainServerVisibleDiff": PROTO / "hypothesis_reframe/browser_success_chain_server_visible_diff_audit.json",
+        "browserSuccessPayloadPcSessionLineage": PROTO / "hypothesis_reframe/browser_success_payload_pc_session_lineage_audit.json",
+        "collectorResponseHandlerValueLineage": PROTO / "hypothesis_reframe/collector_response_handler_value_lineage_audit.json",
+        "downstreamSuccessWithoutCollectorDecode": PROTO / "hypothesis_reframe/downstream_success_without_collector_decode_audit.json",
+        "collectorMaterialOnlyResponseClass": PROTO / "hypothesis_reframe/collector_material_only_response_class_audit.json",
+        "lowValueUnclassifiedTraceClosure": PROTO / "hypothesis_reframe/low_value_unclassified_trace_closure_audit.json",
+        "unclassifiedTraceClassClosureLedger": PROTO / "hypothesis_reframe/unclassified_trace_class_closure_ledger.json",
+        "resetTerminalBoundaryAudit": PROTO / "reset_plan/reset_terminal_boundary_audit.json",
+        "currentRouteAuthorityAudit": PROTO / "hypothesis_reframe/current_route_authority_audit.json",
+    }
+    docs = {name: load_json(path) or {} for name, path in paths.items()}
+    return {
+        "paths": {name: str(path.resolve()) for name, path in paths.items()},
+        "exists": {name: path.exists() for name, path in paths.items()},
+        "hypothesisPlanCoverageChecks": docs["hypothesisPlanCoverageAudit"].get("checks"),
+        "hypothesisPlanCoverageDecision": docs["hypothesisPlanCoverageAudit"].get("decision"),
+        "collectorServerExpectedStateChecks": docs["collectorServerExpectedStateBoundaryAudit"].get("checks"),
+        "collectorServerExpectedStateDecision": docs["collectorServerExpectedStateBoundaryAudit"].get("decision"),
+        "promotedTransitionCandidateIntakeChecks": docs["promotedTransitionCandidateIntake"].get("checks"),
+        "promotedTransitionCandidateIntakeDecision": docs["promotedTransitionCandidateIntake"].get("decision"),
+        "minimalPromotedTransitionExperimentChecks": docs["minimalPromotedTransitionExperiment"].get("checks"),
+        "minimalPromotedTransitionExperimentDecision": docs["minimalPromotedTransitionExperiment"].get("decision"),
+        "finalPureProtocolReplayAuditChecks": docs["finalPureProtocolReplayAudit"].get("checks"),
+        "finalPureProtocolReplayAuditDecision": docs["finalPureProtocolReplayAudit"].get("decision"),
+        "evidenceGateChainAuditChecks": docs["evidenceGateChainAudit"].get("checks"),
+        "evidenceGateChainAuditDecision": docs["evidenceGateChainAudit"].get("decision"),
+        "evidenceManifestChecks": docs["evidenceManifest"].get("checks"),
+        "evidenceManifestDecision": docs["evidenceManifest"].get("decision"),
+        "evidenceManifestVerifyChecks": docs["evidenceManifestVerify"].get("checks"),
+        "evidenceManifestVerifyDecision": docs["evidenceManifestVerify"].get("decision"),
+        "goalCompletionVerifierChecks": docs["goalCompletionVerifier"].get("checks"),
+        "goalCompletionVerifierDecision": docs["goalCompletionVerifier"].get("decision"),
+        "candidateProposalsLintChecks": docs["candidateProposalsLint"].get("checks"),
+        "candidateProposalsLintDecision": docs["candidateProposalsLint"].get("decision"),
+        "phase3ProposalEvidenceTriageChecks": docs["phase3ProposalEvidenceTriage"].get("checks"),
+        "phase3ProposalEvidenceTriageDecision": docs["phase3ProposalEvidenceTriage"].get("decision"),
+        "phase3EvidenceEntranceCoverageChecks": docs["phase3EvidenceEntranceCoverage"].get("checks"),
+        "phase3EvidenceEntranceCoverageDecision": docs["phase3EvidenceEntranceCoverage"].get("decision"),
+        "phase3RawEvidenceEntranceChecks": docs["phase3RawEvidenceEntrance"].get("checks"),
+        "phase3RawEvidenceEntranceDecision": docs["phase3RawEvidenceEntrance"].get("decision"),
+        "phase3RawTraceCrosswalkChecks": docs["phase3RawTraceCrosswalk"].get("checks"),
+        "phase3RawTraceCrosswalkDecision": docs["phase3RawTraceCrosswalk"].get("decision"),
+        "traceClassifierRawCoverageGapChecks": docs["traceClassifierRawCoverageGap"].get("checks"),
+        "traceClassifierRawCoverageGapDecision": docs["traceClassifierRawCoverageGap"].get("decision"),
+        "remainingBoundaryProposalGateChecks": docs["remainingBoundaryProposalGate"].get("checks"),
+        "remainingBoundaryProposalGateDecision": docs["remainingBoundaryProposalGate"].get("decision"),
+        "localTraceEvidenceFreshnessChecks": docs["localTraceEvidenceFreshness"].get("checks"),
+        "localTraceEvidenceFreshnessDecision": docs["localTraceEvidenceFreshness"].get("decision"),
+        "unclassifiedTraceSignalReductionChecks": docs["unclassifiedTraceSignalReduction"].get("checks"),
+        "unclassifiedTraceSignalReductionDecision": docs["unclassifiedTraceSignalReduction"].get("decision"),
+        "browserSuccessChainClassificationBacklogChecks": docs["browserSuccessChainClassificationBacklog"].get("checks"),
+        "browserSuccessChainClassificationBacklogDecision": docs["browserSuccessChainClassificationBacklog"].get("decision"),
+        "browserSuccessChainServerVisibleDiffChecks": docs["browserSuccessChainServerVisibleDiff"].get("checks"),
+        "browserSuccessChainServerVisibleDiffDecision": docs["browserSuccessChainServerVisibleDiff"].get("decision"),
+        "browserSuccessPayloadPcSessionLineageChecks": docs["browserSuccessPayloadPcSessionLineage"].get("checks"),
+        "browserSuccessPayloadPcSessionLineageDecision": docs["browserSuccessPayloadPcSessionLineage"].get("decision"),
+        "collectorResponseHandlerValueLineageChecks": docs["collectorResponseHandlerValueLineage"].get("checks"),
+        "collectorResponseHandlerValueLineageDecision": docs["collectorResponseHandlerValueLineage"].get("decision"),
+        "downstreamSuccessWithoutCollectorDecodeChecks": docs["downstreamSuccessWithoutCollectorDecode"].get("checks"),
+        "downstreamSuccessWithoutCollectorDecodeDecision": docs["downstreamSuccessWithoutCollectorDecode"].get("decision"),
+        "collectorMaterialOnlyResponseClassChecks": docs["collectorMaterialOnlyResponseClass"].get("checks"),
+        "collectorMaterialOnlyResponseClassDecision": docs["collectorMaterialOnlyResponseClass"].get("decision"),
+        "lowValueUnclassifiedTraceClosureChecks": docs["lowValueUnclassifiedTraceClosure"].get("checks"),
+        "lowValueUnclassifiedTraceClosureDecision": docs["lowValueUnclassifiedTraceClosure"].get("decision"),
+        "unclassifiedTraceClassClosureLedgerChecks": docs["unclassifiedTraceClassClosureLedger"].get("checks"),
+        "unclassifiedTraceClassClosureLedgerDecision": docs["unclassifiedTraceClassClosureLedger"].get("decision"),
+        "resetTerminalChecks": docs["resetTerminalBoundaryAudit"].get("checks"),
+        "resetTerminalDecision": docs["resetTerminalBoundaryAudit"].get("decision"),
+        "currentRouteAuthorityChecks": docs["currentRouteAuthorityAudit"].get("checks"),
+        "currentRouteAuthorityDecision": docs["currentRouteAuthorityAudit"].get("decision"),
+        "conclusion": (
+            "Current terminal evidence supersedes stale hypothesis-plan nextArtifact pointers. "
+            "hypothesis_plan_coverage_audit covers H0-H5 and Phase 1-4.7; the only missing hypothesis-plan artifact is the gated Phase 5 minimal experiment, "
+            "which is allowed to be missing because reset_terminal_boundary_audit still has readyForFreshExperiment=false. "
+            "collector_server_expected_state_boundary_audit reduces the final remaining H3 boundary to non-client-visible server expected state: "
+            "request-visible, cookie-visible, and risk/verify-visible surfaces are mirrored or covered by negative controls, but no pre-accept client-visible pure-protocol proxy is promoted. "
+            "promoted_transition_candidate_intake operationalizes the next gate and currently promotes zero candidates. "
+            "minimal_promoted_transition_experiment exists as the Phase C harness, but is currently blocked by the same intake gate and records networkAttemptExecuted=false. "
+            "final_pure_protocol_replay_audit exists as the Phase E completion harness, but is blocked until the evidence-gated PoC proves a fresh no-browser success chain. "
+            "pure_protocol_evidence_gate_chain_audit proves the current offline gate chain can be rebuilt in one command with all steps passing, while still ending in noCurrentRouteToPhase5=true and goalComplete=false. "
+            "pure_protocol_evidence_manifest hashes the current key scripts and terminal artifacts so file drift can be detected before trusting follow-up conclusions. "
+            "pure_protocol_evidence_manifest_verify currently confirms the files still match that manifest. "
+            "pure_protocol_goal_completion_verifier currently confirms completionVerified=false and goalComplete=false. "
+            "promoted_transition_candidate_proposals_lint currently confirms the proposal input is structurally valid and empty. "
+            "phase3_proposal_evidence_triage currently finds no proposal-worthy local evidence and no recursive ready/promoted JSON signal. "
+            "phase3_evidence_entrance_coverage_audit currently confirms no current evidence entrance remains uncovered for proposal-intake purposes. "
+            "phase3_raw_evidence_entrance_audit and phase3_raw_trace_crosswalk_audit currently show raw success tokens outside protocol_reverse are browser/static/package references, and all unindexed browser success-token traces are referenced by protocol_reverse audits. "
+            "trace_classifier_raw_coverage_gap_audit keeps classifier scope honest by refusing to auto-append raw traces without trace_classification artifacts. "
+            "Therefore goal-level next work must not recommend stale field/IP/timing/network retries; it must first introduce genuinely new evidence that promotes exactly one transition."
+        ),
+    }
+
+
 def build_audit() -> dict[str, Any]:
     classifier = load_json(PROTO / "trace_classification_v2/human_trace_classifier_v2_summary.json") or {}
     decoder = load_json(PROTO / "collector_decode/collector_decoder_coverage_audit.json") or {}
@@ -1088,6 +1809,7 @@ def build_audit() -> dict[str, Any]:
     wasm_nq_legacy = load_json(PROTO / "wasm/captcha_wasm_nq_replay_tuisye6ib170_1781129289.json") or {}
     wasm_nq_pxuuid = load_json(PROTO / "wasm/captcha_wasm_nq_replay_s00ld1lglrw0_1781191381.json") or {}
     wasm_import_pxuuid = load_json(PROTO / "wasm/wasm_import_calls_s00ld1lglrw0_1781191381.json") or {}
+    cookie_checks = cookie_audit.get("checks") or {}
 
     classifier_runs = classifier.get("runs") or []
     stage_counts: dict[str, int] = {}
@@ -1096,6 +1818,7 @@ def build_audit() -> dict[str, Any]:
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
 
     collector_build = collector_request_build_summary()
+    collector_build_exact_coverage = collector_request_build_exact_coverage_summary()
     px561_constructor = px561_constructor_summary()
     live_probe = live_probe_summary()
     inner_payload = experimental_inner_payload_summary()
@@ -1146,12 +1869,26 @@ def build_audit() -> dict[str, Any]:
     latest_asset_lineage_encoded_boundary = latest_asset_lineage_encoded_boundary_summary()
     latest_exact_payload_body_controls = latest_exact_payload_body_controls_summary()
     s00_line933_state_window = s00_line933_state_window_summary()
+    s00_seq6_to_seq5_success_bridge_window = s00_seq6_to_seq5_success_bridge_window_summary()
     seq6_response_first_control = seq6_response_first_control_summary()
     h2_multiplex_control = h2_multiplex_control_summary()
     h2_dual_activity_equal_control = h2_dual_activity_equal_control_summary()
     h2_first_failure_dual_activity_control = h2_first_failure_dual_activity_control_summary()
     h2_first_failure_head_delay_control = h2_first_failure_head_delay_control_summary()
     h2_fresh_tail_strongest_control = h2_fresh_tail_strongest_control_summary()
+    h2_inner_uuid_binding_control = h2_inner_uuid_binding_control_summary()
+    h2_fresh_tail_only_control = h2_fresh_tail_only_control_summary()
+    h2_fresh_tail_inner_uuid_control = h2_fresh_tail_inner_uuid_control_summary()
+    h2_fresh_stack_only_control = h2_fresh_stack_only_control_summary()
+    h2_seq6_response_before_seq5_body_control = h2_seq6_response_before_seq5_body_control_summary()
+    first_failure_overlap_probe = first_failure_overlap_probe_summary()
+    forced_first_failure_response_order_control = forced_first_failure_response_order_control_summary()
+    forced_overlap_encoded_decoded_boundary = forced_overlap_encoded_decoded_boundary_summary()
+    forced_overlap_template_final_control = forced_overlap_template_final_control_summary()
+    forced_overlap_payload_pc_split_control = forced_overlap_payload_pc_split_control_summary()
+    hypothesis_reframe = hypothesis_reframe_summary()
+    reset_transport_ip_hypothesis = reset_transport_ip_hypothesis_summary()
+    current_terminal_decision = current_terminal_decision_summary()
 
     requirements = [
         {
@@ -1182,6 +1919,7 @@ def build_audit() -> dict[str, Any]:
             "status": "proved" if collector_build["allExact"] and px561_constructor["requiredChecksPass"] else "partly_proved",
             "evidence": [
                 collector_build,
+                collector_build_exact_coverage,
                 px561_constructor,
                 {
                     "limitation": (
@@ -1207,10 +1945,21 @@ def build_audit() -> dict[str, Any]:
         {
             "id": "px_cookie_token_update",
             "requirement": "_px cookie/token 更新可由 decoded collector handlers 离线回放，并匹配 Microsoft risk/verify 请求。",
-            "status": "partly_proved" if (cookie_audit.get("checks") or {}).get("anyRunProvesContinueRiskVerifyMatchesJar") else "incomplete",
+            "status": "proved" if all(
+                cookie_checks.get(k) is True
+                for k in [
+                    "allRunsHaveTimeline",
+                    "allRunsHaveRiskMaterial",
+                    "allRunsHaveDecodedPxEvents",
+                    "allRunsHaveCorrelatedPx3PxdePxvid",
+                    "allRunsHaveRiskVerifyRequests",
+                    "allRunsRiskProviderMetadataValuesMatchJar",
+                    "anyRunProvesContinueRiskVerifyMatchesJar",
+                ]
+            ) else ("partly_proved" if cookie_checks.get("anyRunProvesContinueRiskVerifyMatchesJar") else "incomplete"),
             "evidence": [
                 check_file(PROTO / "cookie_jar/px_cookie_jar_updater_multi_audit.json"),
-                {"checks": cookie_audit.get("checks")},
+                {"checks": cookie_checks},
             ],
         },
         {
@@ -1493,6 +2242,15 @@ def build_audit() -> dict[str, Any]:
                     ),
                 },
                 {
+                    "s00Seq6ToSeq5SuccessBridgeWindow": s00_seq6_to_seq5_success_bridge_window,
+                    "interpretation": (
+                        "A narrower s00 audit covers runtime lines 938-961 and collector decoded lines 926-948. "
+                        "That window contains no runtime request events, only the seq6 response and accepted seq5 response. "
+                        "The parent bridge lines 946/947 carry _px3/_pxde values that exactly correlate to decoded line926. "
+                        "Therefore current evidence does not support a missing network request between seq6 response and seq5 success."
+                    ),
+                },
+                {
                     "seq6ResponseFirstControl": seq6_response_first_control,
                     "interpretation": (
                         "A new direct Webshare control reduced the seq5/seq6 gap to force seq6 response completion before seq5, matching the observed s00 response order. "
@@ -1542,6 +2300,91 @@ def build_audit() -> dict[str, Any]:
                         "first-failure history, full asset-lineage, the observed HEAD delay, one h2 TLS session, seq6-body-first ordering, and seq6 response first. "
                         "Seq6 decoded activity still equaled s00 line925, while seq5 returned oIIoIooo|-1. "
                         "This proves that the current pure-protocol POW/WASM material path is live and server-bound, but still insufficient for HUMAN acceptance."
+                    ),
+                },
+                {
+                    "h2InnerUuidBindingControl": h2_inner_uuid_binding_control,
+                    "interpretation": (
+                        "A single-variable h2 control corrected PX561 inner FUFvS1Mga38= to the fresh outer uuid while keeping accepted template tail/stack/non-PX decoded activities. "
+                        "It retained first-failure history, full asset-lineage, observed HEAD delay, h2 seq6-body-first ordering, and seq6 response first. "
+                        "The only PX561 field diff vs s00 was FUFvS1Mga38=, non-PX activities remained equal, seq6 decoded activity equaled s00 line925, and seq5 still returned oIIoIooo|-1. "
+                        "This rules out inner/outer uuid binding as a sufficient single-variable fix."
+                    ),
+                },
+                {
+                    "h2FreshTailOnlyControl": h2_fresh_tail_only_control,
+                    "interpretation": (
+                        "A single-variable h2 control replaced only the PX561 POW/WASM tail fields with fresh server-bound values: AEAx from offline Ws.Ng, TBR9 from offline Ws.NQ, solved Bzt, and fresh OSk. "
+                        "Accepted template stack, inner uuid, and non-PX decoded activities were preserved; first-failure history, full asset-lineage, observed HEAD delay, h2 seq6-body-first, and seq6 response first all held. "
+                        "The only PX561 field diffs vs s00 were the four pow_wasm_tail fields, and seq5 still returned oIIoIooo|-1. "
+                        "This rules out fresh POW/WASM tail correctness as a sufficient single-variable fix."
+                    ),
+                },
+                {
+                    "h2FreshTailInnerUuidControl": h2_fresh_tail_inner_uuid_control,
+                    "interpretation": (
+                        "A dual-variable h2 control combined fresh POW/WASM tail fields with fresh PX561 inner FUFvS1Mga38= while preserving accepted template stack and non-PX decoded activities. "
+                        "First-failure history, full asset-lineage, observed HEAD delay, h2 seq6-body-first, seq6 response first, and seq6 decoded equality all held. "
+                        "The only PX561 field diffs vs s00 were the four pow_wasm_tail fields plus FUFvS1Mga38=, and seq5 still returned oIIoIooo|-1. "
+                        "This rules out the tail+inner-uuid pair as a sufficient fix."
+                    ),
+                },
+                {
+                    "h2FreshStackOnlyControl": h2_fresh_stack_only_control,
+                    "interpretation": (
+                        "A single-variable h2 control injected the same-session first-failure fresh PX561 stack W0shQR0nJHc= while preserving accepted template tail, inner uuid, and non-PX decoded activities. "
+                        "First-failure history, full asset-lineage, observed HEAD delay, h2 seq6-body-first, seq6 response first, and seq6 decoded equality all held. "
+                        "The only PX561 field diff vs s00 was W0shQR0nJHc=, and seq5 still returned oIIoIooo|-1. "
+                        "This rules out fresh stack material alone as a sufficient fix."
+                    ),
+                },
+                {
+                    "h2Seq6ResponseBeforeSeq5BodyControl": h2_seq6_response_before_seq5_body_control,
+                    "interpretation": (
+                        "A fresh Webshare h2 control sent seq5 headers on stream 1, sent seq6 on stream 3, waited until the full seq6 response ended, and only then sent seq5 body. "
+                        "The run also included first-failure state, captcha HEAD delay, fresh stack, fresh server-bound tail material, and HTTP 200 responses. "
+                        "Seq6 returned cookie/token handlers before seq5 ended, but seq5 still returned oIIoIooo|-1. "
+                        "Therefore the missing boundary is not merely observing seq6 _px3/_pxde before seq5 completion."
+                    ),
+                },
+                {
+                    "firstFailureOverlapProbe": first_failure_overlap_probe,
+                    "interpretation": (
+                        "s00 first-failure lineage sends seq2 PX561 at runtime line574 and seq3 non-PX at line578 before either response, with seq3 response observed before seq2 rejection. "
+                        "A no-browser h2 probe matched the request overlap gap and used stream 1/3, but seq2 still responded first. "
+                        "This does not prove a fix; it identifies a still-active timing variable earlier than the final seq5/seq6 window."
+                    ),
+                },
+                {
+                    "forcedFirstFailureResponseOrderControl": forced_first_failure_response_order_control,
+                    "interpretation": (
+                        "A follow-up fresh Webshare control forced the first-failure response order to match s00: seq3 response before seq2 rejection. "
+                        "It then advanced seq4 to a new POW and sent final seq5/seq6 with seq6 completed before seq5 body. "
+                        "Final seq5 still returned oIIoIooo|-1. Therefore first-failure response ordering is not sufficient."
+                    ),
+                },
+                {
+                    "forcedOverlapEncodedDecodedBoundary": forced_overlap_encoded_decoded_boundary,
+                    "interpretation": (
+                        "A strict boundary audit for the forced-first-failure control shows it was not a decoded-equality control: final seq5 and seq6 decoded activities both differ from s00, "
+                        "and payload/pc plus outer session fields differ. "
+                        "Therefore this experiment only rules out response ordering as sufficient; it does not close the hidden decoded-material or encoded payload/session binding gaps."
+                    ),
+                },
+                {
+                    "forcedOverlapTemplateFinalControl": forced_overlap_template_final_control,
+                    "interpretation": (
+                        "A fresh Webshare control combined forced s00 first-failure response ordering with final seq5/seq6 decoded activities equal to s00. "
+                        "Final seq5 still returned oIIoIooo|-1, while encoded payload/pc and outer session fields still differed. "
+                        "This rules out response ordering plus decoded final activity equality as sufficient, narrowing the remaining boundary to encoded payload/session/server-state binding."
+                    ),
+                },
+                {
+                    "forcedOverlapPayloadPcSplitControl": forced_overlap_payload_pc_split_control,
+                    "interpretation": (
+                        "After fixing template form parsing to preserve literal plus signs in payload, a fresh Webshare forced-overlap control sent seq5 with exact s00 payload and exact s00 pc but fresh outer session fields. "
+                        "Seq5 returned {do:[]} with no oIIoIooo handler. "
+                        "This proves the exact accepted payload+pc is not portable across fresh session outer state, and narrows the live gap to payload/pc/session/server-state coupling rather than decoded activity equality alone."
                     ),
                 },
                 {
@@ -1628,6 +2471,42 @@ def build_audit() -> dict[str, Any]:
                 },
                 exact_success_replay,
                 {
+                    "hypothesisReframe": hypothesis_reframe,
+                    "interpretation": (
+                        "The hypothesis-driven reframe now proves the downstream Microsoft consumption chain for s00: "
+                        "accepted collector line933 yields line948 challenge_success=0 plus _px3/_pxde, line998 risk/verify consumes those values, "
+                        "risk/verify returns state=continue, and CreateAccount receives the continuation token and returns redirectUrl. "
+                        "The same reframe also proves no remaining candidate currently satisfies the fresh-experiment gate: "
+                        "singleTransitionCandidateCount=0, with decoded activity fields, request order, static payload/pc, and cookie-header bridge eliminated; "
+                        "remaining boundaries are coupled outer/session tuple, pc/marker/uuid encoder binding family, or non-request collector server expected state."
+                    ),
+                },
+                {
+                    "resetTransportIpHypothesis": reset_transport_ip_hypothesis,
+                    "interpretation": (
+                        "Reset sampling repaired the Webshare credential/session shape, implemented browser Webshare sampling, and completed the reset matrix. "
+                        "Current evidence includes counted browser success/failure reset samples plus pure-protocol Webshare/direct reset samples; valid pure-protocol rows reach final seq5/seq6 and all return comboAnySuccess=false. "
+                        "The reset final response class audit shows valid final pure-protocol samples share the same final class: seq5 oIIoIooo|-1 with _px3/_pxde updates and seq6 no outcome handler. "
+                        "The reset cookie mutation audit proves those decoded handlers do mutate _px3/_pxde offline and seq6 overwrites seq5, but the same rows contain no oIIoIooo|0 and therefore do not form a risk/verify success-cookie candidate. "
+                        "The reset single-transition candidate audit has singleTransitionCandidateCount=0, so the reset plan's Phase 5 minimal fresh experiment is not authorized by current evidence. "
+                        "The reset sampling coverage audit now shows browserResetCoverageComplete=true, pureProtocolResetCoverageComplete=true, and allResetCoverageComplete=true. "
+                        "The reset new-hook-axis audit shows missingObservedHookCount=0, missingContrastHookCount=0, notInstrumentedHookCount=0, and recommendedAxisCount=0. "
+                        "The reset hook-feature reducer examines worker/wasm/pow_worker and promotes none of them to Phase 5 inputs. "
+                        "The reset runtime/JS taxonomy finds 194 coarse correlated surfaces, but candidate reduction promotes none and leaves no unclassified reductions. "
+                        "The reset collector handler surface audit splits the largest response-handler bucket into cookie/config/POW/score/state surfaces and promotes none. "
+                        "The reset unobserved lifecycle audit identifies 3 static-reachable hook recommendations, not Phase 5 candidates: pxMobileData, OfflineAudioContext, and serviceWorker/caches. "
+                        "Route B value taxonomy then finds browser-success-only hsprotect lineage, but the instrumentation-control audit proves the contrast is confounded: patch_apply=1 produced 3 successLike browser samples and 0 controlled failure samples, while the only failure remains patch_apply=0. "
+                        "Therefore the applied hsprotect JS patch is active browser-source instrumentation rather than a passive protocol variable, and Route B still promotes 0 pure-protocol transitions. "
+                        "The only network surface is OneCollector telemetry: it appears in 3 success samples, 0 failure samples, and only after CreateAccount redirect in those success traces. "
+                        "The reset terminal boundary audit records noCurrentRouteToPhase5=true while end_to_end_pure_protocol_poc remains missing. "
+                        "The methodological terminal boundary audit records allRoutesClosed=true with no Phase 5 entry. "
+                        "The next evidence entrance audit records allKnownLocalEvidenceEntrancesClosed=true, so repeating old evidence chains is not justified. "
+                        "The encoder variant terminal audit then reopens C5 only for one controlled coherent variant, runs it once, and closes it again: the probe returned {do:[]} with no collector success, so no downstream risk/verify replay is justified. "
+                        "The malformed Webshare reset rows are separately classified as proxy CONNECT 407 before collector bootstrap, so they do not support a HUMAN/IP conclusion. "
+                        "Current reset evidence does not support transport/IP alone as a sufficient success axis."
+                    ),
+                },
+                {
                     "limitation": (
                         "现有 live probe 已使用 live OSk、live Bzt 和 fresh TBR9，并且 collector 返回了 HTTP 200 且 decoded cleanly，"
                         "inner bundle payload 也能解码且 PX561 target tail index 与 accepted j0t8 对齐；"
@@ -1696,7 +2575,20 @@ def build_audit() -> dict[str, Any]:
                         "并保持 full asset-lineage、h2 stream 1/3、seq6 response first、seq5/seq6 decoded bodies 全等，仍返回 oIIoIooo|-1。"
                         "随后 h2 first-failure HEAD-delay control 又把 s00 约 52.8s captcha HEAD→line933 间隔合入同一控制，仍返回 oIIoIooo|-1。"
                         "fresh server-bound strongest control 再使用 fresh POW OSk、offline Ws.Ng/Ws.NQ AEAx/TBR9、solved Bzt、fresh session fields、seq6-body-first 和 seq6 response first，仍返回 oIIoIooo|-1。"
+                        "inner uuid binding control 又证明：只把 PX561 inner FUFvS1Mga38= 改为 fresh outer uuid，其余 decoded activity 保持 accepted template 且强 h2/asset/timing lineage 成立，仍返回 oIIoIooo|-1。"
+                        "fresh tail-only control 又证明：只替换 AEAx/TBR9/Bzt/OSk 四个 POW/WASM tail 字段为 fresh server-bound 值，其余 decoded activity 保持 accepted template，仍返回 oIIoIooo|-1。"
+                        "fresh tail + inner uuid control 进一步证明这两个变量组合后也仍返回 oIIoIooo|-1。"
+                        "fresh stack-only control 进一步证明：只把 W0shQR0nJHc= 替换为同 session first-failure fresh stack，其他 decoded activity 保持 accepted template，也仍返回 oIIoIooo|-1。"
                         "因此这仍是已观测浏览器 session artifact，不是无浏览器端到端纯协议 live PoC。"
+                    )
+                },
+                {
+                    "currentTerminalDecision": current_terminal_decision,
+                    "interpretation": (
+                        "最新 goal-level authority 已接入 hypothesis-plan 覆盖审计、collector server expected-state 边界审计、reset terminal boundary 和 current route authority。"
+                        "这些证据共同证明：H0/H1/H2/H4 已关闭，H5 已降为无 promoted context proxy，H3 仍是 non-client-visible server-state boundary；"
+                        "hypothesis-plan Phase 5 minimal experiment 之所以缺失，是因为当前 terminal gate 仍为 readyForFreshExperiment=false。"
+                        "因此 end-to-end PoC 仍未完成，但目标层不应继续推荐已经被后续审计关闭的 IP、字段、timing 或 accepted packet 重试。"
                     )
                 },
             ],
@@ -1719,28 +2611,34 @@ def build_audit() -> dict[str, Any]:
             "blockingOrMissing": [r["id"] for r in blocking],
             "goalComplete": not blocking and not partial,
         },
+        "currentDecision": {
+            "readyForFreshExperiment": False,
+            "recommendedExperiment": None,
+            "nextArtifact": None,
+            "nextScript": None,
+            "reason": (
+                "The remaining end-to-end gap is collector HUMAN success in a fresh no-browser protocol run. "
+                "Current terminal audits have zero promoted single-transition candidates, hypothesis-plan Phase 5 is gated off, "
+                "promoted_transition_candidate_intake promotes zero candidates, minimal_promoted_transition_experiment is blocked by gate, "
+                "final_pure_protocol_replay_audit is blocked by PoC gate, the one-command gate chain passes offline, the evidence manifest hashes current scripts/artifacts, manifest verification passes, and stale historical nextArtifact pointers are superseded."
+            ),
+            "evidence": current_terminal_decision,
+        },
         "nextEvidenceTargets": [
-            "Map server-side state effects of the captcha challenge lifecycle beyond the observed HEAD request: worker POW/captcha message events, HEAD response timing, and any collector state transitions not represented in decoded activities.",
-            "Minimize and classify PX561 non-tail fields by comparing accepted success vs fresh oIIoIooo|-1 probes, prioritizing LVUcU2s1Gmc=, Ew9iCVZkZD4=, KVkYX28zG2o=, DzN+dUlTekE=, and state progression.",
-            "Because exact body replay is rejected while mixed fresh/template payload+outer combinations can return {do:[]}, next map collector server-side state/time/history transitions and cookie/session lineage around accepted line933.",
-            "After strict header-order parity still rejects, prioritize body/session/server-state coupling across ci/cs/cts/p1/payload/pc/sid/uuid/vid, especially how browser accepted state evolves immediately before line933.",
-            "Since seq5/seq6 overlap timing is not sufficient, next isolate whether accepted browser line933 depends on a hidden browser-side worker/message state not represented in the two collector request bodies.",
-            "Because direct seq5 decoded whole-activity equality plus delivered seq6-pair timing still rejects, next isolate server-side lineage/cookie/session state that changes before accepted browser line933 but is not represented in decoded request bodies.",
-            "Use cookie_session_lineage_gap_audit to decide whether no-browser protocol must emulate parent cookie bridge side effects before the accepted seq5/seq6 window, then test a minimal stateful cookie-bridge replay if evidence supports it.",
-            "After stk/ns replay alone still rejects, map all non-collector browser/network events between first-failure line574 and success line933, especially captcha HEAD/GET and postMessage-triggered internal dispatches, against no-browser state transitions.",
-            "After stk/ns plus captcha.js/iframe/main asset hits still reject and sendBeacon is shown post-success, isolate pre-success collector server-side state or browser/internal material not represented by decoded activities and simple network hits.",
-            "Classify pre-success third-frame/browser messages such as crcldu sync against collector state changes; if no network/server-side edge exists, deprioritize them and focus on collector response lineage and hidden request-body binding.",
-            "For the latest asset-lineage control, reduce encoded payload/pc/session binding by generating fresh controls that keep payload equal while varying pc/session params, and controls that keep pc equal while varying payload/session params, using one fresh Webshare session per attempt.",
-            "Because latest full asset-lineage exact payload+pc returns {do:[]} and exact whole body returns oIIoIooo|-1, test collector/server-side state lineage immediately before line933 rather than replaying static body artifacts again.",
-            "Because seq6-response-first timing is now reproduced and still rejected, isolate whether the parent cookie bridge state after seq6 response but before seq5 response has an observable request-body or server-side equivalent.",
-            "Because HTTP/2 multiplexing on one TLS session is now reproduced and still rejected, stop treating transport/session multiplexing as the primary blocker; focus on state material produced before line933 or server-side lineage established earlier.",
-            "Because seq5 and seq6 decoded request bodies are now both equal to the s00 accepted-window bodies and still reject, focus on server-side/session lineage established before the seq5/seq6 window or hidden material outside decoded request bodies.",
-            "Because first-failure history plus full asset-lineage plus h2 seq5/seq6 decoded equality still rejects, stop treating first-failure lineage as the primary missing combined variable; focus on hidden browser material or server-side session binding outside decoded collector bodies.",
-            "Because captcha HEAD plus the observed HEAD-to-line933 delay also rejects when combined with first-failure history and h2 decoded equality, stop treating HEAD timing as the primary missing variable.",
-            "Because fresh server-bound POW/WASM tail material plus first-failure history, asset lineage, HEAD delay, h2, and seq6-first still rejects, map hidden browser state or server-side session binding not represented by current collector bodies rather than repeating static-template or tail-only controls.",
-            "Generate or substitute fresh candidates for the remaining non-tail/timing fields one at a time while using the now-proved offline Ws.Ng/Ws.NQ replay path, then live-probe the same-session PX561 body.",
-            "Verify collector decoder returns oIIoIooo|0 for a no-browser fresh PX561 request before claiming HUMAN success replay.",
-            "Then replay decoded _px jar into risk/verify + CreateAccount using the existing risk_verify_build exact-body builder and verify redirectUrl without browser.",
+            "Do not run fresh network experiments while reset_terminal_boundary_audit has readyForFreshExperiment=false and noCurrentRouteToPhase5=true.",
+            "Do not follow stale hypothesis-plan nextArtifact pointers; hypothesis_plan_coverage_audit found staleHistoricalNextPointerCount=14 and current authority supersedes them.",
+            "A new route must first satisfy promoted_transition_candidate_intake: exactly one pre-accept, client-visible, pure-protocol constructible transition whose value chain enters request/cookie/risk/verify and is not contradicted by existing controls.",
+            "Use phase3_proposal_evidence_triage to decide whether current local evidence is sufficient to write a candidate proposal; do not write a proposal while proposalWorthyEvidenceCount=0.",
+            "Use phase3_evidence_entrance_coverage_audit to verify whether current evidence entrances are exhausted before starting another local-evidence mining pass.",
+            "Use phase3_raw_evidence_entrance_audit and phase3_raw_trace_crosswalk_audit before treating raw output/outlook_browser success-token files as new proposal evidence.",
+            "Use trace_classifier_raw_coverage_gap_audit before claiming the trace classifier covers every raw browser success-token trace.",
+            "minimal_promoted_transition_experiment is the Phase C entrypoint; it must remain networkAttemptExecuted=false until candidate intake promotes exactly one transition.",
+            "final_pure_protocol_replay_audit is the Phase E completion entrypoint; it must remain replayAttemptExecuted=false until evidence_gated_end_to_end_pure_protocol_poc proves all success checks.",
+            "Use pure_protocol_evidence_gate_chain_audit as the one-command offline rebuild before trusting any terminal decision.",
+            "Use pure_protocol_evidence_manifest and pure_protocol_evidence_manifest_verify to compare key script/artifact hashes before and after any new evidence route.",
+            "Use pure_protocol_goal_completion_verifier as the final completion gate; do not mark the goal complete while completionVerified=false.",
+            "If such a transition appears, attach a candidate-specific executor to the minimal experiment harness before any network run; otherwise keep goalComplete=false and end_to_end_pure_protocol_poc as the sole blocking requirement.",
+            "Completion still requires a fresh no-browser collector oIIoIooo|0 response, decoded _px jar replay, risk/verify state=continue, and CreateAccount redirectUrl.",
         ],
     }
     return result

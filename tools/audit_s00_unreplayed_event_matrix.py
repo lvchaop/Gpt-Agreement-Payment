@@ -167,7 +167,8 @@ def main() -> int:
         },
         "conclusion": (
             "The latest direct control has tested pre-bootstrap stk/ns, captcha.js GET/HEAD, iframe GET, main.js GET, and main.js HEAD in the same lineage, but still does not replay sendBeacon internals. "
-            "Because the asset-lineage control also still rejects with exact seq5 decoded content, the next minimal evidence target is sendBeacon/internal message dispatch or deeper collector server-side state not represented by these simple asset hits."
+            "A separate sendBeacon temporal audit shows sendBeacon is post-success in s00, so it is not supported as a pre-success prerequisite. "
+            "Because the asset-lineage control also still rejects with exact seq5 decoded content, the next minimal evidence target is deeper collector server-side/session state not represented by these simple asset hits."
         ),
     }
     json_path = OUT_DIR / "s00_unreplayed_event_matrix_audit.json"

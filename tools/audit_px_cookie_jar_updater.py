@@ -252,7 +252,13 @@ def main() -> int:
     results = [analyze_run(run) for run in runs]
     checks = {
         "allRunsHaveTimeline": all(r["checks"]["timelineExists"] for r in results),
+        "allRunsHaveRiskMaterial": all(r["checks"]["riskMaterialExists"] for r in results),
         "allRunsHaveDecodedPxEvents": all(r["checks"]["hasDecodedPxEvents"] for r in results),
+        "allRunsHaveCorrelatedPx3PxdePxvid": all(r["checks"]["hasCorrelatedPx3PxdePxvid"] for r in results),
+        "allRunsHaveRiskVerifyRequests": all(r["checks"]["hasRiskVerifyRequests"] for r in results),
+        "allRunsRiskProviderMetadataValuesMatchJar": all(
+            r["checks"]["allRiskProviderMetadataValuesMatchJar"] for r in results
+        ),
         "anyRunProvesContinueRiskVerifyMatchesJar": any(r["checks"]["continueRiskVerifyMatchesJar"] for r in results),
     }
     result = {

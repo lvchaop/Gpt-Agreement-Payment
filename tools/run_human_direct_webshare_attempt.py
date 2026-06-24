@@ -44,13 +44,14 @@ def solved_pow_value(pow_json: str | Path) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a clean no-browser HUMAN attempt through direct Webshare and final seq5+seq6 combo.")
+    parser = argparse.ArgumentParser(description="Run a clean no-browser HUMAN attempt through Webshare or direct connection and final seq5+seq6 combo.")
     parser.add_argument("--session", default="")
     parser.add_argument("--base-user", default="ibtvqcnm")
     parser.add_argument("--country", default="JP")
     parser.add_argument("--password", default="e5wruchrofwl")
     parser.add_argument("--host", default="p.webshare.io")
     parser.add_argument("--port", type=int, default=80)
+    parser.add_argument("--direct", action="store_true", help="Do not set HSPROTECT_PROXY_URL; send requests directly.")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--gap-seconds", type=float, default=0.1816)
     parser.add_argument("--pre-stk-ns", action="store_true")
@@ -65,10 +66,10 @@ def main() -> int:
     parser.add_argument("--combo-include-proxy-authorization", action="store_true")
     parser.add_argument("--combo-parallel", action="store_true")
     parser.add_argument("--combo-transport", choices=["https-threads", "h2-single-session"], default="https-threads")
-    parser.add_argument("--combo-h2-body-order", choices=["normal", "seq6-body-first"], default="normal")
+    parser.add_argument("--combo-h2-body-order", choices=["normal", "seq6-body-first", "seq6-response-before-seq5-body"], default="normal")
     parser.add_argument("--combo-aeax-source", choices=["template", "offline-ng"], default="offline-ng")
     parser.add_argument("--combo-bzt-source", choices=["solve", "template"], default="solve")
-    parser.add_argument("--combo-stack-source", choices=["fresh", "template"], default="template")
+    parser.add_argument("--combo-stack-source", choices=["fresh", "template", "fresh-probe"], default="template")
     parser.add_argument("--combo-tail-source", choices=["fresh", "template"], default="fresh")
     parser.add_argument("--combo-inner-uuid-source", choices=["fresh", "template"], default="fresh")
     parser.add_argument("--combo-non-px-activity-source", choices=["fresh", "template"], default="fresh")
@@ -85,9 +86,12 @@ def main() -> int:
 
     started = time.time()
     session = args.session or f"{args.base_user}-{args.country.upper()}-{int(started) * 1000}"
-    proxy_url = f"http://{session}:{args.password}@{args.host}:{args.port}"
     env = dict(os.environ)
-    env["HSPROTECT_PROXY_URL"] = proxy_url
+    proxy_url = None if args.direct else f"http://{session}:{args.password}@{args.host}:{args.port}"
+    if args.direct:
+        env.pop("HSPROTECT_PROXY_URL", None)
+    else:
+        env["HSPROTECT_PROXY_URL"] = str(proxy_url)
     steps: dict[str, Any] = {}
     fresh_uuid = str(uuid.uuid1()) if args.pre_stk_ns else ""
 
@@ -118,6 +122,7 @@ def main() -> int:
     first_pow = run_json(["node", "tools/solve_collector_pow_from_response.mjs", bundle["json"]])
     steps["firstPow"] = {"summary": first_pow}
 
+    first_px = None
     if args.include_first_failure_history:
         first_ninput = solved_pow_value(first_pow["jsonPath"])
         first_uuid = read_json(bundle["json"])["material"]["freshState"]["uuid"]
@@ -253,6 +258,7 @@ def main() -> int:
         "--gap-seconds", str(args.gap_seconds),
         "--timeout", str(args.timeout),
     ]
+        + (["--stack-probe", first_px["json"]] if args.combo_stack_source == "fresh-probe" and first_px else [])
         + (["--include-proxy-authorization"] if args.combo_include_proxy_authorization else [])
         + (["--parallel"] if args.combo_parallel else [])
     )
@@ -260,7 +266,10 @@ def main() -> int:
     result = {
         "startedAt": started,
         "session": session,
-        "proxyEndpoint": f"http://{args.host}:{args.port}",
+        "transport": "direct" if args.direct else "webshare",
+        "direct": bool(args.direct),
+        "proxyEndpoint": None if args.direct else f"http://{args.host}:{args.port}",
+        "proxySessionUser": None if args.direct else session,
         "comboHeaderMode": args.combo_header_mode,
         "comboIncludeProxyAuthorization": args.combo_include_proxy_authorization,
         "comboParallel": args.combo_parallel,

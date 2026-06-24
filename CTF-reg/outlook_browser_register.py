@@ -896,6 +896,10 @@ def _install_js_internal_trace(page, *, label: str) -> Path:
                 try { return String((new Error()).stack || '').split('\\n').slice(2).join('\\n'); }
                 catch (_) { return ''; }
               };
+              const __outlookRawPerfNow = (() => {
+                try { return performance && performance.now ? performance.now.bind(performance) : (() => 0); }
+                catch (_) { return () => 0; }
+              })();
               const emit = (kind, data = {}) => {
                 try {
                   const item = {
@@ -903,7 +907,7 @@ def _install_js_internal_trace(page, *, label: str) -> Path:
                     href: String(location.href || ''),
                     origin: String(location.origin || ''),
                     frameTop: window === window.top,
-                    perf_t: Math.round(performance.now()),
+                    perf_t: Math.round(__outlookRawPerfNow()),
                     data
                   };
                   const fn = window.__outlookJsInternalTrace;
@@ -1119,6 +1123,114 @@ def _install_js_internal_trace(page, *, label: str) -> Path:
               }
 
               try {
+                const wrapPxMobileDataBridge = () => {
+                  try {
+                    const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pxMobileData;
+                    if (!bridge || typeof bridge.postMessage !== 'function' || bridge.postMessage.__outlookWrapped) return false;
+                    const originalPostMessage = bridge.postMessage.bind(bridge);
+                    bridge.postMessage = function(message) {
+                      emit('webkit.messageHandlers.pxMobileData.postMessage', { message: safeString(message, 1200), stack: stack() });
+                      return originalPostMessage.apply(this, arguments);
+                    };
+                    Object.defineProperty(bridge.postMessage, '__outlookWrapped', { value: true });
+                    emit('webkit.messageHandlers.pxMobileData.wrap', { stack: stack() });
+                    return true;
+                  } catch (err) {
+                    emit('hook_error', { hook: 'pxMobileData.wrap', error: safeString(err) });
+                    return false;
+                  }
+                };
+                wrapPxMobileDataBridge();
+                setInterval(wrapPxMobileDataBridge, 500);
+              } catch (e) {
+                emit('hook_error', { hook: 'pxMobileData', error: safeString(e) });
+              }
+
+              try {
+                const wrapOfflineAudioContext = name => {
+                  const OriginalAudioContext = window[name];
+                  if (!OriginalAudioContext || OriginalAudioContext.__outlookWrapped) return;
+                  window[name] = function() {
+                    emit('OfflineAudioContext.new', { ctor: name, args: Array.from(arguments).map(v => safeString(v, 200)), stack: stack() });
+                    const ctx = new OriginalAudioContext(...arguments);
+                    try {
+                      if (ctx && typeof ctx.startRendering === 'function' && !ctx.startRendering.__outlookWrapped) {
+                        const originalStartRendering = ctx.startRendering.bind(ctx);
+                        ctx.startRendering = function() {
+                          emit('OfflineAudioContext.startRendering', { ctor: name, currentTime: ctx.currentTime, length: ctx.length, sampleRate: ctx.sampleRate, stack: stack() });
+                          const result = originalStartRendering.apply(this, arguments);
+                          try {
+                            if (result && typeof result.then === 'function') {
+                              return result.then(value => {
+                                let summary = { resultType: Object.prototype.toString.call(value) };
+                                try {
+                                  summary.length = value && value.length;
+                                  summary.duration = value && value.duration;
+                                  summary.sampleRate = value && value.sampleRate;
+                                  if (value && typeof value.getChannelData === 'function') {
+                                    const data = value.getChannelData(0);
+                                    let sum = 0;
+                                    for (let i = 4500; data && i < Math.min(5000, data.length); i++) sum += Math.abs(data[i]);
+                                    summary.abs4500_5000 = String(sum);
+                                  }
+                                } catch (inner) {
+                                  summary.error = safeString(inner);
+                                }
+                                emit('OfflineAudioContext.startRendering.resolved', summary);
+                                return value;
+                              });
+                            }
+                          } catch (_) {}
+                          return result;
+                        };
+                        Object.defineProperty(ctx.startRendering, '__outlookWrapped', { value: true });
+                      }
+                    } catch (_) {}
+                    return ctx;
+                  };
+                  window[name].prototype = OriginalAudioContext.prototype;
+                  Object.defineProperty(window[name], '__outlookWrapped', { value: true });
+                  emit('OfflineAudioContext.wrap', { ctor: name, stack: stack() });
+                };
+                wrapOfflineAudioContext('OfflineAudioContext');
+                wrapOfflineAudioContext('webkitOfflineAudioContext');
+              } catch (e) {
+                emit('hook_error', { hook: 'OfflineAudioContext', error: safeString(e) });
+              }
+
+              try {
+                if (window.caches) {
+                  for (const name of ['open', 'match', 'has', 'keys', 'delete']) {
+                    if (typeof window.caches[name] !== 'function' || window.caches[name].__outlookWrapped) continue;
+                    const original = window.caches[name].bind(window.caches);
+                    window.caches[name] = function() {
+                      emit('caches.' + name, { args: Array.from(arguments).map(v => safeString(v, 500)), stack: stack() });
+                      return original.apply(this, arguments);
+                    };
+                    Object.defineProperty(window.caches[name], '__outlookWrapped', { value: true });
+                  }
+                  emit('caches.wrap', { stack: stack() });
+                }
+                if (navigator.serviceWorker) {
+                  if (typeof navigator.serviceWorker.register === 'function' && !navigator.serviceWorker.register.__outlookWrapped) {
+                    const originalRegister = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+                    navigator.serviceWorker.register = function() {
+                      emit('serviceWorker.register', { args: Array.from(arguments).map(v => safeString(v, 500)), stack: stack() });
+                      return originalRegister.apply(this, arguments);
+                    };
+                    Object.defineProperty(navigator.serviceWorker.register, '__outlookWrapped', { value: true });
+                  }
+                  emit('serviceWorker.snapshot', {
+                    controller: !!navigator.serviceWorker.controller,
+                    readyType: Object.prototype.toString.call(navigator.serviceWorker.ready),
+                    stack: stack()
+                  });
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'serviceWorker/caches', error: safeString(e) });
+              }
+
+              try {
                 const OriginalBlob = window.Blob;
                 if (OriginalBlob) {
                   window.Blob = function(parts, options) {
@@ -1204,6 +1316,113 @@ def _install_js_internal_trace(page, *, label: str) -> Path:
                 }
               } catch (e) {
                 emit('hook_error', { hook: 'document.cookie', error: safeString(e) });
+              }
+
+              try {
+                const wrapStorage = (storage, label) => {
+                  if (!storage || storage.__outlookStorageWrapped) return;
+                  Object.defineProperty(storage, '__outlookStorageWrapped', { value: true });
+                  for (const name of ['getItem', 'setItem', 'removeItem', 'clear', 'key']) {
+                    if (typeof storage[name] !== 'function') continue;
+                    const original = storage[name];
+                    storage[name] = function() {
+                      emit(label + '.' + name, { args: Array.from(arguments).map(v => safeString(v, 500)), stack: stack() });
+                      return original.apply(this, arguments);
+                    };
+                  }
+                };
+                wrapStorage(window.localStorage, 'localStorage');
+                wrapStorage(window.sessionStorage, 'sessionStorage');
+              } catch (e) {
+                emit('hook_error', { hook: 'storage', error: safeString(e) });
+              }
+
+              try {
+                if (window.indexedDB) {
+                  for (const name of ['open', 'deleteDatabase']) {
+                    if (typeof indexedDB[name] !== 'function') continue;
+                    const original = indexedDB[name].bind(indexedDB);
+                    indexedDB[name] = function() {
+                      emit('indexedDB.' + name, { args: Array.from(arguments).map(v => safeString(v, 500)), stack: stack() });
+                      return original.apply(this, arguments);
+                    };
+                  }
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'indexedDB', error: safeString(e) });
+              }
+
+              try {
+                emit('performance.snapshot', {
+                  timeOrigin: performance && performance.timeOrigin,
+                  now: performance && performance.now && performance.now(),
+                  dateNow: Date.now(),
+                  stack: stack()
+                });
+                if (performance && typeof performance.now === 'function') {
+                  const originalNow = performance.now.bind(performance);
+                  let perfNowCount = 0;
+                  performance.now = function() {
+                    const out = originalNow();
+                    if (perfNowCount < 20) emit('performance.now.call', { value: out, count: perfNowCount, stack: stack() });
+                    perfNowCount++;
+                    return out;
+                  };
+                }
+                const originalDateNow = Date.now;
+                let dateNowCount = 0;
+                Date.now = function() {
+                  const out = originalDateNow();
+                  if (dateNowCount < 20) emit('Date.now.call', { value: out, count: dateNowCount, stack: stack() });
+                  dateNowCount++;
+                  return out;
+                };
+              } catch (e) {
+                emit('hook_error', { hook: 'performance_time', error: safeString(e) });
+              }
+
+              try {
+                const cryptoObj = window.crypto || window.msCrypto;
+                emit('crypto.snapshot', {
+                  hasCrypto: !!cryptoObj,
+                  hasGetRandomValues: !!(cryptoObj && typeof cryptoObj.getRandomValues === 'function'),
+                  hasSubtle: !!(cryptoObj && cryptoObj.subtle),
+                  subtleKeys: cryptoObj && cryptoObj.subtle ? Object.keys(cryptoObj.subtle).slice(0, 30) : [],
+                  stack: stack()
+                });
+                if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
+                  const originalGetRandomValues = cryptoObj.getRandomValues.bind(cryptoObj);
+                  cryptoObj.getRandomValues = function(array) {
+                    const out = originalGetRandomValues(array);
+                    let bytes = [];
+                    try {
+                      const view = new Uint8Array(array.buffer || array, array.byteOffset || 0, Math.min(array.byteLength || array.length || 0, 64));
+                      bytes = Array.from(view);
+                    } catch (_) {}
+                    emit('crypto.getRandomValues', {
+                      ctor: array && array.constructor && array.constructor.name,
+                      length: array && (array.length || array.byteLength),
+                      firstBytes: bytes,
+                      stack: stack()
+                    });
+                    return out;
+                  };
+                }
+                if (cryptoObj && cryptoObj.subtle) {
+                  for (const name of ['digest', 'importKey', 'deriveBits', 'deriveKey', 'encrypt', 'decrypt', 'sign', 'verify']) {
+                    if (typeof cryptoObj.subtle[name] !== 'function') continue;
+                    const original = cryptoObj.subtle[name].bind(cryptoObj.subtle);
+                    cryptoObj.subtle[name] = function() {
+                      emit('crypto.subtle.' + name, { args: Array.from(arguments).map(v => safeString(v, 500)), stack: stack() });
+                      return original.apply(this, arguments).then(value => {
+                        emit('crypto.subtle.' + name + '.resolved', { resultType: Object.prototype.toString.call(value) });
+                        return value;
+                      });
+                    };
+                  }
+                }
+              } catch (e) {
+                emit('hook_error', { hook: 'crypto', error: safeString(e) });
               }
 
               try {

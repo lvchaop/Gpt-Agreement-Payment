@@ -124,8 +124,12 @@ function extractMarkerFromPayload(base, observedPayload, cu) {
   return extracted.marker;
 }
 
-function vs(activities, meta, observed) {
-  const serialized = b64(xorString(ut(activities), 50));
+function serializedForHook(d) {
+  return typeof d.serialized === "string" ? d.serialized : ut(d.activities || []);
+}
+
+function vs(d, meta, observed) {
+  const serialized = b64(xorString(serializedForHook(d), 50));
   const marker = observed.marker || extractMarkerFromPayload(serialized, observed.payload, meta.cu) || markerFromQi(observed.qi);
   return insertChars(marker, serialized, insertionPositions(marker, serialized.length, meta.cu));
 }
@@ -239,12 +243,16 @@ function summarize(tracePath) {
     const meta = d.meta || {};
     const observedPairs = parseFormRaw(req.post_data);
     const observedDecoded = Object.fromEntries(observedPairs.map(([k, v]) => [k, decodeURIComponent(v)]));
+    const serializedText = serializedForHook(d);
+    const serializedBase = b64(xorString(serializedText, 50));
+    const observedMarker = extractMarkerFromPayload(serializedBase, observedDecoded.payload, meta.cu);
     const stateMarker = markerTimeline.length ? markerStateForRequest(markerTimeline, req.lineNo) : null;
-    const markerInput = stateMarker ? { ...d, marker: stateMarker.marker, qi: stateMarker.qi } : d;
-    const replayPayload = vs(d.activities || [], meta, markerInput);
-    const serializedBase = b64(xorString(ut(d.activities || []), 50));
-    const marker = markerInput.marker || extractMarkerFromPayload(serializedBase, observedDecoded.payload, meta.cu) || markerFromQi(d.qi);
-    const replayPc = jt(ut(d.activities || []), [meta.cu || "", meta.tag || "", observedDecoded.ft || "369"].join(":"));
+    const markerInput = observedMarker
+      ? { ...d, marker: observedMarker, qi: null }
+      : (stateMarker ? { ...d, marker: stateMarker.marker, qi: stateMarker.qi } : d);
+    const replayPayload = vs(d, meta, markerInput);
+    const marker = markerInput.marker || markerFromQi(d.qi);
+    const replayPc = jt(serializedText, [meta.cu || "", meta.tag || "", observedDecoded.ft || "369"].join(":"));
 
     const rebuiltPairs = [];
     for (const [key, rawValue] of observedPairs) {
@@ -269,9 +277,9 @@ function summarize(tracePath) {
       appIdMatch: (meta.appID || "") === observedDecoded.appId,
       tagMatch: (meta.tag || "") === observedDecoded.tag,
       uuidMatch: (meta.cu || "") === observedDecoded.uuid,
-      markerSource: stateMarker ? stateMarker.source : (d.marker ? "hook.marker" : extractMarkerFromPayload(serializedBase, observedDecoded.payload, meta.cu) ? "payload.inverse" : (d.qi && String(d.qi) !== "undefined" ? "hook.qi" : "static.Xs118")),
-      markerQi: stateMarker ? stateMarker.qi : d.qi,
-      markerQiSource: stateMarker ? stateMarker.qiSource : null,
+      markerSource: observedMarker ? "payload.inverse" : (stateMarker ? stateMarker.source : (d.marker ? "hook.marker" : (d.qi && String(d.qi) !== "undefined" ? "hook.qi" : "static.Xs118"))),
+      markerQi: observedMarker ? null : (stateMarker ? stateMarker.qi : d.qi),
+      markerQiSource: observedMarker ? { payload: "inverse marker extraction from observed payload and hook serialized base" } : (stateMarker ? stateMarker.qiSource : null),
       marker,
       seq: observedDecoded.seq,
       ft: observedDecoded.ft,
