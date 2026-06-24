@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
-from refactor_app.application.workflows.account_auth import _active_proxy, _proxy_url
+from refactor_app.application.workflows.account_auth import ensure_account_proxy_url
 from refactor_app.domain.enums import CredentialStatus, HeartbeatStatus
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
 from refactor_app.plugins.contracts import OpenAIChatGPTProvider
@@ -47,8 +47,11 @@ class HeartbeatCodexCredentialWorkflow:
                 )
             access_token = credential.access_token
             team_id = workspace.external_workspace_id
-            proxy = _active_proxy(uow.session, credential.user_account_id) if uow.session else None
-            proxy_url = _proxy_url(proxy) if proxy is not None else ""
+            proxy_url = ensure_account_proxy_url(
+                self._session_factory,
+                credential.user_account_id,
+                bind_reason="codex_heartbeat",
+            )
 
             if credential.token_chatgpt_account_id != team_id:
                 credential.last_heartbeat_status = HeartbeatStatus.FAILED.value

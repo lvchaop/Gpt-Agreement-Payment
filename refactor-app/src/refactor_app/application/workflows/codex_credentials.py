@@ -10,7 +10,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from refactor_app.application.workflows.account_auth import _active_proxy, _proxy_url
+from refactor_app.application.workflows.account_auth import ensure_account_proxy_url
 from refactor_app.domain.enums import CredentialStatus
 from refactor_app.infrastructure.db.models import MembershipModel
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
@@ -159,9 +159,11 @@ class BuildCodexCredentialWorkflow:
             return credential.id
 
     def _active_proxy_url(self, user_account_id: str) -> str:
-        with self._session_factory() as session:
-            proxy = _active_proxy(session, user_account_id)
-            return _proxy_url(proxy) if proxy is not None else ""
+        return ensure_account_proxy_url(
+            self._session_factory,
+            user_account_id,
+            bind_reason="codex_credential_authorize",
+        )
 
 
 class BuildCodexCredentialWorkItemWorkflow:

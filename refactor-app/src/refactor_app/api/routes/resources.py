@@ -33,7 +33,11 @@ from refactor_app.application.workflows.codex_credentials import (
     BuildCodexCredentialWorkInput,
     BuildCodexCredentialWorkItemWorkflow,
 )
-from refactor_app.application.workflows.account_auth import _active_proxy, _proxy_url
+from refactor_app.application.workflows.account_auth import (
+    _active_proxy,
+    _proxy_url,
+    ensure_account_proxy_url,
+)
 from refactor_app.application.workflows.direct_push import (
     MAX_DOWNSTREAM_PUSH_ATTEMPTS,
     _provider_from_channel,
@@ -2374,7 +2378,11 @@ def _probe_monitor_downstream_usage_record(
                 "probe_error_code": "record_not_pushed",
                 "probe_error_message": "downstream push record not found or not pushed",
             }
-        probe = _probe_downstream_record_usage(session=session, record=record)
+        probe = _probe_downstream_record_usage(
+            session=session,
+            record=record,
+            session_factory=session_factory,
+        )
         if persist_result:
             if probe.ok:
                 _apply_usage_probe_success(
@@ -2454,7 +2462,11 @@ def _probe_downstream_record_usage_with_recovery(
     threshold: int,
 ) -> CodexUsageProbeResult:
     now = datetime.now(UTC)
-    result = _probe_downstream_record_usage(session=session, record=record)
+    result = _probe_downstream_record_usage(
+        session=session,
+        record=record,
+        session_factory=session_factory,
+    )
     if result.ok:
         _apply_usage_probe_success(record=record, result=result, threshold=threshold, now=now)
         return result
@@ -2488,7 +2500,11 @@ def _probe_downstream_record_usage_with_recovery(
             fallback_error_message=refresh_error_message,
         )
 
-    result = _probe_downstream_record_usage(session=session, record=record)
+    result = _probe_downstream_record_usage(
+        session=session,
+        record=record,
+        session_factory=session_factory,
+    )
     if result.ok:
         _apply_usage_probe_success(
             record=record,
@@ -2589,7 +2605,11 @@ def _handle_usage_reauthorize_result(
         )
         return failed
 
-    result = _probe_downstream_record_usage(session=session, record=refreshed_record)
+    result = _probe_downstream_record_usage(
+        session=session,
+        record=refreshed_record,
+        session_factory=session_factory,
+    )
     if result.ok:
         _apply_usage_probe_success(
             record=refreshed_record,
@@ -2610,6 +2630,7 @@ def _probe_downstream_record_usage(
     *,
     session: Session,
     record: DownstreamCodexPushRecordModel,
+    session_factory=None,
 ) -> CodexUsageProbeResult:
     credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
     if credential is None:
@@ -2641,8 +2662,19 @@ def _probe_downstream_record_usage(
         team_id=credential.token_chatgpt_account_id,
     )
     body = _codex_usage_probe_body()
-    proxy = _active_proxy(session, credential.user_account_id)
-    proxy_url = _proxy_url(proxy) if proxy is not None else ""
+    try:
+        proxy_url = _account_proxy_url_for_request(
+            session=session,
+            session_factory=session_factory,
+            user_account_id=credential.user_account_id,
+            bind_reason="downstream_usage_probe",
+        )
+    except Exception as exc:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code=type(exc).__name__[:200],
+            error_message=str(exc)[:1000],
+        )
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
     try:
         with curl_requests.Session(impersonate="chrome136", proxies=proxies) as client:
@@ -2693,6 +2725,23 @@ def _probe_downstream_record_usage(
         error_message="chatgpt codex response did not include x-codex usage headers",
         raw_headers=raw_headers,
     )
+
+
+def _account_proxy_url_for_request(
+    *,
+    session: Session,
+    session_factory,
+    user_account_id: str,
+    bind_reason: str,
+) -> str:
+    if session_factory is not None:
+        return ensure_account_proxy_url(
+            session_factory,
+            user_account_id,
+            bind_reason=bind_reason,
+        )
+    proxy = _active_proxy(session, user_account_id)
+    return _proxy_url(proxy) if proxy is not None else ""
 
 
 def _codex_usage_probe_headers(*, access_token: str, team_id: str) -> dict[str, str]:
