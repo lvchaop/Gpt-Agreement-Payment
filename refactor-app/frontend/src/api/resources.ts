@@ -117,6 +117,16 @@ export const resourcesApi = {
   runAutomationScheduleNow: (id: string) =>
     postJson<Row>(`/automation/schedules/${encodeURIComponent(id)}/run-now`, {}),
   automationMonitorJobs: () => getJson<{ items: Row[] }>("/automation/monitor/jobs"),
+  automationMonitorJobRuns: (params: Record<string, string | number> = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => String(value).trim() !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return getJson<{ items: Row[]; limit: number }>(
+      `/automation/monitor/job-runs${query ? `?${query}` : ""}`,
+    );
+  },
   automationMonitorConsole: (params: Record<string, string | number> = {}) => {
     const query = new URLSearchParams(
       Object.entries(params)

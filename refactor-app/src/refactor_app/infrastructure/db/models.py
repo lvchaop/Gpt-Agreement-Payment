@@ -486,6 +486,42 @@ class DownstreamCodexPushRecordModel(Base):
     )
 
 
+class RemoteMemberReleaseTaskModel(Base):
+    __tablename__ = "remote_member_release_tasks"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    team_workspace_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_account_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="SET NULL")
+    )
+    codex_credential_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    downstream_push_record_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    external_workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    remote_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    release_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    release_status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("team_workspace_id", "remote_user_id"),
+        CheckConstraint("release_status IN ('pending', 'running', 'retrying', 'confirmed', 'blocked')"),
+        CheckConstraint("attempt_count >= 0"),
+        Index("idx_remote_release_due", "release_status", "next_attempt_at"),
+        Index("idx_remote_release_workspace", "team_workspace_id"),
+        Index("idx_remote_release_user_account", "user_account_id"),
+        Index("idx_remote_release_push_record", "downstream_push_record_id"),
+    )
+
+
 class DownstreamChannelModel(Base):
     __tablename__ = "downstream_channels"
 
@@ -710,7 +746,8 @@ class AutomationScheduleModel(Base):
             "'automation.workspace_authorize', "
             "'automation.codex_heartbeat', "
             "'automation.downstream_push', "
-            "'automation.downstream_usage_cleanup'"
+            "'automation.downstream_usage_cleanup', "
+            "'automation.remote_member_release'"
             ")"
         ),
         CheckConstraint("schedule_status IN ('active', 'paused', 'error')"),

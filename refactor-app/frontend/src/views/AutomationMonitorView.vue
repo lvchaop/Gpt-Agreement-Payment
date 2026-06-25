@@ -11,6 +11,7 @@ import { useOpsStore } from "../stores/ops";
 const store = useOpsStore();
 
 const jobs = ref<Row[]>([]);
+const jobRuns = ref<Row[]>([]);
 const channels = ref<Row[]>([]);
 const usageItems = ref<Row[]>([]);
 const usageSummary = ref<Row>({});
@@ -18,6 +19,7 @@ const consoleItems = ref<Row[]>([]);
 const selectedUsageRows = ref<Row[]>([]);
 const loading = ref(false);
 const consoleLoading = ref(false);
+const runsLoading = ref(false);
 const usageLoading = ref(false);
 const runningScheduleId = ref("");
 const error = ref("");
@@ -29,6 +31,7 @@ const selectedRunId = ref("");
 const logLevel = ref("");
 const logLimit = ref(1000);
 const logMaxBytes = ref(524288);
+const runLimit = ref(100);
 const autoRefresh = ref(true);
 const usageChannelId = ref("");
 const usageStatus = ref("");
@@ -47,6 +50,7 @@ const jobLabels: Record<string, string> = {
   "automation.codex_heartbeat": "Codex 心跳",
   "automation.downstream_push": "下游推送",
   "automation.downstream_usage_cleanup": "额度清理",
+  "automation.remote_member_release": "远端成员释放",
 };
 
 const usageColumns: Column[] = [
@@ -58,6 +62,18 @@ const usageColumns: Column[] = [
   { key: "usage_percent", label: "使用率" },
   { key: "usage_status", label: "额度状态", badge: true },
   { key: "last_usage_check_at", label: "最近查询", summary: 24 },
+  { key: "error_code", label: "错误码", badge: true },
+];
+
+const runColumns: Column[] = [
+  { key: "started_at", label: "开始时间", summary: 24 },
+  { key: "run_status", label: "运行状态", badge: true },
+  { key: "duration_ms", label: "耗时 ms" },
+  { key: "item_count", label: "总数" },
+  { key: "succeeded", label: "成功" },
+  { key: "failed", label: "失败" },
+  { key: "skipped", label: "跳过" },
+  { key: "event_count", label: "事件" },
   { key: "error_code", label: "错误码", badge: true },
 ];
 
@@ -91,6 +107,8 @@ const consoleLines = computed(() =>
     return { ...item, level, line };
   }),
 );
+
+const selectedRun = computed(() => jobRuns.value.find((row) => row.run_id === selectedRunId.value));
 
 function labelOf(value: unknown) {
   return jobLabels[String(value || "")] || String(value || "");
@@ -128,7 +146,7 @@ function selectJob(row: Row) {
   selectedScheduleType.value = String(row.schedule_type || "");
   selectedJobId.value = String(row.last_job_id || "");
   selectedRunId.value = String(row.last_run_id || "");
-  void loadConsole();
+  void loadRuns().then(loadConsole);
 }
 
 async function loadJobs() {
@@ -157,6 +175,23 @@ async function loadConsole() {
     consoleError.value = String((err as Error).message ?? err);
   } finally {
     consoleLoading.value = false;
+  }
+}
+
+async function loadRuns() {
+  runsLoading.value = true;
+  try {
+    const result = await resourcesApi.automationMonitorJobRuns({
+      schedule_type: selectedScheduleType.value,
+      limit: runLimit.value,
+    });
+    jobRuns.value = result.items || [];
+    if (selectedRunId.value && !jobRuns.value.some((row) => row.run_id === selectedRunId.value)) {
+      selectedRunId.value = "";
+      selectedJobId.value = "";
+    }
+  } finally {
+    runsLoading.value = false;
   }
 }
 
@@ -189,6 +224,7 @@ async function loadAll() {
   error.value = "";
   try {
     await Promise.all([loadJobs(), loadChannels(), loadUsage()]);
+    await loadRuns();
     await loadConsole();
   } catch (err) {
     error.value = String((err as Error).message ?? err);
@@ -254,6 +290,12 @@ function onJobSelectChange() {
 function onScheduleTypeChange() {
   selectedJobId.value = "";
   selectedRunId.value = "";
+  void loadRuns().then(loadConsole);
+}
+
+function selectRun(row: Row) {
+  selectedJobId.value = String(row.job_id || "");
+  selectedRunId.value = String(row.run_id || "");
   void loadConsole();
 }
 
@@ -262,6 +304,7 @@ onMounted(() => {
   pollTimer = window.setInterval(() => {
     if (!autoRefresh.value || loading.value || consoleLoading.value) return;
     void loadJobs();
+    void loadRuns();
     void loadConsole();
   }, 5000);
 });
@@ -330,6 +373,42 @@ onBeforeUnmount(() => {
       </article>
     </div>
 
+    <section class="panel runs-panel">
+      <div class="runs-toolbar">
+        <div>
+          <h3>执行记录</h3>
+          <p>点击某一次执行，下面日志只展示该 run 的完整摘要、失败项和事件。</p>
+        </div>
+        <label class="inline-control">
+          <span>记录数</span>
+          <input v-model.number="runLimit" class="input small-input" type="number" min="1" max="500" />
+        </label>
+        <button class="btn" :disabled="runsLoading" @click="loadRuns">
+          {{ runsLoading ? "加载中..." : "刷新执行记录" }}
+        </button>
+      </div>
+      <DataTable
+        :columns="runColumns"
+        :rows="jobRuns"
+        :loading="runsLoading"
+        empty-text="暂无执行记录。"
+        @refresh="loadRuns"
+      >
+        <template #actions="{ row }">
+          <button class="btn tiny" :class="{ primary: row.run_id === selectedRunId }" @click="selectRun(row)">
+            查看日志
+          </button>
+        </template>
+      </DataTable>
+      <div v-if="selectedRun" class="run-detail">
+        <strong>当前 Run：</strong>
+        <code>{{ selectedRun.run_id }}</code>
+        <span>{{ selectedRun.run_status }}</span>
+        <span>失败 {{ selectedRun.failed ?? 0 }}</span>
+        <span v-if="selectedRun.error_message">错误：{{ selectedRun.error_message }}</span>
+      </div>
+    </section>
+
     <section class="panel console-panel">
       <div class="console-toolbar">
         <label class="filter-field">
@@ -379,6 +458,7 @@ onBeforeUnmount(() => {
       <div class="console-size">
         <span>{{ consoleItems.length }} 行</span>
         <span>最大 {{ bytesText(logMaxBytes) }}</span>
+        <span v-if="selectedRunId">Run {{ shortText(selectedRunId, 24) }}</span>
       </div>
       <div v-if="consoleError" class="console-error">{{ consoleError }}</div>
       <pre class="console-output"><code v-for="item in consoleLines" :key="String(item.id)" :class="item.level.toLowerCase()">{{ item.line }}
@@ -594,6 +674,50 @@ onBeforeUnmount(() => {
 
 .console-panel {
   overflow: hidden;
+}
+
+.runs-panel {
+  overflow: hidden;
+}
+
+.runs-toolbar {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  padding: 14px;
+}
+
+.runs-toolbar h3,
+.runs-toolbar p {
+  margin: 0;
+}
+
+.runs-toolbar p {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.run-detail {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 10px;
+  padding: 10px 14px;
+}
+
+.run-detail code {
+  color: #93c5fd;
+}
+
+.tiny {
+  min-height: 32px;
+  padding: 6px 10px;
 }
 
 .console-toolbar {

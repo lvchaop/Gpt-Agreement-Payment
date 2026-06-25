@@ -63,6 +63,7 @@ from refactor_app.infrastructure.db.models import (
     JobRunModel,
     MembershipModel,
     ProxyInventoryModel,
+    RemoteMemberReleaseTaskModel,
     TeamAdminAccountCheckModel,
     TeamAdminSessionModel,
     TeamWorkspaceModel,
@@ -327,6 +328,13 @@ class AutomationDownstreamUsageCleanupRequest(BaseModel):
     threshold_percent: int = 95
 
 
+class AutomationRemoteMemberReleaseRequest(BaseModel):
+    created_by: str = ""
+    task_limit: int = 200
+    task_concurrency: int = 10
+    page_size: int = 100
+
+
 class MonitorDownstreamUsageProbeRequest(BaseModel):
     downstream_push_record_ids: list[str] = []
     downstream_channel_id: str = ""
@@ -429,6 +437,15 @@ def delete_user_account(user_account_id: str, session: DbSession) -> dict:
     account = session.get(UserAccountModel, user_account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="user account not found")
+    release_result = _ensure_remote_release_tasks_for_user_account(
+        session=session,
+        user_account_id=user_account_id,
+        now=datetime.now(UTC),
+        reason="user_account_delete",
+    )
+    if release_result["failed_count"]:
+        session.commit()
+        raise HTTPException(status_code=409, detail=release_result)
     proxy_result = session.execute(
         delete(UserAccountProxyBindingModel).where(
             UserAccountProxyBindingModel.user_account_id == user_account_id
@@ -440,6 +457,7 @@ def delete_user_account(user_account_id: str, session: DbSession) -> dict:
         "user_account_id": user_account_id,
         "deleted": True,
         "deleted_proxy_bindings": int(proxy_result.rowcount or 0),
+        "remote_release_tasks": release_result,
     }
 
 
@@ -1164,6 +1182,31 @@ def delete_team_admin_session(team_admin_session_id: str, session: DbSession) ->
     deleted_account_checks = 0
 
     if workspace_ids:
+        release_result = _ensure_remote_release_tasks_for_workspaces(
+            session=session,
+            workspace_ids=[str(item) for item in workspace_ids],
+            now=datetime.now(UTC),
+            reason="team_admin_session_delete",
+        )
+        unconfirmed_count = session.scalar(
+            select(func.count())
+            .select_from(RemoteMemberReleaseTaskModel)
+            .where(
+                RemoteMemberReleaseTaskModel.team_workspace_id.in_(workspace_ids),
+                RemoteMemberReleaseTaskModel.release_status != "confirmed",
+            )
+        ) or 0
+        if unconfirmed_count:
+            session.commit()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "workspace has remote member release tasks not confirmed; run remote member release before deleting admin session",
+                    "team_admin_session_id": team_admin_session_id,
+                    "unconfirmed_remote_release_tasks": int(unconfirmed_count),
+                    "remote_release_tasks": release_result,
+                },
+            )
         downstream_result = session.execute(
             delete(DownstreamCodexPushRecordModel).where(
                 DownstreamCodexPushRecordModel.team_workspace_id.in_(workspace_ids)
@@ -1338,6 +1381,20 @@ def remove_team_workspace_members(
         members=targets,
         concurrency=concurrency,
     )
+    local_release_results = []
+    now = datetime.now(UTC)
+    for item in results:
+        if item.get("ok") is True and str(item.get("user_id") or "").strip():
+            local_release_results.append(
+                _settle_local_after_remote_member_absent(
+                    session=session,
+                    workspace=workspace,
+                    remote_user_id=str(item.get("user_id") or "").strip(),
+                    now=now,
+                    reason="manual_remove_workspace_member",
+                )
+            )
+    session.commit()
     removed_count = sum(1 for item in results if item.get("ok") is True)
     failed_count = sum(1 for item in results if item.get("ok") is not True)
     return {
@@ -1352,6 +1409,7 @@ def remove_team_workspace_members(
         "failed_count": failed_count,
         "skipped": skipped,
         "results": results,
+        "local_release_results": local_release_results,
     }
 
 
@@ -1795,6 +1853,30 @@ def create_downstream_usage_cleanup_job(
     return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
 
 
+@router.post("/automation/remote-member-release-job")
+def create_remote_member_release_job(
+    req: AutomationRemoteMemberReleaseRequest,
+    session: DbSession,
+) -> dict:
+    job, run = _create_running_job_run(
+        session=session,
+        job_type="automation.remote_member_release",
+        input_json=req.model_dump(),
+        created_by=req.created_by,
+    )
+    session_factory = _session_factory_from(session)
+    output = _finish_running_job(
+        session=session,
+        job=job,
+        run=run,
+        runner=lambda: _run_remote_member_release_tick(
+            req=req,
+            session_factory=session_factory,
+        ),
+    )
+    return {"job_id": job.id, "job_status": job.job_status, "run_id": run.id, **output}
+
+
 @router.get("/automation/schedules")
 def list_automation_schedules(session: DbSession) -> list[dict]:
     rows = session.scalars(
@@ -1815,6 +1897,31 @@ def get_automation_monitor_jobs(session: DbSession) -> dict:
         )
     ).all()
     return {"items": [_automation_monitor_job_dict(session=session, schedule=row) for row in schedules]}
+
+
+@router.get("/automation/monitor/job-runs")
+def get_automation_monitor_job_runs(
+    session: DbSession,
+    schedule_type: str = "",
+    job_id: str = "",
+    limit: int = 100,
+) -> dict:
+    safe_limit = max(1, min(int(limit or 100), 500))
+    stmt = select(JobRunModel, JobModel).join(JobModel, JobModel.id == JobRunModel.job_id)
+    if schedule_type.strip():
+        stmt = stmt.where(JobModel.type == schedule_type.strip())
+    if job_id.strip():
+        stmt = stmt.where(JobModel.id == job_id.strip())
+    rows = session.execute(
+        stmt.order_by(JobRunModel.started_at.desc().nullslast()).limit(safe_limit)
+    ).all()
+    return {
+        "items": [
+            _automation_monitor_run_dict(session=session, run=run, job=job)
+            for run, job in rows
+        ],
+        "limit": safe_limit,
+    }
 
 
 @router.get("/automation/monitor/job-console")
@@ -1849,15 +1956,15 @@ def get_automation_monitor_job_console(
         _automation_console_event_dict(event=event, run=run, job=job)
         for event, run, job in reversed(rows)
     ]
-    if not items:
-        items = _automation_console_fallback_items(
-            session=session,
-            schedule_type=schedule_type,
-            job_id=job_id,
-            run_id=run_id,
-            level=level,
-            limit=safe_limit,
-        )
+    fallback_items = _automation_console_fallback_items(
+        session=session,
+        schedule_type=schedule_type,
+        job_id=job_id,
+        run_id=run_id,
+        level=level,
+        limit=safe_limit,
+    )
+    items = _merge_console_items(fallback_items, items) if items else fallback_items
     limited_items, returned_bytes, truncated = _limit_console_items_by_bytes(
         items=items,
         max_bytes=safe_max_bytes,
@@ -2296,6 +2403,19 @@ def _run_downstream_usage_sweep(
     near_limit_count = 0
     failed_count = 0
     for record in records:
+        if int(record.usage_percent or 0) >= threshold:
+            near_limit_count += 1
+            release_result = _mark_downstream_record_used_and_cooldown(
+                session=session,
+                record=record,
+                now=datetime.now(UTC),
+                reason=f"stored_usage_percent>={threshold}",
+            )
+            if not release_result.get("ok"):
+                near_limit_count -= 1
+                failed_count += 1
+            checked_count += 1
+            continue
         probe = _probe_downstream_record_usage_with_recovery(
             session=session,
             session_factory=session_factory,
@@ -3748,6 +3868,237 @@ def _run_downstream_usage_cleanup_tick(
     )
 
 
+def _run_remote_member_release_tick(
+    *,
+    req: AutomationRemoteMemberReleaseRequest,
+    session_factory,
+) -> dict:
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        task_ids = session.scalars(
+            select(RemoteMemberReleaseTaskModel.id)
+            .where(
+                RemoteMemberReleaseTaskModel.release_status.in_(("pending", "retrying", "blocked")),
+                (
+                    RemoteMemberReleaseTaskModel.next_attempt_at.is_(None)
+                    | (RemoteMemberReleaseTaskModel.next_attempt_at <= now)
+                ),
+            )
+            .order_by(
+                RemoteMemberReleaseTaskModel.next_attempt_at.asc().nullsfirst(),
+                RemoteMemberReleaseTaskModel.updated_at.asc(),
+            )
+            .limit(max(1, int(req.task_limit or 200)))
+        ).all()
+    concurrency = _bounded_concurrency(req.task_concurrency)
+    results = _parallel_map(
+        items=[str(item) for item in task_ids],
+        max_workers=concurrency,
+        fn=lambda task_id: _process_remote_member_release_task(
+            session_factory=session_factory,
+            task_id=task_id,
+            page_size=max(1, min(int(req.page_size or 100), 200)),
+        ),
+    )
+    return _automation_results_summary(
+        job_type="automation.remote_member_release",
+        results=results,
+        concurrency=concurrency,
+    )
+
+
+def _process_remote_member_release_task(
+    *,
+    session_factory,
+    task_id: str,
+    page_size: int,
+) -> dict:
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        task = session.get(RemoteMemberReleaseTaskModel, task_id)
+        if task is None:
+            return {"task_id": task_id, "status": "skipped", "reason": "task_not_found"}
+        if task.release_status == "confirmed":
+            return {"task_id": task_id, "status": "confirmed", "reason": "already_confirmed"}
+        if task.next_attempt_at and task.next_attempt_at > now:
+            return {"task_id": task_id, "status": "skipped", "reason": "not_due"}
+        task.release_status = "running"
+        task.attempt_count = int(task.attempt_count or 0) + 1
+        task.last_attempt_at = now
+        task.last_error_code = ""
+        task.last_error_message = ""
+        task.updated_at = now
+        session.commit()
+
+    try:
+        result = _attempt_remote_member_release(
+            session_factory=session_factory,
+            task_id=task_id,
+            page_size=page_size,
+        )
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "error_code": type(exc).__name__[:200],
+            "error_message": str(exc)[:1000],
+        }
+
+    with session_factory() as session:
+        task = session.get(RemoteMemberReleaseTaskModel, task_id)
+        if task is None:
+            return {"task_id": task_id, "status": "skipped", "reason": "task_not_found_after_attempt"}
+        now = datetime.now(UTC)
+        if result.get("ok"):
+            workspace = session.get(TeamWorkspaceModel, task.team_workspace_id)
+            local_release_result = {}
+            if workspace is not None:
+                local_release_result = _settle_local_after_remote_member_absent(
+                    session=session,
+                    workspace=workspace,
+                    remote_user_id=task.remote_user_id,
+                    now=now,
+                    reason="remote_release_confirmed",
+                )
+            task.release_status = "confirmed"
+            task.confirmed_at = now
+            task.next_attempt_at = None
+            task.last_error_code = ""
+            task.last_error_message = ""
+            task.updated_at = now
+            session.commit()
+            return {
+                "task_id": task_id,
+                "status": "confirmed",
+                "remote_user_id": task.remote_user_id,
+                "reason": result.get("reason") or "remote_member_absent",
+                "local_release": local_release_result,
+            }
+        error_code = str(result.get("error_code") or "remote_release_failed")[:200]
+        error_message = str(result.get("error_message") or result)[:1000]
+        blocked = _is_remote_release_blocking_error(error_code=error_code, error_message=error_message)
+        task.release_status = "blocked" if blocked else "retrying"
+        task.next_attempt_at = now + _remote_release_backoff(task.attempt_count)
+        task.last_error_code = error_code
+        task.last_error_message = error_message
+        task.updated_at = now
+        session.commit()
+        return {
+            "task_id": task_id,
+            "status": task.release_status,
+            "remote_user_id": task.remote_user_id,
+            "error_code": error_code,
+            "error_message": error_message,
+        }
+
+
+def _attempt_remote_member_release(
+    *,
+    session_factory,
+    task_id: str,
+    page_size: int,
+) -> dict:
+    with session_factory() as session:
+        task = session.get(RemoteMemberReleaseTaskModel, task_id)
+        if task is None:
+            return {"ok": False, "error_code": "task_not_found"}
+        workspace = session.get(TeamWorkspaceModel, task.team_workspace_id)
+        if workspace is None:
+            return {"ok": False, "error_code": "workspace_not_found"}
+        if not workspace.source_admin_session_id:
+            return {"ok": False, "error_code": "workspace_missing_admin_session"}
+        admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+        if admin_session is None or not admin_session.access_token:
+            return {"ok": False, "error_code": "admin_session_missing_access_token"}
+        access_token = admin_session.access_token
+        cookie_header = admin_session.cookie_header
+        account_id = workspace.external_workspace_id
+        remote_user_id = task.remote_user_id
+
+    try:
+        remote_members = _fetch_workspace_members(
+            access_token=access_token,
+            cookie_header=cookie_header,
+            account_id=account_id,
+            page_size=page_size,
+        )
+    except HTTPException as exc:
+        return _remote_release_http_exception_result(exc)
+    target_member = _find_remote_member_by_user_id(remote_members, remote_user_id)
+    if target_member is None:
+        return {"ok": True, "reason": "already_absent"}
+    try:
+        delete_result = _delete_and_confirm_workspace_member(
+            access_token=access_token,
+            cookie_header=cookie_header,
+            account_id=account_id,
+            member=target_member,
+        )
+    except HTTPException as exc:
+        return _remote_release_http_exception_result(exc)
+    if delete_result.get("ok"):
+        return {"ok": True, "reason": "deleted_and_confirmed", "delete_result": delete_result}
+    return {
+        "ok": False,
+        "error_code": str(delete_result.get("error_code") or "remote_delete_failed"),
+        "error_message": str(delete_result.get("error_message") or delete_result),
+    }
+
+
+def _find_remote_member_by_user_id(
+    members: list[dict[str, Any]],
+    remote_user_id: str,
+) -> dict[str, Any] | None:
+    target = str(remote_user_id or "").strip()
+    if not target:
+        return None
+    for member in members:
+        if target in _remote_user_ids(member):
+            return member
+    return None
+
+
+def _remote_release_http_exception_result(exc: HTTPException) -> dict[str, Any]:
+    detail = exc.detail
+    http_status = ""
+    if isinstance(detail, dict):
+        http_status = str(detail.get("http_status") or "")
+    if not http_status:
+        http_status = str(getattr(exc, "status_code", "") or "")
+    if http_status == "402":
+        return {
+            "ok": True,
+            "reason": "http_402_treated_as_released",
+            "http_status": 402,
+        }
+    error_code = f"http_{http_status}" if http_status else type(exc).__name__
+    return {
+        "ok": False,
+        "error_code": error_code[:200],
+        "error_message": str(detail or exc)[:1000],
+    }
+
+
+def _is_remote_release_blocking_error(*, error_code: str, error_message: str) -> bool:
+    text_value = f"{error_code} {error_message}".lower()
+    return (
+        "admin_session" in text_value
+        or "missing_admin" in text_value
+        or "http_401" in text_value
+        or "http_403" in text_value
+        or "unauthor" in text_value
+        or "forbidden" in text_value
+    )
+
+
+def _remote_release_backoff(attempt_count: int) -> timedelta:
+    attempts = max(1, int(attempt_count or 1))
+    if attempts <= 3:
+        return timedelta(seconds=30)
+    if attempts <= 10:
+        return timedelta(minutes=5)
+    return timedelta(minutes=30)
+
+
 _AUTOMATION_SCHEDULER_STARTED = False
 
 
@@ -3977,6 +4328,23 @@ def _run_automation_schedule_job(*, schedule_id: str, session_factory) -> dict:
                 runner=lambda: _run_downstream_usage_cleanup_tick(
                     req=req,
                     session_factory=session_factory,
+                    ),
+                )
+        elif schedule_type == "automation.remote_member_release":
+            req = AutomationRemoteMemberReleaseRequest(**config)
+            job, run = _create_running_job_run(
+                session=session,
+                job_type=schedule_type,
+                input_json=req.model_dump(),
+                created_by=req.created_by,
+            )
+            output = _finish_running_job(
+                session=session,
+                job=job,
+                run=run,
+                runner=lambda: _run_remote_member_release_tick(
+                    req=req,
+                    session_factory=session_factory,
                 ),
             )
         else:
@@ -4010,6 +4378,30 @@ def _process_downstream_usage_cleanup_record(
                 "reason": "local_sub2api_no_remote_usage",
                 "usage_percent": record.usage_percent,
                 "threshold_percent": threshold,
+            }
+        if int(record.usage_percent or 0) >= threshold:
+            now = datetime.now(UTC)
+            release_result = _mark_downstream_record_used_and_cooldown(
+                session=session,
+                record=record,
+                now=now,
+                reason=f"stored_usage_percent>={threshold}",
+            )
+            session.commit()
+            if not release_result.get("ok"):
+                return {
+                    "record_id": record_id,
+                    "status": "failed",
+                    "reason": release_result.get("error_code") or "remote_release_task_failed",
+                    "usage_percent": record.usage_percent,
+                    "threshold_percent": threshold,
+                }
+            return {
+                "record_id": record_id,
+                "status": "used",
+                "usage_percent": record.usage_percent,
+                "threshold_percent": threshold,
+                "remote_release_task_id": release_result.get("task_id") or "",
             }
         probe = _probe_downstream_record_usage_with_recovery(
             session=session,
@@ -4276,17 +4668,34 @@ def _disable_workspace_and_settle_push_records(
     used_count = 0
     skipped_count = 0
     cooldown_count = 0
+    release_task_failed_count = 0
     for record in records:
+        release_task = _ensure_remote_release_task_for_push_record(
+            session=session,
+            record=record,
+            now=now,
+            reason=reason,
+        )
+        if not release_task.get("ok"):
+            release_task_failed_count += 1
+            record.usage_status = "check_failed"
+            record.error_code = str(release_task.get("error_code") or "remote_release_task_failed")[:200]
+            record.error_message = str(release_task.get("error_message") or release_task)[:1000]
+            record.updated_at = now
+            continue
         usage_percent = int(record.usage_percent or 0)
         if usage_percent >= 60:
             if record.push_status != "used":
-                record.push_status = "used"
-                record.usage_status = "used"
-                record.used_at = now
-                record.error_code = "workspace_disabled_http_402"
-                record.error_message = (
-                    f"workspace disabled after 402; marked used because usage_percent={usage_percent}>=60"
-                )[:1000]
+                _settle_pushed_record_locally(
+                    session=session,
+                    record=record,
+                    now=now,
+                    reason="workspace_disabled_http_402",
+                    error_message=(
+                        f"workspace disabled after 402; marked used because usage_percent={usage_percent}>=60; "
+                        f"remote release task={release_task.get('task_id')}"
+                    ),
+                )
                 used_count += 1
             used_credential_ids.add(record.codex_credential_id)
         else:
@@ -4295,7 +4704,8 @@ def _disable_workspace_and_settle_push_records(
             record.usage_status = "check_failed"
             record.error_code = "workspace_disabled_http_402"
             record.error_message = (
-                f"workspace disabled after 402; marked skipped because usage_percent={usage_percent}<60"
+                f"workspace disabled after 402; marked skipped because usage_percent={usage_percent}<60; "
+                f"remote release task={release_task.get('task_id')}"
             )[:1000]
             skipped_count += 1
             skipped_credential_ids.add(record.codex_credential_id)
@@ -4349,6 +4759,7 @@ def _disable_workspace_and_settle_push_records(
         "used_count": used_count,
         "skipped_count": skipped_count,
         "cooldown_count": cooldown_count,
+        "release_task_failed_count": release_task_failed_count,
         "reason": reason,
     }
 
@@ -4360,22 +4771,26 @@ def _mark_downstream_record_used_and_cooldown(
     now: datetime,
     reason: str,
 ) -> dict:
-    remove_result = _remove_remote_member_for_push_record(session=session, record=record)
-    if not remove_result.get("ok"):
+    release_task = _ensure_remote_release_task_for_push_record(
+        session=session,
+        record=record,
+        now=now,
+        reason=reason,
+    )
+    if not release_task.get("ok"):
         record.usage_status = "check_failed"
-        record.error_code = str(remove_result.get("error_code") or "remote_remove_failed")[:200]
-        record.error_message = str(remove_result.get("error_message") or remove_result)[:1000]
+        record.error_code = str(release_task.get("error_code") or "remote_release_task_failed")[:200]
+        record.error_message = str(release_task.get("error_message") or release_task)[:1000]
         record.updated_at = now
-        return remove_result
+        return release_task
 
-    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
-    record.push_status = "used"
-    record.usage_status = "used"
-    record.used_at = now
-    record.updated_at = now
-    if credential is not None:
-        credential.push_lifecycle_status = "used"
-        credential.updated_at = now
+    _settle_pushed_record_locally(
+        session=session,
+        record=record,
+        now=now,
+        reason=reason,
+        error_message=f"marked used locally; remote release task={release_task.get('task_id')}",
+    )
     channel = session.get(DownstreamChannelModel, record.downstream_channel_id)
     if channel is not None:
         channel.used_count += 1
@@ -4412,7 +4827,508 @@ def _mark_downstream_record_used_and_cooldown(
             MembershipModel.team_workspace_id == record.team_workspace_id,
         )
     )
-    return remove_result
+    return release_task
+
+
+def _settle_pushed_record_locally(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+    now: datetime,
+    reason: str,
+    error_message: str,
+) -> None:
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    record.push_status = "used"
+    record.usage_status = "used"
+    record.used_at = now
+    record.error_code = reason[:200]
+    record.error_message = error_message[:1000]
+    record.updated_at = now
+    if credential is not None:
+        credential.push_lifecycle_status = "used"
+        credential.updated_at = now
+
+
+def _ensure_remote_release_task_for_push_record(
+    *,
+    session: Session,
+    record: DownstreamCodexPushRecordModel,
+    now: datetime,
+    reason: str,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, record.team_workspace_id)
+    account = session.get(UserAccountModel, record.user_account_id)
+    auth = session.get(UserAccountAuthModel, record.user_account_id)
+    if workspace is None or account is None:
+        return {"ok": False, "error_code": "missing_workspace_or_account"}
+    credential = session.get(CodexOAuthCredentialModel, record.codex_credential_id)
+    membership = session.scalars(
+        select(MembershipModel).where(
+            MembershipModel.user_account_id == record.user_account_id,
+            MembershipModel.team_workspace_id == record.team_workspace_id,
+        )
+    ).first()
+    if membership is None:
+        membership = MembershipModel(
+            id="",
+            user_account_id=record.user_account_id,
+            team_workspace_id=record.team_workspace_id,
+            membership_status="unknown",
+            created_at=now,
+            updated_at=now,
+        )
+    local_ids = _local_account_remote_user_ids(
+        account=account,
+        auth=auth,
+        membership=membership,
+        credentials=[credential] if credential is not None else [],
+    )
+    remote_user_id = sorted(local_ids)[0] if local_ids else ""
+    if not remote_user_id:
+        return {"ok": False, "error_code": "missing_local_openai_user_id"}
+    task = _ensure_remote_member_release_task(
+        session=session,
+        workspace=workspace,
+        user_account_id=record.user_account_id,
+        remote_user_id=remote_user_id,
+        now=now,
+        reason=reason,
+        codex_credential_id=record.codex_credential_id,
+        downstream_push_record_id=record.id,
+    )
+    return {
+        "ok": True,
+        "task_id": task.id,
+        "remote_user_id": remote_user_id,
+        "release_status": task.release_status,
+    }
+
+
+def _ensure_remote_release_task_for_account(
+    *,
+    session: Session,
+    workspace_id: str,
+    user_account_id: str,
+    now: datetime,
+    reason: str,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, workspace_id)
+    account = session.get(UserAccountModel, user_account_id)
+    auth = session.get(UserAccountAuthModel, user_account_id)
+    if workspace is None or account is None:
+        return {"ok": False, "error_code": "missing_workspace_or_account"}
+    membership = session.scalars(
+        select(MembershipModel).where(
+            MembershipModel.user_account_id == user_account_id,
+            MembershipModel.team_workspace_id == workspace_id,
+        )
+    ).first()
+    if membership is None:
+        membership = MembershipModel(
+            id="",
+            user_account_id=user_account_id,
+            team_workspace_id=workspace_id,
+            membership_status="unknown",
+            created_at=now,
+            updated_at=now,
+        )
+    credentials = session.scalars(
+        select(CodexOAuthCredentialModel).where(
+            CodexOAuthCredentialModel.user_account_id == user_account_id,
+            CodexOAuthCredentialModel.team_workspace_id == workspace_id,
+        )
+    ).all()
+    local_ids = _local_account_remote_user_ids(
+        account=account,
+        auth=auth,
+        membership=membership,
+        credentials=list(credentials),
+    )
+    remote_user_id = sorted(local_ids)[0] if local_ids else ""
+    if not remote_user_id:
+        return {"ok": False, "error_code": "missing_local_openai_user_id"}
+    task = _ensure_remote_member_release_task(
+        session=session,
+        workspace=workspace,
+        user_account_id=user_account_id,
+        remote_user_id=remote_user_id,
+        now=now,
+        reason=reason,
+        codex_credential_id=credentials[0].id if credentials else "",
+        downstream_push_record_id="",
+    )
+    return {
+        "ok": True,
+        "task_id": task.id,
+        "remote_user_id": remote_user_id,
+        "release_status": task.release_status,
+    }
+
+
+def _ensure_remote_release_tasks_for_user_account(
+    *,
+    session: Session,
+    user_account_id: str,
+    now: datetime,
+    reason: str,
+) -> dict:
+    workspace_ids = session.scalars(
+        select(MembershipModel.team_workspace_id).where(
+            MembershipModel.user_account_id == user_account_id
+        )
+    ).all()
+    results: list[dict[str, Any]] = []
+    for workspace_id in workspace_ids:
+        result = _ensure_remote_release_task_for_account(
+            session=session,
+            workspace_id=str(workspace_id),
+            user_account_id=user_account_id,
+            now=now,
+            reason=reason,
+        )
+        results.append({"team_workspace_id": str(workspace_id), **result})
+    return {
+        "requested_count": len(results),
+        "created_or_existing_count": sum(1 for item in results if item.get("ok")),
+        "failed_count": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
+def _ensure_remote_release_tasks_for_workspaces(
+    *,
+    session: Session,
+    workspace_ids: list[str],
+    now: datetime,
+    reason: str,
+) -> dict:
+    results: list[dict[str, Any]] = []
+    for workspace_id in workspace_ids:
+        workspace = session.get(TeamWorkspaceModel, workspace_id)
+        if workspace is None or not workspace.source_admin_session_id:
+            continue
+        admin_session = session.get(TeamAdminSessionModel, workspace.source_admin_session_id)
+        if admin_session is None or not admin_session.access_token:
+            results.append(
+                {
+                    "team_workspace_id": workspace_id,
+                    "ok": False,
+                    "error_code": "admin_session_missing_access_token",
+                }
+            )
+            continue
+        try:
+            remote_members = _fetch_workspace_members(
+                access_token=admin_session.access_token,
+                cookie_header=admin_session.cookie_header,
+                account_id=workspace.external_workspace_id,
+                page_size=100,
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "team_workspace_id": workspace_id,
+                    "ok": False,
+                    "error_code": type(exc).__name__[:200],
+                    "error_message": str(exc)[:1000],
+                }
+            )
+            continue
+        self_ids = _workspace_self_user_ids(
+            session=session,
+            team_admin_session_id=admin_session.id,
+            account_id=workspace.external_workspace_id,
+        )
+        targets, skipped = _split_removable_workspace_members(remote_members, self_ids=self_ids)
+        for member in targets:
+            remote_user_id = _workspace_member_user_id(member)
+            if not remote_user_id:
+                continue
+            task = _ensure_remote_member_release_task(
+                session=session,
+                workspace=workspace,
+                user_account_id=None,
+                remote_user_id=remote_user_id,
+                now=now,
+                reason=reason,
+            )
+            results.append(
+                {
+                    "team_workspace_id": workspace_id,
+                    "remote_user_id": remote_user_id,
+                    "task_id": task.id,
+                    "release_status": task.release_status,
+                    "ok": True,
+                    "source": "remote_member",
+                }
+            )
+        if skipped:
+            results.append(
+                {
+                    "team_workspace_id": workspace_id,
+                    "ok": True,
+                    "source": "remote_member_skipped",
+                    "skipped_count": len(skipped),
+                    "skipped": skipped[:10],
+                }
+            )
+    memberships = session.scalars(
+        select(MembershipModel).where(MembershipModel.team_workspace_id.in_(workspace_ids))
+    ).all()
+    seen: set[tuple[str, str]] = set()
+    for membership in memberships:
+        key = (membership.team_workspace_id, membership.user_account_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result = _ensure_remote_release_task_for_account(
+            session=session,
+            workspace_id=membership.team_workspace_id,
+            user_account_id=membership.user_account_id,
+            now=now,
+            reason=reason,
+        )
+        results.append(
+            {
+                "team_workspace_id": membership.team_workspace_id,
+                "user_account_id": membership.user_account_id,
+                **result,
+            }
+        )
+    records = session.scalars(
+        select(DownstreamCodexPushRecordModel).where(
+            DownstreamCodexPushRecordModel.team_workspace_id.in_(workspace_ids),
+            DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+        )
+    ).all()
+    for record in records:
+        key = (record.team_workspace_id, record.user_account_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result = _ensure_remote_release_task_for_push_record(
+            session=session,
+            record=record,
+            now=now,
+            reason=reason,
+        )
+        results.append(
+            {
+                "team_workspace_id": record.team_workspace_id,
+                "user_account_id": record.user_account_id,
+                "downstream_push_record_id": record.id,
+                **result,
+            }
+        )
+    return {
+        "requested_count": len(results),
+        "created_or_existing_count": sum(1 for item in results if item.get("ok")),
+        "failed_count": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
+def _ensure_remote_member_release_task(
+    *,
+    session: Session,
+    workspace: TeamWorkspaceModel,
+    user_account_id: str | None,
+    remote_user_id: str,
+    now: datetime,
+    reason: str,
+    codex_credential_id: str = "",
+    downstream_push_record_id: str = "",
+) -> RemoteMemberReleaseTaskModel:
+    task = session.scalars(
+        select(RemoteMemberReleaseTaskModel).where(
+            RemoteMemberReleaseTaskModel.team_workspace_id == workspace.id,
+            RemoteMemberReleaseTaskModel.remote_user_id == remote_user_id,
+        )
+    ).first()
+    if task is None:
+        task = RemoteMemberReleaseTaskModel(
+            id=f"remote-member-release-{uuid4()}",
+            team_workspace_id=workspace.id,
+            user_account_id=user_account_id,
+            codex_credential_id=codex_credential_id,
+            downstream_push_record_id=downstream_push_record_id,
+            external_workspace_id=workspace.external_workspace_id,
+            remote_user_id=remote_user_id,
+            release_reason=reason,
+            release_status="pending",
+            attempt_count=0,
+            next_attempt_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(task)
+        return task
+    task.user_account_id = task.user_account_id or user_account_id
+    task.codex_credential_id = task.codex_credential_id or codex_credential_id
+    task.downstream_push_record_id = task.downstream_push_record_id or downstream_push_record_id
+    task.external_workspace_id = workspace.external_workspace_id
+    task.release_reason = reason
+    if task.release_status in {"blocked", "confirmed"}:
+        task.release_status = "retrying" if task.release_status == "blocked" else task.release_status
+    if task.release_status != "confirmed":
+        task.next_attempt_at = now
+    task.updated_at = now
+    return task
+
+
+def _settle_local_after_remote_member_absent(
+    *,
+    session: Session,
+    workspace: TeamWorkspaceModel,
+    remote_user_id: str,
+    now: datetime,
+    reason: str,
+) -> dict:
+    target = str(remote_user_id or "").strip()
+    if not target:
+        return {"ok": False, "error_code": "missing_remote_user_id"}
+    rows = session.execute(
+        select(MembershipModel, UserAccountModel, UserAccountAuthModel)
+        .join(UserAccountModel, UserAccountModel.id == MembershipModel.user_account_id)
+        .outerjoin(
+            UserAccountAuthModel,
+            UserAccountAuthModel.user_account_id == MembershipModel.user_account_id,
+        )
+        .where(MembershipModel.team_workspace_id == workspace.id)
+    ).all()
+    matched_user_account_ids: list[str] = []
+    for membership, account, auth in rows:
+        credentials = session.scalars(
+            select(CodexOAuthCredentialModel).where(
+                CodexOAuthCredentialModel.team_workspace_id == workspace.id,
+                CodexOAuthCredentialModel.user_account_id == account.id,
+            )
+        ).all()
+        local_ids = _local_account_remote_user_ids(
+            account=account,
+            auth=auth,
+            membership=membership,
+            credentials=list(credentials),
+        )
+        if target in local_ids:
+            matched_user_account_ids.append(account.id)
+    if not matched_user_account_ids:
+        task = _ensure_remote_member_release_task(
+            session=session,
+            workspace=workspace,
+            user_account_id=None,
+            remote_user_id=target,
+            now=now,
+            reason=reason,
+        )
+        task.release_status = "confirmed"
+        task.confirmed_at = now
+        task.next_attempt_at = None
+        task.updated_at = now
+        return {"ok": True, "remote_user_id": target, "matched_count": 0, "task_id": task.id}
+
+    settled_records = 0
+    for user_account_id in matched_user_account_ids:
+        task = _ensure_remote_member_release_task(
+            session=session,
+            workspace=workspace,
+            user_account_id=user_account_id,
+            remote_user_id=target,
+            now=now,
+            reason=reason,
+        )
+        task.release_status = "confirmed"
+        task.confirmed_at = now
+        task.next_attempt_at = None
+        task.updated_at = now
+        records = session.scalars(
+            select(DownstreamCodexPushRecordModel).where(
+                DownstreamCodexPushRecordModel.team_workspace_id == workspace.id,
+                DownstreamCodexPushRecordModel.user_account_id == user_account_id,
+                DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+            )
+        ).all()
+        for record in records:
+            if record.push_status != "used":
+                _settle_pushed_record_locally(
+                    session=session,
+                    record=record,
+                    now=now,
+                    reason=reason,
+                    error_message=f"remote member {target} absent; local settled",
+                )
+                channel = session.get(DownstreamChannelModel, record.downstream_channel_id)
+                if channel is not None:
+                    channel.used_count += 1
+                    channel.updated_at = now
+                settled_records += 1
+        session.execute(
+            update(CodexOAuthCredentialModel)
+            .where(
+                CodexOAuthCredentialModel.team_workspace_id == workspace.id,
+                CodexOAuthCredentialModel.user_account_id == user_account_id,
+            )
+            .values(push_lifecycle_status="used", updated_at=now)
+        )
+        _ensure_user_account_cooldown(
+            session=session,
+            user_account_id=user_account_id,
+            team_workspace_id=workspace.id,
+            now=now,
+            reason=reason,
+            source_push_record_id="",
+        )
+        session.execute(
+            delete(MembershipModel).where(
+                MembershipModel.team_workspace_id == workspace.id,
+                MembershipModel.user_account_id == user_account_id,
+            )
+        )
+    return {
+        "ok": True,
+        "remote_user_id": target,
+        "matched_count": len(matched_user_account_ids),
+        "settled_push_records": settled_records,
+    }
+
+
+def _ensure_user_account_cooldown(
+    *,
+    session: Session,
+    user_account_id: str,
+    team_workspace_id: str,
+    now: datetime,
+    reason: str,
+    source_push_record_id: str,
+) -> None:
+    cooldown_until = now + timedelta(hours=72)
+    existing = session.scalars(
+        select(UserAccountCooldownModel).where(
+            UserAccountCooldownModel.user_account_id == user_account_id,
+            UserAccountCooldownModel.team_workspace_id == team_workspace_id,
+            UserAccountCooldownModel.cooldown_type == "post_usage_remove",
+        )
+    ).first()
+    if existing is None:
+        session.add(
+            UserAccountCooldownModel(
+                id=f"user-account-cooldown-{uuid4()}",
+                user_account_id=user_account_id,
+                team_workspace_id=team_workspace_id,
+                cooldown_type="post_usage_remove",
+                cooldown_until=cooldown_until,
+                reason=reason,
+                source_push_record_id=source_push_record_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return
+    existing.cooldown_until = cooldown_until
+    existing.reason = reason
+    existing.source_push_record_id = source_push_record_id
+    existing.updated_at = now
 
 
 def _remove_remote_member_for_account(
@@ -4766,15 +5682,17 @@ def _handle_candidate_authorization_failed(
         membership.failure_code = "codex_authorization_failed"
         membership.failure_message = error[:1000]
         membership.updated_at = datetime.now(UTC)
-    session.commit()
-    remote_delete_result = _remove_remote_member_for_account(
+    release_task = _ensure_remote_release_task_for_account(
         session=session,
         workspace_id=workspace_id,
         user_account_id=user_account_id,
+        now=datetime.now(UTC),
+        reason="codex_authorization_failed",
     )
+    session.commit()
     return {
         "account_invalidated": False,
-        "remote_delete": remote_delete_result,
+        "remote_release_task": release_task,
     }
 
 
@@ -4803,32 +5721,16 @@ def _handle_authorization_phone_verification_failed(
         membership.failure_code = "codex_authorization_phone_verification_required"
         membership.failure_message = error[:1000]
         membership.updated_at = now
-    session.commit()
-
-    remote_delete_result = _remove_remote_member_for_account(
+    release_task_result = _ensure_remote_release_task_for_account(
         session=session,
         workspace_id=workspace_id,
         user_account_id=user_account_id,
+        now=now,
+        reason="codex_authorization_phone_verification_required",
     )
     sync_result: dict[str, Any] = {}
     local_prune_result: dict[str, Any] = {}
-    if max(0, int(sync_after_seconds or 0)):
-        sleep(max(0, int(sync_after_seconds or 0)))
-    try:
-        sync_result = _sync_workspace_remote_state_inline(
-            session=session,
-            workspace_id=workspace_id,
-            page_size=100,
-        )
-        session.commit()
-    except Exception as exc:
-        sync_result = {
-            "ok": False,
-            "error_code": type(exc).__name__,
-            "error_message": str(exc)[:1000],
-        }
-
-    if remote_delete_result.get("ok") or remote_delete_result.get("error_code") == "remote_member_not_found":
+    if release_task_result.get("ok"):
         local_prune_result = _delete_local_memberships_with_credentials(
             session=session,
             workspace_id=workspace_id,
@@ -4836,10 +5738,10 @@ def _handle_authorization_phone_verification_failed(
             now=datetime.now(UTC),
             mark_protected_downstream_used=False,
         )
-        session.commit()
+    session.commit()
     return {
         "account_invalidated": invalidated,
-        "remote_delete": remote_delete_result,
+        "remote_release_task": release_task_result,
         "post_delete_sync": sync_result,
         "local_prune": local_prune_result,
     }
@@ -6085,6 +6987,42 @@ def _automation_monitor_job_dict(*, session: Session, schedule: AutomationSchedu
     }
 
 
+def _automation_monitor_run_dict(*, session: Session, run: JobRunModel, job: JobModel) -> dict:
+    output = run.output_json if isinstance(run.output_json, dict) else {}
+    started_at = run.started_at
+    finished_at = run.finished_at
+    duration_ms = (
+        int((finished_at - started_at).total_seconds() * 1000)
+        if started_at is not None and finished_at is not None
+        else 0
+    )
+    event_count = session.scalar(
+        select(func.count()).select_from(JobEventModel).where(JobEventModel.run_id == run.id)
+    ) or 0
+    return {
+        "id": run.id,
+        "run_id": run.id,
+        "job_id": job.id,
+        "job_type": job.type,
+        "job_status": job.job_status,
+        "run_status": run.run_status,
+        "attempt": run.attempt,
+        "started_at": started_at.isoformat() if started_at else "",
+        "finished_at": finished_at.isoformat() if finished_at else "",
+        "duration_ms": duration_ms,
+        "error_code": run.error_code,
+        "error_message": run.error_message,
+        "item_count": int(output.get("item_count") or output.get("work_count") or 0),
+        "succeeded": int(output.get("succeeded") or 0),
+        "failed": int(output.get("failed") or 0),
+        "skipped": int(output.get("skipped") or 0),
+        "paused": int(output.get("paused") or 0),
+        "event_count": int(event_count),
+        "output_summary": _summarize_json(output, max_chars=1200),
+        "output_json": output,
+    }
+
+
 def _automation_console_event_dict(
     *,
     event: JobEventModel,
@@ -6102,7 +7040,7 @@ def _automation_console_event_dict(
         "event_type": event.event_type,
         "message": event.message,
         "data_json": data_json,
-        "data_summary": _summarize_json(data_json, max_chars=500),
+        "data_summary": _summarize_json(data_json, max_chars=4000),
     }
 
 
@@ -6115,8 +7053,7 @@ def _automation_console_fallback_items(
     level: str,
     limit: int,
 ) -> list[dict]:
-    if level.strip() and level.strip().upper() not in {"ALL", "INFO"}:
-        return []
+    level_filter = level.strip().upper()
     stmt = select(JobRunModel, JobModel).join(JobModel, JobModel.id == JobRunModel.job_id)
     if run_id.strip():
         stmt = stmt.where(JobRunModel.id == run_id.strip())
@@ -6146,21 +7083,60 @@ def _automation_console_fallback_items(
             "error_message": run.error_message,
             "output_json": output_json,
         }
-        items.append(
-            {
-                "id": f"fallback-{run.id}",
-                "job_id": job.id,
-                "job_type": job.type,
-                "run_id": run.id,
-                "ts": (run.finished_at or run.started_at or datetime.now(UTC)).isoformat(),
-                "level": level_value,
-                "event_type": "job.run_summary",
-                "message": message,
-                "data_json": data_json,
-                "data_summary": _summarize_json(data_json, max_chars=500),
-            }
-        )
+        base_item = {
+            "id": f"fallback-{run.id}",
+            "job_id": job.id,
+            "job_type": job.type,
+            "run_id": run.id,
+            "ts": (run.finished_at or run.started_at or datetime.now(UTC)).isoformat(),
+            "level": level_value,
+            "event_type": "job.run_summary",
+            "message": message,
+            "data_json": data_json,
+            "data_summary": _summarize_json(data_json, max_chars=4000),
+        }
+        if not level_filter or level_filter == "ALL" or level_filter == level_value:
+            items.append(base_item)
+        for index, result_item in enumerate(_automation_result_items(output_json)):
+            item_status = str(result_item.get("status") or "")
+            item_error = str(result_item.get("error") or result_item.get("error_message") or "")
+            item_level = "ERROR" if item_status == "failed" or item_error else "INFO"
+            if level_filter and level_filter not in {"ALL", item_level}:
+                continue
+            item_message = (
+                item_error
+                or str(result_item.get("reason") or "")
+                or f"automation item {item_status or 'result'}"
+            )
+            items.append(
+                {
+                    "id": f"fallback-{run.id}-result-{index}",
+                    "job_id": job.id,
+                    "job_type": job.type,
+                    "run_id": run.id,
+                    "ts": (run.finished_at or run.started_at or datetime.now(UTC)).isoformat(),
+                    "level": item_level,
+                    "event_type": "job.result_item",
+                    "message": item_message,
+                    "data_json": result_item,
+                    "data_summary": _summarize_json(result_item, max_chars=4000),
+                }
+            )
     return items
+
+
+def _automation_result_items(output_json: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_results = output_json.get("results")
+    if not isinstance(raw_results, list):
+        return []
+    return [item for item in raw_results if isinstance(item, dict)]
+
+
+def _merge_console_items(base_items: list[dict], event_items: list[dict]) -> list[dict]:
+    existing_ids = {str(item.get("id") or "") for item in event_items}
+    merged = [item for item in base_items if str(item.get("id") or "") not in existing_ids]
+    merged.extend(event_items)
+    return sorted(merged, key=lambda item: str(item.get("ts") or ""))
 
 
 def _limit_console_items_by_bytes(*, items: list[dict], max_bytes: int) -> tuple[list[dict], int, bool]:
@@ -6198,6 +7174,7 @@ def _fixed_automation_schedule_id(schedule_type: str) -> str:
         "automation.codex_heartbeat": "automation-schedule-codex-heartbeat",
         "automation.downstream_push": "automation-schedule-downstream-push",
         "automation.downstream_usage_cleanup": "automation-schedule-downstream-usage-cleanup",
+        "automation.remote_member_release": "automation-schedule-remote-member-release",
     }
     schedule_id = mapping.get(schedule_type)
     if not schedule_id:

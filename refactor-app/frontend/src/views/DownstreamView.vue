@@ -16,6 +16,7 @@ const columns = [
   { key: "downstream_channel_name", label: "渠道" },
   { key: "downstream_provider", label: "下游平台", badge: true },
   { key: "push_status", label: "推送状态", badge: true },
+  { key: "push_time_display", label: "推送时间" },
   { key: "push_attempt_count", label: "推送尝试" },
   { key: "usage_display", label: "使用额度" },
   { key: "usage_status", label: "额度状态", badge: true },
@@ -43,6 +44,7 @@ async function loadDownstreamRows() {
     return {
       ...row,
       usage_display: `${Number.isFinite(usagePercent) ? usagePercent : 0}%`,
+      push_time_display: formatDateTime(row.created_at),
       last_usage_check_display: formatDateTime(row.last_usage_check_at),
       used_at_display: formatDateTime(row.used_at),
     };

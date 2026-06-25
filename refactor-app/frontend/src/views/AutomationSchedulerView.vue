@@ -28,7 +28,11 @@ const labels: Record<string, { title: string; desc: string }> = {
   },
   "automation.downstream_usage_cleanup": {
     title: "用量清理",
-    desc: "扫描已推送记录，达到阈值后剔除远端成员、本地删除并写 72 小时冷却。",
+    desc: "扫描已推送记录，达到阈值后本地结算并创建远端释放任务。",
+  },
+  "automation.remote_member_release": {
+    title: "远端成员释放",
+    desc: "扫描待释放远端成员任务，删除并复查远端成员，直到确认不存在。",
   },
 };
 
@@ -105,7 +109,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageHeader title="自动化调度" description="配置 4 个长期 Job 的定时触发、参数和最近运行状态。">
+  <PageHeader title="自动化调度" description="配置长期 Job 的定时触发、参数和最近运行状态。">
     <button class="btn" :disabled="loading" @click="load">
       {{ loading ? "刷新中..." : "刷新" }}
     </button>
