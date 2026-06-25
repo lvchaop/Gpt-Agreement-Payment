@@ -320,6 +320,8 @@ def _validate_pushable(
     workspace = session.get(TeamWorkspaceModel, credential.team_workspace_id)
     if workspace is None:
         raise DirectPushWorkflowError("missing_workspace")
+    if workspace.workspace_status != "active":
+        raise DirectPushWorkflowError("workspace_not_active")
     if credential.token_chatgpt_account_id != workspace.external_workspace_id:
         raise DirectPushWorkflowError("workspace_mismatch")
 

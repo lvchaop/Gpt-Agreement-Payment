@@ -159,3 +159,8 @@ class HeartbeatCodexCredentialWorkflow:
 def _is_unauthorized_heartbeat_error(message: str) -> bool:
     text = str(message or "").lower()
     return "http_status=401" in text or "http_401" in text or " 401" in text
+
+
+def _is_payment_required_heartbeat_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return "http_status=402" in text or "http_402" in text or " 402" in text

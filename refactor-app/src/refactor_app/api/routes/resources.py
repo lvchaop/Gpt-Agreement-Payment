@@ -45,6 +45,7 @@ from refactor_app.application.workflows.direct_push import (
 from refactor_app.application.workflows.downstream import downstream_payload
 from refactor_app.application.workflows.heartbeat import (
     HeartbeatCodexCredentialWorkflow,
+    _is_payment_required_heartbeat_error,
     _is_unauthorized_heartbeat_error,
 )
 from refactor_app.application.workflows.proxy import HealthcheckProxyWorkflow
@@ -103,6 +104,7 @@ class CodexUsageProbeResult:
     error_code: str = ""
     error_message: str = ""
     unauthorized: bool = False
+    payment_required: bool = False
     raw_headers: dict[str, str] = field(default_factory=dict)
 
 
@@ -960,6 +962,7 @@ def _select_channel_push_credential_ids(
         CodexOAuthCredentialModel.last_heartbeat_status == "ok",
         CodexOAuthCredentialModel.access_token != "",
         CodexOAuthCredentialModel.refresh_token != "",
+        TeamWorkspaceModel.workspace_status == "active",
     ]
     if selected_ids:
         retry_conditions.append(~CodexOAuthCredentialModel.id.in_(selected_ids))
@@ -968,6 +971,10 @@ def _select_channel_push_credential_ids(
         .join(
             DownstreamCodexPushRecordModel,
             DownstreamCodexPushRecordModel.codex_credential_id == CodexOAuthCredentialModel.id,
+        )
+        .join(
+            TeamWorkspaceModel,
+            TeamWorkspaceModel.id == CodexOAuthCredentialModel.team_workspace_id,
         )
         .where(*retry_conditions)
         .order_by(DownstreamCodexPushRecordModel.updated_at.asc())
@@ -987,11 +994,16 @@ def _select_channel_push_credential_ids(
         CodexOAuthCredentialModel.last_heartbeat_status == "ok",
         CodexOAuthCredentialModel.access_token != "",
         CodexOAuthCredentialModel.refresh_token != "",
+        TeamWorkspaceModel.workspace_status == "active",
     ]
     if selected_ids:
         pending_conditions.append(~CodexOAuthCredentialModel.id.in_(selected_ids))
     pending_ids = session.scalars(
         select(CodexOAuthCredentialModel.id)
+        .join(
+            TeamWorkspaceModel,
+            TeamWorkspaceModel.id == CodexOAuthCredentialModel.team_workspace_id,
+        )
         .where(*pending_conditions)
         .order_by(CodexOAuthCredentialModel.updated_at.asc())
         .limit(pending_take)
@@ -2474,6 +2486,21 @@ def _probe_downstream_record_usage_with_recovery(
     if result.ok:
         _apply_usage_probe_success(record=record, result=result, threshold=threshold, now=now)
         return result
+    if result.payment_required:
+        settlement = _disable_workspace_and_settle_push_records(
+            session=session,
+            workspace_id=record.team_workspace_id,
+            now=now,
+            reason="downstream_usage_probe_http_402",
+        )
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code="workspace_disabled_http_402",
+            error_message=f"workspace disabled after usage probe 402; settlement={settlement}"[:1000],
+            payment_required=True,
+            raw_headers=result.raw_headers,
+        )
+        return failed
     if not result.unauthorized:
         _apply_usage_probe_failure(record=record, result=result, now=now)
         return result
@@ -2517,6 +2544,22 @@ def _probe_downstream_record_usage_with_recovery(
             now=datetime.now(UTC),
         )
         return result
+    if result.payment_required:
+        now = datetime.now(UTC)
+        settlement = _disable_workspace_and_settle_push_records(
+            session=session,
+            workspace_id=record.team_workspace_id,
+            now=now,
+            reason="downstream_usage_probe_http_402_after_refresh",
+        )
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code="workspace_disabled_http_402",
+            error_message=f"workspace disabled after refreshed usage probe 402; settlement={settlement}"[:1000],
+            payment_required=True,
+            raw_headers=result.raw_headers,
+        )
+        return failed
     if not result.unauthorized:
         _apply_usage_probe_failure(record=record, result=result, now=datetime.now(UTC))
         return result
@@ -2621,6 +2664,22 @@ def _handle_usage_reauthorize_result(
             threshold=threshold,
             now=datetime.now(UTC),
         )
+    elif result.payment_required:
+        now = datetime.now(UTC)
+        settlement = _disable_workspace_and_settle_push_records(
+            session=session,
+            workspace_id=refreshed_record.team_workspace_id,
+            now=now,
+            reason="downstream_usage_probe_http_402_after_reauthorize",
+        )
+        failed = CodexUsageProbeResult(
+            ok=False,
+            error_code="workspace_disabled_http_402",
+            error_message=f"workspace disabled after reauthorized usage probe 402; settlement={settlement}"[:1000],
+            payment_required=True,
+            raw_headers=result.raw_headers,
+        )
+        return failed
     else:
         _apply_usage_probe_failure(
             record=refreshed_record,
@@ -2714,6 +2773,14 @@ def _probe_downstream_record_usage(
             error_code="http_401",
             error_message="chatgpt codex usage probe returned 401",
             unauthorized=True,
+            raw_headers=raw_headers,
+        )
+    if status_code == 402:
+        return CodexUsageProbeResult(
+            ok=False,
+            error_code="http_402",
+            error_message="chatgpt codex usage probe returned 402",
+            payment_required=True,
             raw_headers=raw_headers,
         )
     if status_code < 200 or status_code >= 300:
@@ -3460,7 +3527,12 @@ def _run_codex_heartbeat_tick(
     with session_factory() as session:
         credential_ids = session.scalars(
             select(CodexOAuthCredentialModel.id)
+            .join(
+                TeamWorkspaceModel,
+                TeamWorkspaceModel.id == CodexOAuthCredentialModel.team_workspace_id,
+            )
             .where(
+                TeamWorkspaceModel.workspace_status == "active",
                 CodexOAuthCredentialModel.credential_status.in_(
                     (CredentialStatus.ACTIVE.value, CredentialStatus.ERROR.value)
                 ),
@@ -3501,6 +3573,13 @@ def _process_codex_heartbeat_credential(
     session_factory,
     credential_id: str,
 ) -> dict:
+    with session_factory() as session:
+        credential = session.get(CodexOAuthCredentialModel, credential_id)
+        if credential is None:
+            return {"id": credential_id, "status": "skipped", "reason": "credential_not_found"}
+        workspace = session.get(TeamWorkspaceModel, credential.team_workspace_id)
+        if workspace is None or workspace.workspace_status != "active":
+            return {"id": credential_id, "status": "skipped", "reason": "workspace_not_active"}
     try:
         HeartbeatCodexCredentialWorkflow(
             session_factory=session_factory,
@@ -3509,6 +3588,29 @@ def _process_codex_heartbeat_credential(
         return {"id": credential_id, "status": "active"}
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"[:1000]
+        if _is_payment_required_heartbeat_error(error):
+            with session_factory() as session:
+                credential = session.get(CodexOAuthCredentialModel, credential_id)
+                if credential is None:
+                    return {
+                        "id": credential_id,
+                        "status": "failed",
+                        "error": error,
+                        "reason": "credential_not_found_for_402_cleanup",
+                    }
+                settlement = _disable_workspace_and_settle_push_records(
+                    session=session,
+                    workspace_id=credential.team_workspace_id,
+                    now=datetime.now(UTC),
+                    reason="codex_heartbeat_http_402",
+                )
+                session.commit()
+            return {
+                "id": credential_id,
+                "status": "workspace_disabled",
+                "error": error,
+                "settlement": settlement,
+            }
         if not _is_unauthorized_heartbeat_error(error):
             return {"id": credential_id, "status": "failed", "error": error}
 
@@ -3618,7 +3720,14 @@ def _run_downstream_usage_cleanup_tick(
     with session_factory() as session:
         record_ids = session.scalars(
             select(DownstreamCodexPushRecordModel.id)
-            .where(DownstreamCodexPushRecordModel.push_status == "pushed")
+            .join(
+                TeamWorkspaceModel,
+                TeamWorkspaceModel.id == DownstreamCodexPushRecordModel.team_workspace_id,
+            )
+            .where(
+                DownstreamCodexPushRecordModel.push_status == "pushed",
+                TeamWorkspaceModel.workspace_status == "active",
+            )
             .order_by(DownstreamCodexPushRecordModel.updated_at.asc())
             .limit(max(1, int(req.record_limit or 100)))
         ).all()
@@ -3885,6 +3994,15 @@ def _process_downstream_usage_cleanup_record(
         record = session.get(DownstreamCodexPushRecordModel, record_id)
         if record is None or record.push_status != "pushed":
             return {"record_id": record_id, "status": "skipped", "reason": "record_not_pushed"}
+        workspace = session.get(TeamWorkspaceModel, record.team_workspace_id)
+        if workspace is None or workspace.workspace_status != "active":
+            return {
+                "record_id": record_id,
+                "status": "skipped",
+                "reason": "workspace_not_active",
+                "usage_percent": record.usage_percent,
+                "threshold_percent": threshold,
+            }
         if record.downstream_provider == "local_sub2api":
             return {
                 "record_id": record_id,
@@ -3901,9 +4019,10 @@ def _process_downstream_usage_cleanup_record(
         )
         if not probe.ok:
             session.commit()
+            status = "workspace_disabled" if probe.payment_required else "failed"
             return {
                 "record_id": record_id,
-                "status": "failed",
+                "status": status,
                 "reason": probe.error_code or "usage_probe_failed",
                 "usage_percent": record.usage_percent,
                 "threshold_percent": threshold,
@@ -4089,7 +4208,12 @@ def _automation_results_summary(
         "job_type": job_type,
         "item_count": len(results),
         "concurrency": concurrency,
-        "succeeded": sum(1 for item in results if item.get("status") in {"synced", "invited", "authorized", "used", "active"}),
+        "succeeded": sum(
+            1
+            for item in results
+            if item.get("status")
+            in {"synced", "invited", "authorized", "used", "active", "workspace_disabled"}
+        ),
         "skipped": sum(1 for item in results if item.get("status") == "skipped"),
         "paused": sum(1 for item in results if item.get("status") == "paused"),
         "failed": sum(1 for item in results if item.get("status") == "failed"),
@@ -4114,6 +4238,119 @@ def _active_downstream_slot_count(session: Session, downstream_channel_id: str) 
         )
         or 0
     )
+
+
+def _disable_workspace_and_settle_push_records(
+    *,
+    session: Session,
+    workspace_id: str,
+    now: datetime,
+    reason: str,
+) -> dict:
+    workspace = session.get(TeamWorkspaceModel, workspace_id)
+    if workspace is None:
+        return {
+            "ok": False,
+            "error_code": "workspace_not_found",
+            "team_workspace_id": workspace_id,
+        }
+
+    workspace.workspace_status = "disabled"
+    workspace.updated_at = now
+    state = session.get(WorkspaceAutomationStateModel, workspace_id)
+    if state is not None:
+        state.automation_status = "paused"
+        state.pause_reason = reason
+        state.last_error_code = "workspace_disabled_http_402"
+        state.last_error_message = reason
+        state.updated_at = now
+
+    records = session.scalars(
+        select(DownstreamCodexPushRecordModel).where(
+            DownstreamCodexPushRecordModel.team_workspace_id == workspace_id,
+            DownstreamCodexPushRecordModel.push_status.in_(("pushing", "pushed", "failed")),
+        )
+    ).all()
+    used_credential_ids: set[str] = set()
+    skipped_credential_ids: set[str] = set()
+    used_count = 0
+    skipped_count = 0
+    cooldown_count = 0
+    for record in records:
+        usage_percent = int(record.usage_percent or 0)
+        if usage_percent >= 60:
+            if record.push_status != "used":
+                record.push_status = "used"
+                record.usage_status = "used"
+                record.used_at = now
+                record.error_code = "workspace_disabled_http_402"
+                record.error_message = (
+                    f"workspace disabled after 402; marked used because usage_percent={usage_percent}>=60"
+                )[:1000]
+                used_count += 1
+            used_credential_ids.add(record.codex_credential_id)
+        else:
+            _refund_skipped_downstream_quota(session=session, record=record, now=now)
+            record.push_status = "skipped"
+            record.usage_status = "check_failed"
+            record.error_code = "workspace_disabled_http_402"
+            record.error_message = (
+                f"workspace disabled after 402; marked skipped because usage_percent={usage_percent}<60"
+            )[:1000]
+            skipped_count += 1
+            skipped_credential_ids.add(record.codex_credential_id)
+        record.updated_at = now
+
+        existing = session.scalars(
+            select(UserAccountCooldownModel).where(
+                UserAccountCooldownModel.user_account_id == record.user_account_id,
+                UserAccountCooldownModel.team_workspace_id == record.team_workspace_id,
+                UserAccountCooldownModel.cooldown_type == "post_usage_remove",
+            )
+        ).first()
+        cooldown_until = now + timedelta(hours=72)
+        if existing is None:
+            existing = UserAccountCooldownModel(
+                id=f"user-account-cooldown-{uuid4()}",
+                user_account_id=record.user_account_id,
+                team_workspace_id=record.team_workspace_id,
+                cooldown_type="post_usage_remove",
+                cooldown_until=cooldown_until,
+                reason=reason,
+                source_push_record_id=record.id,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(existing)
+            cooldown_count += 1
+        else:
+            existing.cooldown_until = cooldown_until
+            existing.reason = reason
+            existing.source_push_record_id = record.id
+            existing.updated_at = now
+
+    if used_credential_ids:
+        session.execute(
+            update(CodexOAuthCredentialModel)
+            .where(CodexOAuthCredentialModel.id.in_(used_credential_ids))
+            .values(push_lifecycle_status="used", updated_at=now)
+        )
+    if skipped_credential_ids:
+        session.execute(
+            update(CodexOAuthCredentialModel)
+            .where(CodexOAuthCredentialModel.id.in_(skipped_credential_ids))
+            .values(push_lifecycle_status="blocked", updated_at=now)
+        )
+    return {
+        "ok": True,
+        "team_workspace_id": workspace_id,
+        "workspace_status": "disabled",
+        "settled_count": len(records),
+        "used_count": used_count,
+        "skipped_count": skipped_count,
+        "cooldown_count": cooldown_count,
+        "reason": reason,
+    }
 
 
 def _mark_downstream_record_used_and_cooldown(
