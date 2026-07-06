@@ -12,18 +12,12 @@ const store = useOpsStore();
 
 const jobs = ref<Row[]>([]);
 const jobRuns = ref<Row[]>([]);
-const channels = ref<Row[]>([]);
-const usageItems = ref<Row[]>([]);
-const usageSummary = ref<Row>({});
 const consoleItems = ref<Row[]>([]);
-const selectedUsageRows = ref<Row[]>([]);
 const loading = ref(false);
 const consoleLoading = ref(false);
 const runsLoading = ref(false);
-const usageLoading = ref(false);
 const runningScheduleId = ref("");
 const error = ref("");
-const usageError = ref("");
 const consoleError = ref("");
 const selectedScheduleType = ref("");
 const selectedJobId = ref("");
@@ -33,37 +27,13 @@ const logLimit = ref(1000);
 const logMaxBytes = ref(524288);
 const runLimit = ref(100);
 const autoRefresh = ref(true);
-const usageChannelId = ref("");
-const usageStatus = ref("");
-const usageProvider = ref("");
-const usageQuery = ref("");
-const usageLimit = ref(500);
-const probeLimit = ref(100);
-const probeConcurrency = ref(5);
-const probing = ref(false);
 const initializedDefaultJob = ref(false);
 let pollTimer: number | undefined;
 
 const jobLabels: Record<string, string> = {
-  "automation.workspace_invite_sync": "空间邀请同步",
-  "automation.workspace_authorize": "空间授权",
-  "automation.codex_heartbeat": "Codex 心跳",
-  "automation.downstream_push": "下游推送",
-  "automation.downstream_usage_cleanup": "额度清理",
-  "automation.remote_member_release": "远端成员释放",
+  "automation.space_downstream_push": "Space 下游推送",
+  "automation.space_recycle_sweep": "Space 回收扫描",
 };
-
-const usageColumns: Column[] = [
-  { key: "email", label: "账号邮箱", summary: 26 },
-  { key: "workspace_name", label: "空间", summary: 22 },
-  { key: "downstream_channel_name", label: "渠道" },
-  { key: "downstream_provider", label: "类型", badge: true },
-  { key: "push_status", label: "推送", badge: true },
-  { key: "usage_percent", label: "使用率" },
-  { key: "usage_status", label: "额度状态", badge: true },
-  { key: "last_usage_check_at", label: "最近查询", summary: 24 },
-  { key: "error_code", label: "错误码", badge: true },
-];
 
 const runColumns: Column[] = [
   { key: "started_at", label: "开始时间", summary: 24 },
@@ -135,13 +105,6 @@ function bytesText(value: unknown) {
   return `${(bytes / 1024 / 1024).toFixed(2)}MB`;
 }
 
-function usageTone(value: unknown) {
-  const num = Number(value || 0);
-  if (num >= 95) return "danger";
-  if (num >= 80) return "warning";
-  return "success";
-}
-
 function selectJob(row: Row) {
   selectedScheduleType.value = String(row.schedule_type || "");
   selectedJobId.value = String(row.last_job_id || "");
@@ -195,35 +158,11 @@ async function loadRuns() {
   }
 }
 
-async function loadUsage() {
-  usageLoading.value = true;
-  usageError.value = "";
-  try {
-    const result = await resourcesApi.automationMonitorDownstreamUsage({
-      downstream_channel_id: usageChannelId.value,
-      usage_status: usageStatus.value,
-      provider_type: usageProvider.value,
-      q: usageQuery.value,
-      limit: usageLimit.value,
-    });
-    usageItems.value = result.items || [];
-    usageSummary.value = result.summary || {};
-  } catch (err) {
-    usageError.value = String((err as Error).message ?? err);
-  } finally {
-    usageLoading.value = false;
-  }
-}
-
-async function loadChannels() {
-  channels.value = await resourcesApi.downstreamChannels();
-}
-
 async function loadAll() {
   loading.value = true;
   error.value = "";
   try {
-    await Promise.all([loadJobs(), loadChannels(), loadUsage()]);
+    await loadJobs();
     await loadRuns();
     await loadConsole();
   } catch (err) {
@@ -247,37 +186,6 @@ async function runNow(row: Row) {
     store.toast("触发调度失败", String((err as Error).message ?? err), "error");
   } finally {
     runningScheduleId.value = "";
-  }
-}
-
-async function probeUsage(selectedOnly = false) {
-  const ids = selectedOnly
-    ? selectedUsageRows.value.map((row) => String(row.id || "")).filter(Boolean)
-    : [];
-  if (selectedOnly && !ids.length) {
-    store.toast("没有选中记录", "请先勾选要查询额度的推送记录。", "warning");
-    return;
-  }
-  probing.value = true;
-  try {
-    const result = await resourcesApi.automationMonitorDownstreamUsageProbe({
-      downstream_push_record_ids: ids,
-      downstream_channel_id: selectedOnly ? "" : usageChannelId.value,
-      limit: selectedOnly ? ids.length : probeLimit.value,
-      concurrency: probeConcurrency.value,
-      threshold_percent: 95,
-      persist_result: true,
-    });
-    store.toast(
-      "额度查询完成",
-      `检查=${result.checked ?? 0} 成功=${result.succeeded ?? 0} 失败=${result.failed ?? 0}`,
-      Number(result.failed || 0) > 0 ? "warning" : "success",
-    );
-    await loadUsage();
-  } catch (err) {
-    store.toast("额度查询失败", String((err as Error).message ?? err), "error");
-  } finally {
-    probing.value = false;
   }
 }
 
@@ -315,7 +223,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageHeader title="自动化监控" description="五个长期 Job 的运行态、控制台日志，以及已推送凭证的额度使用情况。">
+  <PageHeader title="自动化监控" description="Space 自动化调度的运行态和控制台日志。">
     <button class="btn" :disabled="loading" @click="loadAll">{{ loading ? "刷新中..." : "刷新全部" }}</button>
   </PageHeader>
 
@@ -324,7 +232,7 @@ onBeforeUnmount(() => {
   <section class="monitor-section">
     <div class="section-title">
       <div>
-        <h2>五个 Job 执行情况</h2>
+        <h2>Space Job 执行情况</h2>
         <p>点击卡片会把下面控制台切换到该 Job 的最近一次运行。</p>
       </div>
     </div>
@@ -466,101 +374,6 @@ onBeforeUnmount(() => {
     </section>
   </section>
 
-  <section class="monitor-section">
-    <div class="section-title">
-      <div>
-        <h2>推送凭证额度使用情况</h2>
-        <p>这里只查询额度并回写查询结果，不执行远端剔除、不删除本地成员。</p>
-      </div>
-    </div>
-    <div class="usage-summary-grid">
-      <article class="panel summary-card"><span>已推送凭证</span><strong>{{ usageSummary.total ?? 0 }}</strong></article>
-      <article class="panel summary-card"><span>低于 80%</span><strong>{{ usageSummary.below_80 ?? 0 }}</strong></article>
-      <article class="panel summary-card warning"><span>80% - 94%</span><strong>{{ usageSummary.between_80_94 ?? 0 }}</strong></article>
-      <article class="panel summary-card danger"><span>>= 95%</span><strong>{{ usageSummary.gte_95 ?? 0 }}</strong></article>
-      <article class="panel summary-card"><span>查询失败</span><strong>{{ usageSummary.check_failed ?? 0 }}</strong></article>
-    </div>
-
-    <section class="panel usage-actions">
-      <div class="filter-grid">
-        <label class="filter-field">
-          <span>渠道</span>
-          <select v-model="usageChannelId" class="select">
-            <option value="">全部渠道</option>
-            <option v-for="channel in channels" :key="String(channel.id)" :value="String(channel.id)">
-              {{ channel.provider_type }} / {{ channel.name }}
-            </option>
-          </select>
-        </label>
-        <label class="filter-field">
-          <span>下游类型</span>
-          <select v-model="usageProvider" class="select">
-            <option value="">全部</option>
-            <option value="cpa">cpa</option>
-            <option value="sub2api">sub2api</option>
-          </select>
-        </label>
-        <label class="filter-field">
-          <span>额度状态</span>
-          <select v-model="usageStatus" class="select">
-            <option value="">全部</option>
-            <option value="unknown">unknown</option>
-            <option value="active">active</option>
-            <option value="near_limit">near_limit</option>
-            <option value="check_failed">check_failed</option>
-            <option value="used">used</option>
-          </select>
-        </label>
-        <label class="filter-field">
-          <span>关键词</span>
-          <input v-model="usageQuery" class="input" placeholder="邮箱 / 空间 / 凭证 / 错误码" />
-        </label>
-        <label class="filter-field compact">
-          <span>展示数量</span>
-          <input v-model.number="usageLimit" class="input" type="number" min="1" max="2000" />
-        </label>
-        <div class="filter-actions">
-          <button class="btn" :disabled="usageLoading" @click="loadUsage">
-            {{ usageLoading ? "筛选中..." : "筛选" }}
-          </button>
-        </div>
-      </div>
-      <div class="probe-row">
-        <label class="inline-control">
-          <span>查询数量</span>
-          <input v-model.number="probeLimit" class="input small-input" type="number" min="1" max="1000" />
-        </label>
-        <label class="inline-control">
-          <span>并发</span>
-          <input v-model.number="probeConcurrency" class="input small-input" type="number" min="1" max="100" />
-        </label>
-        <button class="btn" :disabled="probing" @click="probeUsage(true)">
-          查询选中额度（{{ selectedUsageRows.length }}）
-        </button>
-        <button class="btn primary" :disabled="probing" @click="probeUsage(false)">
-          {{ probing ? "查询中..." : "查询当前筛选额度" }}
-        </button>
-      </div>
-    </section>
-
-    <DataTable
-      :columns="usageColumns"
-      :rows="usageItems"
-      :loading="usageLoading"
-      :error="usageError"
-      selectable
-      empty-text="暂无已推送凭证。"
-      @selection-change="(rows) => (selectedUsageRows = rows as Row[])"
-      @refresh="loadUsage"
-    >
-      <template #actions="{ row }">
-        <div class="usage-cell" :class="usageTone(row.usage_percent)">
-          <span>{{ row.usage_percent ?? 0 }}%</span>
-          <i :style="{ width: `${Number(row.usage_percent || 0)}%` }"></i>
-        </div>
-      </template>
-    </DataTable>
-  </section>
 </template>
 
 <style scoped>

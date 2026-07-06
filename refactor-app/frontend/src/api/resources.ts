@@ -12,6 +12,11 @@ export type AccountWorkJobResult = JobCreated & {
   cancelled: number;
 };
 
+async function listItems(path: string): Promise<Row[]> {
+  const result = await getJson<Row[] | { items: Row[] }>(path);
+  return Array.isArray(result) ? result : result.items;
+}
+
 export const resourcesApi = {
   accounts: () => getJson<Row[]>("/user-accounts"),
   backfillSessionRt: (body: Record<string, unknown>) =>
@@ -27,61 +32,32 @@ export const resourcesApi = {
       `/user-accounts/${encodeURIComponent(id)}`,
     ),
   importTeamAdminSession: (body: Record<string, unknown>) =>
-    postJson<{ team_admin_session_id: string; admin_email: string; workspace_count: number; workspaces: Row[] }>(
+    postJson<{ team_admin_session_id: string; admin_email: string; space_count: number; spaces: Row[] }>(
       "/team-admin-sessions/import",
       body,
     ),
   teamAdminSessions: () => getJson<Row[]>("/team-admin-sessions"),
   deleteTeamAdminSession: (id: string) =>
     deleteJson<Row>(`/team-admin-sessions/${encodeURIComponent(id)}`),
-  workspaces: () => getJson<Row[]>("/team-workspaces"),
-  importWorkspace: (body: Record<string, unknown>) =>
-    postJson<{ team_workspace_id: string }>("/team-workspaces/import", body),
-  removeWorkspaceMembers: (id: string, body: Record<string, unknown>) =>
-    postJson<Row>(`/team-workspaces/${encodeURIComponent(id)}/remove-members`, body),
-  revokeWorkspaceInvite: (id: string, body: Record<string, unknown>) =>
-    postJson<Row>(`/team-workspaces/${encodeURIComponent(id)}/revoke-invite`, body),
+  spaces: () => listItems("/spaces"),
+  createBusinessAccessTokenCredentials: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>(
+      "/space-credentials/business-access-token-job",
+      body,
+    ),
   memberships: (params: Record<string, string> = {}) => {
     const query = new URLSearchParams(
       Object.entries(params).filter(([, value]) => value.trim() !== ""),
     ).toString();
     return getJson<Row[]>(`/memberships${query ? `?${query}` : ""}`);
   },
-  membershipProbe: (body: Record<string, unknown>) =>
-    postJson<JobCreated>("/memberships/probe-job", body),
-  membershipInvite: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/memberships/invite-member-job", body),
-  membershipAcceptInvite: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/memberships/accept-invite-job", body),
-  membershipSessionOtpPrepare: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/memberships/session-otp-prepare-job", body),
-  membershipSessionOtpSubmit: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/memberships/session-otp-submit-job", body),
-  syncMembershipRemoteState: (body: Record<string, unknown>) =>
-    postJson<Row>("/memberships/sync-remote-state", body),
-  workspaceFillAutomation: (body: Record<string, unknown>) =>
-    postJson<Row>("/automation/workspace-fill-job", body),
-  batches: () => getJson<Row[]>("/workspace-join-batches"),
-  batch: (id: string) => getJson<Row>(`/workspace-join-batches/${encodeURIComponent(id)}`),
-  batchItems: (id: string) =>
-    getJson<Row[]>(`/workspace-join-batches/${encodeURIComponent(id)}/items`),
-  createBatch: (body: Record<string, unknown>) =>
-    postJson<JobCreated>("/workspace-join-batches", body),
-  createBatchFromCredentials: (body: Record<string, unknown>) =>
-    postJson<{ batch_id: string }>("/workspace-join-batches/from-credentials", body),
-  activateBatch: (id: string) =>
-    postJson<JobCreated>(`/workspace-join-batches/${encodeURIComponent(id)}/activate`, {}),
-  credentials: () => getJson<Row[]>("/codex-credentials"),
-  buildCredentials: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/codex-credentials/build-job", body),
-  heartbeatCredential: (id: string) =>
-    postJson<JobCreated>(`/codex-credentials/${encodeURIComponent(id)}/heartbeat-job`, {}),
-  heartbeatCredentials: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/codex-credentials/heartbeat-job", body),
+  credentials: () => listItems("/space-credentials"),
+  buildBusinessAccessTokenCredentials: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/space-credentials/business-access-token-job", body),
   pushCredentials: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/codex-credentials/push-job", body),
+    postJson<AccountWorkJobResult>("/space-credentials/push-job", body),
   pushPendingCredentials: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/codex-credentials/push-pending-job", body),
+    postJson<AccountWorkJobResult>("/space-credentials/push-pending-job", body),
   proxies: () => getJson<Row[]>("/proxies"),
   refreshProxies: (body: Record<string, unknown>) =>
     postJson<JobCreated>("/proxies/refresh-webshare-job", body),
@@ -103,14 +79,23 @@ export const resourcesApi = {
   patchDownstreamChannel: (id: string, body: Record<string, unknown>) =>
     patchJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`, body),
   addDownstreamChannelBalance: (id: string, body: Record<string, unknown>) =>
-    postJson<Row>(`/downstream-channels/${encodeURIComponent(id)}/add-balance`, body),
+    postJson<Row>(
+      `/downstream-channels/${encodeURIComponent(id)}/credential-type-balances/${encodeURIComponent(String(body.credential_type || ""))}/add-balance`,
+      body,
+    ),
+  patchDownstreamChannelCredentialTypeBalance: (
+    id: string,
+    credentialType: string,
+    body: Record<string, unknown>,
+  ) =>
+    patchJson<Row>(
+      `/downstream-channels/${encodeURIComponent(id)}/credential-type-balances/${encodeURIComponent(credentialType)}`,
+      body,
+    ),
   deleteDownstreamChannel: (id: string) =>
     deleteJson<Row>(`/downstream-channels/${encodeURIComponent(id)}`),
-  downstream: () => getJson<Row[]>("/downstream-push-records"),
-  repushDownstreamRecords: (body: Record<string, unknown>) =>
-    postJson<Row>("/downstream-push-records/repush", body),
-  downstreamUsageSweep: (body: Record<string, unknown>) =>
-    postJson<Row>("/automation/downstream-usage-sweep-job", body),
+  spaceRecycleSweep: (body: Record<string, unknown>) =>
+    postJson<Row>("/spaces/recycle-sweep-job", body),
   automationSchedules: () => getJson<Row[]>("/automation/schedules"),
   patchAutomationSchedule: (id: string, body: Record<string, unknown>) =>
     patchJson<Row>(`/automation/schedules/${encodeURIComponent(id)}`, body),
@@ -137,19 +122,4 @@ export const resourcesApi = {
       `/automation/monitor/job-console${query ? `?${query}` : ""}`,
     );
   },
-  automationMonitorDownstreamUsage: (params: Record<string, string | number> = {}) => {
-    const query = new URLSearchParams(
-      Object.entries(params)
-        .filter(([, value]) => String(value).trim() !== "")
-        .map(([key, value]) => [key, String(value)]),
-    ).toString();
-    return getJson<{ summary: Row; items: Row[] }>(
-      `/automation/monitor/downstream-usage${query ? `?${query}` : ""}`,
-    );
-  },
-  automationMonitorDownstreamUsageProbe: (body: Record<string, unknown>) =>
-    postJson<{ checked: number; succeeded: number; failed: number; items: Row[] }>(
-      "/automation/monitor/downstream-usage-probe",
-      body,
-    ),
 };

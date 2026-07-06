@@ -10,22 +10,7 @@ from refactor_app.application.workflows.account_auth import (
     BackfillSessionRtWorkflow,
     BackfillSessionWorkflow,
 )
-from refactor_app.application.workflows.batches import (
-    ActivateWorkspaceJoinBatchWorkflow,
-    JoinWorkspaceBatchInput,
-    JoinWorkspaceBatchWorkflow,
-    ProcessWorkspaceJoinBatchItemInput,
-    ProcessWorkspaceJoinBatchItemWorkflow,
-)
-from refactor_app.application.workflows.codex_credentials import (
-    BuildCodexCredentialWorkInput,
-    BuildCodexCredentialWorkItemWorkflow,
-)
-from refactor_app.application.workflows.direct_push import (
-    PushCodexCredentialDirectInput,
-    PushCodexCredentialDirectWorkflow,
-)
-from refactor_app.application.workflows.heartbeat import HeartbeatCodexCredentialWorkflow
+from refactor_app.application.workflows.downstream_provider import provider_from_channel
 from refactor_app.application.workflows.mail import (
     AllocateMailLeaseWorkflow,
     MarkMailLeaseFailedWorkflow,
@@ -33,25 +18,25 @@ from refactor_app.application.workflows.mail import (
     PollMailOtpWorkflow,
     ReleaseMailLeaseWorkflow,
 )
-from refactor_app.application.workflows.membership import (
-    AcceptWorkspaceInviteWorkflow,
-    InviteWorkspaceMemberWorkflow,
-    MembershipProbeWorkflow,
-)
 from refactor_app.application.workflows.proxy import (
     BindAccountProxyWorkflow,
     HealthcheckProxyWorkflow,
     RefreshWebsharePoolWorkflow,
 )
-from refactor_app.application.workflows.session_otp import (
-    PrepareSessionOtpWorkflow,
-    SubmitSessionOtpWorkflow,
+from refactor_app.application.workflows.space_authorization import (
+    CreateBusinessAccessTokenCredentialInput,
+    CreateBusinessAccessTokenCredentialWorkflow,
 )
-from refactor_app.application.workflows.workspace import (
-    ImportTeamWorkspaceInput,
-    ImportTeamWorkspaceWorkflow,
+from refactor_app.application.workflows.space_direct_push import (
+    SpaceDirectPushInput,
+    SpaceDirectPushWorkflow,
+)
+from refactor_app.application.workflows.space_recycle import (
+    SpaceRecycleSweepInput,
+    SpaceRecycleSweepWorkflow,
 )
 from refactor_app.config.settings import Settings
+from refactor_app.infrastructure.db.models import DownstreamChannelModel
 from refactor_app.plugins.mail_external_api.client import ExternalMailApiClientConfig
 from refactor_app.plugins.mail_external_api.plugin import ExternalMailApiPlugin
 from refactor_app.plugins.openai_chatgpt.client import OpenAIChatGPTClientConfig
@@ -69,14 +54,6 @@ def register_core_handlers(
     settings: Settings,
 ) -> None:
     runner.register(
-        "team_workspace.import",
-        lambda _session, input_json: {
-            "team_workspace_id": ImportTeamWorkspaceWorkflow(
-                session_factory=session_factory
-            ).run(ImportTeamWorkspaceInput(**input_json))
-        },
-    )
-    runner.register(
         "proxy.refresh_webshare_pool",
         lambda _session, input_json: {
             "proxy_count": RefreshWebsharePoolWorkflow(
@@ -84,7 +61,9 @@ def register_core_handlers(
                 proxy_provider=_webshare_plugin(
                     settings,
                     download_url=str(input_json.get("download_url") or ""),
+                    proxy_type=str(input_json.get("proxy_type") or "proxyserver"),
                 ),
+                proxy_type=str(input_json.get("proxy_type") or "proxyserver"),
             ).run()
         },
     )
@@ -163,77 +142,15 @@ def register_core_handlers(
         },
     )
     runner.register(
-        "membership.probe",
-        lambda _session, input_json: {
-            "membership": MembershipProbeWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            )
-            .run(membership_id=str(input_json["membership_id"]))
-            .__dict__
-        },
-    )
-    runner.register(
-        "membership.invite_member",
-        lambda _session, input_json: {
-            "invite": InviteWorkspaceMemberWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            ).run(
-                inviter_membership_id=str(input_json["inviter_membership_id"]),
-                email=str(input_json["email"]),
-            )
-        },
-    )
-    runner.register(
-        "membership.invite_member.bulk",
+        "space.business_access_token.create.bulk",
         lambda _session, input_json: {
             "work_count": len(input_json.get("user_account_ids") or []),
         },
     )
     runner.register(
-        "workspace_join_batch.run",
+        "space_credential.push.bulk",
         lambda _session, input_json: {
-            "batch_id": JoinWorkspaceBatchWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-                mail_provider=_mail_plugin(settings),
-            ).run(JoinWorkspaceBatchInput(**input_json))
-        },
-    )
-    runner.register(
-        "workspace_join_batch.activate",
-        lambda _session, input_json: {
-            "batch_id": ActivateWorkspaceJoinBatchWorkflow(
-                session_factory=session_factory
-            ).run(batch_id=str(input_json["batch_id"]))
-        },
-    )
-    runner.register(
-        "codex_credential.heartbeat",
-        lambda _session, input_json: {
-            "codex_credential_id": HeartbeatCodexCredentialWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            ).run(codex_credential_id=str(input_json["codex_credential_id"]))
-        },
-    )
-    runner.register(
-        "codex_credential.build.bulk",
-        lambda _session, input_json: {
-            "work_count": len(input_json.get("user_account_ids") or []),
-        },
-    )
-    runner.register(
-        "codex_credential.heartbeat.bulk",
-        lambda _session, input_json: {
-            "work_count": len(input_json.get("codex_credential_ids") or []),
-        },
-    )
-    runner.register(
-        "codex_credential.push.bulk",
-        lambda _session, input_json: {
-            "work_count": len(input_json.get("codex_credential_ids") or []),
+            "work_count": len(input_json.get("space_credential_ids") or []),
         },
     )
     runner.register(
@@ -255,108 +172,53 @@ def register_core_handlers(
         },
     )
     runner.register(
-        "session_otp.prepare.bulk",
-        lambda _session, input_json: {
-            "work_count": len(input_json.get("membership_ids") or []),
-        },
-    )
-    runner.register(
-        "session_otp.submit.bulk",
-        lambda _session, input_json: {
-            "work_count": len(input_json.get("membership_ids") or []),
-        },
+        "space.recycle.sweep",
+        lambda _session, input_json: SpaceRecycleSweepWorkflow(
+            session_factory=session_factory,
+        )
+        .run(
+            SpaceRecycleSweepInput(
+                limit=int(input_json.get("limit") or 100),
+            )
+        )
+        .__dict__,
     )
     runner.register_work(
-        "workspace_join_batch.item",
+        "space.business_access_token.create.account",
         lambda _session, input_json: {
-            "batch_item_id": ProcessWorkspaceJoinBatchItemWorkflow(
+            "space_credential_id": CreateBusinessAccessTokenCredentialWorkflow(
                 session_factory=session_factory,
                 openai_provider=_openai_plugin(settings),
-                mail_provider=_mail_plugin(settings),
             ).run(
-                ProcessWorkspaceJoinBatchItemInput(
-                    batch_id=str(input_json["batch_id"]),
-                    batch_item_id=str(input_json["batch_item_id"]),
+                CreateBusinessAccessTokenCredentialInput(
                     user_account_id=str(input_json["user_account_id"]),
-                    team_workspace_id=str(input_json["team_workspace_id"]),
-                    codex_client_id=str(input_json["codex_client_id"]),
+                    external_space_id=str(input_json["external_space_id"]),
+                    session_access_token=str(input_json["session_access_token"]),
+                    credential_name=str(input_json["credential_name"]),
+                    cookie_header=str(input_json.get("cookie_header") or ""),
+                    space_name=str(input_json.get("space_name") or ""),
+                    owner_user_account_id=str(input_json.get("owner_user_account_id") or ""),
+                    source_admin_session_id=str(input_json.get("source_admin_session_id") or ""),
+                    proxy_url=str(input_json.get("proxy_url") or ""),
                 )
             )
         },
     )
     runner.register_work(
-        "codex_credential.build.account",
+        "space_credential.push.account",
         lambda _session, input_json: {
-            "codex_credential_id": BuildCodexCredentialWorkItemWorkflow(
+            "space_credential_id": SpaceDirectPushWorkflow(
                 session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-                mail_provider=_mail_plugin(settings),
+                downstream_provider=_downstream_plugin_from_channel_id(
+                    session_factory,
+                    str(input_json["downstream_channel_id"]),
+                ),
             ).run(
-                BuildCodexCredentialWorkInput(
-                    user_account_id=str(input_json["user_account_id"]),
-                    team_workspace_id=str(input_json["team_workspace_id"]),
-                    codex_client_id=str(input_json["codex_client_id"]),
-                    force_reauthorize=bool(input_json.get("force_reauthorize")),
-                )
-            )
-        },
-    )
-    runner.register_work(
-        "codex_credential.heartbeat.account",
-        lambda _session, input_json: {
-            "codex_credential_id": HeartbeatCodexCredentialWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            ).run(codex_credential_id=str(input_json["codex_credential_id"]))
-        },
-    )
-    runner.register_work(
-        "codex_credential.push.account",
-        lambda _session, input_json: {
-            "downstream_push_record_id": PushCodexCredentialDirectWorkflow(
-                session_factory=session_factory,
-            ).run(
-                PushCodexCredentialDirectInput(
-                    codex_credential_id=str(input_json["codex_credential_id"]),
+                SpaceDirectPushInput(
+                    space_credential_id=str(input_json["space_credential_id"]),
                     downstream_channel_id=str(input_json["downstream_channel_id"]),
-                    request_endpoint=str(input_json.get("request_endpoint") or ""),
+                    is_retry=bool(input_json.get("is_retry") or False),
                 )
-            )
-        },
-    )
-    runner.register_work(
-        "membership.invite_member.account",
-        lambda _session, input_json: {
-            "invite": InviteWorkspaceMemberWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            ).run_admin_invite(
-                team_workspace_id=str(input_json["team_workspace_id"]),
-                user_account_id=str(input_json["user_account_id"]),
-                team_admin_session_id=str(input_json.get("team_admin_session_id") or ""),
-                barrier_key=str(input_json.get("_barrier_key") or ""),
-                barrier_group=str(input_json.get("_barrier_group") or ""),
-                barrier_expected=int(input_json.get("_barrier_expected") or 0),
-                barrier_timeout_s=float(input_json.get("_barrier_timeout_s") or 30),
-                run_id=str(input_json.get("_run_id") or ""),
-                work_id=str(input_json.get("_work_id") or ""),
-            )
-        },
-    )
-    runner.register_work(
-        "membership.accept_invite.account",
-        lambda _session, input_json: {
-            "accept": AcceptWorkspaceInviteWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            ).run(
-                membership_id=str(input_json["membership_id"]),
-                barrier_key=str(input_json.get("_barrier_key") or ""),
-                barrier_group=str(input_json.get("_barrier_group") or ""),
-                barrier_expected=int(input_json.get("_barrier_expected") or 0),
-                barrier_timeout_s=float(input_json.get("_barrier_timeout_s") or 30),
-                run_id=str(input_json.get("_run_id") or ""),
-                work_id=str(input_json.get("_work_id") or ""),
             )
         },
     )
@@ -396,42 +258,20 @@ def register_core_handlers(
             )
         },
     )
-    runner.register_work(
-        "session_otp.prepare.account",
-        lambda _session, input_json: {
-            "user_account_id": PrepareSessionOtpWorkflow(
-                session_factory=session_factory,
-                mail_provider=_mail_plugin(settings),
-            ).run(
-                membership_id=str(input_json["membership_id"]),
-                run_id=str(input_json.get("_run_id") or ""),
-            )
-        },
-    )
-    runner.register_work(
-        "session_otp.submit.account",
-        lambda _session, input_json: {
-            "user_account_id": SubmitSessionOtpWorkflow(
-                session_factory=session_factory,
-                mail_provider=_mail_plugin(settings),
-            ).run(
-                membership_id=str(input_json["membership_id"]),
-                barrier_key=str(input_json.get("_barrier_key") or ""),
-                barrier_group=str(input_json.get("_barrier_group") or ""),
-                barrier_expected=int(input_json.get("_barrier_expected") or 0),
-                barrier_timeout_s=float(input_json.get("_barrier_timeout_s") or 120),
-                run_id=str(input_json.get("_run_id") or ""),
-            )
-        },
-    )
 
 
-def _webshare_plugin(settings: Settings, *, download_url: str = "") -> WebshareProxyPlugin:
+def _webshare_plugin(
+    settings: Settings,
+    *,
+    download_url: str = "",
+    proxy_type: str = "proxyserver",
+) -> WebshareProxyPlugin:
     return WebshareProxyPlugin.from_config(
         WebshareClientConfig(
             api_token=settings.webshare_api_token,
             base_url=settings.webshare_base_url,
             download_url=download_url or settings.webshare_download_url,
+            proxy_type=proxy_type,
         )
     )
 
@@ -454,3 +294,14 @@ def _mail_plugin(settings: Settings) -> ExternalMailApiPlugin:
             provider_name=settings.external_mail_provider_name,
         )
     )
+
+
+def _downstream_plugin_from_channel_id(
+    session_factory: SessionFactory,
+    downstream_channel_id: str,
+):
+    with session_factory() as session:
+        channel = session.get(DownstreamChannelModel, downstream_channel_id)
+        if channel is None:
+            raise RuntimeError(f"downstream channel not found: {downstream_channel_id}")
+        return provider_from_channel(channel)

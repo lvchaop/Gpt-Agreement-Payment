@@ -1,27 +1,38 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from pytest import MonkeyPatch
+from sqlalchemy import delete
 
 from refactor_app.api.app import create_app
 from refactor_app.config.settings import Settings
 from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
-from refactor_app.infrastructure.db.models import JobModel, TeamWorkspaceModel
+from refactor_app.infrastructure.db.models import JobModel
 
 
-def test_create_app_registers_p8_routes() -> None:
+def _disable_web_login(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("REFACTOR_APP_WEB_LOGIN_PASSWORD", "")
+
+
+def test_create_app_registers_p8_routes(monkeypatch: MonkeyPatch) -> None:
+    _disable_web_login(monkeypatch)
     app = create_app()
 
-    paths = {route.path for route in app.routes}
+    paths = set(app.openapi()["paths"])
 
     assert app.title == "refactor-app"
     assert "/health" in paths
     assert "/jobs" in paths
     assert "/user-accounts" in paths
-    assert "/team-workspaces" in paths
-    assert "/workspace-join-batches" in paths
-    assert "/workspace-join-batches/{batch_id}/items" in paths
-    assert "/memberships/invite-member-job" in paths
+    assert "/spaces" in paths
+    assert "/space-credentials" in paths
+    assert "/space-credentials/business-access-token-job" in paths
+    assert "/space-credentials/push-job" in paths
+    assert "/spaces/recycle-sweep-job" in paths
+    assert "/team-workspaces" not in paths
+    assert "/codex-credentials" not in paths
+    assert "/workspace-join-batches" not in paths
+    assert "/downstream-push-records" not in paths
     assert "/proxies" in paths
     assert "/mail/allocate-job" in paths
     assert "/mail/poll-otp-job" in paths
@@ -31,17 +42,19 @@ def test_create_app_registers_p8_routes() -> None:
     assert "/ops" in paths
 
 
-def test_ops_ui_serves_minimal_operations_page() -> None:
+def test_ops_ui_serves_minimal_operations_page(monkeypatch: MonkeyPatch) -> None:
+    _disable_web_login(monkeypatch)
     client = TestClient(create_app())
 
     response = client.get("/ops")
 
     assert response.status_code == 200
-    assert "Refactor Ops Console" in response.text
-    assert "/ops/assets/" in response.text or "refactor-app 运维台" in response.text
+    assert '<div id="app"></div>' in response.text
+    assert "/ops/assets/" in response.text
 
 
-def test_create_job_api_enqueues_job() -> None:
+def test_create_job_api_enqueues_job(monkeypatch: MonkeyPatch) -> None:
+    _disable_web_login(monkeypatch)
     client = TestClient(create_app())
     response = client.post(
         "/jobs",
@@ -62,42 +75,10 @@ def test_create_job_api_enqueues_job() -> None:
         session.commit()
 
 
-def test_import_team_workspace_api_upserts_by_provider_external_id() -> None:
+def test_legacy_team_workspace_import_route_is_not_exposed(monkeypatch: MonkeyPatch) -> None:
+    _disable_web_login(monkeypatch)
     client = TestClient(create_app())
-    payload = {
-        "provider": "openai_chatgpt",
-        "external_workspace_id": "api-upsert-workspace",
-        "name": "Initial Workspace",
-        "plan_type": "team",
-        "seat_limit": 10,
-        "workspace_status": "active",
-    }
 
-    first = client.post("/team-workspaces/import", json=payload)
-    second = client.post(
-        "/team-workspaces/import",
-        json={**payload, "name": "Updated Workspace", "seat_limit": 20},
-    )
+    response = client.post("/team-workspaces/import", json={})
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json()["team_workspace_id"] == second.json()["team_workspace_id"]
-
-    settings = Settings()
-    session_factory = make_session_factory(make_engine(settings))
-    with session_factory() as session:
-        rows = session.scalars(
-            select(TeamWorkspaceModel).where(
-                TeamWorkspaceModel.provider == "openai_chatgpt",
-                TeamWorkspaceModel.external_workspace_id == "api-upsert-workspace",
-            )
-        ).all()
-        assert len(rows) == 1
-        assert rows[0].name == "Updated Workspace"
-        assert rows[0].seat_limit == 20
-        session.execute(
-            delete(TeamWorkspaceModel).where(
-                TeamWorkspaceModel.external_workspace_id == "api-upsert-workspace"
-            )
-        )
-        session.commit()
+    assert response.status_code == 404

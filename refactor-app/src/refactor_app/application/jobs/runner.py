@@ -9,13 +9,12 @@ from sqlalchemy.orm import Session
 
 from refactor_app.application.jobs.queue import JobQueue, WorkQueue
 from refactor_app.infrastructure.db.models import (
-    CodexOAuthCredentialModel,
     JobRunModel,
-    MembershipModel,
-    TeamWorkspaceModel,
+    SpaceCredentialModel,
+    SpaceMembershipModel,
+    SpaceModel,
     UserAccountModel,
     WorkItemModel,
-    WorkspaceJoinBatchItemModel,
 )
 from refactor_app.infrastructure.logging.event_writer import EventWriter
 
@@ -240,40 +239,36 @@ def _fail_work(
 
 def _work_context(session: Session, input_json: dict) -> dict:
     user_account_id = str(input_json.get("user_account_id") or "")
-    team_workspace_id = str(input_json.get("team_workspace_id") or "")
-    membership_id = str(input_json.get("membership_id") or "")
-    codex_credential_id = str(input_json.get("codex_credential_id") or "")
-    batch_item_id = str(input_json.get("batch_item_id") or "")
+    space_id = str(input_json.get("space_id") or "")
+    space_membership_id = str(input_json.get("space_membership_id") or "")
+    space_credential_id = str(input_json.get("space_credential_id") or "")
+    downstream_channel_id = str(input_json.get("downstream_channel_id") or "")
 
-    if membership_id:
-        membership = session.get(MembershipModel, membership_id)
+    if space_membership_id:
+        membership = session.get(SpaceMembershipModel, space_membership_id)
         if membership is not None:
             user_account_id = user_account_id or membership.user_account_id
-            team_workspace_id = team_workspace_id or membership.team_workspace_id
+            space_id = space_id or membership.space_id
 
-    if codex_credential_id:
-        credential = session.get(CodexOAuthCredentialModel, codex_credential_id)
+    if space_credential_id:
+        credential = session.get(SpaceCredentialModel, space_credential_id)
         if credential is not None:
             user_account_id = user_account_id or credential.user_account_id
-            team_workspace_id = team_workspace_id or credential.team_workspace_id
-
-    if batch_item_id:
-        batch_item = session.get(WorkspaceJoinBatchItemModel, batch_item_id)
-        if batch_item is not None:
-            user_account_id = user_account_id or batch_item.user_account_id
-            team_workspace_id = team_workspace_id or batch_item.team_workspace_id
-            membership_id = membership_id or str(batch_item.membership_id or "")
-            codex_credential_id = codex_credential_id or str(batch_item.codex_credential_id or "")
+            space_id = space_id or credential.space_id
+            space_membership_id = space_membership_id or str(
+                credential.space_membership_id or ""
+            )
 
     account = session.get(UserAccountModel, user_account_id) if user_account_id else None
-    workspace = session.get(TeamWorkspaceModel, team_workspace_id) if team_workspace_id else None
+    space = session.get(SpaceModel, space_id) if space_id else None
     return {
         "user_account_id": user_account_id,
         "email": account.email if account is not None else "",
-        "team_workspace_id": team_workspace_id,
-        "external_workspace_id": workspace.external_workspace_id if workspace is not None else "",
-        "workspace_name": workspace.name if workspace is not None else "",
-        "membership_id": membership_id,
-        "codex_credential_id": codex_credential_id,
-        "batch_item_id": batch_item_id,
+        "space_id": space_id,
+        "external_space_id": space.external_space_id if space is not None else "",
+        "space_name": space.name if space is not None else "",
+        "credential_type": space.credential_type if space is not None else "",
+        "space_membership_id": space_membership_id,
+        "space_credential_id": space_credential_id,
+        "downstream_channel_id": downstream_channel_id,
     }

@@ -21,76 +21,30 @@ class UserAccountModel(Base):
     phone_dial_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
     phone_country: Mapped[str] = mapped_column(Text, nullable=False, default="")
     openai_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    password: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    session_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    auth_cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    device_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    csrf_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    session_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    last_session_refresh_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_login_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_login_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     account_status: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
         CheckConstraint("account_status IN ('active', 'invalid')"),
+        CheckConstraint(
+            "session_status IN "
+            "('unknown', 'active', 'expired', 'invalid', 'refreshing', 'dead', 'error')"
+        ),
         Index("idx_user_accounts_email", "email"),
         Index("idx_user_accounts_phone_number", "phone_number"),
         Index("idx_user_accounts_openai_user_id", "openai_user_id"),
         Index("idx_user_accounts_account_status", "account_status"),
-    )
-
-
-class TeamWorkspaceModel(Base):
-    __tablename__ = "team_workspaces"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    provider: Mapped[str] = mapped_column(Text, nullable=False)
-    external_workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
-    name: Mapped[str] = mapped_column(Text, nullable=False)
-    plan_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    seat_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    seats_in_use: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    seats_entitled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    workspace_status: Mapped[str] = mapped_column(Text, nullable=False)
-    source_admin_session_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    raw_workspace_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    last_subscription_sync_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("provider = 'openai_chatgpt'"),
-        CheckConstraint("seat_limit >= 0"),
-        CheckConstraint("seats_in_use >= 0"),
-        CheckConstraint("seats_entitled >= 0"),
-        CheckConstraint(
-            "workspace_status IN ('unknown', 'active', 'disabled', 'expired', 'error')"
-        ),
-        UniqueConstraint("provider", "external_workspace_id"),
-        Index("idx_team_workspaces_status", "workspace_status"),
-    )
-
-
-class WorkspaceAutomationStateModel(Base):
-    __tablename__ = "workspace_automation_states"
-
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), primary_key=True
-    )
-    automation_status: Mapped[str] = mapped_column(Text, nullable=False, default="paused")
-    invite_status: Mapped[str] = mapped_column(Text, nullable=False, default="not_sent")
-    invite_job_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_invite_finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_sync_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_authorization_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_push_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_usage_cleanup_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    pause_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("automation_status IN ('active', 'paused', 'stopped', 'error')"),
-        CheckConstraint("invite_status IN ('not_sent', 'sent')"),
-        Index("idx_workspace_automation_states_status", "automation_status", "invite_status"),
-        Index("idx_workspace_automation_states_last_invite", "last_invite_finished_at"),
     )
 
 
@@ -134,44 +88,361 @@ class TeamAdminAccountCheckModel(Base):
     )
 
 
-class UserAccountAuthModel(Base):
-    __tablename__ = "user_account_auth"
+class SpaceModel(Base):
+    __tablename__ = "spaces"
 
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    provider: Mapped[str] = mapped_column(Text, nullable=False, default="openai_chatgpt")
+    external_space_id: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_user_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    space_type: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_mode: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_type: Mapped[str] = mapped_column(Text, nullable=False)
+    plan_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    seat_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seats_in_use: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seats_entitled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    space_status: Mapped[str] = mapped_column(Text, nullable=False)
+    source_admin_session_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    raw_space_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    last_subscription_sync_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("provider = 'openai_chatgpt'"),
+        CheckConstraint("space_type IN ('personal', 'business')"),
+        CheckConstraint("auth_mode IN ('codex_oauth', 'backend_access_token')"),
+        CheckConstraint(
+            "credential_type IN ('personal_account', 'team_5h_weekly', 'team_monthly')"
+        ),
+        CheckConstraint("seat_limit >= 0"),
+        CheckConstraint("seats_in_use >= 0"),
+        CheckConstraint("seats_entitled >= 0"),
+        CheckConstraint("space_status IN ('unknown', 'active', 'disabled', 'expired', 'error')"),
+        UniqueConstraint("provider", "external_space_id"),
+        Index("idx_spaces_type_status", "space_type", "space_status"),
+        Index("idx_spaces_credential_type", "credential_type"),
+        Index("idx_spaces_owner_user_account_id", "owner_user_account_id"),
+    )
+
+
+class SpaceCredentialModel(Base):
+    __tablename__ = "space_credentials"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
     user_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), primary_key=True
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
     )
-    password: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    session_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    space_membership_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("space_memberships.id", ondelete="SET NULL")
+    )
+    external_credential_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    credential_status: Mapped[str] = mapped_column(Text, nullable=False, default="missing")
     access_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    id_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     refresh_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    auth_cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    personal_chatgpt_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    personal_chatgpt_account_discovered_at: Mapped[datetime | None] = mapped_column(
-        nullable=True
+    codex_client_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    token_chatgpt_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_authorized_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_probe_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    failure_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    failure_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    raw_credential_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("space_id", "user_account_id"),
+        CheckConstraint(
+            "credential_status IN ('missing', 'active', 'expired', 'invalid', 'revoked', 'error')"
+        ),
+        Index("idx_space_credentials_space_id", "space_id"),
+        Index("idx_space_credentials_user_account_id", "user_account_id"),
+        Index("idx_space_credentials_status", "credential_status"),
+        Index("idx_space_credentials_external_credential_id", "external_credential_id"),
     )
-    device_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    csrf_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    token_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    scope: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    refresh_token_status: Mapped[str] = mapped_column(Text, nullable=False)
-    session_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
-    last_refresh_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_session_refresh_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_auth_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_auth_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class SpaceMembershipModel(Base):
+    __tablename__ = "space_memberships"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_account_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    membership_status: Mapped[str] = mapped_column(Text, nullable=False)
+    invite_permission: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    user_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    invite_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seat_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    can_invite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    remote_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_account_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_seat_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_role: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    remote_synced_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_probe_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    failure_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    failure_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("space_id", "user_account_id"),
+        CheckConstraint(
+            "membership_status IN "
+            "('unknown', 'invited', 'accepted', 'active', 'left', 'disabled', 'banned', 'failed')"
+        ),
+        CheckConstraint("invite_permission IN ('unknown', 'ok', 'no_permission', 'error')"),
+        CheckConstraint("user_count >= 0"),
+        CheckConstraint("invite_count >= 0"),
+        CheckConstraint("seat_status IN ('unknown', 'available', 'full', 'error')"),
+        Index("idx_space_memberships_space_id", "space_id"),
+        Index("idx_space_memberships_user_account_id", "user_account_id"),
+        Index("idx_space_memberships_status", "membership_status"),
+        Index("idx_space_memberships_remote_user_id", "remote_user_id"),
+    )
+
+
+class DownstreamChannelCredentialTypeBalanceModel(Base):
+    __tablename__ = "downstream_channel_credential_type_balances"
+
+    downstream_channel_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("downstream_channels.id", ondelete="CASCADE"), primary_key=True
+    )
+    credential_type: Mapped[str] = mapped_column(Text, primary_key=True)
+    max_active_slots: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    push_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    claimed_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pushed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    used_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    balance_status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
         CheckConstraint(
-            "refresh_token_status IN "
-            "('missing', 'active', 'refreshing', 'expired', 'invalid', 'dead', 'error')"
+            "credential_type IN ('personal_account', 'team_5h_weekly', 'team_monthly')"
         ),
+        CheckConstraint("max_active_slots >= 0"),
+        CheckConstraint("push_balance >= 0"),
+        CheckConstraint("claimed_push_count >= 0"),
+        CheckConstraint("pushed_count >= 0"),
+        CheckConstraint("failed_push_count >= 0"),
+        CheckConstraint("used_count >= 0"),
+        CheckConstraint("balance_status IN ('active', 'disabled')"),
+        Index("idx_downstream_type_balances_credential_type", "credential_type"),
+        Index("idx_downstream_type_balances_status", "balance_status"),
+    )
+
+
+class SpacePushBindingModel(Base):
+    __tablename__ = "space_push_bindings"
+
+    space_credential_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("space_credentials.id", ondelete="CASCADE"), primary_key=True
+    )
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    downstream_channel_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("downstream_channels.id", ondelete="SET NULL")
+    )
+    push_status: Mapped[str] = mapped_column(Text, nullable=False, default="none")
+    downstream_external_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    pushed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_push_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    used_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recycle_status: Mapped[str] = mapped_column(Text, nullable=False, default="none")
+    recycled_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
         CheckConstraint(
-            "session_status IN "
-            "('unknown', 'active', 'expired', 'invalid', 'refreshing', 'dead', 'error')"
+            "push_status IN ('none', 'pending', 'pushing', 'pushed', 'failed', 'skipped', 'used')"
         ),
+        CheckConstraint("pushed_count >= 0"),
+        CheckConstraint("failed_push_count >= 0"),
+        CheckConstraint("used_count >= 0"),
+        CheckConstraint(
+            "recycle_status IN ('none', 'pending', 'running', 'done', 'failed', 'blocked')"
+        ),
+        Index("idx_space_push_bindings_space_id", "space_id"),
+        Index("idx_space_push_bindings_downstream_channel_id", "downstream_channel_id"),
+        Index("idx_space_push_bindings_status", "push_status", "recycle_status"),
+    )
+
+
+class SpacePushAttemptModel(Base):
+    __tablename__ = "space_push_attempts"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_credential_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("space_credentials.id", ondelete="CASCADE"), nullable=False
+    )
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    downstream_channel_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("downstream_channels.id", ondelete="SET NULL")
+    )
+    payload_type: Mapped[str] = mapped_column(Text, nullable=False)
+    request_endpoint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    request_body_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    response_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    attempt_status: Mapped[str] = mapped_column(Text, nullable=False)
+    error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    started_at: Mapped[datetime] = mapped_column(nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("payload_type IN ('personal_account', 'team_5h_weekly', 'team_monthly')"),
+        CheckConstraint("attempt_status IN ('running', 'pushed', 'failed', 'skipped')"),
+        Index("idx_space_push_attempts_credential_id", "space_credential_id"),
+        Index("idx_space_push_attempts_space_id", "space_id"),
+        Index("idx_space_push_attempts_channel_id", "downstream_channel_id"),
+        Index("idx_space_push_attempts_status", "attempt_status"),
+    )
+
+
+class SpaceCredentialUsageStateModel(Base):
+    __tablename__ = "space_credential_usage_states"
+
+    space_credential_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("space_credentials.id", ondelete="CASCADE"), primary_key=True
+    )
+    quota_window_kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    usage_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usage_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    limit_window_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reset_after_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reset_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    raw_usage_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("quota_window_kind IN ('five_hour', 'weekly', 'monthly')"),
+        CheckConstraint(
+            "usage_status IN ('unknown', 'active', 'near_limit', 'used', 'check_failed')"
+        ),
+        CheckConstraint("usage_percent >= 0 AND usage_percent <= 100"),
+        CheckConstraint("limit_window_seconds >= 0"),
+        CheckConstraint("reset_after_seconds >= 0"),
+        Index("idx_space_usage_states_space_id", "space_id"),
+        Index("idx_space_usage_states_status", "usage_status"),
+    )
+
+
+class SpaceUsageCheckModel(Base):
+    __tablename__ = "space_usage_checks"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_credential_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("space_credentials.id", ondelete="CASCADE"), nullable=False
+    )
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    quota_window_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    usage_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    limit_window_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reset_after_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reset_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    limit_reached: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    raw_usage_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    check_status: Mapped[str] = mapped_column(Text, nullable=False)
+    error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    checked_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("quota_window_kind IN ('five_hour', 'weekly', 'monthly')"),
+        CheckConstraint("usage_percent >= 0 AND usage_percent <= 100"),
+        CheckConstraint("limit_window_seconds >= 0"),
+        CheckConstraint("reset_after_seconds >= 0"),
+        CheckConstraint("check_status IN ('ok', 'failed')"),
+        Index("idx_space_usage_checks_credential_id", "space_credential_id"),
+        Index("idx_space_usage_checks_space_id", "space_id"),
+        Index("idx_space_usage_checks_checked_at", "checked_at"),
+    )
+
+
+class SpaceRecycleRuleModel(Base):
+    __tablename__ = "space_recycle_rules"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    credential_type: Mapped[str] = mapped_column(Text, nullable=False)
+    quota_window_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    threshold_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=95)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("credential_type", "quota_window_kind"),
+        CheckConstraint(
+            "credential_type IN ('personal_account', 'team_5h_weekly', 'team_monthly')"
+        ),
+        CheckConstraint("quota_window_kind IN ('five_hour', 'weekly', 'monthly')"),
+        CheckConstraint("threshold_percent >= 1 AND threshold_percent <= 100"),
+        CheckConstraint("action IN ('mark_used', 'disable_push_only')"),
+        Index("idx_space_recycle_rules_enabled", "enabled"),
+    )
+
+
+class SpaceAccountCooldownModel(Base):
+    __tablename__ = "space_account_cooldowns"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_account_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    cooldown_type: Mapped[str] = mapped_column(Text, nullable=False)
+    cooldown_until: Mapped[datetime] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source_space_push_binding_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source_space_usage_check_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_account_id", "space_id", "cooldown_type"),
+        CheckConstraint("cooldown_type IN ('post_usage_remove')"),
+        Index("idx_space_account_cooldowns_account_space", "user_account_id", "space_id"),
+        Index("idx_space_account_cooldowns_until", "cooldown_until"),
     )
 
 
@@ -203,322 +474,6 @@ class AccountSessionOtpSnapshotModel(Base):
         Index("idx_account_session_otp_snapshots_user_account_id", "user_account_id"),
         Index("idx_account_session_otp_snapshots_status", "snapshot_status"),
         Index("idx_account_session_otp_snapshots_source_membership_id", "source_membership_id"),
-    )
-
-
-class MembershipModel(Base):
-    __tablename__ = "user_account_team_workspace_memberships"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    user_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
-    )
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    role: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    membership_status: Mapped[str] = mapped_column(Text, nullable=False)
-    invite_permission: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
-    user_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    invite_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    seat_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
-    can_invite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    remote_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    remote_account_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    remote_seat_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    remote_role: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    remote_synced_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    chatgpt_web_backend_access_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    chatgpt_web_backend_id_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    chatgpt_web_backend_access_token_expires_at: Mapped[datetime | None] = mapped_column(
-        nullable=True
-    )
-    chatgpt_web_backend_access_token_status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="unknown"
-    )
-    last_chatgpt_web_backend_token_refresh_at: Mapped[datetime | None] = mapped_column(
-        nullable=True
-    )
-    last_probe_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    failure_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    failure_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("user_account_id", "team_workspace_id"),
-        CheckConstraint(
-            "membership_status IN "
-            "('unknown', 'invited', 'accepted', 'active', 'left', 'disabled', 'banned', 'failed')"
-        ),
-        CheckConstraint("invite_permission IN ('unknown', 'ok', 'no_permission', 'error')"),
-        CheckConstraint("user_count >= 0"),
-        CheckConstraint("invite_count >= 0"),
-        CheckConstraint("seat_status IN ('unknown', 'available', 'full', 'error')"),
-        CheckConstraint(
-            "chatgpt_web_backend_access_token_status IN "
-            "('unknown', 'active', 'expired', 'refreshing', 'revoked', 'invalid', 'dead', 'error')"
-        ),
-        Index("idx_memberships_user_account_id", "user_account_id"),
-        Index("idx_memberships_team_workspace_id", "team_workspace_id"),
-        Index("idx_memberships_can_invite", "can_invite"),
-        Index("idx_memberships_status", "membership_status"),
-    )
-
-
-class WorkspaceJoinBatchModel(Base):
-    __tablename__ = "workspace_join_batches"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    batch_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    batch_status: Mapped[str] = mapped_column(Text, nullable=False)
-    activation_status: Mapped[str] = mapped_column(Text, nullable=False)
-    source_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    source_job_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    activated_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    deactivated_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    pushed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        CheckConstraint(
-            "batch_status IN "
-            "('created', 'running', 'partial_success', 'success', 'failed', 'cancelled')"
-        ),
-        CheckConstraint(
-            "activation_status IN "
-            "('inactive', 'activating', 'active', 'superseded', 'retired')"
-        ),
-        CheckConstraint("total_count >= 0"),
-        CheckConstraint("success_count >= 0"),
-        CheckConstraint("failed_count >= 0"),
-        CheckConstraint("pushed_count >= 0"),
-        Index("idx_batches_team_workspace_id", "team_workspace_id"),
-        Index("idx_batches_status", "batch_status", "activation_status"),
-        Index(
-            "uq_workspace_join_batches_one_active",
-            "team_workspace_id",
-            unique=True,
-            postgresql_where=(activation_status == "active"),
-        ),
-    )
-
-
-class WorkspaceJoinBatchItemModel(Base):
-    __tablename__ = "workspace_join_batch_items"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    batch_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("workspace_join_batches.id", ondelete="CASCADE"), nullable=False
-    )
-    user_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
-    )
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    membership_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("user_account_team_workspace_memberships.id", ondelete="SET NULL")
-    )
-    codex_credential_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("codex_oauth_credentials.id", ondelete="RESTRICT")
-    )
-    item_status: Mapped[str] = mapped_column(Text, nullable=False)
-    batch_binding_status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
-    join_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    token_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    push_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    plan_tag: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    plan_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    generated_chatgpt_web_backend_access_token: Mapped[str] = mapped_column(
-        Text, nullable=False, default=""
-    )
-    generated_chatgpt_web_backend_id_token: Mapped[str] = mapped_column(
-        Text, nullable=False, default=""
-    )
-    generated_chatgpt_web_backend_token_expires_at: Mapped[datetime | None] = mapped_column(
-        nullable=True
-    )
-    downstream_provider: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    downstream_external_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    failure_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    failure_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("batch_id", "user_account_id", "team_workspace_id"),
-        CheckConstraint(
-            "item_status IN ('pending', 'joined', 'token_generated', 'pushed', 'failed', 'skipped')"
-        ),
-        CheckConstraint("batch_binding_status IN ('active', 'released')"),
-        Index("idx_batch_items_batch_id", "batch_id"),
-        Index("idx_batch_items_user_account_id", "user_account_id"),
-        Index("idx_batch_items_team_workspace_id", "team_workspace_id"),
-        Index("idx_batch_items_membership_id", "membership_id"),
-        Index("idx_batch_items_codex_credential_id", "codex_credential_id"),
-        Index("idx_batch_items_status", "item_status", "push_status"),
-        Index("idx_batch_items_plan_tag", "plan_tag"),
-        Index(
-            "uq_batch_items_one_active_credential",
-            "codex_credential_id",
-            unique=True,
-            postgresql_where=(batch_binding_status == "active"),
-        ),
-    )
-
-
-class CodexOAuthCredentialModel(Base):
-    __tablename__ = "codex_oauth_credentials"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    user_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
-    )
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    codex_client_id: Mapped[str] = mapped_column(Text, nullable=False)
-    credential_status: Mapped[str] = mapped_column(Text, nullable=False)
-    account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    token_chatgpt_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    access_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    id_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    refresh_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    push_lifecycle_status: Mapped[str] = mapped_column(Text, nullable=False, default="none")
-    expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_refresh_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_heartbeat_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_heartbeat_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
-    last_heartbeat_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_heartbeat_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    failure_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    failure_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("user_account_id", "team_workspace_id", "codex_client_id"),
-        CheckConstraint(
-            "credential_status IN ('active', 'expired', 'refreshing', 'invalid', 'error')"
-        ),
-        CheckConstraint(
-            "push_lifecycle_status IN "
-            "('none', 'pending_push', 'pushing', 'pushed', 'used', 'failed', 'blocked')"
-        ),
-        CheckConstraint("last_heartbeat_status IN ('unknown', 'ok', 'failed', 'skipped', 'error')"),
-        Index("idx_codex_credentials_user_account_id", "user_account_id"),
-        Index("idx_codex_credentials_team_workspace_id", "team_workspace_id"),
-        Index("idx_codex_credentials_status", "credential_status"),
-        Index("idx_codex_credentials_expires_at", "expires_at"),
-        Index("idx_codex_credentials_token_chatgpt_account_id", "token_chatgpt_account_id"),
-        Index("idx_codex_credentials_heartbeat_status", "last_heartbeat_status"),
-    )
-
-
-class DownstreamCodexPushRecordModel(Base):
-    __tablename__ = "downstream_codex_push_records"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    batch_item_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("workspace_join_batch_items.id", ondelete="CASCADE")
-    )
-    codex_credential_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("codex_oauth_credentials.id", ondelete="CASCADE"), nullable=False
-    )
-    downstream_channel_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("downstream_channels.id", ondelete="SET NULL")
-    )
-    user_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
-    )
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    membership_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("user_account_team_workspace_memberships.id", ondelete="SET NULL")
-    )
-    downstream_provider: Mapped[str] = mapped_column(Text, nullable=False)
-    downstream_external_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    push_status: Mapped[str] = mapped_column(Text, nullable=False)
-    codex_client_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    codex_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    codex_email: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    downstream_chatgpt_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    token_chatgpt_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    codex_token_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    request_endpoint: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    push_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    usage_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    usage_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
-    last_usage_check_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    used_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("codex_credential_id"),
-        CheckConstraint("downstream_provider IN ('cpa', 'sub2api', 'local_sub2api', 'custom_http')"),
-        CheckConstraint("push_status IN ('pending', 'pushing', 'pushed', 'failed', 'skipped', 'used')"),
-        CheckConstraint("push_attempt_count >= 0"),
-        CheckConstraint("usage_status IN ('unknown', 'active', 'near_limit', 'used', 'check_failed')"),
-        CheckConstraint("usage_percent >= 0 AND usage_percent <= 100"),
-        Index("idx_downstream_push_batch_item_id", "batch_item_id"),
-        Index("idx_downstream_push_codex_credential_id", "codex_credential_id"),
-        Index("idx_downstream_push_channel_id", "downstream_channel_id"),
-        Index("idx_downstream_push_user_account_id", "user_account_id"),
-        Index("idx_downstream_push_team_workspace_id", "team_workspace_id"),
-        Index("idx_downstream_push_membership_id", "membership_id"),
-        Index("idx_downstream_push_status", "downstream_provider", "push_status"),
-    )
-
-
-class RemoteMemberReleaseTaskModel(Base):
-    __tablename__ = "remote_member_release_tasks"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    user_account_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="SET NULL")
-    )
-    codex_credential_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    downstream_push_record_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    external_workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
-    remote_user_id: Mapped[str] = mapped_column(Text, nullable=False)
-    release_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    release_status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
-    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    confirmed_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    last_error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("team_workspace_id", "remote_user_id"),
-        CheckConstraint("release_status IN ('pending', 'running', 'retrying', 'confirmed', 'blocked')"),
-        CheckConstraint("attempt_count >= 0"),
-        Index("idx_remote_release_due", "release_status", "next_attempt_at"),
-        Index("idx_remote_release_workspace", "team_workspace_id"),
-        Index("idx_remote_release_user_account", "user_account_id"),
-        Index("idx_remote_release_push_record", "downstream_push_record_id"),
     )
 
 
@@ -565,54 +520,12 @@ class DownstreamChannelModel(Base):
     )
 
 
-class UserAccountCooldownModel(Base):
-    __tablename__ = "user_account_cooldowns"
-
-    id: Mapped[str] = mapped_column(Text, primary_key=True)
-    user_account_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
-    )
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), nullable=False
-    )
-    cooldown_type: Mapped[str] = mapped_column(Text, nullable=False)
-    cooldown_until: Mapped[datetime] = mapped_column(nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    source_push_record_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("user_account_id", "team_workspace_id", "cooldown_type"),
-        CheckConstraint("cooldown_type IN ('post_usage_remove')"),
-        Index("idx_user_account_cooldowns_account_workspace", "user_account_id", "team_workspace_id"),
-        Index("idx_user_account_cooldowns_until", "cooldown_until"),
-    )
-
-
-class WorkspaceOperationLockModel(Base):
-    __tablename__ = "workspace_operation_locks"
-
-    team_workspace_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("team_workspaces.id", ondelete="CASCADE"), primary_key=True
-    )
-    lock_type: Mapped[str] = mapped_column(Text, primary_key=True)
-    locked_by: Mapped[str] = mapped_column(Text, nullable=False)
-    locked_until: Mapped[datetime] = mapped_column(nullable=False)
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("lock_type IN ('codex_fill', 'workspace_mutation')"),
-        Index("idx_workspace_operation_locks_until", "locked_until"),
-    )
-
-
 class ProxyInventoryModel(Base):
     __tablename__ = "proxy_inventory"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     provider: Mapped[str] = mapped_column(Text, nullable=False)
+    proxy_type: Mapped[str] = mapped_column(Text, nullable=False, default="proxyserver")
     external_proxy_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     connection_mode: Mapped[str] = mapped_column(Text, nullable=False)
     proxy_host: Mapped[str] = mapped_column(Text, nullable=False)
@@ -633,12 +546,14 @@ class ProxyInventoryModel(Base):
     __table_args__ = (
         UniqueConstraint("provider", "external_proxy_id"),
         CheckConstraint("provider = 'webshare'"),
+        CheckConstraint("proxy_type IN ('proxyserver', 'static_proxy')"),
         CheckConstraint("proxy_port > 0 AND proxy_port <= 65535"),
         CheckConstraint(
             "proxy_status IN "
             "('unknown', 'available', 'bound', 'invalid', 'cooldown', 'retired', 'error')"
         ),
         Index("idx_proxy_inventory_status", "proxy_status"),
+        Index("idx_proxy_inventory_type_status", "proxy_type", "proxy_status"),
     )
 
 
@@ -666,6 +581,30 @@ class UserAccountProxyBindingModel(Base):
         CheckConstraint("bind_status IN ('active', 'repairing', 'disabled', 'released', 'error')"),
         Index("idx_proxy_bindings_proxy_id", "proxy_id"),
         Index("idx_proxy_bindings_status", "bind_status"),
+    )
+
+
+class TeamAdminProxyBindingModel(Base):
+    __tablename__ = "team_admin_proxy_bindings"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    team_admin_session_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("team_admin_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    proxy_id: Mapped[str] = mapped_column(Text, nullable=False)
+    bind_status: Mapped[str] = mapped_column(Text, nullable=False)
+    bind_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    bound_at: Mapped[datetime] = mapped_column(nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("team_admin_session_id"),
+        CheckConstraint("bind_status IN ('active', 'repairing', 'disabled', 'released', 'error')"),
+        Index("idx_team_admin_proxy_bindings_proxy_id", "proxy_id"),
+        Index("idx_team_admin_proxy_bindings_status", "bind_status"),
     )
 
 
@@ -742,12 +681,8 @@ class AutomationScheduleModel(Base):
         UniqueConstraint("schedule_type"),
         CheckConstraint(
             "schedule_type IN ("
-            "'automation.workspace_invite_sync', "
-            "'automation.workspace_authorize', "
-            "'automation.codex_heartbeat', "
-            "'automation.downstream_push', "
-            "'automation.downstream_usage_cleanup', "
-            "'automation.remote_member_release'"
+            "'automation.space_downstream_push', "
+            "'automation.space_recycle_sweep'"
             ")"
         ),
         CheckConstraint("schedule_status IN ('active', 'paused', 'error')"),

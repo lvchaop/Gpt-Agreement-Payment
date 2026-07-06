@@ -11,16 +11,13 @@ const nav = [
   { to: "/jobs", label: "任务" },
   { to: "/automation-scheduler", label: "自动化调度" },
   { to: "/automation-monitor", label: "自动化监控" },
-  { to: "/automation-flow", label: "自动化流水" },
   { to: "/accounts", label: "账号" },
-  { to: "/team-workspaces", label: "团队空间" },
+  { to: "/spaces", label: "空间" },
   { to: "/memberships", label: "空间成员" },
-  { to: "/join-batches", label: "加入批次" },
-  { to: "/codex-credentials", label: "Codex 授权" },
+  { to: "/space-credentials", label: "空间凭证" },
   { to: "/proxy", label: "代理" },
   { to: "/mail", label: "邮箱" },
   { to: "/downstream-channels", label: "下游渠道" },
-  { to: "/downstream", label: "下游推送" },
 ];
 </script>
 

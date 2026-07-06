@@ -14,25 +14,13 @@ const error = ref("");
 let pollTimer: number | undefined;
 
 const labels: Record<string, { title: string; desc: string }> = {
-  "automation.workspace_invite_sync": {
-    title: "空间邀请同步",
-    desc: "扫描可用空间，发送 350 邀请，2 分钟后同步远端成员和待处理邀请，并剔除本地不存在成员。",
+  "automation.space_downstream_push": {
+    title: "Space 下游推送",
+    desc: "按下游渠道和 credential_type 的余额/坑位补量，选择 Space 凭证推送。",
   },
-  "automation.workspace_authorize": {
-    title: "空间授权",
-    desc: "扫描席位未满的空间，拿 workspace 锁，随机授权 1 个账号，生成 pending_push 凭证。",
-  },
-  "automation.downstream_push": {
-    title: "下游推送",
-    desc: "扫描所有下游渠道，未达到推送上限时推送 pending_push 凭证。",
-  },
-  "automation.downstream_usage_cleanup": {
-    title: "用量清理",
-    desc: "扫描已推送记录，达到阈值后本地结算并创建远端释放任务。",
-  },
-  "automation.remote_member_release": {
-    title: "远端成员释放",
-    desc: "扫描待释放远端成员任务，删除并复查远端成员，直到确认不存在。",
+  "automation.space_recycle_sweep": {
+    title: "Space 回收扫描",
+    desc: "从已推送 Space 绑定开始检查用量，达到规则阈值后只做本地 used 标记。",
   },
 };
 

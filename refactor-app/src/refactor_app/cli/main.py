@@ -19,19 +19,13 @@ db_app = typer.Typer(no_args_is_help=True)
 worker_app = typer.Typer(no_args_is_help=True)
 job_app = typer.Typer(no_args_is_help=True)
 webshare_app = typer.Typer(no_args_is_help=True)
-batch_app = typer.Typer(no_args_is_help=True)
-codex_app = typer.Typer(no_args_is_help=True)
 mail_app = typer.Typer(no_args_is_help=True)
-membership_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(db_app, name="db")
 app.add_typer(worker_app, name="worker")
 app.add_typer(job_app, name="job")
 app.add_typer(webshare_app, name="webshare")
-app.add_typer(batch_app, name="batch")
-app.add_typer(codex_app, name="codex")
 app.add_typer(mail_app, name="mail")
-app.add_typer(membership_app, name="membership")
 
 
 @db_app.command("check")
@@ -126,43 +120,6 @@ def job_enqueue(job_type: str, input_json: str = "{}", created_by: str = "cli") 
 @webshare_app.command("refresh")
 def webshare_refresh() -> None:
     _enqueue_and_echo("proxy.refresh_webshare_pool", {})
-
-
-@batch_app.command("create")
-def batch_create(team_workspace_id: str, user_account_ids_csv: str, codex_client_id: str) -> None:
-    _enqueue_and_echo(
-        "workspace_join_batch.run",
-        {
-            "team_workspace_id": team_workspace_id,
-            "user_account_ids": [
-                value.strip() for value in user_account_ids_csv.split(",") if value.strip()
-            ],
-            "codex_client_id": codex_client_id,
-        },
-    )
-
-
-@batch_app.command("activate")
-def batch_activate(batch_id: str) -> None:
-    _enqueue_and_echo("workspace_join_batch.activate", {"batch_id": batch_id})
-
-
-@membership_app.command("probe")
-def membership_probe(membership_id: str) -> None:
-    _enqueue_and_echo("membership.probe", {"membership_id": membership_id})
-
-
-@membership_app.command("invite-member")
-def membership_invite_member(inviter_membership_id: str, email: str) -> None:
-    _enqueue_and_echo(
-        "membership.invite_member",
-        {"inviter_membership_id": inviter_membership_id, "email": email},
-    )
-
-
-@codex_app.command("heartbeat")
-def codex_heartbeat(credential_id: str) -> None:
-    _enqueue_and_echo("codex_credential.heartbeat", {"codex_credential_id": credential_id})
 
 
 @mail_app.command("allocate")

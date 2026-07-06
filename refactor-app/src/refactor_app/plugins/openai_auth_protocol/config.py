@@ -23,7 +23,7 @@ class MailConfig:
     catch_all_domain: str = ""
     # 域名池：pipeline 运行时从中挑一个作为 catch_all_domain（轮换 + 根据 invite 探测结果烧掉）
     catch_all_domains: list = field(default_factory=list)
-    # Cloudflare 按需开通子域（被 pipeline 读取使用，CTF-reg 自身不处理）
+    # Cloudflare 按需开通子域；调用方按需读取。
     auto_provision: dict = field(default_factory=dict)
     otp_timeout: int = 180
     mark_seen: bool = False
@@ -70,7 +70,7 @@ class TeamPlanConfig:
     is_coupon_from_query_param: bool = False
     checkout_ui_mode: str = "custom"
     output_url_mode: str = ""
-    # 以下字段由 webui wizard 写入，CTF-reg 不直接消费但需要兼容加载
+    # 以下字段由外部配置向导写入；本配置对象需要兼容加载。
     plan_type: str = "team"           # team | plus
     entry_point: str = ""             # team_workspace_purchase_modal | all_plans_pricing_modal
     billing_country: str = ""
@@ -157,7 +157,7 @@ class Config:
         import dataclasses
 
         def filtered_kwargs(dataclass_type, raw: Optional[dict]) -> dict:
-            # WebUI 与 CTF-pay 会逐步增加配置字段；CTF-reg 只消费其中一部分。
+            # 外部配置来源会逐步增加字段；当前流程只消费其中一部分。
             # 加载时过滤未知 key，避免因为“注册阶段不用的支付字段”中断注册流程。
             valid_keys = {f.name for f in dataclasses.fields(dataclass_type)}
             return {k: v for k, v in (raw or {}).items() if k in valid_keys}

@@ -18,7 +18,13 @@ class CustomHttpDownstreamPlugin:
         return HealthcheckResult(status="ok", details={"provider": "custom_http"})
 
     def capabilities(self) -> list[str]:
-        return ["downstream.custom_http.push_codex_credential"]
+        return [
+            "downstream.custom_http.push_codex_credential",
+            "downstream.custom_http.push_business_access_token",
+        ]
 
     def push_codex_credential(self, payload: DownstreamCodexPayload) -> DownstreamPushResult:
         return self._client.push_codex_credential(payload)
+
+    def push_business_access_token(self, payload: dict) -> DownstreamPushResult:
+        return self._client.push_business_access_token(payload)

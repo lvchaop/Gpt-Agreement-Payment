@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { ref } from "vue";
 import { useRouter } from "vue-router";
 
 import ResourcePage from "../components/ResourcePage.vue";
@@ -15,10 +15,10 @@ const columns = [
   { key: "email", label: "邮箱" },
   { key: "phone_number", label: "手机号" },
   { key: "openai_user_id", label: "OpenAI 用户 ID", mono: true },
-  { key: "personal_chatgpt_account_id", label: "个人 Account ID", mono: true, summary: 28 },
   { key: "account_status", label: "账号状态", badge: true },
   { key: "session_status", label: "Session 状态", badge: true },
-  { key: "refresh_token_status", label: "RT 状态", badge: true },
+  { key: "last_session_refresh_at", label: "最近 Session 刷新", summary: 30 },
+  { key: "last_login_error_code", label: "登录错误码", badge: true },
   { key: "created_at", label: "创建时间" },
 ];
 
@@ -44,47 +44,18 @@ const filters = [
       { label: "error", value: "error" },
     ],
   },
-  {
-    key: "refresh_token_status",
-    label: "RT 状态",
-    options: [
-      { label: "missing", value: "missing" },
-      { label: "active", value: "active" },
-      { label: "refreshing", value: "refreshing" },
-      { label: "expired", value: "expired" },
-      { label: "invalid", value: "invalid" },
-      { label: "dead", value: "dead" },
-      { label: "error", value: "error" },
-    ],
-  },
 ];
 
 const selectedCount = ref(0);
 const selectedRows = ref<Row[]>([]);
 const backfillConcurrency = ref(10);
-const inviteConcurrency = ref(50);
-const authConcurrency = ref(50);
-const workspaces = ref<Row[]>([]);
-const selectedWorkspaceId = ref("");
-const selectedAuthWorkspaceId = ref("");
-const codexClientId = ref("app_EMoamEEZ73f0CkXaXp7hrann");
-
-onMounted(async () => {
-  workspaces.value = await resourcesApi.workspaces();
-  if (!selectedWorkspaceId.value && workspaces.value.length) {
-    selectedWorkspaceId.value = String(workspaces.value[0].id || "");
-  }
-  if (!selectedAuthWorkspaceId.value && workspaces.value.length) {
-    selectedAuthWorkspaceId.value = String(workspaces.value[0].id || "");
-  }
-});
 
 function updateSelection(rows: Record<string, unknown>[]) {
   selectedRows.value = rows as Row[];
   selectedCount.value = rows.length;
 }
 
-async function runSelectedAccountJob(kind: "session" | "rt" | "session_rt") {
+async function runSelectedAccountJob() {
   const ids = selectedRows.value.map((row) => String(row.id || "")).filter(Boolean);
   if (!ids.length) {
     store.toast("未选择账号", "请先勾选账号。", "warning");
@@ -95,67 +66,9 @@ async function runSelectedAccountJob(kind: "session" | "rt" | "session_rt") {
     created_by: "ops-ui",
     concurrency: backfillConcurrency.value,
   };
-  const result = kind === "session"
-    ? await resourcesApi.backfillSession(payload)
-    : kind === "rt"
-      ? await resourcesApi.backfillRt(payload)
-      : await resourcesApi.backfillSessionRt(payload);
-  const titleByKind = {
-    session: "补 Session 执行完成",
-    rt: "补 RT 执行完成",
-    session_rt: "补 Session + RT 执行完成",
-  };
+  const result = await resourcesApi.backfillSession(payload);
   store.toast(
-    titleByKind[kind],
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
-    result.failed > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
-}
-
-async function inviteSelectedUsers() {
-  const ids = selectedRows.value.map((row) => String(row.id || "")).filter(Boolean);
-  if (!ids.length) {
-    store.toast("未选择账号", "请先勾选账号。", "warning");
-    return;
-  }
-  if (!selectedWorkspaceId.value) {
-    store.toast("未选择空间", "请先选择要邀请进入的空间。", "warning");
-    return;
-  }
-  const result = await resourcesApi.membershipInvite({
-    team_workspace_id: selectedWorkspaceId.value,
-    user_account_ids: ids,
-    created_by: "ops-ui",
-    concurrency: inviteConcurrency.value,
-  });
-  store.toast(
-    "邀请任务执行完成",
-    `work=${result.work_count ?? ids.length} 成功=${result.succeeded ?? 0} 失败=${result.failed ?? 0}`,
-    Number(result.failed ?? 0) > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
-}
-
-async function buildSelectedCredentials() {
-  const ids = selectedRows.value.map((row) => String(row.id || "")).filter(Boolean);
-  if (!ids.length) {
-    store.toast("未选择账号", "请先勾选账号。", "warning");
-    return;
-  }
-  if (!selectedAuthWorkspaceId.value) {
-    store.toast("未选择空间", "请先选择要授权的空间。", "warning");
-    return;
-  }
-  const result = await resourcesApi.buildCredentials({
-    user_account_ids: ids,
-    team_workspace_id: selectedAuthWorkspaceId.value,
-    codex_client_id: codexClientId.value,
-    created_by: "ops-ui",
-    concurrency: authConcurrency.value,
-  });
-  store.toast(
-    "Codex 授权执行完成",
+    "补 Session 执行完成",
     `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
     result.failed > 0 ? "warning" : "success",
   );
@@ -181,7 +94,7 @@ async function deleteAccount(row: Row, reload: () => Promise<void>) {
 <template>
   <ResourcePage
     title="账号"
-    description="账号级只区分 active / invalid；Session 与账号级 RT 状态在本页展示，Workspace/Codex token 在对应页面展示。"
+    description="账号基本信息与账号级登录状态。Space token 只在空间凭证表维护。"
     :columns="columns"
     :loader="resourcesApi.accounts"
     :filters="filters"
@@ -195,6 +108,7 @@ async function deleteAccount(row: Row, reload: () => Promise<void>) {
           <div>
             <h2>账号认证</h2>
             <p>对选中账号补 Session、个人 RT 或同时补齐。</p>
+            <p>账号页只维护账号级登录材料；Space token 在空间凭证页维护。</p>
           </div>
           <span class="selected-hint">已选 {{ selectedCount }} 个账号</span>
         </div>
@@ -203,73 +117,12 @@ async function deleteAccount(row: Row, reload: () => Promise<void>) {
             <span>并发 Work</span>
             <input v-model.number="backfillConcurrency" class="input small-input" type="number" min="1" max="500" />
           </label>
-          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('session')">
+          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob">
             补 Session
           </button>
-          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('rt')">
-            补 RT
-          </button>
-          <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob('session_rt')">
-            补 Session + RT
-          </button>
         </div>
       </section>
 
-      <section class="panel account-action-card">
-        <div class="account-action-heading">
-          <div>
-            <h2>Codex 授权</h2>
-            <p>使用选中账号对指定 Team Workspace 生成 Codex OAuth credential。</p>
-          </div>
-        </div>
-        <div class="account-action-body">
-          <label class="inline-control">
-            <span>授权空间</span>
-            <select v-model="selectedAuthWorkspaceId" class="select workspace-select">
-              <option v-for="workspace in workspaces" :key="String(workspace.id)" :value="String(workspace.id)">
-                {{ workspace.name || workspace.external_workspace_id }} / {{ workspace.external_workspace_id }}
-              </option>
-            </select>
-          </label>
-          <label class="inline-control">
-            <span>Codex Client</span>
-            <input v-model="codexClientId" class="input workspace-select" />
-          </label>
-          <label class="inline-control">
-            <span>授权并发</span>
-            <input v-model.number="authConcurrency" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <button class="btn primary" :disabled="selectedCount === 0 || !selectedAuthWorkspaceId" @click="buildSelectedCredentials">
-            生成 Codex 授权
-          </button>
-        </div>
-      </section>
-
-      <section class="panel account-action-card">
-        <div class="account-action-heading">
-          <div>
-            <h2>空间邀请</h2>
-            <p>向指定 Team Workspace 发送邀请，接受邀请在“空间成员”页处理。</p>
-          </div>
-        </div>
-        <div class="account-action-body">
-          <label class="inline-control">
-            <span>邀请空间</span>
-            <select v-model="selectedWorkspaceId" class="select workspace-select">
-              <option v-for="workspace in workspaces" :key="String(workspace.id)" :value="String(workspace.id)">
-                {{ workspace.name || workspace.external_workspace_id }} / {{ workspace.external_workspace_id }}
-              </option>
-            </select>
-          </label>
-          <label class="inline-control">
-            <span>邀请并发</span>
-            <input v-model.number="inviteConcurrency" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <button class="btn primary" :disabled="selectedCount === 0 || !selectedWorkspaceId" @click="inviteSelectedUsers">
-            发送邀请
-          </button>
-        </div>
-      </section>
     </template>
     <template #rowActions="{ row, reload }">
       <button class="btn danger" @click="deleteAccount(row, reload)">删除</button>

@@ -13,42 +13,27 @@ const pageRef = ref<InstanceType<typeof ResourcePage> | null>(null);
 const selectedRows = ref<Row[]>([]);
 const selectedCount = ref(0);
 const adminEmail = ref("");
-const externalWorkspaceId = ref("");
+const externalSpaceId = ref("");
 const userEmail = ref("");
-const workspace = ref("");
+const spaceFilter = ref("");
 const membershipStatus = ref("");
-const hasCodexCredential = ref("");
+const hasSpaceCredential = ref("");
 const sessionOtpStatus = ref("");
-const acceptConcurrency = ref(50);
-const codexClientId = ref("app_EMoamEEZ73f0CkXaXp7hrann");
-const authConcurrency = ref(50);
-const sessionOtpConcurrency = ref(50);
 const sessionConcurrency = ref(10);
-const automationInviteConcurrency = ref(350);
-const automationWaitSeconds = ref(120);
-const workspaces = ref<Row[]>([]);
-const syncWorkspaceId = ref("");
-const syncPageSize = ref(100);
-const sessionOtpBatchCount = computed(() => {
-  const size = Math.max(1, Number(sessionOtpConcurrency.value || 1));
-  return selectedCount.value > 0 ? Math.ceil(selectedCount.value / size) : 0;
-});
-const authBatchCount = computed(() => {
-  const size = Math.max(1, Number(authConcurrency.value || 1));
-  return selectedCount.value > 0 ? Math.ceil(selectedCount.value / size) : 0;
-});
+const spaces = ref<Row[]>([]);
+const selectedAccountCount = computed(() =>
+  new Set(selectedRows.value.map((row) => String(row.user_account_id || "")).filter(Boolean)).size,
+);
 
 const columns = [
   { key: "id", label: "成员关系 ID", mono: true, summary: 28 },
   { key: "user_email", label: "账号邮箱", summary: 30 },
   { key: "admin_email", label: "管理员邮箱", summary: 30 },
-  { key: "external_workspace_id", label: "外部空间 ID", mono: true, summary: 28 },
-  { key: "workspace_name", label: "空间名称" },
-  { key: "workspace_plan_type", label: "空间订阅类型", summary: 24 },
+  { key: "external_space_id", label: "外部空间 ID", mono: true, summary: 28 },
+  { key: "space_name", label: "空间名称" },
+  { key: "space_plan_type", label: "空间订阅类型", summary: 24 },
   { key: "membership_status", label: "成员状态", badge: true },
-  { key: "has_codex_credential", label: "是否授权", badge: true },
-  { key: "codex_credential_count", label: "授权数" },
-  { key: "last_codex_credential_at", label: "最近授权时间", summary: 30 },
+  { key: "has_space_credential", label: "是否有空间凭证", badge: true },
   { key: "session_otp_status", label: "验证码状态", badge: true },
   { key: "session_otp_code_len", label: "验证码长度" },
   { key: "failure_code", label: "失败码", summary: 24 },
@@ -58,11 +43,11 @@ const columns = [
 async function loadMemberships() {
   return resourcesApi.memberships({
     admin_email: adminEmail.value,
-    external_workspace_id: externalWorkspaceId.value,
+    external_space_id: externalSpaceId.value,
     user_email: userEmail.value,
-    workspace: workspace.value,
+    space: spaceFilter.value,
     membership_status: membershipStatus.value,
-    has_codex_credential: hasCodexCredential.value,
+    has_space_credential: hasSpaceCredential.value,
     session_otp_status: sessionOtpStatus.value,
   });
 }
@@ -76,118 +61,8 @@ async function reload() {
   await pageRef.value?.load();
 }
 
-async function loadWorkspaces() {
-  workspaces.value = await resourcesApi.workspaces();
-  if (!syncWorkspaceId.value && workspaces.value.length) {
-    syncWorkspaceId.value = String(workspaces.value[0].id || "");
-  }
-}
-
-async function syncRemoteState() {
-  if (!syncWorkspaceId.value) {
-    store.toast("缺少空间", "请先选择要同步的 Team Workspace。", "warning");
-    return;
-  }
-  const result = await resourcesApi.syncMembershipRemoteState({
-    team_workspace_id: syncWorkspaceId.value,
-    page_size: syncPageSize.value,
-  });
-  store.toast(
-    "远端同步完成",
-    `远端成员=${result.remote_member_count ?? 0} 远端邀请=${result.remote_invite_count ?? 0} 剔除本地=${result.removed_local_count ?? 0}`,
-    "success",
-  );
-  await reload();
-}
-
-async function acceptMemberships(rows: Row[]) {
-  const ids = rows.map((row) => String(row.id || "")).filter(Boolean);
-  if (!ids.length) {
-    store.toast("未选择成员", "请先勾选要接受邀请的成员关系。", "warning");
-    return;
-  }
-  const result = await resourcesApi.membershipAcceptInvite({
-    membership_ids: ids,
-    created_by: "ops-ui",
-    concurrency: acceptConcurrency.value,
-  });
-  store.toast(
-    "接受邀请执行完成",
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
-    result.failed > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
-}
-
-async function prepareSessionOtp(rows: Row[]) {
-  const ids = rows.map((row) => String(row.id || "")).filter(Boolean);
-  if (!ids.length) {
-    store.toast("未选择成员", "请先勾选要获取验证码的成员。", "warning");
-    return;
-  }
-  const result = await resourcesApi.membershipSessionOtpPrepare({
-    membership_ids: ids,
-    created_by: "ops-ui",
-    concurrency: sessionOtpConcurrency.value,
-  });
-  store.toast(
-    "验证码准备完成",
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
-    result.failed > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
-}
-
-async function submitSessionOtp(rows: Row[]) {
-  const ids = rows.map((row) => String(row.id || "")).filter(Boolean);
-  if (!ids.length) {
-    store.toast("未选择成员", "请先勾选要提交验证码的成员。", "warning");
-    return;
-  }
-  const result = await resourcesApi.membershipSessionOtpSubmit({
-    membership_ids: ids,
-    created_by: "ops-ui",
-    concurrency: sessionOtpConcurrency.value,
-  });
-  store.toast(
-    "验证码提交完成",
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
-    result.failed > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
-}
-
-async function buildCodexCredentials(rows: Row[]) {
-  const userAccountIds = [
-    ...new Set(rows.map((row) => String(row.user_account_id || "")).filter(Boolean)),
-  ];
-  if (!userAccountIds.length) {
-    store.toast("未选择成员", "请先勾选要获取 Codex 授权的成员。", "warning");
-    return;
-  }
-  const workspaceIds = new Set(rows.map((row) => String(row.team_workspace_id || "")).filter(Boolean));
-  if (workspaceIds.size !== 1) {
-    store.toast("空间不一致", "选中成员必须属于同一个团队空间。", "warning");
-    return;
-  }
-  if (!codexClientId.value.trim()) {
-    store.toast("缺少客户端", "Codex Client 不能为空。", "warning");
-    return;
-  }
-  const result = await resourcesApi.buildCredentials({
-    user_account_ids: userAccountIds,
-    team_workspace_id: [...workspaceIds][0],
-    codex_client_id: codexClientId.value.trim(),
-    created_by: "ops-ui-memberships",
-    concurrency: authConcurrency.value,
-    force_reauthorize: false,
-  });
-  store.toast(
-    "Codex 授权完成",
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
-    result.failed > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+async function loadSpaces() {
+  spaces.value = await resourcesApi.spaces();
 }
 
 async function backfillSessionForMemberships(rows: Row[]) {
@@ -209,52 +84,18 @@ async function backfillSessionForMemberships(rows: Row[]) {
   await router.push({ name: "job-trace", params: { jobId: result.job_id } });
 }
 
-async function runWorkspaceFillAutomation(rows: Row[]) {
-  const userAccountIds = [
-    ...new Set(rows.map((row) => String(row.user_account_id || "")).filter(Boolean)),
-  ];
-  if (!userAccountIds.length) {
-    store.toast("未选择成员", "请先勾选要参与自动化的成员。", "warning");
-    return;
-  }
-  const workspaceIds = new Set(rows.map((row) => String(row.team_workspace_id || "")).filter(Boolean));
-  if (workspaceIds.size !== 1) {
-    store.toast("空间不一致", "自动化要求选中成员属于同一个团队空间。", "warning");
-    return;
-  }
-  const result = await resourcesApi.workspaceFillAutomation({
-    team_workspace_id: [...workspaceIds][0],
-    user_account_ids: userAccountIds,
-    codex_client_id: codexClientId.value.trim(),
-    created_by: "ops-ui-automation",
-    invite_concurrency: automationInviteConcurrency.value,
-    post_invite_wait_seconds: automationWaitSeconds.value,
-    sync_page_size: syncPageSize.value,
-  });
-  store.toast(
-    "空间自动化完成",
-    `邀请=${(result.invite_job as Record<string, unknown> | undefined)?.work_count ?? 0} 授权=${result.authorized_credential_count ?? 0} 失败=${result.fill_error_count ?? 0}`,
-    Number(result.fill_error_count ?? 0) > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "automation-flow", query: { jobId: String(result.job_id || "") } });
-}
-
-async function acceptOne(row: Row) {
-  await acceptMemberships([row]);
-}
-
 async function backfillSessionOne(row: Row) {
   await backfillSessionForMemberships([row]);
 }
 
-onMounted(loadWorkspaces);
+onMounted(loadSpaces);
 </script>
 
 <template>
   <ResourcePage
     ref="pageRef"
     title="空间成员"
-    description="账号与 Team Workspace 的当前关系、邀请状态和接受邀请动作。"
+    description="账号与 Space 的当前成员关系。成员动作后续只接 Space 流程。"
     :columns="columns"
     :loader="loadMemberships"
     empty-text="暂无成员关系。"
@@ -282,18 +123,18 @@ onMounted(loadWorkspaces);
           <label class="field">
             <span>外部空间 ID</span>
             <input
-              v-model="externalWorkspaceId"
+              v-model="externalSpaceId"
               class="input"
-              placeholder="按 external_workspace_id 筛选"
+              placeholder="按 external_space_id 筛选"
               @keyup.enter="reload"
             />
           </label>
           <label class="field">
             <span>空间</span>
-            <select v-model="workspace" class="select">
+            <select v-model="spaceFilter" class="select">
               <option value="">全部空间</option>
-              <option v-for="item in workspaces" :key="String(item.id)" :value="String(item.id)">
-                {{ item.name || item.id }} / {{ item.external_workspace_id || "" }}
+              <option v-for="item in spaces" :key="String(item.id)" :value="String(item.id)">
+                {{ item.name || item.id }} / {{ item.external_space_id || "" }}
               </option>
             </select>
           </label>
@@ -313,7 +154,7 @@ onMounted(loadWorkspaces);
           </label>
           <label class="field">
             <span>是否授权</span>
-            <select v-model="hasCodexCredential" class="select">
+            <select v-model="hasSpaceCredential" class="select">
               <option value="">全部</option>
               <option value="yes">已授权</option>
               <option value="no">未授权</option>
@@ -336,76 +177,6 @@ onMounted(loadWorkspaces);
       <section class="panel action-card">
         <div class="action-heading">
           <div>
-            <h2>Codex 授权</h2>
-            <p>对选中的成员账号，在其所属空间生成 Codex 授权。</p>
-          </div>
-          <span class="selected-hint">已选 {{ selectedCount }} 条</span>
-        </div>
-        <div class="action-row">
-          <label class="inline-control wide-control">
-            <span>Codex Client</span>
-            <input v-model="codexClientId" class="input" />
-          </label>
-          <label class="inline-control">
-            <span>授权并发</span>
-            <input v-model.number="authConcurrency" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <button class="btn primary" :disabled="selectedCount === 0" @click="buildCodexCredentials(selectedRows)">
-            获取授权（{{ selectedCount }}）
-          </button>
-          <span class="operation-hint">
-            预计 {{ authBatchCount }} 批；选中成员必须属于同一个团队空间。
-          </span>
-        </div>
-      </section>
-
-      <section class="panel action-card">
-        <div class="action-heading">
-          <div>
-            <h2>验证码两阶段</h2>
-            <p>第一阶段获取邮箱验证码并保存快照；第二阶段读取快照并同步提交验证码。</p>
-          </div>
-          <span class="selected-hint">已选 {{ selectedCount }} 条</span>
-        </div>
-        <div class="action-row">
-          <label class="inline-control">
-            <span>阶段并发</span>
-            <input v-model.number="sessionOtpConcurrency" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <button class="btn" :disabled="selectedCount === 0" @click="prepareSessionOtp(selectedRows)">
-            获取验证码（{{ selectedCount }}）
-          </button>
-          <button class="btn primary" :disabled="selectedCount === 0" @click="submitSessionOtp(selectedRows)">
-            提交验证码（{{ selectedCount }}）
-          </button>
-          <span class="operation-hint">
-            预计 {{ sessionOtpBatchCount }} 批；提交阶段会在真正 validate 前等待同批次就绪。
-          </span>
-        </div>
-      </section>
-
-      <section class="panel action-card">
-        <div class="action-heading">
-          <div>
-            <h2>接受邀请</h2>
-            <p>对选中的成员关系执行接受邀请。</p>
-          </div>
-          <span class="selected-hint">已选 {{ selectedCount }} 条</span>
-        </div>
-        <div class="action-row">
-          <label class="inline-control">
-            <span>接受并发</span>
-            <input v-model.number="acceptConcurrency" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <button class="btn primary" :disabled="selectedCount === 0" @click="acceptMemberships(selectedRows)">
-            接受选中邀请（{{ selectedCount }}）
-          </button>
-        </div>
-      </section>
-
-      <section class="panel action-card">
-        <div class="action-heading">
-          <div>
             <h2>补 Session</h2>
             <p>按选中成员提取账号 ID，复用账号补 Session 流程。</p>
           </div>
@@ -417,64 +188,13 @@ onMounted(loadWorkspaces);
             <input v-model.number="sessionConcurrency" class="input small-input" type="number" min="1" max="500" />
           </label>
           <button class="btn" :disabled="selectedCount === 0" @click="backfillSessionForMemberships(selectedRows)">
-            补选中 Session（{{ selectedCount }}）
-          </button>
-        </div>
-      </section>
-
-      <section class="panel action-card">
-        <div class="action-heading">
-          <div>
-            <h2>远端同步</h2>
-            <p>读取远端成员和邀请，剔除本地不存在于远端的数据。</p>
-          </div>
-        </div>
-        <div class="action-row">
-          <label class="inline-control wide-control">
-            <span>同步空间</span>
-            <select v-model="syncWorkspaceId" class="select">
-              <option value="">请选择</option>
-              <option v-for="item in workspaces" :key="String(item.id)" :value="String(item.id)">
-                {{ item.name || item.id }} / {{ item.external_workspace_id || "" }}
-              </option>
-            </select>
-          </label>
-          <label class="inline-control">
-            <span>同步分页</span>
-            <input v-model.number="syncPageSize" class="input small-input" type="number" min="1" max="200" />
-          </label>
-          <button class="btn danger" :disabled="!syncWorkspaceId" @click="syncRemoteState">
-            同步远端成员和邀请，并剔除本地
-          </button>
-        </div>
-      </section>
-
-      <section class="panel action-card">
-        <div class="action-heading">
-          <div>
-            <h2>空间自动化</h2>
-            <p>选中同一空间成员后：批量邀请、等待、同步远端，并在该空间内随机选择 1 个账号生成待推送 Codex 授权。</p>
-          </div>
-          <span class="selected-hint">已选 {{ selectedCount }} 条</span>
-        </div>
-        <div class="action-row">
-          <label class="inline-control">
-            <span>邀请并发</span>
-            <input v-model.number="automationInviteConcurrency" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <label class="inline-control">
-            <span>邀请后等待秒</span>
-            <input v-model.number="automationWaitSeconds" class="input small-input" type="number" min="0" />
-          </label>
-          <button class="btn primary" :disabled="selectedCount === 0" @click="runWorkspaceFillAutomation(selectedRows)">
-            启动空间自动化（{{ selectedCount }}）
+            补选中账号 Session（{{ selectedAccountCount }}）
           </button>
         </div>
       </section>
     </template>
     <template #rowActions="{ row }">
       <div class="row-actions">
-        <button class="btn small" @click="acceptOne(row)">接受邀请</button>
         <button class="btn small" @click="backfillSessionOne(row)">补 Session</button>
       </div>
     </template>

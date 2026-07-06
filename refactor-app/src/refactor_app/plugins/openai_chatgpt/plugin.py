@@ -31,6 +31,8 @@ class OpenAIChatGPTPlugin:
             "openai_chatgpt.team_workspace.accept_invite",
             "openai_chatgpt.team_workspace.probe_membership",
             "openai_chatgpt.codex.heartbeat",
+            "openai_chatgpt.wham.usage",
+            "openai_chatgpt.wham.auth_credentials.create",
         ]
 
     def refresh_workspace_token(
@@ -57,6 +59,7 @@ class OpenAIChatGPTPlugin:
         email: str,
         cookie_header: str = "",
         seat_type: str = "default",
+        proxy_url: str = "",
     ) -> dict:
         return self._client.invite_member(
             access_token=access_token,
@@ -64,6 +67,7 @@ class OpenAIChatGPTPlugin:
             email=email,
             cookie_header=cookie_header,
             seat_type=seat_type,
+            proxy_url=proxy_url,
         )
 
     def accept_invite(
@@ -97,4 +101,38 @@ class OpenAIChatGPTPlugin:
             team_id=team_id,
             proxy_url=proxy_url,
             model=model,
+        )
+
+    def fetch_wham_usage(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str = "",
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.fetch_wham_usage(
+            access_token=access_token,
+            chatgpt_account_id=chatgpt_account_id,
+            cookie_header=cookie_header,
+            proxy_url=proxy_url,
+        )
+
+    def create_wham_auth_credential(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str,
+        name: str,
+        ttl_seconds: int = 7_776_000,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.create_wham_auth_credential(
+            access_token=access_token,
+            chatgpt_account_id=chatgpt_account_id,
+            name=name,
+            ttl_seconds=ttl_seconds,
+            cookie_header=cookie_header,
+            proxy_url=proxy_url,
         )

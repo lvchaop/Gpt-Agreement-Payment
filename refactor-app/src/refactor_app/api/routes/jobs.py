@@ -16,8 +16,6 @@ from refactor_app.infrastructure.db.models import (
     JobRunModel,
     JobStepModel,
     WorkItemModel,
-    WorkspaceJoinBatchItemModel,
-    WorkspaceJoinBatchModel,
 )
 
 router = APIRouter(tags=["jobs"])
@@ -85,7 +83,6 @@ def cancel_job(job_id: str, session: DbSession) -> dict:
         work.work_status = "cancelled"
         work.finished_at = now
         work.updated_at = now
-        _sync_cancelled_workspace_batch_work(session, work, now=now)
     session.commit()
     return {**_job_dict(job), "cancelled_work_count": len(queued_work_items)}
 
@@ -121,7 +118,6 @@ def cancel_work_item(work_item_id: str, session: DbSession) -> dict:
     work.work_status = "cancelled"
     work.finished_at = now
     work.updated_at = now
-    _sync_cancelled_workspace_batch_work(session, work, now=now)
     session.commit()
     return _work_item_dict(work)
 
@@ -222,54 +218,3 @@ def _work_item_dict(work: WorkItemModel) -> dict:
         "created_at": work.created_at.isoformat(),
         "updated_at": work.updated_at.isoformat(),
     }
-
-
-def _sync_cancelled_workspace_batch_work(
-    session: Session,
-    work: WorkItemModel,
-    *,
-    now: datetime,
-) -> None:
-    if work.work_type != "workspace_join_batch.item":
-        return
-    batch_item_id = str(work.input_json.get("batch_item_id") or "")
-    if not batch_item_id:
-        return
-    item = session.get(WorkspaceJoinBatchItemModel, batch_item_id)
-    if item is None:
-        return
-    item.item_status = "skipped"
-    item.batch_binding_status = "released"
-    item.failure_code = "work_cancelled"
-    item.failure_message = "work item was cancelled before execution"
-    item.updated_at = now
-    _finish_workspace_batch_if_complete(session, item.batch_id, now=now)
-
-
-def _finish_workspace_batch_if_complete(session: Session, batch_id: str, *, now: datetime) -> None:
-    batch = session.get(WorkspaceJoinBatchModel, batch_id)
-    if batch is None:
-        return
-    items = (
-        session.query(WorkspaceJoinBatchItemModel)
-        .filter_by(batch_id=batch_id)
-        .all()
-    )
-    terminal_statuses = {"token_generated", "joined", "pushed", "failed", "skipped"}
-    if any(item.item_status not in terminal_statuses for item in items):
-        batch.updated_at = now
-        return
-    success_count = sum(
-        1 for item in items if item.item_status in {"token_generated", "joined", "pushed"}
-    )
-    failed_count = sum(1 for item in items if item.item_status == "failed")
-    batch.success_count = success_count
-    batch.failed_count = failed_count
-    batch.finished_at = now
-    if failed_count == 0:
-        batch.batch_status = "success"
-    elif success_count > 0:
-        batch.batch_status = "partial_success"
-    else:
-        batch.batch_status = "failed"
-    batch.updated_at = now

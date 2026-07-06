@@ -23,9 +23,11 @@ class RefreshWebsharePoolWorkflow:
         *,
         session_factory: Callable[[], Session],
         proxy_provider: ProxyProvider,
+        proxy_type: str = "proxyserver",
     ) -> None:
         self._session_factory = session_factory
         self._proxy_provider = proxy_provider
+        self._proxy_type = proxy_type
 
     def run(self) -> int:
         proxies = self._proxy_provider.list_proxies()
@@ -35,7 +37,9 @@ class RefreshWebsharePoolWorkflow:
             if uow.proxy_inventory is None:
                 raise ProxyWorkflowError("proxy_inventory repository is not initialized")
             for proxy in proxies:
-                uow.proxy_inventory.upsert_from_values(proxy_inventory_values(proxy, now))
+                uow.proxy_inventory.upsert_from_values(
+                    proxy_inventory_values(proxy, now, proxy_type=self._proxy_type)
+                )
 
         return len(proxies)
 
@@ -135,10 +139,16 @@ class HealthcheckProxyWorkflow:
         }
 
 
-def proxy_inventory_values(proxy: ProxyNode, now: datetime) -> dict:
+def proxy_inventory_values(
+    proxy: ProxyNode,
+    now: datetime,
+    *,
+    proxy_type: str | None = None,
+) -> dict:
     return {
         "id": f"proxy-webshare-{proxy.external_proxy_id}",
         "provider": proxy.provider,
+        "proxy_type": proxy_type or proxy.proxy_type or "proxyserver",
         "external_proxy_id": proxy.external_proxy_id,
         "connection_mode": proxy.connection_mode,
         "proxy_host": proxy.proxy_host,

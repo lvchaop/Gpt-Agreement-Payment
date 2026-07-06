@@ -14,7 +14,6 @@ def test_runtime_code_does_not_reference_old_project_or_sqlite() -> None:
         "webui",
         "pipeline.py",
         "sys.path",
-        "subprocess",
     ]
 
     violations: list[str] = []

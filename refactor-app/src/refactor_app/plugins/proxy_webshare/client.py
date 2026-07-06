@@ -22,6 +22,7 @@ class WebshareClientConfig:
     api_token: str
     base_url: str = DEFAULT_BASE_URL
     download_url: str = ""
+    proxy_type: str = "proxyserver"
     page_size: int = 100
     timeout_s: float = 30.0
 
@@ -90,7 +91,7 @@ class WebshareClient:
             raise WebshareClientError(
                 f"webshare download proxies failed: http_status={response.status_code}"
             )
-        return parse_download_proxy_text(response.text)
+        return parse_download_proxy_text(response.text, proxy_type=self._config.proxy_type)
 
 
 def parse_proxy_node(item: dict[str, Any]) -> ProxyNode:
@@ -105,6 +106,7 @@ def parse_proxy_node(item: dict[str, Any]) -> ProxyNode:
         proxy_host=proxy_host,
         proxy_port=proxy_port,
         proxy_scheme="http",
+        proxy_type=str(item.get("proxy_type") or "proxyserver"),
         proxy_username=str(item.get("username") or ""),
         proxy_password=str(item.get("password") or ""),
         country_code=str(item.get("country_code") or ""),
@@ -115,17 +117,22 @@ def parse_proxy_node(item: dict[str, Any]) -> ProxyNode:
     )
 
 
-def parse_download_proxy_text(text: str) -> list[ProxyNode]:
+def parse_download_proxy_text(text: str, *, proxy_type: str = "proxyserver") -> list[ProxyNode]:
     proxies: list[ProxyNode] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
-        proxies.append(parse_download_proxy_line(line, line_number=line_number))
+        proxies.append(parse_download_proxy_line(line, line_number=line_number, proxy_type=proxy_type))
     return proxies
 
 
-def parse_download_proxy_line(line: str, *, line_number: int) -> ProxyNode:
+def parse_download_proxy_line(
+    line: str,
+    *,
+    line_number: int,
+    proxy_type: str = "proxyserver",
+) -> ProxyNode:
     parts = line.split(":")
     if len(parts) != 4:
         raise WebshareClientError(
@@ -148,6 +155,7 @@ def parse_download_proxy_line(line: str, *, line_number: int) -> ProxyNode:
         proxy_host=proxy_host,
         proxy_port=proxy_port,
         proxy_scheme="http",
+        proxy_type=proxy_type,
         proxy_username=username,
         proxy_password=password,
         provider_valid=True,

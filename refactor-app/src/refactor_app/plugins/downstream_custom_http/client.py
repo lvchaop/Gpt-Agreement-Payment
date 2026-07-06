@@ -70,6 +70,25 @@ class CustomHttpClient:
             raw=raw,
         )
 
+    def push_business_access_token(self, payload: dict) -> DownstreamPushResult:
+        headers = {"Content-Type": "application/json"}
+        if self._config.auth_header_name:
+            headers[self._config.auth_header_name] = self._config.auth_header_value
+        response = self._client.post(self._config.url, json=payload, headers=headers)
+        raw = _safe_json(response)
+        if response.is_error:
+            return DownstreamPushResult(
+                pushed=False,
+                error_code=f"http_{response.status_code}",
+                error_message=str(raw.get("message") or raw.get("error") or raw.get("body") or ""),
+                raw=raw,
+            )
+        return DownstreamPushResult(
+            pushed=True,
+            downstream_external_id=_custom_http_external_id(raw),
+            raw=raw,
+        )
+
 
 def build_custom_http_payload(
     payload: DownstreamCodexPayload,

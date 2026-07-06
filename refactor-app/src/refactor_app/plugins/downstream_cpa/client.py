@@ -65,6 +65,27 @@ class CpaClient:
             raw=raw,
         )
 
+    def push_business_access_token(self, payload: dict) -> DownstreamPushResult:
+        name, body = build_cpa_business_access_token_auth_file(payload)
+        response = self._client.post(
+            "/v0/management/auth-files",
+            params={"name": name},
+            json=body,
+        )
+        raw = _safe_json(response)
+        if response.is_error:
+            return DownstreamPushResult(
+                pushed=False,
+                error_code=f"http_{response.status_code}",
+                error_message=str(raw.get("message") or raw.get("error") or ""),
+                raw=raw,
+            )
+        return DownstreamPushResult(
+            pushed=True,
+            downstream_external_id=str(raw.get("id") or name),
+            raw=raw,
+        )
+
 
 def build_cpa_auth_file(payload: DownstreamCodexPayload) -> tuple[str, dict]:
     validate_codex_payload(payload)
@@ -84,6 +105,30 @@ def build_cpa_auth_file(payload: DownstreamCodexPayload) -> tuple[str, dict]:
         "type": "codex",
     }
     return name, body
+
+
+def build_cpa_business_access_token_auth_file(payload: dict) -> tuple[str, dict]:
+    _validate_business_access_token_payload(payload)
+    account = payload["accounts"][0]
+    credentials = account["credentials"]
+    tag = hashlib.md5(str(credentials["email"]).encode()).hexdigest()[:8]
+    name = f"pat-{tag}-{credentials['email']}-{credentials['chatgpt_account_id']}.json"
+    return name, payload
+
+
+def _validate_business_access_token_payload(payload: dict) -> None:
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, list) or not accounts:
+        raise CpaClientError("business access token payload missing accounts")
+    account = accounts[0]
+    if not isinstance(account, dict):
+        raise CpaClientError("business access token account must be an object")
+    credentials = account.get("credentials")
+    if not isinstance(credentials, dict):
+        raise CpaClientError("business access token credentials must be an object")
+    for key in ("access_token", "chatgpt_account_id", "chatgpt_user_id", "email"):
+        if not str(credentials.get(key) or "").strip():
+            raise CpaClientError(f"business access token credentials.{key} is required")
 
 
 def _safe_json(response: httpx.Response) -> dict:

@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS remote_member_release_tasks CASCADE;
+DROP TABLE IF EXISTS downstream_codex_push_records CASCADE;
+DROP TABLE IF EXISTS workspace_join_batch_items CASCADE;
+DROP TABLE IF EXISTS workspace_join_batches CASCADE;
+DROP TABLE IF EXISTS codex_oauth_credentials CASCADE;
+DROP TABLE IF EXISTS user_account_team_workspace_memberships CASCADE;
+DROP TABLE IF EXISTS workspace_operation_locks CASCADE;
+DROP TABLE IF EXISTS workspace_automation_states CASCADE;
+DROP TABLE IF EXISTS user_account_cooldowns CASCADE;
+DROP TABLE IF EXISTS team_workspaces CASCADE;

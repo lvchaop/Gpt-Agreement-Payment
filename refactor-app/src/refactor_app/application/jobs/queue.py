@@ -3,10 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from refactor_app.infrastructure.db.models import JobModel, WorkItemModel
+
+
+JOB_CONCURRENCY_LIMITED_WORK_TYPES = {
+    "account.backfill_session_rt",
+    "account.backfill_session",
+    "account.backfill_rt",
+}
 
 
 class JobQueue:
@@ -88,7 +95,25 @@ class WorkQueue:
         )
         if job_id:
             stmt = stmt.where(WorkItemModel.job_id == job_id)
-        work = self.session.scalars(stmt).first()
+        work = None
+        for candidate in self.session.scalars(stmt).all():
+            if candidate.work_type in JOB_CONCURRENCY_LIMITED_WORK_TYPES and not self._can_claim_limited_job_work(
+                job_id=candidate.job_id
+            ):
+                continue
+            work = candidate
+            break
+        if work is None and not job_id:
+            work = self.session.scalars(
+                select(WorkItemModel)
+                .where(
+                    WorkItemModel.work_status == "queued",
+                    ~WorkItemModel.work_type.in_(JOB_CONCURRENCY_LIMITED_WORK_TYPES),
+                )
+                .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            ).first()
         if work is None:
             return None
         now = datetime.now(UTC)
@@ -98,3 +123,28 @@ class WorkQueue:
         work.started_at = now
         work.updated_at = now
         return work
+
+    def _can_claim_limited_job_work(self, *, job_id: str) -> bool:
+        job = self.session.scalars(
+            select(JobModel)
+            .where(JobModel.id == job_id)
+            .with_for_update()
+            .limit(1)
+        ).first()
+        if job is None:
+            return False
+        try:
+            concurrency = int((job.input_json or {}).get("concurrency") or 1)
+        except (TypeError, ValueError):
+            concurrency = 1
+        concurrency = max(1, concurrency)
+        running_count = self.session.scalar(
+            select(func.count())
+            .select_from(WorkItemModel)
+            .where(
+                WorkItemModel.job_id == job_id,
+                WorkItemModel.work_status == "running",
+                WorkItemModel.work_type.in_(JOB_CONCURRENCY_LIMITED_WORK_TYPES),
+            )
+        )
+        return int(running_count or 0) < concurrency

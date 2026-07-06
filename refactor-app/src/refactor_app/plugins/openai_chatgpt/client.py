@@ -17,6 +17,9 @@ DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com"
 CHATGPT_AUTH_CLAIM = "https://api.openai.com/auth"
 DEFAULT_CODEX_HEARTBEAT_MODEL = "gpt-5.5"
 CODEX_RESPONSES_PATH = "/backend-api/codex/responses"
+WHAM_USAGE_PATH = "/backend-api/wham/usage"
+WHAM_AUTH_CREDENTIALS_PATH = "/backend-api/wham/auth-credentials"
+WHAM_CODEX_LOCAL_ACCESS_SCOPE = "chatgpt.workspace.feature.allow-codex-local-access.access"
 CODEX_INSTRUCTIONS_PATH = (
     Path(__file__).resolve().parents[2] / "assets" / "openai_codex_instructions.txt"
 )
@@ -133,6 +136,7 @@ class OpenAIChatGPTClient:
         email: str,
         cookie_header: str = "",
         seat_type: str = "default",
+        proxy_url: str = "",
     ) -> dict:
         response = self._chatgpt_post(
             f"/backend-api/accounts/{team_id}/invites",
@@ -148,6 +152,7 @@ class OpenAIChatGPTClient:
                 "seat_type": seat_type,
                 "resend_emails": True,
             },
+            proxy_url=proxy_url,
         )
         return _response_payload(response)
 
@@ -208,6 +213,59 @@ class OpenAIChatGPTClient:
         )
         _assert_codex_heartbeat_http_ok(response)
         return {"status": "ok", "token_chatgpt_account_id": claims.token_chatgpt_account_id}
+
+    def fetch_wham_usage(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str = "",
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        response = self._chatgpt_get(
+            WHAM_USAGE_PATH,
+            headers=_wham_headers(
+                access_token=access_token,
+                chatgpt_account_id=chatgpt_account_id,
+                cookie_header=cookie_header,
+            ),
+            proxy_url=proxy_url,
+        )
+        return _response_payload(response)
+
+    def create_wham_auth_credential(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str,
+        name: str,
+        ttl_seconds: int = 7_776_000,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        if not chatgpt_account_id:
+            raise OpenAIChatGPTClientError("chatgpt_account_id is required")
+        credential_name = str(name or "").strip()
+        if not credential_name:
+            raise OpenAIChatGPTClientError("name is required")
+        ttl = int(ttl_seconds or 0)
+        if ttl <= 0:
+            raise OpenAIChatGPTClientError("ttl_seconds must be positive")
+        response = self._chatgpt_post(
+            WHAM_AUTH_CREDENTIALS_PATH,
+            headers=_wham_headers(
+                access_token=access_token,
+                chatgpt_account_id=chatgpt_account_id,
+                cookie_header=cookie_header,
+            ),
+            json={
+                "name": credential_name,
+                "scopes": [WHAM_CODEX_LOCAL_ACCESS_SCOPE],
+                "ttl": ttl,
+            },
+            proxy_url=proxy_url,
+        )
+        return _response_payload(response)
 
     def _chatgpt_post(
         self,
@@ -357,6 +415,37 @@ def _codex_responses_headers(*, access_token: str, team_id: str) -> dict[str, st
             "Chrome/148.0.0.0 Safari/537.36"
         ),
     }
+
+
+def _wham_headers(
+    *,
+    access_token: str,
+    chatgpt_account_id: str = "",
+    cookie_header: str = "",
+) -> dict[str, str]:
+    if not access_token:
+        raise OpenAIChatGPTClientError("access_token is required")
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "content-type": "application/json",
+        "accept": "*/*",
+        "host": "chatgpt.com",
+        "origin": "https://chatgpt.com",
+        "referer": "https://chatgpt.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/148.0.0.0 Safari/537.36"
+        ),
+    }
+    if chatgpt_account_id:
+        headers["chatgpt-account-id"] = chatgpt_account_id
+    if cookie_header:
+        headers["cookie"] = cookie_header
+        device_id = _cookie_value(cookie_header, "oai-did")
+        if device_id:
+            headers["oai-device-id"] = device_id
+    return headers
 
 
 def _assert_codex_heartbeat_http_ok(response) -> None:

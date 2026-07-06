@@ -5,88 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>refactor-app ops</title>
     <style>
-      body {
-        color: #172033;
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        margin: 24px;
-      }
-      header {
-        border-bottom: 1px solid #d7dde8;
-        margin-bottom: 16px;
-      }
-      button, input, textarea {
-        font: inherit;
-      }
-      button {
-        background: #1f5eff;
-        border: 0;
-        border-radius: 6px;
-        color: white;
-        cursor: pointer;
-        margin: 4px 4px 4px 0;
-        padding: 8px 12px;
-      }
-      input, textarea {
-        border: 1px solid #c8d0df;
-        border-radius: 6px;
-        margin: 4px;
-        padding: 8px;
-      }
-      textarea {
-        min-height: 92px;
-        min-width: 520px;
-        vertical-align: top;
-      }
-      section {
-        border: 1px solid #d7dde8;
-        border-radius: 8px;
-        margin: 16px 0;
-        padding: 14px;
-      }
-      table {
-        border-collapse: collapse;
-        margin-top: 12px;
-        width: 100%;
-      }
-      td, th {
-        border-bottom: 1px solid #e7ebf2;
-        font-size: 13px;
-        max-width: 380px;
-        overflow-wrap: anywhere;
-        padding: 8px;
-        text-align: left;
-        vertical-align: top;
-      }
-      code, pre {
-        background: #f5f7fb;
-        border-radius: 6px;
-      }
-      pre {
-        overflow: auto;
-        padding: 12px;
-      }
-      .muted {
-        color: #647089;
-      }
+      body { color: #172033; font-family: system-ui, sans-serif; margin: 24px; }
+      button, input, textarea { font: inherit; }
+      button { background: #1f5eff; border: 0; border-radius: 6px; color: white; cursor: pointer; margin: 4px; padding: 8px 12px; }
+      input, textarea { border: 1px solid #c8d0df; border-radius: 6px; margin: 4px; padding: 8px; }
+      textarea { min-height: 92px; min-width: 560px; vertical-align: top; }
+      section { border: 1px solid #d7dde8; border-radius: 8px; margin: 16px 0; padding: 14px; }
+      pre { background: #f5f7fb; border-radius: 6px; overflow: auto; padding: 12px; }
+      .muted { color: #647089; }
     </style>
   </head>
   <body>
     <header>
       <h1>refactor-app 运维台</h1>
-      <p class="muted">只通过当前项目 API 操作；长任务统一创建 Job，由 Worker 执行。</p>
+      <p class="muted">只保留 Space 口径入口；旧 workspace / codex credential / batch / remote release 入口不在此页出现。</p>
     </header>
 
     <section>
       <h2>快捷查看</h2>
       <button data-load="/jobs">Job 列表</button>
-      <button data-load="/user-accounts">UserAccount</button>
-      <button data-load="/team-workspaces">TeamWorkspace</button>
-      <button data-load="/memberships">Membership</button>
-      <button data-load="/workspace-join-batches">Batch</button>
-      <button data-load="/codex-credentials">CodexCredential</button>
-      <button data-load="/downstream-push-records">Downstream Push</button>
-      <button data-load="/proxies">Proxy inventory</button>
-      <button data-load="/mail-leases">Mail lease</button>
+      <button data-load="/user-accounts">User Account</button>
+      <button data-load="/spaces">Spaces</button>
+      <button data-load="/space-credentials">Space Credentials</button>
+      <button data-load="/memberships">Space Memberships</button>
+      <button data-load="/downstream-channels">Downstream Channels</button>
+      <button data-load="/automation/schedules">Automation Schedules</button>
     </section>
 
     <section>
@@ -94,39 +37,18 @@
       <input id="jobId" placeholder="job_id" />
       <button onclick="loadPath('/jobs/' + valueOf('jobId'))">查看 Job</button>
       <button onclick="loadPath('/jobs/' + valueOf('jobId') + '/runs')">查看 JobRun</button>
+      <button onclick="loadPath('/jobs/' + valueOf('jobId') + '/work-items')">查看 Work Items</button>
       <input id="runId" placeholder="run_id" />
       <button onclick="loadPath('/runs/' + valueOf('runId') + '/steps')">Step timeline</button>
       <button onclick="loadPath('/runs/' + valueOf('runId') + '/events')">Event log</button>
     </section>
 
     <section>
-      <h2>Batch 操作</h2>
-      <textarea id="batchPayload">{"team_workspace_id":"","user_account_ids":[],"codex_client_id":"","batch_name":"","created_by":"ops"}</textarea>
-      <button onclick="postJson('/workspace-join-batches', 'batchPayload')">创建 batch job</button>
-      <input id="batchId" placeholder="batch_id" />
-      <button onclick="loadPath('/workspace-join-batches/' + valueOf('batchId'))">查看 batch</button>
-      <button onclick="loadPath('/workspace-join-batches/' + valueOf('batchId') + '/items')">查看 batch item</button>
-      <button onclick="postRaw('/workspace-join-batches/' + valueOf('batchId') + '/activate', {})">激活 batch job</button>
-    </section>
-
-    <section>
-      <h2>Workspace / Proxy / Heartbeat</h2>
-      <textarea id="workspacePayload">{"provider":"openai_chatgpt","external_workspace_id":"","name":"","plan_type":"","seat_limit":0,"workspace_status":"unknown"}</textarea>
-      <button onclick="postJson('/team-workspaces/import', 'workspacePayload')">导入 Team Workspace</button>
-      <button onclick="postRaw('/proxies/refresh-webshare-job', {})">刷新 Webshare proxy job</button>
-      <textarea id="bindProxyPayload">{"user_account_id":""}</textarea>
-      <button onclick="postJson('/proxies/bind-account-job', 'bindProxyPayload')">绑定账号 proxy job</button>
-      <textarea id="invitePayload">{"inviter_membership_id":"","email":""}</textarea>
-      <button onclick="postJson('/memberships/invite-member-job', 'invitePayload')">邀请 Workspace 成员 job</button>
-      <textarea id="mailPayload">{"user_account_id":null,"purpose":""}</textarea>
-      <button onclick="postJson('/mail/allocate-job', 'mailPayload')">申请邮箱 lease job</button>
-      <textarea id="mailLifecyclePayload">{"mail_lease_id":"","timeout_s":60,"failure_code":"","failure_message":"","reason":""}</textarea>
-      <button onclick="postJson('/mail/poll-otp-job', 'mailLifecyclePayload')">轮询 OTP job</button>
-      <button onclick="postJson('/mail/mark-used-job', 'mailLifecyclePayload')">标记邮箱 used job</button>
-      <button onclick="postJson('/mail/mark-failed-job', 'mailLifecyclePayload')">标记邮箱 failed job</button>
-      <button onclick="postJson('/mail/release-job', 'mailLifecyclePayload')">释放邮箱 lease job</button>
-      <input id="credentialId" placeholder="codex_credential_id" />
-      <button onclick="postRaw('/codex-credentials/' + valueOf('credentialId') + '/heartbeat-job', {})">Credential heartbeat job</button>
+      <h2>Space Job</h2>
+      <textarea id="pushPendingPayload">{"downstream_channel_id":"","limit":1,"created_by":"ops","concurrency":1}</textarea>
+      <button onclick="postJson('/space-credentials/push-pending-job', 'pushPendingPayload')">按下游余额补推</button>
+      <textarea id="recyclePayload">{"limit":100,"created_by":"ops"}</textarea>
+      <button onclick="postJson('/spaces/recycle-sweep-job', 'recyclePayload')">Space 回收扫描</button>
     </section>
 
     <section>
@@ -139,65 +61,32 @@
       function valueOf(id) {
         return encodeURIComponent(document.getElementById(id).value.trim());
       }
-
       function render(data) {
         document.getElementById("resultMeta").textContent = new Date().toISOString();
-        if (Array.isArray(data)) {
-          renderTable(data);
-          return;
-        }
         document.getElementById("result").innerHTML = "<pre>" + escapeHtml(JSON.stringify(data, null, 2)) + "</pre>";
       }
-
-      function renderTable(rows) {
-        if (rows.length === 0) {
-          document.getElementById("result").innerHTML = "<p class=\"muted\">无数据</p>";
-          return;
-        }
-        const keys = Array.from(rows.reduce((set, row) => {
-          Object.keys(row).forEach((key) => set.add(key));
-          return set;
-        }, new Set()));
-        const head = keys.map((key) => "<th>" + escapeHtml(key) + "</th>").join("");
-        const body = rows.map((row) => "<tr>" + keys.map((key) => {
-          const value = row[key];
-          const text = typeof value === "object" ? JSON.stringify(value) : String(value ?? "");
-          return "<td>" + escapeHtml(text) + "</td>";
-        }).join("") + "</tr>").join("");
-        document.getElementById("result").innerHTML = "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
-      }
-
       async function loadPath(path) {
         const response = await fetch(path);
         render(await response.json());
       }
-
       async function postJson(path, textareaId) {
         const payload = JSON.parse(document.getElementById(textareaId).value);
-        await postRaw(path, payload);
-      }
-
-      async function postRaw(path, payload) {
         const response = await fetch(path, {
           method: "POST",
-          headers: {"content-type": "application/json"},
+          headers: { "content-type": "application/json" },
           body: JSON.stringify(payload),
         });
         render(await response.json());
       }
-
-      function escapeHtml(text) {
-        return text.replace(/[&<>"']/g, (char) => ({
-          "&": "&amp;",
-          "<": "&lt;",
-          ">": "&gt;",
-          "\"": "&quot;",
-          "'": "&#039;",
-        }[char]));
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
       }
-
       document.querySelectorAll("[data-load]").forEach((button) => {
-        button.addEventListener("click", () => loadPath(button.dataset.load));
+        button.addEventListener("click", () => loadPath(button.getAttribute("data-load")));
       });
     </script>
   </body>

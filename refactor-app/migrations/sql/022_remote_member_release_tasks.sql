@@ -34,6 +34,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_release_push_record
   ON remote_member_release_tasks(downstream_push_record_id);
 
 ALTER TABLE automation_schedules
+  DROP CONSTRAINT IF EXISTS automation_schedules_type_check;
+
+ALTER TABLE automation_schedules
   DROP CONSTRAINT IF EXISTS automation_schedules_schedule_type_check;
 
 ALTER TABLE automation_schedules
@@ -48,3 +51,29 @@ ALTER TABLE automation_schedules
       'automation.remote_member_release'
     )
   );
+
+INSERT INTO automation_schedules (
+  id,
+  schedule_type,
+  schedule_status,
+  enabled,
+  interval_seconds,
+  config_json,
+  next_run_at,
+  created_by,
+  created_at,
+  updated_at
+)
+VALUES (
+  'automation-schedule-remote-member-release',
+  'automation.remote_member_release',
+  'paused',
+  false,
+  60,
+  $json${"task_limit":200,"task_concurrency":10,"page_size":100}$json$::jsonb,
+  NOW(),
+  'migration',
+  NOW(),
+  NOW()
+)
+ON CONFLICT (id) DO NOTHING;

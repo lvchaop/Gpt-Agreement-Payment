@@ -30,6 +30,7 @@ class ProxyNode:
     proxy_host: str
     proxy_port: int
     proxy_scheme: str
+    proxy_type: str = "proxyserver"
     proxy_username: str = ""
     proxy_password: str = ""
     country_code: str = ""
@@ -110,6 +111,7 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
         email: str,
         cookie_header: str = "",
         seat_type: str = "default",
+        proxy_url: str = "",
     ) -> dict: ...
 
     def accept_invite(
@@ -130,6 +132,26 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
         team_id: str,
         proxy_url: str = "",
         model: str = "",
+    ) -> dict: ...
+
+    def fetch_wham_usage(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str = "",
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def create_wham_auth_credential(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str,
+        name: str,
+        ttl_seconds: int = 7_776_000,
+        cookie_header: str = "",
+        proxy_url: str = "",
     ) -> dict: ...
 
 
@@ -163,3 +185,5 @@ class DownstreamPushResult:
 
 class DownstreamProvider(PluginContract, Protocol):
     def push_codex_credential(self, payload: DownstreamCodexPayload) -> DownstreamPushResult: ...
+
+    def push_business_access_token(self, payload: dict) -> DownstreamPushResult: ...

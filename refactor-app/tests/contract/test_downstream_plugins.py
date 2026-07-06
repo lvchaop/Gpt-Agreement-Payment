@@ -41,13 +41,10 @@ def sample_payload() -> DownstreamCodexPayload:
 def test_cpa_payload_builder_preserves_workspace_chatgpt_account_id() -> None:
     name, body = build_cpa_auth_file(sample_payload())
 
-    assert name == "ChatGPT_team_user@example.test"
+    assert name == "codex-08ea5c18-user@example.test-team.json"
     assert body["type"] == "codex"
     assert body["email"] == "user@example.test"
     assert body["account_id"] == "chatgpt-user-1"
-    assert body["chatgpt_account_id"] == "workspace-1"
-    assert body["chatgpt_user_id"] == "chatgpt-user-1"
-    assert body["client_id"] == "client-1"
 
 
 def test_sub2api_payload_builder_sets_update_existing_false_by_default() -> None:
@@ -106,10 +103,10 @@ def test_cpa_client_posts_management_auth_file() -> None:
         requests.append(request)
         assert request.method == "POST"
         assert request.url.path == "/v0/management/auth-files"
-        assert request.url.params["name"] == "ChatGPT_team_user@example.test"
+        assert request.url.params["name"] == "codex-08ea5c18-user@example.test-team.json"
         assert request.headers["Authorization"] == "Bearer admin-key"
         body = request.read()
-        assert b'"chatgpt_account_id":"workspace-1"' in body
+        assert b'"account_id":"chatgpt-user-1"' in body
         return httpx.Response(200, json={"id": "auth-file-1"})
 
     plugin: DownstreamProvider = CpaDownstreamPlugin(

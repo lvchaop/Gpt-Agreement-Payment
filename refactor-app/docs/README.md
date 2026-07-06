@@ -26,6 +26,9 @@
 | `11-consistency-review.md` | 文档、ER、schema 一致性审查记录 |
 | `12-implementation-plan.md` | 按当前设计功能点和流程组织的实施计划 |
 | `14-local-postgres-bootstrap.md` | 本地 Docker PostgreSQL 建库、schema 导入和校验记录 |
+| `15-ops-console-ui-design.md` | 当前 Ops Console 的页面结构和 UI 设计记录 |
+| `16-portal-operations-redesign.md` | Portal 运营端最终形态：导航、页面职责、操作流和后端接口改造 |
+| `17-space-auth-push-redesign.md` | Space 授权、推送、余额、用量、回收重构；目标态只有一套 Space 逻辑 |
 | `schema/001_initial_schema.sql` | PostgreSQL 目标表结构 |
 | `schema/ER.md` | ER 图、核心关系和约束说明 |
 
@@ -34,6 +37,7 @@
 - 本目录不维护“老项目迁移路线”。
 - 本目录不维护“老项目功能盘点”作为实施依据。
 - 实施只按 `12-implementation-plan.md` 中定义的当前设计功能点和流程推进。
+- Space 授权、推送、余额、用量、回收以 `17-space-auth-push-redesign.md` 为最新实施依据；该域没有旧逻辑并行、没有过渡期。
 
 ## 总体方向
 

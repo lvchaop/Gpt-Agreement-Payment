@@ -10,26 +10,39 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
-from curl_cffi import requests as curl_requests
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+try:
+    from curl_cffi import requests as curl_requests
+except ModuleNotFoundError:  # pragma: no cover - exercised in minimal test envs.
+    class _MissingCurlRequests:
+        def Session(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("curl_cffi is required for ChatGPT browser-session requests")
+
+    curl_requests = _MissingCurlRequests()
 
 from refactor_app.domain.enums import ProxyBindStatus, ProxyStatus
 from refactor_app.infrastructure.db.models import (
     JobStepModel,
     ProxyInventoryModel,
-    UserAccountAuthModel,
+    SpaceModel,
     UserAccountModel,
     UserAccountProxyBindingModel,
 )
 from refactor_app.infrastructure.logging.event_writer import EventWriter
 from refactor_app.plugins.mail_external_api.plugin import ExternalMailApiPlugin
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
+    DEFAULT_CODEX_CLIENT_ID,
     acquire_codex_rt_with_browser_login,
     acquire_codex_rt_with_existing_browser_session,
 )
 from refactor_app.plugins.openai_auth_protocol.session_login import acquire_chatgpt_session
 from refactor_app.plugins.openai_chatgpt.client import decode_access_token_claims
+from refactor_app.application.workflows.space_authorization import (
+    UpsertPersonalCodexSpaceCredentialInput,
+    UpsertPersonalCodexSpaceCredentialWorkflow,
+)
 
 PROXY_HEALTHCHECK_URL = "https://chatgpt.com/cdn-cgi/trace"
 ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
@@ -184,28 +197,6 @@ class BackfillSessionWorkflow:
             raise
         now = datetime.now(UTC)
 
-        if auth is None:
-            self._write_failure(
-                user_account_id=user_account_id,
-                error_code="missing_auth_row",
-                error_message="user_account_auth row not found",
-                now=now,
-            )
-            self._write_event(
-                run_id,
-                "account_auth.failed",
-                "missing user_account_auth row",
-                {"user_account_id": user_account_id},
-                level="ERROR",
-                step_id=workflow_step_id,
-            )
-            self._finish_step(
-                workflow_step_id,
-                "failed",
-                error_code="missing_auth_row",
-                error_message="user_account_auth row not found",
-            )
-            raise AccountAuthWorkflowError("missing_auth_row")
         if not auth.password:
             self._write_failure(
                 user_account_id=user_account_id,
@@ -410,7 +401,7 @@ class BackfillSessionWorkflow:
         self,
         user_account_id: str,
         run_id: str = "",
-    ) -> tuple[UserAccountModel, UserAccountAuthModel | None, str]:
+    ) -> tuple[UserAccountModel, UserAccountModel, str]:
         account, auth, proxy = self._load_account_auth_proxy(user_account_id)
         if proxy is not None and _probe_proxy_alive(_proxy_url(proxy)):
             self._mark_proxy_health(proxy.id, alive=True)
@@ -461,14 +452,13 @@ class BackfillSessionWorkflow:
     def _load_account_auth_proxy(
         self,
         user_account_id: str,
-    ) -> tuple[UserAccountModel, UserAccountAuthModel | None, ProxyInventoryModel | None]:
+    ) -> tuple[UserAccountModel, UserAccountModel, ProxyInventoryModel | None]:
         with self._session_factory() as session:
             account = session.get(UserAccountModel, user_account_id)
             if account is None:
                 raise AccountAuthWorkflowError(f"user account not found: {user_account_id}")
-            auth = session.get(UserAccountAuthModel, user_account_id)
             proxy = _active_proxy(session, user_account_id)
-            return account, auth, proxy
+            return account, account, proxy
 
     def _rebind_least_bound_proxy(self, user_account_id: str) -> ProxyInventoryModel:
         now = datetime.now(UTC)
@@ -638,58 +628,53 @@ class BackfillSessionWorkflow:
     def _write_success(self, *, user_account_id: str, result, now: datetime) -> None:
         auth_result = result.auth_result
         with self._session_factory() as session:
-            auth = session.get(UserAccountAuthModel, user_account_id)
             account = session.get(UserAccountModel, user_account_id)
-            if auth is None:
-                raise AccountAuthWorkflowError("user_account_auth row disappeared")
-            auth.session_token = _keep_existing_if_empty(
-                auth.session_token,
+            if account is None:
+                raise AccountAuthWorkflowError("user_account row disappeared")
+            account.session_token = _keep_existing_if_empty(
+                account.session_token,
                 auth_result.session_token,
             )
-            auth.access_token = _keep_existing_if_empty(
-                auth.access_token,
-                auth_result.access_token,
-            )
-            auth.refresh_token = _keep_existing_if_empty(
-                auth.refresh_token,
-                auth_result.refresh_token,
-            )
-            auth.cookie_header = _keep_existing_if_empty(
-                auth.cookie_header,
+            account.cookie_header = _keep_existing_if_empty(
+                account.cookie_header,
                 result.cookie_header or auth_result.cookie_header,
             )
-            auth.cookie_header = _ensure_session_token_cookie(
-                auth.cookie_header,
-                auth.session_token,
+            account.cookie_header = _ensure_session_token_cookie(
+                account.cookie_header,
+                account.session_token,
             )
-            auth.auth_cookie_header = _keep_existing_if_empty(
-                auth.auth_cookie_header,
+            account.auth_cookie_header = _keep_existing_if_empty(
+                account.auth_cookie_header,
                 getattr(result, "auth_cookie_header", ""),
             )
-            auth.device_id = _keep_existing_if_empty(auth.device_id, auth_result.device_id)
-            auth.csrf_token = _keep_existing_if_empty(auth.csrf_token, auth_result.csrf_token)
+            account.device_id = _keep_existing_if_empty(account.device_id, auth_result.device_id)
+            account.csrf_token = _keep_existing_if_empty(account.csrf_token, auth_result.csrf_token)
             if (
                 str(getattr(auth_result, "chatgpt_account_structure", "") or "").lower()
                 == "personal"
                 and str(getattr(auth_result, "chatgpt_account_id", "") or "").strip()
             ):
-                auth.personal_chatgpt_account_id = str(
-                    getattr(auth_result, "chatgpt_account_id", "") or ""
-                ).strip()
-                auth.personal_chatgpt_account_discovered_at = now
-            if auth_result.refresh_token:
-                auth.refresh_token_status = "active"
-                auth.last_refresh_at = now
-            auth.session_status = (
-                "active" if auth.session_token or auth.cookie_header else auth.session_status
+                _ensure_personal_space(
+                    session=session,
+                    user_account_id=user_account_id,
+                    external_space_id=str(
+                        getattr(auth_result, "chatgpt_account_id", "") or ""
+                    ).strip(),
+                    space_name=account.email,
+                    now=now,
+                )
+            account.session_status = (
+                "active"
+                if account.session_token or account.cookie_header
+                else account.session_status
             )
-            auth.last_session_refresh_at = now
-            auth.last_auth_error_code = ""
-            auth.last_auth_error_message = ""
-            auth.updated_at = now
-            if account is not None and auth.access_token:
+            account.last_session_refresh_at = now
+            account.last_login_error_code = ""
+            account.last_login_error_message = ""
+            account.updated_at = now
+            if auth_result.access_token:
                 try:
-                    claims = decode_access_token_claims(auth.access_token)
+                    claims = decode_access_token_claims(auth_result.access_token)
                 except Exception:
                     claims = None
                 if claims is not None and claims.chatgpt_account_user_id:
@@ -698,9 +683,11 @@ class BackfillSessionWorkflow:
             session.commit()
 
     def _has_personal_chatgpt_account_id(self, user_account_id: str) -> bool:
+        return bool(self._personal_space_external_id(user_account_id))
+
+    def _personal_space_external_id(self, user_account_id: str) -> str:
         with self._session_factory() as session:
-            auth = session.get(UserAccountAuthModel, user_account_id)
-            return bool(auth and auth.personal_chatgpt_account_id)
+            return _personal_space_external_id(session=session, user_account_id=user_account_id)
 
     def _discover_personal_chatgpt_account(
         self,
@@ -743,12 +730,16 @@ class BackfillSessionWorkflow:
                 return
             now = datetime.now(UTC)
             with self._session_factory() as session:
-                auth = session.get(UserAccountAuthModel, user_account_id)
-                if auth is None:
-                    raise AccountAuthWorkflowError("user_account_auth row disappeared")
-                auth.personal_chatgpt_account_id = personal_account_id
-                auth.personal_chatgpt_account_discovered_at = now
-                auth.updated_at = now
+                account = session.get(UserAccountModel, user_account_id)
+                if account is None:
+                    raise AccountAuthWorkflowError("user_account row disappeared")
+                _ensure_personal_space(
+                    session=session,
+                    user_account_id=user_account_id,
+                    external_space_id=personal_account_id,
+                    space_name=account.email,
+                    now=now,
+                )
                 session.commit()
             self._write_event(
                 run_id,
@@ -794,12 +785,16 @@ class BackfillSessionWorkflow:
         now: datetime,
     ) -> None:
         with self._session_factory() as session:
-            auth = session.get(UserAccountAuthModel, user_account_id)
-            if auth is not None:
-                auth.session_status = "error"
-                auth.last_auth_error_code = error_code[:200]
-                auth.last_auth_error_message = error_message[:1000]
-                auth.updated_at = now
+            account = session.get(UserAccountModel, user_account_id)
+            if account is not None:
+                if _is_deleted_or_deactivated_account_error(error_message):
+                    account.account_status = "invalid"
+                    account.session_status = "dead"
+                else:
+                    account.session_status = "error"
+                account.last_login_error_code = error_code[:200]
+                account.last_login_error_message = error_message[:1000]
+                account.updated_at = now
                 session.commit()
 
 
@@ -829,23 +824,9 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
             {"user_account_id": user_account_id},
         )
         account, auth, proxy_url = self._load_input(user_account_id, run_id=run_id)
-        if auth is None:
-            self._write_rt_failure(
-                user_account_id=user_account_id,
-                error_code="missing_auth_row",
-                error_message="user_account_auth row not found",
-            )
-            self._finish_step(
-                step_id,
-                "failed",
-                error_code="missing_auth_row",
-                error_message="user_account_auth row not found",
-            )
-            raise AccountAuthWorkflowError("missing_auth_row")
-
         cookie_header = auth.cookie_header or ""
         auth_cookie_header = auth.auth_cookie_header or ""
-        personal_chatgpt_account_id = str(auth.personal_chatgpt_account_id or "").strip()
+        personal_chatgpt_account_id = self._personal_space_external_id(user_account_id)
         if not personal_chatgpt_account_id:
             self._write_rt_failure(
                 user_account_id=user_account_id,
@@ -1011,13 +992,13 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
             )
             self._write_rt_failure(
                 user_account_id=user_account_id,
-                error_code="personal_rt_workspace_mismatch",
+                error_code="personal_rt_space_mismatch",
                 error_message=message,
             )
             self._write_event(
                 run_id,
-                "account_auth.rt_personal_workspace_mismatch",
-                "personal rt token workspace mismatch",
+                "account_auth.rt_personal_space_mismatch",
+                "personal rt token space mismatch",
                 {
                     "user_account_id": user_account_id,
                     "expected": personal_chatgpt_account_id,
@@ -1029,29 +1010,43 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
             self._finish_step(
                 step_id,
                 "failed",
-                error_code="personal_rt_workspace_mismatch",
+                error_code="personal_rt_space_mismatch",
                 error_message=message,
             )
-            raise AccountAuthWorkflowError("personal_rt_workspace_mismatch")
+            raise AccountAuthWorkflowError("personal_rt_space_mismatch")
 
         now = datetime.now(UTC)
         with self._session_factory() as session:
-            auth_row = session.get(UserAccountAuthModel, user_account_id)
             account = session.get(UserAccountModel, user_account_id)
-            if auth_row is None:
-                raise AccountAuthWorkflowError("user_account_auth row disappeared")
-            auth_row.refresh_token = result.refresh_token
-            auth_row.refresh_token_status = "active"
-            auth_row.token_type = result.token_type
-            auth_row.scope = result.scope
-            auth_row.last_refresh_at = now
-            auth_row.last_auth_error_code = ""
-            auth_row.last_auth_error_message = ""
-            auth_row.updated_at = now
-            if account is not None and claims.chatgpt_account_user_id:
+            if account is None:
+                raise AccountAuthWorkflowError("user_account row disappeared")
+            if claims.chatgpt_account_user_id:
                 account.openai_user_id = claims.chatgpt_account_user_id
-                account.updated_at = now
+            account.last_login_error_code = ""
+            account.last_login_error_message = ""
+            account.updated_at = now
             session.commit()
+        UpsertPersonalCodexSpaceCredentialWorkflow(
+            session_factory=self._session_factory,
+        ).run(
+            UpsertPersonalCodexSpaceCredentialInput(
+                user_account_id=user_account_id,
+                external_space_id=personal_chatgpt_account_id,
+                access_token=result.access_token,
+                id_token=result.id_token,
+                refresh_token=result.refresh_token,
+                codex_client_id=DEFAULT_CODEX_CLIENT_ID,
+                account_id=claims.chatgpt_account_user_id,
+                token_chatgpt_account_id=claims.token_chatgpt_account_id,
+                expires_at=None,
+                raw_credential_json={
+                    "token_type": result.token_type,
+                    "scope": result.scope,
+                    "source": "account.backfill_rt",
+                },
+                space_name=account_email,
+            )
+        )
 
         self._write_event(
             run_id,
@@ -1096,12 +1091,11 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
     ) -> None:
         now = datetime.now(UTC)
         with self._session_factory() as session:
-            auth = session.get(UserAccountAuthModel, user_account_id)
-            if auth is not None:
-                auth.refresh_token_status = "error"
-                auth.last_auth_error_code = error_code[:200]
-                auth.last_auth_error_message = error_message[:1000]
-                auth.updated_at = now
+            account = session.get(UserAccountModel, user_account_id)
+            if account is not None:
+                account.last_login_error_code = error_code[:200]
+                account.last_login_error_message = error_message[:1000]
+                account.updated_at = now
                 session.commit()
 
 
@@ -1119,6 +1113,69 @@ def _active_proxy(session: Session, user_account_id: str) -> ProxyInventoryModel
         return None
     _binding, proxy = row
     return proxy
+
+
+def _personal_space_external_id(*, session: Session, user_account_id: str) -> str:
+    space = session.scalars(
+        select(SpaceModel).where(
+            SpaceModel.provider == "openai_chatgpt",
+            SpaceModel.owner_user_account_id == user_account_id,
+            SpaceModel.space_type == "personal",
+            SpaceModel.credential_type == "personal_account",
+        )
+    ).first()
+    return space.external_space_id if space is not None else ""
+
+
+def _ensure_personal_space(
+    *,
+    session: Session,
+    user_account_id: str,
+    external_space_id: str,
+    space_name: str,
+    now: datetime,
+) -> SpaceModel:
+    external_id = external_space_id.strip()
+    if not external_id:
+        raise AccountAuthWorkflowError("personal_space_external_id_required")
+    space = session.scalars(
+        select(SpaceModel).where(
+            SpaceModel.provider == "openai_chatgpt",
+            SpaceModel.external_space_id == external_id,
+        )
+    ).first()
+    if space is None:
+        space = SpaceModel(
+            id=f"space-{uuid4()}",
+            provider="openai_chatgpt",
+            external_space_id=external_id,
+            owner_user_account_id=user_account_id,
+            name=space_name or external_id,
+            space_type="personal",
+            auth_mode="codex_oauth",
+            credential_type="personal_account",
+            plan_type="",
+            seat_limit=0,
+            seats_in_use=0,
+            seats_entitled=0,
+            space_status="active",
+            source_admin_session_id="",
+            raw_space_json={},
+            last_probe_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(space)
+        return space
+    space.owner_user_account_id = user_account_id
+    space.name = space.name or space_name or external_id
+    space.space_type = "personal"
+    space.auth_mode = "codex_oauth"
+    space.credential_type = "personal_account"
+    space.space_status = "active"
+    space.last_probe_at = now
+    space.updated_at = now
+    return space
 
 
 def _new_trace_path(*, user_account_id: str, run_id: str) -> Path:
@@ -1318,6 +1375,7 @@ def _least_bound_proxy_for_update(session: Session) -> ProxyInventoryModel | Non
         .outerjoin(bind_counts, bind_counts.c.proxy_id == ProxyInventoryModel.id)
         .where(
             ProxyInventoryModel.provider == "webshare",
+            ProxyInventoryModel.proxy_type == "proxyserver",
             ProxyInventoryModel.proxy_status.in_(
                 (ProxyStatus.AVAILABLE.value, ProxyStatus.BOUND.value)
             ),
@@ -1339,6 +1397,14 @@ def _proxy_url(proxy: ProxyInventoryModel) -> str:
         password = quote(proxy.proxy_password or "", safe="")
         return f"{scheme}://{username}:{password}@{host}:{port}"
     return f"{scheme}://{host}:{port}"
+
+
+def _is_deleted_or_deactivated_account_error(error_message: str) -> bool:
+    normalized = " ".join(str(error_message or "").lower().split())
+    return (
+        "you do not have an account because it has been deleted or deactivated"
+        in normalized
+    )
 
 
 def _probe_proxy_alive(proxy_url: str) -> bool:

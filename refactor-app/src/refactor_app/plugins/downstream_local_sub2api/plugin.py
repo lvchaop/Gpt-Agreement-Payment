@@ -21,7 +21,13 @@ class LocalSub2ApiDownstreamPlugin:
         return HealthcheckResult(status="ok", details={"provider": "local_sub2api"})
 
     def capabilities(self) -> list[str]:
-        return ["downstream.local_sub2api.push_codex_credential"]
+        return [
+            "downstream.local_sub2api.push_codex_credential",
+            "downstream.local_sub2api.push_business_access_token",
+        ]
 
     def push_codex_credential(self, payload: DownstreamCodexPayload) -> DownstreamPushResult:
         return self._client.push_codex_credential(payload)
+
+    def push_business_access_token(self, payload: dict) -> DownstreamPushResult:
+        return self._client.push_business_access_token(payload)
