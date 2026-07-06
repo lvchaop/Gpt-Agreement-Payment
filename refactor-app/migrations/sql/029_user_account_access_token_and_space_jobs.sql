@@ -1,3 +1,6 @@
+ALTER TABLE user_accounts
+  ADD COLUMN IF NOT EXISTS access_token TEXT NOT NULL DEFAULT '';
+
 DELETE FROM automation_schedules
 WHERE schedule_type NOT IN (
   'automation.space_membership_invite_sync',

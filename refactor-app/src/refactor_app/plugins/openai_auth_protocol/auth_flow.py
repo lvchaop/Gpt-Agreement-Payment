@@ -2049,12 +2049,15 @@ class AuthFlow:
                         "请切换可直连 chatgpt.com 的网络或在界面中配置可用代理后重试。"
                     ) from e
                 raise
-            if resp.status_code == 403 and attempt < 2:
-                wait = (attempt + 1) * 5
-                logger.warning(f"Cloudflare 403, {wait}s 后重试 ({attempt + 1}/3)...")
-                import time
-                time.sleep(wait)
-                continue
+            if resp.status_code == 403:
+                if attempt < 2:
+                    wait = (attempt + 1) * 5
+                    logger.warning(f"Cloudflare 403, {wait}s 后重试 ({attempt + 1}/3)...")
+                    import time
+                    time.sleep(wait)
+                    continue
+                self._trace_http("chatgpt_csrf", resp)
+                raise RuntimeError("cloudflare_csrf_403_after_3_retries")
             resp.raise_for_status()
             break
 

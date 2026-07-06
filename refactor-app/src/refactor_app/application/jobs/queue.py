@@ -9,10 +9,18 @@ from sqlalchemy.orm import Session
 from refactor_app.infrastructure.db.models import JobModel, WorkItemModel
 
 
-JOB_CONCURRENCY_LIMITED_WORK_TYPES = {
+JOB_WORK_COUNT_LIMITED_WORK_TYPES = {
     "account.backfill_session_rt",
     "account.backfill_session",
     "account.backfill_rt",
+    "space.business_access_token.create.account",
+    "space_credential.push.account",
+}
+
+JOB_SCOPED_WORK_TYPES = {
+    "space.membership_invite.account",
+    "space.business_access_token.create.account",
+    "space_credential.push.account",
 }
 
 
@@ -91,15 +99,15 @@ class WorkQueue:
             .where(WorkItemModel.work_status == "queued")
             .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
             .with_for_update(skip_locked=True)
-            .limit(1)
+            .limit(100)
         )
         if job_id:
             stmt = stmt.where(WorkItemModel.job_id == job_id)
+        else:
+            stmt = stmt.where(~WorkItemModel.work_type.in_(JOB_SCOPED_WORK_TYPES))
         work = None
         for candidate in self.session.scalars(stmt).all():
-            if candidate.work_type in JOB_CONCURRENCY_LIMITED_WORK_TYPES and not self._can_claim_limited_job_work(
-                job_id=candidate.job_id
-            ):
+            if candidate.work_type in JOB_WORK_COUNT_LIMITED_WORK_TYPES and not self._can_claim_limited_job_work(candidate):
                 continue
             work = candidate
             break
@@ -108,7 +116,7 @@ class WorkQueue:
                 select(WorkItemModel)
                 .where(
                     WorkItemModel.work_status == "queued",
-                    ~WorkItemModel.work_type.in_(JOB_CONCURRENCY_LIMITED_WORK_TYPES),
+                    ~WorkItemModel.work_type.in_(JOB_WORK_COUNT_LIMITED_WORK_TYPES | JOB_SCOPED_WORK_TYPES),
                 )
                 .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
                 .with_for_update(skip_locked=True)
@@ -124,27 +132,29 @@ class WorkQueue:
         work.updated_at = now
         return work
 
-    def _can_claim_limited_job_work(self, *, job_id: str) -> bool:
+    def _can_claim_limited_job_work(self, candidate: WorkItemModel) -> bool:
         job = self.session.scalars(
             select(JobModel)
-            .where(JobModel.id == job_id)
+            .where(JobModel.id == candidate.job_id)
             .with_for_update()
             .limit(1)
         ).first()
         if job is None:
             return False
         try:
-            concurrency = int((job.input_json or {}).get("concurrency") or 1)
+            work_count = int((job.input_json or {}).get("work_count") or 1)
         except (TypeError, ValueError):
-            concurrency = 1
-        concurrency = max(1, concurrency)
+            work_count = 1
+        work_count = max(1, work_count)
+        conditions = [
+            WorkItemModel.job_id == candidate.job_id,
+            WorkItemModel.work_status == "running",
+            WorkItemModel.work_type == candidate.work_type,
+        ]
+        if candidate.work_type == "space.business_access_token.create.account":
+            external_space_id = str((candidate.input_json or {}).get("external_space_id") or "")
+            conditions.append(WorkItemModel.input_json["external_space_id"].astext == external_space_id)
         running_count = self.session.scalar(
-            select(func.count())
-            .select_from(WorkItemModel)
-            .where(
-                WorkItemModel.job_id == job_id,
-                WorkItemModel.work_status == "running",
-                WorkItemModel.work_type.in_(JOB_CONCURRENCY_LIMITED_WORK_TYPES),
-            )
+            select(func.count()).select_from(WorkItemModel).where(*conditions)
         )
-        return int(running_count or 0) < concurrency
+        return int(running_count or 0) < work_count

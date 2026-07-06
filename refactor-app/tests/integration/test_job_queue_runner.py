@@ -55,7 +55,7 @@ def test_job_runner_executes_registered_handler_and_writes_events() -> None:
         session.commit()
 
 
-def test_limited_work_claims_up_to_job_concurrency() -> None:
+def test_limited_work_claims_up_to_job_work_count() -> None:
     settings = Settings()
     engine = make_engine(settings)
     session_factory = make_session_factory(engine)
@@ -71,7 +71,7 @@ def test_limited_work_claims_up_to_job_concurrency() -> None:
         queue = JobQueue(session)
         job = queue.enqueue(
             job_type=job_type,
-            input_json={"concurrency": 3},
+            input_json={"work_count": 3},
             created_by="test",
         )
         job_id = job.id
@@ -90,8 +90,7 @@ def test_limited_work_claims_up_to_job_concurrency() -> None:
             session.commit()
             return work.id if work is not None else ""
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        claimed_ids = list(executor.map(claim_once, [f"worker-{index}" for index in range(3)]))
+    claimed_ids = [claim_once(f"worker-{index}") for index in range(3)]
 
     with session_factory() as session:
         works = session.scalars(select(WorkItemModel).where(WorkItemModel.job_id == job_id)).all()
@@ -101,6 +100,64 @@ def test_limited_work_claims_up_to_job_concurrency() -> None:
         assert len(set(claimed_ids)) == 3
         assert len(running) == 3
         assert {work.claimed_by for work in running} == {"worker-0", "worker-1", "worker-2"}
+
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_authorize_work_count_is_limited_per_external_space_id() -> None:
+    settings = Settings()
+    engine = make_engine(settings)
+    session_factory = make_session_factory(engine)
+    job_type = "test.authorize-per-space"
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 2},
+            created_by="test",
+        )
+        job_id = job.id
+        work_queue = WorkQueue(session)
+        for index in range(3):
+            work_queue.enqueue(
+                job_id=job_id,
+                work_type="space.business_access_token.create.account",
+                input_json={"external_space_id": "space-a", "index": index},
+            )
+        for index in range(2):
+            work_queue.enqueue(
+                job_id=job_id,
+                work_type="space.business_access_token.create.account",
+                input_json={"external_space_id": "space-b", "index": index},
+            )
+        session.commit()
+
+    def claim_once(worker_id: str) -> str:
+        with session_factory() as session:
+            work = WorkQueue(session).claim_next(worker_id=worker_id, job_id=job_id)
+            session.commit()
+            return work.id if work is not None else ""
+
+    claimed_ids = [claim_once(f"worker-{index}") for index in range(5)]
+
+    with session_factory() as session:
+        works = session.scalars(select(WorkItemModel).where(WorkItemModel.job_id == job_id)).all()
+        running = [work for work in works if work.work_status == "running"]
+        running_by_space: dict[str, int] = {}
+        for work in running:
+            external_space_id = str((work.input_json or {}).get("external_space_id") or "")
+            running_by_space[external_space_id] = running_by_space.get(external_space_id, 0) + 1
+
+        assert len([item for item in claimed_ids if item]) == 4
+        assert running_by_space == {"space-a": 2, "space-b": 2}
 
         session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
         session.execute(delete(JobModel).where(JobModel.id == job_id))

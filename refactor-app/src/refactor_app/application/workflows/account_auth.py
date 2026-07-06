@@ -26,6 +26,7 @@ from refactor_app.domain.enums import ProxyBindStatus, ProxyStatus
 from refactor_app.infrastructure.db.models import (
     JobStepModel,
     ProxyInventoryModel,
+    SpaceMembershipModel,
     SpaceModel,
     UserAccountModel,
     UserAccountProxyBindingModel,
@@ -220,81 +221,134 @@ class BackfillSessionWorkflow:
             )
             raise AccountAuthWorkflowError("missing_password")
 
-        protocol_step_id = self._start_step(
-            run_id,
-            "chatgpt_session_login_protocol",
-            {"user_account_id": user_account_id, "proxy_used": bool(proxy_url)},
-        )
-        trace_path = (
-            _new_trace_path(user_account_id=user_account_id, run_id=run_id)
-            if _auth_trace_enabled()
-            else None
-        )
-        trace_path_value = _trace_path_value(trace_path)
-        try:
-            event_data = {
-                "user_account_id": user_account_id,
-                "proxy_used": bool(proxy_url),
-            }
-            if trace_path_value:
-                event_data["trace_path"] = trace_path_value
-            self._write_event(
+        proxy_reassign_count = 0
+        while True:
+            protocol_step_id = self._start_step(
                 run_id,
-                "account_auth.protocol_started",
-                "chatgpt session login protocol started",
-                event_data,
-                step_id=protocol_step_id,
+                "chatgpt_session_login_protocol",
+                {
+                    "user_account_id": user_account_id,
+                    "proxy_used": bool(proxy_url),
+                    "proxy_reassign_count": proxy_reassign_count,
+                },
             )
-            result = acquire_chatgpt_session(
-                email=account.email,
-                password=auth.password,
-                proxy=proxy_url,
-                mail_provider=self._mail_provider,
-                trace_dump_path=trace_path_value,
-                skip_oauth_token_exchange=True,
+            trace_path = (
+                _new_trace_path(user_account_id=user_account_id, run_id=run_id)
+                if _auth_trace_enabled()
+                else None
             )
-        except Exception as exc:
-            trace_summary = _trace_summary(trace_path)
-            self._write_failure(
-                user_account_id=user_account_id,
-                error_code=type(exc).__name__,
-                error_message=str(exc),
-                now=datetime.now(UTC),
-            )
-            event_data = {
-                "user_account_id": user_account_id,
-                "error_type": type(exc).__name__,
-                "error_message": str(exc)[:1000],
-                "trace_summary": trace_summary,
-            }
-            if trace_path_value:
-                event_data["trace_path"] = trace_path_value
-            self._write_event(
-                run_id,
-                "account_auth.protocol_exception",
-                "chatgpt session login protocol raised exception",
-                event_data,
-                level="ERROR",
-                step_id=protocol_step_id,
-            )
-            self._write_trace_steps(run_id, protocol_step_id, trace_summary)
-            step_output = {"trace_summary": trace_summary}
-            if trace_path_value:
-                step_output["trace_path"] = trace_path_value
-            self._finish_step(
-                protocol_step_id,
-                "failed",
-                output_json=step_output,
-                error_code=type(exc).__name__,
-                error_message=str(exc),
-            )
-            self._finish_step(
-                workflow_step_id,
-                "failed",
-                error_code=type(exc).__name__,
-                error_message=str(exc),
-            )
-            raise
+            trace_path_value = _trace_path_value(trace_path)
+            try:
+                event_data = {
+                    "user_account_id": user_account_id,
+                    "proxy_used": bool(proxy_url),
+                    "proxy_reassign_count": proxy_reassign_count,
+                }
+                if trace_path_value:
+                    event_data["trace_path"] = trace_path_value
+                self._write_event(
+                    run_id,
+                    "account_auth.protocol_started",
+                    "chatgpt session login protocol started",
+                    event_data,
+                    step_id=protocol_step_id,
+                )
+                result = acquire_chatgpt_session(
+                    email=account.email,
+                    password=auth.password,
+                    proxy=proxy_url,
+                    mail_provider=self._mail_provider,
+                    trace_dump_path=trace_path_value,
+                    skip_oauth_token_exchange=True,
+                )
+                break
+            except Exception as exc:
+                trace_summary = _trace_summary(trace_path)
+                if _is_cloudflare_csrf_403_after_retries(exc):
+                    released_proxy_id = self._release_active_proxy_for_reassign(
+                        user_account_id=user_account_id,
+                        error_code="cloudflare_csrf_403_after_3_retries",
+                        error_message=str(exc),
+                    )
+                    event_data = {
+                        "user_account_id": user_account_id,
+                        "proxy_id": released_proxy_id,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc)[:1000],
+                        "trace_summary": trace_summary,
+                        "next_action": "reassign_proxy",
+                    }
+                    if trace_path_value:
+                        event_data["trace_path"] = trace_path_value
+                    self._write_event(
+                        run_id,
+                        "account_auth.proxy_reassign_after_cloudflare_403",
+                        "cloudflare csrf 403 after retries; releasing proxy and reassigning",
+                        event_data,
+                        level="WARN",
+                        step_id=protocol_step_id,
+                    )
+                    self._write_trace_steps(run_id, protocol_step_id, trace_summary)
+                    step_output = {
+                        "trace_summary": trace_summary,
+                        "released_proxy_id": released_proxy_id,
+                    }
+                    if trace_path_value:
+                        step_output["trace_path"] = trace_path_value
+                    self._finish_step(
+                        protocol_step_id,
+                        "failed",
+                        output_json=step_output,
+                        error_code="cloudflare_csrf_403_after_3_retries",
+                        error_message=str(exc),
+                    )
+                    account, auth, proxy_url = self._load_input(
+                        user_account_id,
+                        run_id=run_id,
+                    )
+                    proxy_reassign_count += 1
+                    continue
+
+                self._write_failure(
+                    user_account_id=user_account_id,
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                    now=datetime.now(UTC),
+                )
+                event_data = {
+                    "user_account_id": user_account_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:1000],
+                    "trace_summary": trace_summary,
+                }
+                if trace_path_value:
+                    event_data["trace_path"] = trace_path_value
+                self._write_event(
+                    run_id,
+                    "account_auth.protocol_exception",
+                    "chatgpt session login protocol raised exception",
+                    event_data,
+                    level="ERROR",
+                    step_id=protocol_step_id,
+                )
+                self._write_trace_steps(run_id, protocol_step_id, trace_summary)
+                step_output = {"trace_summary": trace_summary}
+                if trace_path_value:
+                    step_output["trace_path"] = trace_path_value
+                self._finish_step(
+                    protocol_step_id,
+                    "failed",
+                    output_json=step_output,
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                self._finish_step(
+                    workflow_step_id,
+                    "failed",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
 
         if (
             not result.ok
@@ -359,6 +413,15 @@ class BackfillSessionWorkflow:
             raise AccountAuthWorkflowError("session_not_obtained")
 
         self._write_success(user_account_id=user_account_id, result=result, now=datetime.now(UTC))
+        accounts_check_payload = self._mark_detected_space_memberships(
+            user_account_id=user_account_id,
+            access_token=result.auth_result.access_token,
+            cookie_header=result.cookie_header or result.auth_result.cookie_header,
+            proxy_url=proxy_url,
+            oai_device_id=result.auth_result.device_id,
+            run_id=run_id,
+            parent_step_id=workflow_step_id,
+        )
         if not self._has_personal_chatgpt_account_id(user_account_id):
             self._discover_personal_chatgpt_account(
                 user_account_id=user_account_id,
@@ -368,6 +431,7 @@ class BackfillSessionWorkflow:
                 oai_device_id=result.auth_result.device_id,
                 run_id=run_id,
                 parent_step_id=workflow_step_id,
+                accounts_check_payload=accounts_check_payload,
             )
         trace_summary = _trace_summary(trace_path)
         self._write_trace_steps(run_id, protocol_step_id, trace_summary)
@@ -625,6 +689,43 @@ class BackfillSessionWorkflow:
             proxy.updated_at = now
             session.commit()
 
+    def _release_active_proxy_for_reassign(
+        self,
+        *,
+        user_account_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> str:
+        now = datetime.now(UTC)
+        with self._session_factory() as session:
+            row = session.execute(
+                select(UserAccountProxyBindingModel, ProxyInventoryModel)
+                .join(
+                    ProxyInventoryModel,
+                    ProxyInventoryModel.id == UserAccountProxyBindingModel.proxy_id,
+                )
+                .where(
+                    UserAccountProxyBindingModel.user_account_id == user_account_id,
+                    UserAccountProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value,
+                )
+                .with_for_update()
+                .limit(1)
+            ).first()
+            if row is None:
+                return ""
+
+            binding, proxy = row
+            binding.bind_status = ProxyBindStatus.RELEASED.value
+            binding.last_error_code = error_code[:200]
+            binding.updated_at = now
+
+            proxy.provider_valid = False
+            proxy.proxy_status = ProxyStatus.ERROR.value
+            proxy.last_healthcheck_at = now
+            proxy.updated_at = now
+            session.commit()
+            return proxy.id
+
     def _write_success(self, *, user_account_id: str, result, now: datetime) -> None:
         auth_result = result.auth_result
         with self._session_factory() as session:
@@ -649,6 +750,8 @@ class BackfillSessionWorkflow:
             )
             account.device_id = _keep_existing_if_empty(account.device_id, auth_result.device_id)
             account.csrf_token = _keep_existing_if_empty(account.csrf_token, auth_result.csrf_token)
+            if auth_result.access_token:
+                account.access_token = auth_result.access_token
             if (
                 str(getattr(auth_result, "chatgpt_account_structure", "") or "").lower()
                 == "personal"
@@ -699,6 +802,7 @@ class BackfillSessionWorkflow:
         oai_device_id: str = "",
         run_id: str,
         parent_step_id: str,
+        accounts_check_payload: dict | None = None,
     ) -> None:
         step_id = self._start_step(
             run_id,
@@ -706,12 +810,14 @@ class BackfillSessionWorkflow:
             {"user_account_id": user_account_id},
         )
         try:
-            payload = _fetch_accounts_check_v4(
-                access_token=access_token,
-                cookie_header=cookie_header,
-                proxy_url=proxy_url,
-                oai_device_id=oai_device_id,
-            )
+            payload = accounts_check_payload
+            if payload is None:
+                payload = _fetch_accounts_check_v4(
+                    access_token=access_token,
+                    cookie_header=cookie_header,
+                    proxy_url=proxy_url,
+                    oai_device_id=oai_device_id,
+                )
             personal_account_id = _extract_personal_chatgpt_account_id(payload)
             if not personal_account_id:
                 self._write_event(
@@ -775,6 +881,122 @@ class BackfillSessionWorkflow:
                 error_code=type(exc).__name__,
                 error_message=str(exc),
             )
+
+    def _mark_detected_space_memberships(
+        self,
+        *,
+        user_account_id: str,
+        access_token: str,
+        cookie_header: str,
+        proxy_url: str,
+        oai_device_id: str = "",
+        run_id: str,
+        parent_step_id: str,
+    ) -> dict | None:
+        step_id = self._start_step(
+            run_id,
+            "account_auth.accounts_check_memberships",
+            {"user_account_id": user_account_id},
+        )
+        try:
+            payload = _fetch_accounts_check_v4(
+                access_token=access_token,
+                cookie_header=cookie_header,
+                proxy_url=proxy_url,
+                oai_device_id=oai_device_id,
+            )
+            visible_account_ids = _extract_visible_chatgpt_account_ids(payload)
+            if not visible_account_ids:
+                self._finish_step(
+                    step_id,
+                    "skipped",
+                    output_json={"reason": "no_visible_account_ids"},
+                )
+                return payload
+
+            now = datetime.now(UTC)
+            with self._session_factory() as session:
+                account = session.get(UserAccountModel, user_account_id)
+                if account is None:
+                    raise AccountAuthWorkflowError("user_account row disappeared")
+                spaces = session.scalars(
+                    select(SpaceModel).where(
+                        SpaceModel.provider == "openai_chatgpt",
+                        SpaceModel.external_space_id.in_(visible_account_ids),
+                    )
+                ).all()
+                marked = 0
+                for space in spaces:
+                    membership = session.scalars(
+                        select(SpaceMembershipModel).where(
+                            SpaceMembershipModel.space_id == space.id,
+                            SpaceMembershipModel.user_account_id == user_account_id,
+                        )
+                    ).first()
+                    if membership is None:
+                        membership = SpaceMembershipModel(
+                            id=f"space-membership-{uuid4()}",
+                            space_id=space.id,
+                            user_account_id=user_account_id,
+                            role="",
+                            membership_status="active",
+                            session_account_detected=True,
+                            remote_user_id=account.openai_user_id,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        session.add(membership)
+                    else:
+                        membership.membership_status = "active"
+                        membership.session_account_detected = True
+                        if account.openai_user_id and not membership.remote_user_id:
+                            membership.remote_user_id = account.openai_user_id
+                        membership.failure_code = ""
+                        membership.failure_message = ""
+                        membership.updated_at = now
+                    marked += 1
+                session.commit()
+
+            self._write_event(
+                run_id,
+                "account_auth.space_memberships_detected",
+                "space memberships detected from accounts/check",
+                {
+                    "user_account_id": user_account_id,
+                    "visible_account_count": len(visible_account_ids),
+                    "marked_membership_count": marked,
+                },
+                step_id=step_id or parent_step_id,
+            )
+            self._finish_step(
+                step_id,
+                "succeeded",
+                output_json={
+                    "visible_account_count": len(visible_account_ids),
+                    "marked_membership_count": marked,
+                },
+            )
+            return payload
+        except Exception as exc:
+            self._write_event(
+                run_id,
+                "account_auth.space_membership_detection_failed",
+                "accounts/check space membership detection failed",
+                {
+                    "user_account_id": user_account_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:1000],
+                },
+                level="WARN",
+                step_id=step_id or parent_step_id,
+            )
+            self._finish_step(
+                step_id,
+                "failed",
+                error_code=type(exc).__name__,
+                error_message=str(exc)[:1000],
+            )
+            return None
 
     def _write_failure(
         self,
@@ -1105,7 +1327,11 @@ def _active_proxy(session: Session, user_account_id: str) -> ProxyInventoryModel
         .join(ProxyInventoryModel, ProxyInventoryModel.id == UserAccountProxyBindingModel.proxy_id)
         .where(
             UserAccountProxyBindingModel.user_account_id == user_account_id,
-            UserAccountProxyBindingModel.bind_status == "active",
+            UserAccountProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value,
+            ProxyInventoryModel.proxy_status.in_(
+                (ProxyStatus.AVAILABLE.value, ProxyStatus.BOUND.value)
+            ),
+            ProxyInventoryModel.provider_valid.is_(True),
         )
         .limit(1)
     ).first()
@@ -1407,6 +1633,24 @@ def _is_deleted_or_deactivated_account_error(error_message: str) -> bool:
     )
 
 
+def _is_cloudflare_csrf_403_after_retries(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    if "cloudflare_csrf_403_after_3_retries" in text:
+        return True
+
+    response = getattr(exc, "response", None)
+    try:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+    except Exception:
+        status_code = 0
+    if status_code != 403:
+        return False
+
+    request = getattr(response, "request", None)
+    request_url = str(getattr(request, "url", "") or getattr(response, "url", "") or "")
+    return "/api/auth/csrf" in request_url
+
+
 def _probe_proxy_alive(proxy_url: str) -> bool:
     if not proxy_url:
         return False
@@ -1505,6 +1749,38 @@ def _extract_personal_chatgpt_account_id(payload: dict) -> str:
         if account_id:
             return account_id
     return ""
+
+
+def _extract_visible_chatgpt_account_ids(payload: dict) -> set[str]:
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, dict):
+        return set()
+
+    result: set[str] = set()
+    for key, entry in accounts.items():
+        key_text = str(key or "").strip()
+        if key_text and key_text != "default":
+            result.add(key_text)
+        entry_id = _account_id_from_entry(entry)
+        if entry_id:
+            result.add(entry_id)
+    return result
+
+
+def _account_id_from_entry(entry: object) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    account = entry.get("account")
+    if isinstance(account, dict):
+        value = account.get("account_id") or account.get("accountId") or account.get("id")
+        if value:
+            return str(value).strip()
+    return str(
+        entry.get("account_id")
+        or entry.get("accountId")
+        or entry.get("id")
+        or ""
+    ).strip()
 
 
 def _personal_account_id_from_entry(entry: object) -> str:

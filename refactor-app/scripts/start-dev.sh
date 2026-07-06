@@ -39,6 +39,20 @@ ensure_port_free() {
   exit 1
 }
 
+kill_existing_workers() {
+  if [ "$KILL_EXISTING" != "1" ]; then
+    return
+  fi
+  local pids
+  pids="$(pgrep -f "refactor_app.cli.main worker run" 2>/dev/null || true)"
+  if [ -z "$pids" ]; then
+    return
+  fi
+  echo "kill existing workers: $pids"
+  kill $pids 2>/dev/null || true
+  sleep 0.5
+}
+
 cleanup() {
   if [ "${BACKEND_PID:-}" ]; then kill "$BACKEND_PID" 2>/dev/null || true; fi
   if [ "${WORKER_PID:-}" ]; then kill "$WORKER_PID" 2>/dev/null || true; fi
@@ -53,6 +67,7 @@ fi
 
 ensure_port_free "backend" "$BACKEND_PORT"
 ensure_port_free "frontend" "$FRONTEND_PORT"
+kill_existing_workers
 
 cd "$APP_DIR"
 export PYTHONPATH="$APP_DIR/src"

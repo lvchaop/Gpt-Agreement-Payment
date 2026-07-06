@@ -35,7 +35,8 @@ Business Space 下每个成员账号可以各有一条 member + business_space �
 7. Payload 按 spaces.credential_type 区分。
 8. personal_account 复用现有 Codex OAuth payload；team_5h_weekly / team_monthly 使用 Business access token payload。
 9. sub2api / CPA 的 Business access token payload 使用 personal access token 导出格式；CPA 与 sub2api 同一格式。
-10. 额度接口已从 HAR 确认为 GET /backend-api/wham/usage。
+10. 空间额度窗口识别接口已从 HAR 确认为 GET /backend-api/wham/usage。
+    该接口只允许在创建/导入 business space 时识别 spaces.credential_type；不属于 4 个长期定时 job。
 11. 推送状态和推送量按凭证区分。
 12. 下游渠道余额按 downstream_channel + credential_type 维护，不按单条凭证维护。
 13. OpenAI 额度用量按 spaces.credential_type + quota_window_kind 维护。
@@ -52,7 +53,7 @@ Business Space 下每个成员账号可以各有一条 member + business_space �
 21. personal_account 达到阈值后标记为 used，后续不再推送。
 22. Space 回收不剔除远端成员，只标记本地 used，后续不再推送。
 23. Space 回收不创建远端剔除任务，不暴露远端剔除开关。
-24. team_monthly 的 monthly 回收默认关闭，但代码保留规则能力。
+24. team_monthly 的 monthly 达到阈值后标记为 used。
 25. team_monthly 额度识别按 HAR usage 窗口规则实现。
 ```
 
@@ -76,8 +77,9 @@ Space = 可授权、可推送、可计量、可回收、可展示的空间
   维度: downstream_channel_id + credential_type。
 
 OpenAI 额度用量:
-  来源: GET /backend-api/wham/usage
-  字段: rate_limit.*_window.used_percent
+  Space 类型识别来源: GET /backend-api/wham/usage，仅限创建/导入 business space 时使用
+  回收判断来源: 复用旧心跳逻辑，直接用该 credential 调 ChatGPT Codex Responses 发最小 hi 请求。
+  字段: codex_5h_used_percent / codex_7d_used_percent / codex_primary_used_percent / codex_secondary_used_percent / monthly 等归一化字段。
   存储: space_credential_usage_states
   维度: space_credential_id + quota_window_kind。
 
@@ -122,7 +124,7 @@ spaces WHERE space_type = 'business'
   session 探测
   personal Codex OAuth 授权动作
   business 后台 access_token 创建动作
-  business 成员邀请 / 接受 / 同步动作
+  business 成员邀请 / 同步动作
 
 不允许保留的是“旧主模型 / 旧调度逻辑”：
   team_workspace 作为空间主模型
@@ -140,7 +142,8 @@ Codex OAuth 只能是 personal_account 的授权动作。
 Business access_token 创建只能是 business credential 的授权动作。
 授权结果也必须写入 space_credentials。
 推送只能读取 spaces + space_credentials + space_push_bindings。
-回收只能读取 spaces + space_credentials + space_push_bindings + space_credential_usage_states。
+回收只能读取 Space 模型，并现场执行旧 Codex Responses probe 得到当前凭证状态。
+回收阶段不直接调用 wham/usage。
 ```
 
 ## 2. 只允许一套 Space 主逻辑
@@ -269,8 +272,8 @@ CREATE TABLE spaces (
     auth_mode IN ('codex_oauth', 'backend_access_token')
   ),
 
-  credential_type TEXT NOT NULL DEFAULT '' CHECK (
-    credential_type IN ('', 'personal_account', 'team_5h_weekly', 'team_monthly')
+  credential_type TEXT NOT NULL CHECK (
+    credential_type IN ('personal_account', 'team_5h_weekly', 'team_monthly')
   ),
 
   plan_type TEXT NOT NULL DEFAULT '',
@@ -354,11 +357,17 @@ plan_type 只能作为辅助展示字段。
   不创建 spaces。
   原因是此时还没有 usage 窗口证据，不能确定 spaces.credential_type。
 
-Business 后台 AT 创建流程:
+Business Space 识别 / 入库流程:
   先用 chatgpt-account-id 查询 usage。
   根据 usage 窗口确定 credential_type。
-  再创建或更新 spaces(space_type=business)。
-  然后创建 access_token 并写入 spaces 对应的唯一 credential。
+  创建或更新 spaces(space_type=business, credential_type=已确定类型)。
+
+Business 后台 AT 创建流程:
+  只读取已存在的 spaces。
+  以 spaces.credential_type 为准，不在 AT 创建阶段重新判定类型。
+  调 auth-credentials 时必须带 chatgpt-account-id = spaces.external_space_id。
+  只校验响应 workspace_id 等于 spaces.external_space_id。
+  创建 access_token 并写入该 Space 对应的 member credential。
 ```
 
 ### 3.3 space_credentials
@@ -590,7 +599,9 @@ active_slot_count 也按 downstream_channel_id + credential_type 计算。
 active slot 包含 push_status IN ('pushing', 'pushed', 'failed')。
 新推送数量不得超过 max_active_slots - active_slot_count。
 下游渠道余额不是 OpenAI 额度用量。
-OpenAI 额度用量仍来自 /backend-api/wham/usage。
+授权流程不调用 /backend-api/wham/usage。
+创建/导入 business space 时，如果未显式提供 credential_type，可以调用 /backend-api/wham/usage 识别空间额度窗口。
+回收判断的 OpenAI 额度用量来自旧 Codex Responses probe，不来自下游渠道状态查询。
 该表承接当前 downstream_channels 的余额/计数语义，只是增加 credential_type 维度。
 ```
 
@@ -744,7 +755,7 @@ CREATE TABLE space_recycle_rules (
 personal_account + monthly 默认 threshold_percent = 95，action = mark_used。
 team_5h_weekly + five_hour 默认只记录用量，不触发回收。
 team_5h_weekly + weekly 默认 threshold_percent = 95，action = mark_used。
-team_monthly + monthly 默认 enabled = false，代码保留规则能力。
+team_monthly + monthly 默认 threshold_percent = 95，action = mark_used。
 ```
 
 ## 4. 关联关系
@@ -883,9 +894,8 @@ user_accounts 不保存 personal_chatgpt_account_id。
 
 ```text
 此阶段只有登录/session/候选空间证据。
-还没有调用 /backend-api/wham/usage。
-没有 usage 窗口证据就不能确定 spaces.credential_type。
-credential_type 跟着 Space 走，因此不能提前创建 business space。
+如果要创建 business space，必须已经显式提供 credential_type，或通过创建/导入 space 的识别流程调用 /backend-api/wham/usage 后再写 spaces.credential_type。
+credential_type 跟着 Space 走，授权流程不能补写或改写。
 ```
 
 ### 5.4 Personal Codex 授权
@@ -904,17 +914,16 @@ credential_type 跟着 Space 走，因此不能提前创建 business space。
 
 ```text
 1. 使用成员账号登录后 session。
-2. 使用目标 Business 的 chatgpt-account-id 查询 /backend-api/wham/usage。
-3. 按 usage 窗口确定 spaces.credential_type：
+2. 读取已存在的 spaces.credential_type：
    - team_5h_weekly
    - team_monthly
-4. ensure spaces(space_type=business, external_space_id=chatgpt-account-id, credential_type=上一步结果)。
-5. ensure space_memberships(space_id=business_space.id, user_account_id=member_user_account_id)。
-6. 使用该成员 session 调后台 AT 创建接口。
-7. 校验 response.workspace_id / account_id 与 spaces.external_space_id 一致。
-8. upsert space_credentials(space_id=business_space.id, user_account_id=member_user_account_id)。
-9. refresh_token 写空字符串。
-10. 不走 Codex OAuth。
+3. 不在 AT 创建阶段创建或改写 spaces.credential_type。
+4. 读取已存在 active space_memberships(space_id=business_space.id, user_account_id=member_user_account_id)。
+5. 使用该成员 session 调后台 AT 创建接口。
+6. 校验 response.workspace_id / account_id 与 spaces.external_space_id 一致。
+7. upsert space_credentials(space_id=business_space.id, user_account_id=member_user_account_id)。
+8. refresh_token 写空字符串。
+9. 不走 Codex OAuth。
 ```
 
 HAR 已确认创建接口：
@@ -1039,21 +1048,73 @@ Space 主逻辑只使用
 15. 不写 downstream_codex_push_records。
 ```
 
-### 5.7 用量探测
+### 5.7 用量更新动作
 
 ```text
-1. 查 spaces。
-2. 按 space_id 选择要探测的 space_credentials。
-3. 调 GET https://chatgpt.com/backend-api/wham/usage。
-4. 按 spaces.credential_type 决定额度窗口：
+1. 不设置独立 usage probe 定时 job。
+2. usage 更新是 space_recycle_sweep 的内部动作。
+3. 回收流程按 pushed binding 选择要检查的 space_credentials。
+4. 调 ChatGPT Codex Responses probe，沿用旧 WebUI 心跳方式：
+   POST https://chatgpt.com/backend-api/codex/responses
+   body.input = hi
+   stream = true
+   store = false
+   business/team 凭证带 chatgpt-account-id
+5. 回收阶段不直接调用 GET https://chatgpt.com/backend-api/wham/usage。
+6. 按 spaces.credential_type 决定额度窗口：
    personal_account -> 按接口实际返回窗口写入
    team_5h_weekly -> five_hour + weekly
    team_monthly -> monthly
-5. 每个窗口写一条 space_usage_checks。
-6. 回写对应 credential + quota_window_kind 的 space_credential_usage_states 当前状态。
+7. 每个窗口写一条 space_usage_checks。
+8. 回写对应 credential + quota_window_kind 的 space_credential_usage_states 当前状态。
 ```
 
-HAR 已确认 usage 接口：
+旧回收实现证据：
+
+```text
+旧 WebUI heartbeat 只证明了 Codex Responses 发 hi 的探测方式。
+旧回收不是从 SSE body 解析 used_percent，而是从 Codex Responses 响应头解析：
+  x-codex-primary-used-percent
+  x-codex-secondary-used-percent
+  x-codex-primary-over-secondary-limit-percent
+  x-codex-primary-window-minutes
+  x-codex-secondary-window-minutes
+旧实现取这些 header 的最大值作为 usage_percent。
+usage_percent >= threshold_percent，默认 threshold_percent=95 时触发回收。
+旧实现返回 usage_source = chatgpt_codex_response_headers。
+旧 cleanup probe 使用 stream=true，但拿到响应 headers 后直接关闭 response；不依赖 SSE body completed。
+```
+
+Space 新逻辑独有判断：
+
+```text
+1. 创建/导入 business space 时可用 GET /backend-api/wham/usage 识别 spaces.credential_type：
+   - 返回窗口包含 limit_window_seconds=18000 和 604800 -> team_5h_weekly
+   - 返回窗口包含 limit_window_seconds=2592000 -> team_monthly
+
+2. 回收阶段用 POST /backend-api/codex/responses 的 x-codex 响应头判断窗口用量：
+   - x-codex-primary-window-minutes=300   -> five_hour
+   - x-codex-secondary-window-minutes=10080 -> weekly
+   - x-codex-primary-window-minutes=43200 -> monthly
+
+3. team_5h_weekly:
+   - five_hour 只写 space_credential_usage_states，不触发回收。
+   - weekly 的 used_percent >= space_recycle_rules.threshold_percent，默认 95，才 mark_used。
+   - 如果 header 只返回旧式最大值而不能区分窗口，不能按 team_5h_weekly 规则回收，必须 check_failed。
+
+4. team_monthly:
+   - monthly 的 used_percent >= space_recycle_rules.threshold_percent，默认 95，满足规则才 mark_used。
+   - team_monthly 默认规则 enabled=true，monthly 达到阈值后 mark_used。
+
+5. Business access_token 调 Codex 后端：
+   - access_token 来源为 POST /backend-api/wham/auth-credentials 返回的 access_token。
+   - 调 Codex Responses 时 Authorization: Bearer <business_access_token>。
+   - 必须带 chatgpt-account-id: spaces.external_space_id。
+   - 请求体沿用旧 cleanup probe：model + input hi + stream=true + store=false + instructions。
+   - header 沿用旧 cleanup probe：Accept: text/event-stream、OpenAI-Beta: responses=experimental、Originator: codex_cli_rs、Version、User-Agent。
+```
+
+HAR 已确认的 wham usage 接口只用于创建/导入 business space 时识别空间额度窗口：
 
 ```http
 GET https://chatgpt.com/backend-api/wham/usage
@@ -1156,17 +1217,19 @@ rate_limit.allowed = false 或 rate_limit.limit_reached = true:
 2. 对每条 pushed binding 读取：
    spaces.credential_type
    space_push_bindings.downstream_channel_id
-   space_credential_usage_states(space_credential_id, quota_window_kind)
    space_recycle_rules(credential_type, quota_window_kind)
 
-3. local_sub2api 等无远端 usage cleanup 的渠道跳过 usage cleanup。
-   判断字段为 downstream_channels.provider_type。
+3. 回收判断不依赖下游 provider 是否提供 usage 查询接口。
+   因为回收判断由本系统直接执行 ChatGPT Codex Responses probe。
 
 4. 判断顺序：
-   先看本地 space_credential_usage_states.usage_percent。
-   未达到阈值时再调 usage probe。
-   probe 失败只标 check_failed，不回收。
-   达到阈值才进入回收。
+   先现场执行旧 Codex Responses probe 检查该 pushed credential。
+   probe 成功解析窗口用量后写 space_usage_checks。
+   probe 成功解析窗口用量后回写 space_credential_usage_states。
+   probe 返回 HTTP 401 / 402 时按最终不可用进入结算。
+   probe 失败或无法解析窗口用量时只标 check_failed，不结算，push_status 保持 pushed。
+   达到 95 阈值才进入结算。
+   结算规则：usage_percent >= 60 标记 used；usage_percent < 60 标记 skipped 并退 push_balance。
 
 5. credential_type 规则：
    personal_account:
@@ -1189,7 +1252,7 @@ rate_limit.allowed = false 或 rate_limit.limit_reached = true:
    space_push_bindings.recycled_at = now
    space_credential_usage_states.usage_status = used
    downstream_channel_credential_type_balances.used_count += 1
-   写 space_account_cooldowns，冷却类型 post_usage_remove，默认 72h
+   不写账号冷却；该账号后续仍可被其他 space 选择
 
 7. 不删除本地 space_memberships。
    不调用远端成员移除接口。
@@ -1342,7 +1405,8 @@ chatgpt_user_id = member 的 OpenAI user id，优先取 space_memberships.remote
   不存在时取 user_accounts.openai_user_id 或 auth/session 解析到的 user_id。
 email = user_accounts.email。
 plan_type = team。
-usage extra 字段来自 GET /backend-api/wham/usage。
+usage extra 字段来自 space_credential_usage_states。
+space_credential_usage_states 不由授权 job 初始化；回收阶段由旧 Codex Responses probe 同步刷新。
 team_5h_weekly:
   primary_window(18000) -> codex_5h_* / codex_primary_*
   secondary_window(604800) -> codex_7d_* / codex_secondary_*
@@ -1352,17 +1416,435 @@ team_monthly:
 CPA 与 sub2api 使用同一 payload body。
 ```
 
-## 7. Job / Workflow
+## 7. 长期定时调度 Job / Workflow
 
-新增：
+长期定时调度只保留 4 个 Space 口径 job。
 
 ```text
-space.personal.discover.account
-space.personal_codex_authorize.account
-space.business_access_token.create.account
-space.push.account
-space.usage_probe.account
-space.recycle.account
+1. automation.space_membership_invite_sync
+2. automation.space_authorize
+3. automation.space_downstream_push
+4. automation.space_recycle_sweep
+```
+
+不单独设置以下长期调度：
+
+```text
+1. 不设置 proxy_maintenance。
+2. 不设置 space_credential_heartbeat_usage。
+3. 不设置独立 space.usage_probe。
+```
+
+usage 更新归属 `automation.space_recycle_sweep`：
+
+```text
+space_recycle_sweep 每次处理 pushed credential 时执行旧 Codex Responses probe，
+读取该 credential 当前可用/限额状态，
+写 space_usage_checks，
+回写 space_credential_usage_states，
+再按 space_recycle_rules 判断是否 mark_used。
+不在回收阶段直接调用 GET https://chatgpt.com/backend-api/wham/usage。
+```
+
+### 7.1 调度总图
+
+```mermaid
+flowchart TD
+  S["scheduler tick"] --> A["automation.space_membership_invite_sync"]
+  S --> B["automation.space_authorize"]
+  S --> C["automation.space_downstream_push"]
+  S --> D["automation.space_recycle_sweep"]
+
+  A --> A1["business space membership / invite state"]
+  B --> B1["space_credentials"]
+  C --> C1["space_push_bindings + downstream channel"]
+  D --> D1["space_usage_checks + space_credential_usage_states + used binding"]
+
+  D -. "owns usage sync" .-> U["ChatGPT Codex Responses probe"]
+```
+
+### 7.2 automation.space_membership_invite_sync
+
+目标：
+
+```text
+维护 business space 的成员、邀请和席位快照。
+只处理 spaces.space_type = business。
+不处理 personal space。
+```
+
+上游接口：
+
+```text
+GET  https://chatgpt.com/backend-api/subscriptions?account_id={space.external_space_id}
+GET  https://chatgpt.com/backend-api/accounts/{space.external_space_id}/users?offset={offset}&limit={limit}&query=
+GET  https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites?offset={offset}&limit={limit}&query=
+POST https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites
+```
+
+关键判断：
+
+```text
+1. space.space_type 必须是 business。
+2. space.space_status 必须是 active。
+3. 必须存在可用 admin/session/access_token；否则跳过该 space。
+4. 不用席位数限制邀请数量；席位只做同步展示和错误诊断。
+5. 不根据 invite_permission 预判是否能邀请；当前以远端 POST invites 的结果为准。
+6. 每个 business space 的 active / invited / accepted 累计数量达到 1000 后，不再发送新邀请。
+7. 已经 active / invited / accepted 的 membership 不重复邀请；failed membership 不算当前占位。
+8. 不判断账号冷却期；设计上不存在邀请冷却、回收后冷却、跨 space 全局冷却。
+9. 一个 user_account 可以同时存在于多个 business space；只禁止同一个 user_account + 同一个 space 重复邀请。
+10. 邀请成功后写 space_memberships.membership_status = invited。
+11. 不主动接受邀请，不调用 invites/accept。
+12. 每轮邀请前必须先同步远端 users / invites；远端同步结果优先校正本地状态。
+13. 本地 failed 但远端 users / invites 已经出现时，统一改成 active / invited，并清空 failure_code / failure_message。
+14. 只通过成员同步接口观察 membership 是否变为 active，并更新 remote_user_id / remote_synced_at。
+15. 同步失败只标该 membership / space 的同步失败，不影响其他 space。
+```
+
+选择加入该 Space 的账号逻辑：
+
+```text
+选择入口:
+  从单个 business space 出发，不从账号全表直接随机邀请。
+
+可邀请数量:
+  invite_limit_per_space = job.config.invite_limit_per_space，默认 350
+  work_count = job.config.work_count，默认 350
+  membership_cap_per_space = job.config.membership_cap_per_space，默认 1000
+  current_membership_count = 同一 space 下 active / invited / accepted 的累计数量
+  remaining_membership_capacity = max(0, membership_cap_per_space - current_membership_count)
+  target_count = min(invite_limit_per_space, remaining_membership_capacity, eligible_account_count)
+  每个 business space 每轮最多邀请 350 个账号。
+  同一 business space 累计 active / invited / accepted 达到 1000 后不再邀请。
+  不因为 seats_entitled / seats_in_use / remote_default_seat_count 不足而减少 target_count。
+
+单次调度上限:
+  space_limit 固定按 1 执行。
+  每次 scheduler tick 最多处理 1 个 business space。
+  该 business space 最多创建 350 个 invite work。
+  同时运行的 invite work 数 = min(work_count, selected_account_count)，默认最多 350。
+  invite work 使用 barrier：按 work_count 分组；同一组 work 全部到达 barrier 后，再同时调用 POST invites。
+  实际邀请数受 invite_limit_per_space、membership_cap_per_space 剩余额度、eligible_account_count 限制。
+
+席位来源:
+  1. seats_entitled / seats_in_use 来自 subscriptions 接口。
+  2. 远端 users 中 seat_type = default 的成员数只用于展示 / 诊断，不参与邀请数量计算。
+  3. 本地 space_memberships 只用于避免同一个 user_account + space 重复邀请，不作为席位占用真相。
+  4. 远端 invites 只用于避免重复邀请同一邮箱，不参与邀请数量计算。
+
+远端同步:
+  1. 每轮处理 space 时，先调用 users 接口同步远端 active members。
+  2. 再调用 invites 接口同步远端 pending invites。
+  3. users / invites 同步结果 upsert 到 space_memberships：
+     - 命中远端 users 时写 membership_status = active
+     - 命中远端 invites 时写 membership_status = invited
+     - 如果本地原来是 failed，以远端结果为准改成 active / invited，并清空 failure_code / failure_message
+  4. 本地存在 active / invited / accepted，但本轮远端 users / invites 都不存在的 membership，直接物理删除该 space_memberships 行。
+     删除必须限定当前正在同步的 space_id：
+       DELETE FROM space_memberships
+       WHERE space_id = :current_space_id
+         AND user_account_id = :user_account_id
+     禁止只按 user_account_id 删除，避免误删同一账号在其它 space 下的 membership。
+  5. 删除后再计算 current_membership_count。
+  6. POST invites 成功后立即写本地 invited；下一轮远端同步负责把 invited 校正为 active / still invited / deleted。
+
+账号必须满足:
+  1. user_accounts.account_status = active。
+  2. user_accounts.email 非空。
+  3. 账号未在同一个 space 下存在 active / invited / accepted membership。
+  4. 账号未在同一个 space 下存在 active credential。
+  5. 账号具备后续创建 Business AT 的登录条件：
+     - session_status = active
+     - cookie_header 或 session_token 至少一个非空
+
+明确不做:
+  1. 不排除“已在其它 business space 的账号”。
+  2. 不查 user_account_cooldowns / space_account_cooldowns。
+  3. 不因为回收过就阻止该账号加入其它 space。
+
+排序:
+  复用旧实现的公平策略，优先选择 user_accounts.updated_at 最早的账号。
+  后续如增加 last_space_selected_at，再改为该字段；当前不新增字段。
+
+failed membership:
+  failed 不算当前占位。
+  如果下一轮远端 users / invites 已出现，以远端状态统一改成 active / invited。
+  如果下一轮远端仍未出现，且该账号仍满足候选条件，可以再次发起邀请。
+```
+
+流程图：
+
+```mermaid
+flowchart TD
+  A["start"] --> B["select active business spaces"]
+  B --> C{"has usable admin session/access_token?"}
+  C -- "no" --> C1["skip space: missing_admin_auth"]
+  C -- "yes" --> D["sync subscription/users/invites"]
+  D --> E["select target accounts"]
+  E --> F["enqueue up to 350 invite works"]
+  F --> G["run invite works with work_count pool"]
+  G --> H["barrier wait per group"]
+  H --> I["POST /backend-api/accounts/{space_id}/invites"]
+  I --> J{"invite ok?"}
+  J -- "no" --> J1["mark invite failed"]
+  J -- "yes" --> K["write membership invited"]
+  K --> L["membership sync later observes remote state"]
+  L --> M{"remote member active?"}
+  M -- "no" --> M1["keep invited / pending"]
+  M -- "yes" --> N["write membership active + remote_user_id"]
+```
+
+### 7.3 automation.space_authorize
+
+目标：
+
+```text
+把可授权的 Space 成员转成 space_credentials。
+personal_account 走 Codex OAuth 授权。
+business/team 走 ChatGPT backend access token 创建。
+```
+
+上游接口：
+
+```text
+personal_account:
+  https://auth.openai.com/oauth/authorize
+  https://auth.openai.com/oauth/token
+  https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27
+
+business/team:
+  POST https://chatgpt.com/backend-api/wham/auth-credentials
+```
+
+关键判断：
+
+```text
+1. personal space 只授权 owner + personal space 这一条当前凭证。
+2. business space 按 user_account_id + space_id 唯一维护当前凭证。
+3. 已有 active credential 且未要求重授权时跳过。
+4. personal 授权必须拿到 access_token + refresh_token；否则失败。
+5. business 创建 AT 前必须已有 spaces 记录；spaces.credential_type 已经跟随 Space。
+6. AT 创建只使用 spaces.external_space_id 作为 chatgpt-account-id。
+7. AT 创建响应 workspace_id 必须等于 spaces.external_space_id。
+8. POST /wham/auth-credentials 返回 workspace_id 必须等于 spaces.external_space_id。
+9. business auth-credentials 必须返回 access_token；没有 refresh_token 是正常情况。
+10. 授权阶段不得根据 /wham/usage 推断或改写 spaces.credential_type；credential_type 只读取 spaces.credential_type。
+11. 授权阶段不调用 GET /backend-api/wham/usage；该接口不属于 4 个长期定时 job，回收使用 Codex Responses probe。
+12. 授权阶段不得创建 membership，也不得把 invited/unknown membership 提升为 active。
+13. business 授权只能选择已由 space_membership_invite_sync 同步为 active 的 membership。
+14. 授权成功只写入 space_credentials，并更新 last_authorized_at；不在 space_credentials 重复保存 credential_type。
+15. 授权 job 只配置 `work_count`，含义是“同时最多运行多少个授权 work”。
+16. 授权 job 先按业务条件选出本轮全部待授权 membership，再按 work_count 运行 work 池。
+17. 任意 work 完成后，如果该 job 还有 queued work，立即补下一个 work。
+18. 不存在第二个 job 内执行参数；不得再用 `work_count * 其他参数` 这类二级模型。
+19. 同一时间只允许一个 `space.business_access_token.create.bulk` 处于 queued/running；如果已有活跃授权 bulk，新触发直接跳过，不再叠加 work。
+```
+
+流程图：
+
+```mermaid
+flowchart TD
+  A["start"] --> A0{"active authorize bulk exists?"}
+  A0 -- "yes" --> A0S["skip this run"]
+  A0 -- "no" --> B["select up to work_count memberships needing credential"]
+  B --> C{"space_type?"}
+
+  C -- "personal" --> P1["owner personal space"]
+  P1 --> P2{"active credential exists?"}
+  P2 -- "yes" --> P3["skip"]
+  P2 -- "no" --> P4["run Codex OAuth authorize"]
+  P4 --> P5{"access_token + refresh_token ok?"}
+  P5 -- "no" --> P6["mark credential failure"]
+  P5 -- "yes" --> P7["upsert personal_account credential"]
+
+  C -- "business" --> T1["business membership"]
+  T1 --> T0{"membership_status is active?"}
+  T0 -- "no" --> T0A["skip/fail: membership_not_active"]
+  T0 -- "yes" --> T2{"active credential exists?"}
+  T2 -- "yes" --> T3["skip"]
+  T2 -- "no" --> T4["read spaces.credential_type"]
+  T4 --> T5{"credential_type is team_5h_weekly/team_monthly?"}
+  T5 -- "no" --> T8["fail invalid_space_credential_type"]
+  T5 -- "yes" --> T9["POST /backend-api/wham/auth-credentials ttl=90d"]
+  T9 --> T10{"workspace_id matches and access_token exists?"}
+  T10 -- "no" --> T11["mark credential failure"]
+  T10 -- "yes" --> T12["upsert business credential"]
+```
+
+### 7.4 automation.space_downstream_push
+
+目标：
+
+```text
+按下游渠道和 credential_type 的余额 / 坑位补量。
+推送入口从 downstream_channel_credential_type_balances 出发，不从 space_credentials 全表盲扫。
+```
+
+下游接口：
+
+```text
+sub2api:
+  POST /api/v1/admin/accounts/import/codex-session
+
+CPA:
+  POST /v0/management/auth-files
+
+custom_http:
+  POST downstream_channels.base_url
+  Header 可使用 downstream_channels.custom_auth_header_name/custom_auth_header_value
+  personal_account payload 按 downstream_channels.custom_payload_type 构造:
+    sub2api / sub2api_admin_accounts / cpa
+  business/team payload 直接发送 Business AT payload。
+
+local_sub2api:
+  不发 HTTP 请求。
+  按 sub2api payload 生成本地 JSON 导入文件。
+  downstream_external_id 写生成文件路径。
+```
+
+关键判断：
+
+```text
+1. channel.enabled 必须为 true。
+2. downstream_channel_credential_type_balances.balance_status 必须为 active。
+3. max_active_slots <= 0 时不推。
+4. 新推送要求 push_balance > 0；retry 不消耗新的 push_balance。
+5. active slot 统计 push_status IN ('pushing', 'pushed', 'failed')。
+6. 先选同 channel + credential_type 下 retryable failed binding。
+7. 再按 push_balance 选择 pending credential。
+8. credential_status 必须 active。
+9. credential.access_token 必须存在。
+10. personal_account 必须有 refresh_token。
+11. pushed / used / pushing 状态不重复推。
+12. payload 按 spaces.credential_type 分支，不按 space_type 分支。
+13. 推送成功写 pushed；失败写 failed；used 后不再推。
+```
+
+流程图：
+
+```mermaid
+flowchart TD
+  A["start"] --> B["select enabled downstream channels"]
+  B --> C["load balances by channel + credential_type"]
+  C --> D{"balance active and slots available?"}
+  D -- "no" --> D1["skip credential_type"]
+  D -- "yes" --> E["select retryable failed bindings first"]
+  E --> F["select new pending credentials by push_balance"]
+  F --> G{"selected empty?"}
+  G -- "yes" --> G1["skip channel/type"]
+  G -- "no" --> H["reserve slot / deduct push_balance for new only"]
+  H --> I{"credential_type?"}
+  I -- "personal_account" --> I1["build Codex OAuth payload"]
+  I -- "team_5h_weekly" --> I2["build Business AT payload with 5h/weekly extra"]
+  I -- "team_monthly" --> I3["build Business AT payload with monthly extra"]
+  I1 --> J["push to CPA/sub2api"]
+  I2 --> J
+  I3 --> J
+  J --> K{"push ok?"}
+  K -- "yes" --> L["binding=pushed; increment pushed_count"]
+  K -- "no" --> M["binding=failed; increment failed_push_count"]
+```
+
+### 7.5 automation.space_recycle_sweep
+
+目标：
+
+```text
+回收只做本地结算。
+不剔除远端成员。
+不创建 release task。
+不调用 wham/usage。
+用旧 Codex Responses probe 得到的凭证状态做判断。
+正常 95% 触发结算后标记 used，用于释放坑位。
+异常最终不可用也进入同一套结算。
+```
+
+上游接口：
+
+```text
+POST https://chatgpt.com/backend-api/codex/responses
+Authorization: Bearer <space_credentials.access_token>
+business/team 凭证必须带 chatgpt-account-id: spaces.external_space_id
+body.input 发送 hi，stream=true，store=false。
+从响应头读取 x-codex-primary-used-percent / x-codex-secondary-used-percent / x-codex-primary-over-secondary-limit-percent。
+```
+
+关键判断：
+
+```text
+1. 只扫描 space_push_bindings.push_status = pushed。
+2. 每条 pushed credential 处理时执行 Codex Responses probe。
+3. probe 响应头存在 x-codex usage header 时，解析 primary / secondary 的 used_percent 和 window_minutes。
+4. 旧实现是取 primary / secondary / over_secondary 的最大值判断 95；Space 新实现按 credential_type + quota_window_kind 分窗口写入。
+5. probe 返回 HTTP 401 / 402 时视为最终不可用，进入结算。
+6. probe 返回网络错误 / 5xx / 没有 x-codex usage header / 未识别错误时，只写 check_failed，不结算，push_status 保持 pushed，继续占坑位等待重试。
+7. 根据 spaces.credential_type + quota_window_kind 查 space_recycle_rules。
+8. rule 不存在或 enabled=false 时不回收。
+9. used_percent < threshold_percent 时不结算，push_status 保持 pushed。
+10. personal_account 按接口实际窗口和规则判断。
+11. team_5h_weekly 的 five_hour 只记录，不触发回收。
+12. team_5h_weekly 的 weekly 默认 95% 进入结算。
+13. team_monthly 的 monthly 默认 95% 进入结算。
+14. 结算规则：
+    usage_percent >= 60 -> push_status = used，不退 push_balance。
+    usage_percent < 60 -> push_status = skipped，space_credentials.credential_status = invalid，退 push_balance，claimed_push_count -1。
+15. used 动作只更新本地：
+    space_push_bindings.push_status = used
+    space_push_bindings.recycle_status = done
+    space_push_bindings.used_count += 1
+    downstream_channel_credential_type_balances.used_count += 1
+    不写账号冷却
+16. skipped 动作只更新本地：
+    space_push_bindings.push_status = skipped
+    space_push_bindings.recycle_status = done
+    space_credentials.credential_status = invalid
+    downstream_channel_credential_type_balances.push_balance += 1
+    downstream_channel_credential_type_balances.claimed_push_count -= 1
+17. used / skipped 都释放坑位；pushed / pushing / failed 继续占坑位。
+18. 不调用远端删除成员接口。
+19. 不删除 space_memberships。
+```
+
+流程图：
+
+```mermaid
+flowchart TD
+  A["start"] --> B["select pushed space_push_bindings"]
+  B --> C["load credential + space + channel"]
+  C --> D["POST /backend-api/codex/responses hi"]
+  D --> E{"HTTP 401/402?"}
+  E -- "yes" --> S{"usage_percent >= 60?"}
+  S -- "yes" --> U["local mark used; release slot"]
+  S -- "no" --> V["local mark skipped; refund push_balance; release slot"]
+  E -- "no" --> F{"probe parsed?"}
+  F -- "no" --> F1["write check_failed; keep pushed; retry later"]
+  F -- "yes" --> G["write checks and upsert usage states"]
+  G --> H["for each quota_window_kind"]
+  H --> I{"rule exists and enabled?"}
+  I -- "no" --> I1["keep pushed"]
+  I -- "yes" --> J{"used_percent >= threshold?"}
+  J -- "no" --> J1["keep pushed"]
+  J -- "yes" --> S
+  U --> N["do not remove remote member"]
+  V --> N
+```
+
+### 7.6 被明确取消的长期调度
+
+```text
+proxy_maintenance:
+  不做长期定时调度。
+  代理刷新、绑定、探活只作为授权流程内部能力或手动运维能力。
+
+space_credential_heartbeat_usage:
+  不做长期定时调度。
+  Codex Responses probe 只作为 space_recycle_sweep 内部动作执行。
+
+space.usage_probe:
+  不做独立长期定时调度。
+  usage 同步只在 space_recycle_sweep 处理 pushed credential 时发生。
+  回收 usage 来源为旧 Codex Responses probe，不是 wham/usage，也不是下游渠道 usage 查询。
 ```
 
 删除非 Space 入口：
@@ -1370,14 +1852,12 @@ space.recycle.account
 ```text
 codex_credential.build.account
 codex_credential.push.account
-```
-
-Business 成员/邀请类 workflow 改名但保留能力：
-
-```text
-space_membership.invite.account
-space_membership.accept.account
-space_membership.sync.business_space
+automation.codex_heartbeat
+automation.workspace_authorize
+automation.workspace_invite_sync
+automation.downstream_push
+automation.downstream_usage_cleanup
+automation.remote_member_release
 ```
 
 ## 8. Portal
@@ -1443,7 +1923,8 @@ updated_at
 8. 增加 space_credential_usage_states / space_usage_checks / space_recycle_rules。
 9. 改授权流程。
 10. 按已确认 Business access token payload 样例实现 team_5h_weekly / team_monthly 推送 builder。
-11. 按 HAR 已确认的 /backend-api/wham/usage 实现 usage parser。
+11. 按 HAR 已确认的 /backend-api/wham/usage 实现创建/导入 business space 时的 credential_type 识别 parser。
+12. 按 CPA / sub2api 样例实现回收阶段 downstream usage parser。
 ```
 
 ## 10. 非 Space 模型清理项
@@ -1483,10 +1964,10 @@ batch item 里仍有 codex_credential_id、push_status、downstream_provider。
 处理：
 
 ```text
-如果还需要批量邀请/接受成员：
+如果还需要批量邀请 / 同步成员：
   改名为 space_membership_batches / space_membership_batch_items。
   只允许 business space 使用。
-  只记录 invite / accept / membership sync。
+  只记录 invite / membership sync。
   删除 token / push / codex / downstream 字段。
 
 如果不需要批次历史：
@@ -1526,11 +2007,11 @@ source_push_record_id 指向非 Space 推送记录口径。
 处理：
 
 ```text
-保留冷却主逻辑，改为 space_account_cooldowns。
-字段使用 user_account_id + space_id + cooldown_type。
-默认 post_usage_remove 72h 冷却。
-source 改为 source_space_push_binding_id 或 source_space_usage_check_id。
-不要删除该模型，除非后续明确要求取消回收后的账号冷却。
+取消账号冷却主逻辑。
+不新增 space_account_cooldowns。
+邀请选账号不判断冷却。
+回收只做本地 used/skipped 结算，不写 cooldown。
+一个 user_account 可以同时存在于多个 space。
 ```
 
 ### 10.5 workspace_operation_locks
@@ -1604,8 +2085,8 @@ downstream_channels 主表不保存混合 push_balance，也不保存多个凭�
 已闭环:
 1. sub2api Business access token payload 样例已提供。
 2. CPA Business access token payload 与 sub2api 同一格式。
-3. personal_account 达到阈值后 action = mark_used，后续不再推送。
-4. team_monthly + monthly 默认关闭自动回收，代码保留规则能力。
+3. personal_account 达到 95 阈值后结算为 used，后续不再推送。
+4. team_monthly + monthly 默认 95% 进入结算，>=60 used，<60 skipped。
 5. Space 回收不剔除远端成员，也不保留显式远端剔除开关。
 6. team_monthly usage 规则按 HAR 窗口规则实现。
 
@@ -1645,9 +2126,8 @@ downstream_channels 主表不保存混合 push_balance，也不保存多个凭�
 7. 新增 space_credential_usage_states。
 8. 新增 space_usage_checks。
 9. 新增 space_recycle_rules。
-10. 新增 space_account_cooldowns。
-11. 更新 SQLAlchemy models。
-12. 更新 migration SQL。
+10. 更新 SQLAlchemy models。
+11. 更新 migration SQL。
 ```
 
 必须满足：
@@ -1711,7 +2191,7 @@ chatgpt-account-id 来源只使用 spaces.external_space_id。
 目标：
 
 ```text
-personal 和 business 授权统一写 spaces + space_credentials。
+personal 和 business 的 Space 入库统一写 spaces；授权统一写 space_credentials。
 ```
 
 改动：
@@ -1719,16 +2199,20 @@ personal 和 business 授权统一写 spaces + space_credentials。
 ```text
 personal_account:
   1. 保留现有 Codex OAuth 授权动作。
-  2. 授权结果写 spaces(space_type=personal, credential_type=personal_account)。
-  3. 授权结果写 space_credentials(space_id, user_account_id)。
+  2. personal space 在拿到个人 external_space_id 时写 spaces(space_type=personal, credential_type=personal_account)。
+  3. 授权结果只写 space_credentials(space_id, user_account_id)。
 
 business:
   1. 不走 Codex OAuth RT。
   2. 使用登录 session。
-  3. 调 usage 识别空间和额度窗口。
-  4. 写 spaces(space_type=business, credential_type=team_5h_weekly 或 team_monthly)。
-  5. 调 auth-credentials 创建 access_token。
-  6. 写 space_credentials(space_id, user_account_id)。
+  3. 读取已存在的 spaces(space_type=business, credential_type=team_5h_weekly 或 team_monthly)。
+  4. 读取已存在的 space_memberships(space_id, user_account_id, membership_status=active)。
+  5. 如果 membership 不存在或 membership_status != active，跳过/失败；授权流程不得创建 membership。
+  6. 授权流程不得把 invited / unknown / failed membership 改成 active。
+  7. 调 auth-credentials 时带 chatgpt-account-id = spaces.external_space_id。
+  8. 调 auth-credentials 创建 access_token。
+  9. 授权结果只写 space_credentials(space_id, user_account_id, space_membership_id)。
+  10. 授权流程不得 upsert spaces，不得改写 spaces.credential_type。
 ```
 
 credential_type 判定：
@@ -1849,29 +2333,37 @@ retry / 扣余额 / 退余额语义明确且只落在 Space 表。
 推送选择不从 space_credentials 全表无条件扫起，而是从 channel + credential_type 的补量需求出发。
 ```
 
-### Phase 6: Usage Probe
+### Phase 6: Usage 更新归属回收流程
 
 目标：
 
 ```text
-把 /backend-api/wham/usage 结果写入单凭证用量状态。
+不设置独立 usage probe 长期调度。
+把旧 Codex Responses probe 并入 space_recycle_sweep。
+回收流程不直接调用 /backend-api/wham/usage。
 ```
 
 改动：
 
 ```text
-1. 每次查询写 space_usage_checks。
-2. 当前状态写 space_credential_usage_states。
-3. 18000 -> five_hour。
-4. 604800 -> weekly。
-5. 2592000 -> monthly。
-6. team_5h_weekly 同时记录 five_hour 和 weekly。
-7. team_monthly 按 HAR 窗口规则记录 monthly。
+1. 删除 / 不注册独立 automation.space_credential_heartbeat_usage。
+2. 删除 / 不注册独立 space.usage_probe 定时调度。
+3. space_recycle_sweep 处理 pushed credential 时现场执行 Codex Responses probe。
+4. 每次 probe 写 space_usage_checks。
+5. 当前状态写 space_credential_usage_states。
+6. 18000 -> five_hour。
+7. 604800 -> weekly。
+8. 2592000 -> monthly。
+9. team_5h_weekly 同时记录 five_hour 和 weekly。
+10. team_monthly 按 HAR 窗口规则记录 monthly。
 ```
 
 验收：
 
 ```text
+没有独立心跳/usage 定时调度。
+回收流程不依赖提前跑好的 usage 状态。
+回收 usage 来源是旧 Codex Responses probe。
 team_5h_weekly 的 five_hour 只记录，不触发回收。
 team_5h_weekly 的 weekly 可被回收规则读取。
 personal_account monthly 可被 mark_used 规则读取。
@@ -1889,12 +2381,12 @@ personal_account monthly 可被 mark_used 规则读取。
 
 ```text
 只扫 pushed。
-先看本地 usage_percent。
-本地没达到阈值再 probe。
-probe 失败不回收。
-达到阈值才回收。
-local_sub2api 等无远端 usage cleanup 的渠道保持跳过。
-默认 Business/team 回收只本地 mark_used，不剔除远端成员。
+每条 pushed credential 都现场执行 Codex Responses probe。
+probe 返回 HTTP 401 / 402 时按最终不可用进入结算。
+probe 失败且不能识别为最终不可用时不结算，保持 pushed 等待重试。
+达到 95 阈值才进入结算。
+结算规则：usage_percent >= 60 标记 used；usage_percent < 60 标记 skipped 并退 push_balance。
+默认 Business/team 回收只本地结算，不剔除远端成员。
 不创建远端剔除任务。
 不调用远端成员删除接口。
 不删除 space_memberships。
@@ -1915,8 +2407,8 @@ team_5h_weekly + weekly:
   action = mark_used
 
 team_monthly + monthly:
-  enabled = false
-  代码保留规则能力
+  threshold_percent = 95
+  action = mark_used
 ```
 
 改动：
@@ -1924,18 +2416,22 @@ team_monthly + monthly:
 ```text
 1. 回收入口使用 space_push_bindings。
 2. remote_member_release_tasks 不进入 Space 主流程。
-3. user_account_cooldowns -> space_account_cooldowns。
-4. 回收模型字段使用 space_id。
-5. channel.used_count -> downstream_channel_credential_type_balances.used_count。
-6. Space 回收不删除 space_memberships。
+3. user_account_cooldowns 不迁移到 Space 主流程。
+4. 不新增 space_account_cooldowns。
+5. 回收模型字段使用 space_id。
+6. channel.used_count -> downstream_channel_credential_type_balances.used_count。
+7. Space 回收不删除 space_memberships。
+8. 回收流程内部执行 Codex Responses probe，并更新 space_usage_checks / space_credential_usage_states。
+9. 回收流程不直接调用 wham/usage。
 ```
 
 验收：
 
 ```text
+不会存在独立 usage_probe 定时 job。
 personal 达阈值只 mark_used，不创建 release task。
 team_5h_weekly weekly 达 95% 只 mark_used，不创建 release task。
-team_monthly 默认不自动回收。
+team_monthly monthly 达 95% 只 mark_used，不创建 release task。
 不会创建 space_recycle_tasks。
 不会调用远端成员删除接口。
 ```
@@ -1955,7 +2451,7 @@ team_workspaces -> spaces
 codex_oauth_credentials -> space_credentials
 downstream_codex_push_records -> space_push_bindings + space_push_attempts
 remote_member_release_tasks 不进入 Space 主流程
-user_account_cooldowns -> space_account_cooldowns
+user_account_cooldowns 不进入 Space 主流程
 downstream_channels.push_balance -> downstream_channel_credential_type_balances.push_balance
 downstream_channels.max_active_slots -> downstream_channel_credential_type_balances.max_active_slots
 ```
@@ -2002,9 +2498,10 @@ UI 能分别配置 personal_account / team_5h_weekly / team_monthly 的 push_bal
    - skipped 退 balance
    - active slots 公式不变
 6. recycle:
-   - personal 95% mark_used
-   - team_5h_weekly weekly 95% mark_used
-   - team_monthly 默认 disabled
+   - personal 95% 进入结算并标记 used
+   - team_5h_weekly weekly 95% 进入结算并标记 used
+   - team_monthly monthly 95% 进入结算并标记 used
+   - 异常最终不可用时 usage_percent >= 60 used，<60 skipped 并退 balance
    - 默认自动回收不创建 release task
    - 不暴露 allow_remote_member_release
    - 不调用远端成员删除接口
@@ -2018,7 +2515,7 @@ UI 能分别配置 personal_account / team_5h_weekly / team_monthly 的 push_bal
 3. authorization workflow
 4. payload builders
 5. downstream push space rewrite
-6. usage probe + recycle space rewrite
+6. recycle-owned usage update + recycle space rewrite
 7. API/frontend cleanup
 8. tests
 ```

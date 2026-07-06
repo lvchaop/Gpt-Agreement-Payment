@@ -28,9 +28,13 @@ class OpenAIChatGPTPlugin:
             "openai_chatgpt.oauth.refresh_workspace_token",
             "openai_chatgpt.jwt.decode_access_token",
             "openai_chatgpt.team_workspace.invite_member",
+            "openai_chatgpt.team_workspace.subscription",
+            "openai_chatgpt.team_workspace.users.list",
+            "openai_chatgpt.team_workspace.invites.list",
             "openai_chatgpt.team_workspace.accept_invite",
             "openai_chatgpt.team_workspace.probe_membership",
             "openai_chatgpt.codex.heartbeat",
+            "openai_chatgpt.codex.responses_usage_probe",
             "openai_chatgpt.wham.usage",
             "openai_chatgpt.wham.auth_credentials.create",
         ]
@@ -88,6 +92,55 @@ class OpenAIChatGPTPlugin:
     def probe_membership(self, *, access_token: str, team_id: str) -> dict:
         return self._client.probe_membership(access_token=access_token, team_id=team_id)
 
+    def fetch_subscription(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.fetch_subscription(
+            access_token=access_token,
+            account_id=account_id,
+            cookie_header=cookie_header,
+            proxy_url=proxy_url,
+        )
+
+    def list_account_users(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]:
+        return self._client.list_account_users(
+            access_token=access_token,
+            account_id=account_id,
+            cookie_header=cookie_header,
+            page_size=page_size,
+            proxy_url=proxy_url,
+        )
+
+    def list_account_invites(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]:
+        return self._client.list_account_invites(
+            access_token=access_token,
+            account_id=account_id,
+            cookie_header=cookie_header,
+            page_size=page_size,
+            proxy_url=proxy_url,
+        )
+
     def heartbeat_codex_credential(
         self,
         *,
@@ -97,6 +150,21 @@ class OpenAIChatGPTPlugin:
         model: str = "",
     ) -> dict:
         return self._client.heartbeat_codex_credential(
+            access_token=access_token,
+            team_id=team_id,
+            proxy_url=proxy_url,
+            model=model,
+        )
+
+    def probe_codex_responses_usage(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str = "",
+        model: str = "",
+    ) -> dict:
+        return self._client.probe_codex_responses_usage(
             access_token=access_token,
             team_id=team_id,
             proxy_url=proxy_url,
@@ -121,7 +189,7 @@ class OpenAIChatGPTPlugin:
     def create_wham_auth_credential(
         self,
         *,
-        access_token: str,
+        access_token: str = "",
         chatgpt_account_id: str,
         name: str,
         ttl_seconds: int = 7_776_000,

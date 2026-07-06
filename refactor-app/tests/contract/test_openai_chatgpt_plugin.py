@@ -10,6 +10,7 @@ from refactor_app.plugins.contracts import OpenAIChatGPTProvider
 from refactor_app.plugins.openai_chatgpt import (
     OpenAIChatGPTClient,
     OpenAIChatGPTClientConfig,
+    OpenAIChatGPTClientError,
     OpenAIChatGPTPlugin,
     WorkspaceMismatchError,
     decode_access_token_claims,
@@ -158,6 +159,93 @@ def test_invite_and_accept_use_team_backend_endpoints_and_headers() -> None:
         "/backend-api/accounts/workspace-1/invites",
         "/backend-api/accounts/workspace-1/invites/accept",
     ]
+
+
+def test_create_wham_auth_credential_exchanges_workspace_before_post() -> None:
+    requests: list[httpx.Request] = []
+
+    def chatgpt_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/auth/session":
+            assert request.url.params["exchange_workspace_token"] == "true"
+            assert request.url.params["workspace_id"] == "workspace-1"
+            assert request.url.params["reason"] == "setCurrentAccount"
+            assert request.headers["cookie"] == "oai-did=device-1; session=s1"
+            return httpx.Response(200, json={"accessToken": "workspace-access-1"})
+        if request.url.path == "/backend-api/wham/auth-credentials":
+            assert request.headers["authorization"] == "Bearer workspace-access-1"
+            assert request.headers["chatgpt-account-id"] == "workspace-1"
+            assert "cookie" not in request.headers
+            assert request.headers["oai-device-id"] == "device-1"
+            body = json.loads(request.content)
+            assert body == {
+                "name": "cred-1",
+                "scopes": ["chatgpt.workspace.feature.allow-codex-local-access.access"],
+                "ttl": 7776000,
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "at-1",
+                    "workspace_id": "workspace-1",
+                    "credential_id": "token-1",
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    client = OpenAIChatGPTClient(
+        OpenAIChatGPTClientConfig(),
+        auth_http_client=httpx.Client(
+            base_url="https://auth.openai.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        ),
+        chatgpt_http_client=httpx.Client(
+            base_url="https://chatgpt.com",
+            transport=httpx.MockTransport(chatgpt_handler),
+        ),
+    )
+
+    payload = client.create_wham_auth_credential(
+        chatgpt_account_id="workspace-1",
+        name="cred-1",
+        cookie_header="oai-did=device-1; session=s1",
+    )
+
+    assert payload["access_token"] == "at-1"
+    assert [request.url.path for request in requests] == [
+        "/api/auth/session",
+        "/backend-api/wham/auth-credentials",
+    ]
+
+
+def test_create_wham_auth_credential_requires_exchanged_access_token() -> None:
+    requests: list[httpx.Request] = []
+
+    def chatgpt_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/api/auth/session"
+        return httpx.Response(200, json={"user": {"email": "member@example.test"}})
+
+    client = OpenAIChatGPTClient(
+        OpenAIChatGPTClientConfig(),
+        auth_http_client=httpx.Client(
+            base_url="https://auth.openai.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        ),
+        chatgpt_http_client=httpx.Client(
+            base_url="https://chatgpt.com",
+            transport=httpx.MockTransport(chatgpt_handler),
+        ),
+    )
+
+    with pytest.raises(OpenAIChatGPTClientError, match="workspace_session_access_token_missing"):
+        client.create_wham_auth_credential(
+            chatgpt_account_id="workspace-1",
+            name="cred-1",
+            cookie_header="oai-did=device-1; session=s1",
+        )
+
+    assert [request.url.path for request in requests] == ["/api/auth/session"]
 
 
 def test_openai_chatgpt_plugin_contract() -> None:

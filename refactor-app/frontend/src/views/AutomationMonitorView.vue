@@ -56,11 +56,11 @@ const sortedJobs = computed(() =>
 const selectedJobOptions = computed(() =>
   jobs.value
     .filter((row) => !selectedScheduleType.value || row.schedule_type === selectedScheduleType.value)
-    .filter((row) => row.last_job_id)
+    .filter((row) => effectiveJobId(row))
     .map((row) => ({
-      label: `${labelOf(row.schedule_type)} / ${shortText(row.last_job_id, 18)}`,
-      jobId: String(row.last_job_id || ""),
-      runId: String(row.last_run_id || ""),
+      label: `${labelOf(row.schedule_type)} / ${shortText(effectiveJobId(row), 18)}`,
+      jobId: effectiveJobId(row),
+      runId: effectiveRunId(row),
     })),
 );
 
@@ -91,6 +91,14 @@ function shortText(value: unknown, size = 16) {
   return `${text.slice(0, head)}…${text.slice(-(size - head - 1))}`;
 }
 
+function effectiveJobId(row: Row) {
+  return String(row.latest_job_id || row.last_job_id || "");
+}
+
+function effectiveRunId(row: Row) {
+  return String(row.last_run_id || "");
+}
+
 function durationText(ms: unknown) {
   const value = Number(ms || 0);
   if (!value) return "-";
@@ -107,8 +115,8 @@ function bytesText(value: unknown) {
 
 function selectJob(row: Row) {
   selectedScheduleType.value = String(row.schedule_type || "");
-  selectedJobId.value = String(row.last_job_id || "");
-  selectedRunId.value = String(row.last_run_id || "");
+  selectedJobId.value = effectiveJobId(row);
+  selectedRunId.value = effectiveRunId(row);
   void loadRuns().then(loadConsole);
 }
 
@@ -149,9 +157,18 @@ async function loadRuns() {
       limit: runLimit.value,
     });
     jobRuns.value = result.items || [];
-    if (selectedRunId.value && !jobRuns.value.some((row) => row.run_id === selectedRunId.value)) {
+    const selected = jobRuns.value.find((row) => row.run_id === selectedRunId.value);
+    if (selected) {
+      selectedJobId.value = String(selected.job_id || selectedJobId.value || "");
+      return;
+    }
+    const latest = jobRuns.value[0];
+    if (latest) {
+      selectedJobId.value = String(latest.job_id || "");
+      selectedRunId.value = String(latest.run_id || "");
+    } else {
       selectedRunId.value = "";
-      selectedJobId.value = "";
+      selectedJobId.value = selectedJobOptions.value[0]?.jobId || "";
     }
   } finally {
     runsLoading.value = false;
@@ -181,7 +198,11 @@ async function runNow(row: Row) {
     store.toast("已触发调度", labelOf(row.schedule_type), "success");
     await loadJobs();
     const updated = jobs.value.find((item) => item.id === id);
-    if (updated) selectJob(updated);
+    if (updated) {
+      selectedScheduleType.value = String(updated.schedule_type || "");
+      await loadRuns();
+      await loadConsole();
+    }
   } catch (err) {
     store.toast("触发调度失败", String((err as Error).message ?? err), "error");
   } finally {
@@ -263,11 +284,11 @@ onBeforeUnmount(() => {
         <div class="job-meta">
           <span>Job</span>
           <RouterLink
-            v-if="row.last_job_id"
-            :to="{ name: 'job-trace', params: { jobId: String(row.last_job_id) } }"
+            v-if="effectiveJobId(row)"
+            :to="{ name: 'job-trace', params: { jobId: effectiveJobId(row) } }"
             @click.stop
           >
-            {{ shortText(row.last_job_id, 24) }}
+            {{ shortText(effectiveJobId(row), 24) }}
           </RouterLink>
           <code v-else>-</code>
         </div>

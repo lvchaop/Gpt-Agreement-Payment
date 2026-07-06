@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from refactor_app.application.jobs.runner import JobRunner
@@ -19,6 +21,7 @@ from refactor_app.application.workflows.mail import (
     ReleaseMailLeaseWorkflow,
 )
 from refactor_app.application.workflows.proxy import (
+    BindTeamAdminProxyWorkflow,
     BindAccountProxyWorkflow,
     HealthcheckProxyWorkflow,
     RefreshWebsharePoolWorkflow,
@@ -31,12 +34,16 @@ from refactor_app.application.workflows.space_direct_push import (
     SpaceDirectPushInput,
     SpaceDirectPushWorkflow,
 )
+from refactor_app.application.workflows.space_membership_invite_sync import (
+    SpaceMembershipInviteSyncInput,
+    SpaceMembershipInviteSyncWorkflow,
+)
 from refactor_app.application.workflows.space_recycle import (
     SpaceRecycleSweepInput,
     SpaceRecycleSweepWorkflow,
 )
 from refactor_app.config.settings import Settings
-from refactor_app.infrastructure.db.models import DownstreamChannelModel
+from refactor_app.infrastructure.db.models import DownstreamChannelModel, WorkItemModel
 from refactor_app.plugins.mail_external_api.client import ExternalMailApiClientConfig
 from refactor_app.plugins.mail_external_api.plugin import ExternalMailApiPlugin
 from refactor_app.plugins.openai_chatgpt.client import OpenAIChatGPTClientConfig
@@ -73,6 +80,15 @@ def register_core_handlers(
             "proxy_binding_id": BindAccountProxyWorkflow(session_factory=session_factory).run(
                 user_account_id=str(input_json["user_account_id"]),
                 bound_by_job_id=str(input_json.get("bound_by_job_id") or ""),
+                bind_reason=str(input_json.get("bind_reason") or ""),
+            )
+        },
+    )
+    runner.register(
+        "proxy.bind_team_admin",
+        lambda _session, input_json: {
+            "proxy_binding_id": BindTeamAdminProxyWorkflow(session_factory=session_factory).run(
+                team_admin_session_id=str(input_json["team_admin_session_id"]),
                 bind_reason=str(input_json.get("bind_reason") or ""),
             )
         },
@@ -172,9 +188,18 @@ def register_core_handlers(
         },
     )
     runner.register(
+        "space.membership_invite_sync",
+        lambda _session, input_json: _run_space_membership_invite_sync_job(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
+    )
+    runner.register(
         "space.recycle.sweep",
         lambda _session, input_json: SpaceRecycleSweepWorkflow(
             session_factory=session_factory,
+            openai_provider=_openai_plugin(settings),
         )
         .run(
             SpaceRecycleSweepInput(
@@ -182,6 +207,25 @@ def register_core_handlers(
             )
         )
         .__dict__,
+    )
+    runner.register_work(
+        "space.membership_invite.account",
+        lambda _session, input_json: {
+            "invite": SpaceMembershipInviteSyncWorkflow(
+                session_factory=session_factory,
+                openai_provider=_openai_plugin(settings),
+            ).run_invite_work(
+                space_id=str(input_json["space_id"]),
+                user_account_id=str(input_json["user_account_id"]),
+                team_admin_session_id=str(input_json["team_admin_session_id"]),
+                barrier_key=str(input_json.get("_barrier_key") or ""),
+                barrier_group=str(input_json.get("_barrier_group") or ""),
+                barrier_expected=int(input_json.get("_barrier_expected") or 0),
+                barrier_timeout_s=float(input_json.get("_barrier_timeout_s") or 30),
+                run_id=str(input_json.get("_run_id") or ""),
+                work_id=str(input_json.get("_work_id") or ""),
+            )
+        },
     )
     runner.register_work(
         "space.business_access_token.create.account",
@@ -258,6 +302,93 @@ def register_core_handlers(
             )
         },
     )
+
+
+def _run_space_membership_invite_sync_job(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    work_count = max(1, int(input_json.get("work_count") or 350))
+    workflow_result = SpaceMembershipInviteSyncWorkflow(
+        session_factory=session_factory,
+        openai_provider=_openai_plugin(settings),
+    ).run(
+        SpaceMembershipInviteSyncInput(
+            space_limit=1,
+            invite_limit_per_space=int(input_json.get("invite_limit_per_space") or 350),
+            work_count=work_count,
+            membership_cap_per_space=int(input_json.get("membership_cap_per_space") or 1000),
+            page_size=int(input_json.get("page_size") or 100),
+            barrier_timeout_s=float(input_json.get("barrier_timeout_s") or 30),
+        ),
+        job_id=str(input_json.get("_job_id") or ""),
+        run_id=str(input_json.get("_run_id") or ""),
+    )
+    queued_invites = int(workflow_result.queued_invite_count or 0)
+    work_summary = {
+        "queued": 0,
+        "running": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    if queued_invites > 0:
+        _run_job_work_now(
+            session_factory=session_factory,
+            settings=settings,
+            job_id=str(input_json.get("_job_id") or ""),
+            work_count=work_count,
+        )
+        work_summary = _work_summary(
+            session_factory=session_factory,
+            job_id=str(input_json.get("_job_id") or ""),
+        )
+    output = dict(workflow_result.__dict__)
+    output["invited_count"] = int(work_summary["succeeded"])
+    output["failed_invite_count"] = int(work_summary["failed"])
+    return {
+        **output,
+        "space_limit": 1,
+        "work_count": queued_invites,
+        **work_summary,
+    }
+
+
+def _run_job_work_now(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    job_id: str,
+    work_count: int,
+) -> None:
+    def run_loop() -> None:
+        runner = JobRunner(session_factory)
+        register_core_handlers(runner, session_factory=session_factory, settings=settings)
+        while runner.run_one_work_for_job(job_id) is not None:
+            pass
+
+    worker_count = max(1, int(work_count or 1))
+    if worker_count == 1:
+        run_loop()
+        return
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(run_loop) for _ in range(worker_count)]
+        for future in as_completed(futures):
+            future.result()
+
+
+def _work_summary(*, session_factory: SessionFactory, job_id: str) -> dict[str, int]:
+    with session_factory() as session:
+        rows = session.scalars(select(WorkItemModel).where(WorkItemModel.job_id == job_id)).all()
+        return {
+            "queued": sum(1 for row in rows if row.work_status == "queued"),
+            "running": sum(1 for row in rows if row.work_status == "running"),
+            "succeeded": sum(1 for row in rows if row.work_status == "succeeded"),
+            "failed": sum(1 for row in rows if row.work_status == "failed"),
+            "cancelled": sum(1 for row in rows if row.work_status == "cancelled"),
+        }
 
 
 def _webshare_plugin(

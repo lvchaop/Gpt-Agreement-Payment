@@ -16,6 +16,7 @@ from refactor_app.infrastructure.db.models import (
     JobRunModel,
     JobStepModel,
     ProxyInventoryModel,
+    TeamAdminProxyBindingModel,
     DownstreamChannelCredentialTypeBalanceModel,
     SpaceAccountCooldownModel,
     SpaceCredentialModel,
@@ -244,15 +245,7 @@ class ProxyInventoryRepository(SqlAlchemyRepository[ProxyInventoryModel]):
         return self.least_bound_available_for_update()
 
     def least_bound_available_for_update(self) -> ProxyInventoryModel | None:
-        bind_counts = (
-            select(
-                UserAccountProxyBindingModel.proxy_id.label("proxy_id"),
-                func.count(UserAccountProxyBindingModel.id).label("active_bind_count"),
-            )
-            .where(UserAccountProxyBindingModel.bind_status == "active")
-            .group_by(UserAccountProxyBindingModel.proxy_id)
-            .subquery()
-        )
+        bind_counts = _proxy_bind_counts(UserAccountProxyBindingModel)
         active_bind_count = func.coalesce(bind_counts.c.active_bind_count, 0)
         stmt = (
             select(ProxyInventoryModel)
@@ -260,6 +253,24 @@ class ProxyInventoryRepository(SqlAlchemyRepository[ProxyInventoryModel]):
             .where(
                 ProxyInventoryModel.provider == "webshare",
                 ProxyInventoryModel.proxy_type == "proxyserver",
+                ProxyInventoryModel.proxy_status.in_(("available", "bound")),
+                ProxyInventoryModel.provider_valid.is_(True),
+            )
+            .order_by(active_bind_count.asc(), ProxyInventoryModel.updated_at.asc())
+            .with_for_update(of=ProxyInventoryModel, skip_locked=True)
+            .limit(1)
+        )
+        return self.session.scalars(stmt).first()
+
+    def least_bound_static_available_for_update(self) -> ProxyInventoryModel | None:
+        bind_counts = _proxy_bind_counts(TeamAdminProxyBindingModel)
+        active_bind_count = func.coalesce(bind_counts.c.active_bind_count, 0)
+        stmt = (
+            select(ProxyInventoryModel)
+            .outerjoin(bind_counts, bind_counts.c.proxy_id == ProxyInventoryModel.id)
+            .where(
+                ProxyInventoryModel.provider == "webshare",
+                ProxyInventoryModel.proxy_type == "static_proxy",
                 ProxyInventoryModel.proxy_status.in_(("available", "bound")),
                 ProxyInventoryModel.provider_valid.is_(True),
             )
@@ -292,6 +303,41 @@ class UserAccountProxyBindingRepository(SqlAlchemyRepository[UserAccountProxyBin
             .returning(UserAccountProxyBindingModel)
         )
         return self.session.scalars(stmt).one()
+
+
+class TeamAdminProxyBindingRepository(SqlAlchemyRepository[TeamAdminProxyBindingModel]):
+    model = TeamAdminProxyBindingModel
+
+    def upsert_active_binding(self, values: dict) -> TeamAdminProxyBindingModel:
+        stmt = (
+            insert(TeamAdminProxyBindingModel)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=["team_admin_session_id"],
+                set_={
+                    "proxy_id": values["proxy_id"],
+                    "bind_status": values["bind_status"],
+                    "bind_reason": values["bind_reason"],
+                    "bound_at": values["bound_at"],
+                    "last_error_code": "",
+                    "updated_at": values["updated_at"],
+                },
+            )
+            .returning(TeamAdminProxyBindingModel)
+        )
+        return self.session.scalars(stmt).one()
+
+
+def _proxy_bind_counts(binding_model):
+    return (
+        select(
+            binding_model.proxy_id.label("proxy_id"),
+            func.count(binding_model.id).label("active_bind_count"),
+        )
+        .where(binding_model.bind_status == "active")
+        .group_by(binding_model.proxy_id)
+        .subquery()
+    )
 
 
 class ExternalMailLeaseRepository(SqlAlchemyRepository[ExternalMailLeaseModel]):

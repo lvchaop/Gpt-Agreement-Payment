@@ -45,7 +45,7 @@
 
     <section>
       <h2>Space Job</h2>
-      <textarea id="pushPendingPayload">{"downstream_channel_id":"","limit":1,"created_by":"ops","concurrency":1}</textarea>
+      <textarea id="pushPendingPayload">{"downstream_channel_id":"","created_by":"ops","work_count":1}</textarea>
       <button onclick="postJson('/space-credentials/push-pending-job', 'pushPendingPayload')">按下游余额补推</button>
       <textarea id="recyclePayload">{"limit":100,"created_by":"ops"}</textarea>
       <button onclick="postJson('/spaces/recycle-sweep-job', 'recyclePayload')">Space 回收扫描</button>

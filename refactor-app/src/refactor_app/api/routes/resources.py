@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
+import json
 from socket import gethostname
 from threading import Thread
 from time import sleep
@@ -10,17 +11,29 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from refactor_app.api.dependencies import get_db_session
 from refactor_app.application.jobs.handlers import register_core_handlers
 from refactor_app.application.jobs.queue import JobQueue, WorkQueue
 from refactor_app.application.jobs.runner import JobRunner
+from refactor_app.application.workflows.account_auth import ensure_account_proxy_url
+from refactor_app.application.workflows.proxy import (
+    ProxyWorkflowError,
+    bind_team_admin_static_proxy_in_session,
+    ensure_team_admin_static_proxy_url_in_session,
+    reassign_team_admin_static_proxy_in_session,
+)
+from refactor_app.application.workflows.space_membership_invite_sync import (
+    SpaceMembershipInviteSyncWorkflow,
+    SpaceMembershipInviteSyncWorkflowError,
+)
 from refactor_app.application.workflows.space_recycle import (
     SpaceRecycleSweepInput,
     SpaceRecycleSweepWorkflow,
 )
+from refactor_app.application.workflows.space_usage import SpaceUsageError, infer_credential_type
 from refactor_app.config.settings import get_settings
 from refactor_app.domain.enums import AccountStatus
 from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
@@ -39,18 +52,29 @@ from refactor_app.infrastructure.db.models import (
     SpaceMembershipModel,
     SpaceModel,
     SpacePushBindingModel,
+    TeamAdminProxyBindingModel,
     TeamAdminSessionModel,
     UserAccountModel,
     UserAccountProxyBindingModel,
     WorkItemModel,
 )
-from refactor_app.plugins.openai_chatgpt.client import decode_access_token_claims
+from refactor_app.plugins.openai_chatgpt.client import (
+    OpenAIChatGPTClientError,
+    OpenAIChatGPTClientConfig,
+    decode_access_token_claims,
+)
+from refactor_app.plugins.openai_chatgpt.plugin import OpenAIChatGPTPlugin
 
 router = APIRouter(tags=["resources"])
 DbSession = Annotated[Session, Depends(get_db_session)]
 
 SPACE_CREDENTIAL_TYPES = ("personal_account", "team_5h_weekly", "team_monthly")
-SPACE_AUTOMATION_TYPES = ("automation.space_downstream_push", "automation.space_recycle_sweep")
+SPACE_AUTOMATION_TYPES = (
+    "automation.space_membership_invite_sync",
+    "automation.space_authorize",
+    "automation.space_downstream_push",
+    "automation.space_recycle_sweep",
+)
 DOWNSTREAM_PROVIDER_TYPES = {"sub2api", "cpa", "local_sub2api", "custom_http"}
 CUSTOM_HTTP_PAYLOAD_TYPES = {"", "sub2api", "sub2api_admin_accounts", "cpa"}
 
@@ -72,39 +96,42 @@ class PatchUserAccountRequest(BaseModel):
 class BackfillSessionRtRequest(BaseModel):
     user_account_ids: list[str]
     created_by: str = ""
-    concurrency: int = 1
+    work_count: int = 10
 
 
 class CreateBusinessAccessTokenCredentialsJobRequest(BaseModel):
     user_account_ids: list[str]
     external_space_id: str
-    session_access_token: str
+    session_access_token: str = ""
     credential_name_prefix: str = "codex"
     cookie_header: str = ""
     space_name: str = ""
     owner_user_account_id: str = ""
     source_admin_session_id: str = ""
     created_by: str = ""
-    concurrency: int = 1
+    work_count: int = 5
 
 
 class PushSpaceCredentialsRequest(BaseModel):
     space_credential_ids: list[str]
     downstream_channel_id: str
     created_by: str = ""
-    concurrency: int = 5
+    work_count: int = 5
 
 
 class PushPendingSpaceCredentialsRequest(BaseModel):
     downstream_channel_id: str
-    limit: int = 1
     created_by: str = ""
-    concurrency: int = 5
+    work_count: int = 5
 
 
 class SpaceRecycleSweepJobRequest(BaseModel):
     created_by: str = ""
     limit: int = 100
+
+
+class SyncRemoteSpaceMembershipsRequest(BaseModel):
+    page_size: int = 100
 
 
 class ImportTeamAdminSessionRequest(BaseModel):
@@ -282,6 +309,29 @@ def list_spaces(session: DbSession) -> dict:
     return {"items": [_space_dict(row) for row in rows]}
 
 
+@router.post("/spaces/{space_id}/memberships/sync-remote")
+def sync_remote_space_memberships(
+    space_id: str,
+    req: SyncRemoteSpaceMembershipsRequest,
+    session: DbSession,
+) -> dict:
+    openai_provider = OpenAIChatGPTPlugin.from_config(
+        OpenAIChatGPTClientConfig(
+            auth_base_url=get_settings().openai_auth_base_url,
+            chatgpt_base_url=get_settings().openai_chatgpt_base_url,
+        )
+    )
+    try:
+        return SpaceMembershipInviteSyncWorkflow(
+            session_factory=_session_factory_from_session(session),
+            openai_provider=openai_provider,
+        ).sync_remote_memberships_only(space_id=space_id, page_size=max(1, int(req.page_size or 100)))
+    except SpaceMembershipInviteSyncWorkflowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (OpenAIChatGPTClientError, ProxyWorkflowError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/space-credentials")
 def list_space_credentials(session: DbSession) -> dict:
     rows = session.scalars(
@@ -326,14 +376,25 @@ def create_space_recycle_sweep_job(req: SpaceRecycleSweepJobRequest, session: Db
 def import_team_admin_session(req: ImportTeamAdminSessionRequest, session: DbSession) -> dict:
     now = datetime.now(UTC)
     access_token = _session_access_token(req.raw_session_json)
-    claims = decode_access_token_claims(access_token) if access_token else {}
+    try:
+        claims = decode_access_token_claims(access_token) if access_token else None
+    except OpenAIChatGPTClientError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    claim_raw = claims.raw if claims is not None else {}
+    profile_claim = claim_raw.get("https://api.openai.com/profile") or {}
+    if not isinstance(profile_claim, dict):
+        profile_claim = {}
     admin_email = str(
         req.raw_session_json.get("email")
         or req.raw_session_json.get("admin_email")
-        or claims.get("email")
-        or claims.get("https://api.openai.com/profile", {}).get("email", "")
+        or claim_raw.get("email")
+        or profile_claim.get("email", "")
         or ""
     )
+    account_payload = req.raw_session_json.get("account")
+    if not isinstance(account_payload, dict):
+        account_payload = {}
+    external_space_id = _admin_session_account_id(account_payload)
     row = TeamAdminSessionModel(
         id=f"team-admin-session-{uuid4()}",
         admin_email=admin_email,
@@ -347,13 +408,225 @@ def import_team_admin_session(req: ImportTeamAdminSessionRequest, session: DbSes
         updated_at=now,
     )
     session.add(row)
+    session.flush()
+    try:
+        proxy_binding = bind_team_admin_static_proxy_in_session(
+            session=session,
+            team_admin_session_id=row.id,
+            bind_reason="team_admin_session_import",
+        )
+    except ProxyWorkflowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    spaces: list[dict] = []
+    if external_space_id:
+        openai_provider = OpenAIChatGPTPlugin.from_config(
+            OpenAIChatGPTClientConfig(
+                auth_base_url=get_settings().openai_auth_base_url,
+                chatgpt_base_url=get_settings().openai_chatgpt_base_url,
+            )
+        )
+        try:
+            usage_payload = _fetch_business_usage_with_admin_proxy_retry(
+                session=session,
+                openai_provider=openai_provider,
+                admin_session=row,
+                access_token=access_token,
+                chatgpt_account_id=external_space_id,
+            )
+            credential_type = infer_credential_type(
+                space_type="business",
+                usage_payload=usage_payload,
+            )
+        except (OpenAIChatGPTClientError, SpaceUsageError, ProxyWorkflowError) as exc:
+            raise HTTPException(status_code=400, detail=f"business space usage probe failed: {exc}") from exc
+        subscription_payload: dict[str, Any] = {}
+        try:
+            proxy_url = ensure_team_admin_static_proxy_url_in_session(
+                session=session,
+                team_admin_session_id=row.id,
+                bind_reason="team_admin_session_import_subscription",
+            )
+            subscription_payload = openai_provider.fetch_subscription(
+                access_token=access_token,
+                account_id=external_space_id,
+                cookie_header=row.cookie_header,
+                proxy_url=proxy_url,
+            )
+        except Exception:
+            subscription_payload = {}
+        space = _upsert_business_space_from_admin_session(
+            session=session,
+            account_payload=account_payload,
+            usage_payload=usage_payload,
+            subscription_payload=subscription_payload,
+            admin_session=row,
+            admin_email=admin_email,
+            credential_type=credential_type,
+            now=now,
+        )
+        spaces.append(_space_dict(space))
     session.commit()
     return {
         "team_admin_session_id": row.id,
         "admin_email": row.admin_email,
-        "space_count": 0,
-        "spaces": [],
+        "team_admin_proxy_binding_id": proxy_binding.id,
+        "proxy_id": proxy_binding.proxy_id,
+        "space_count": len(spaces),
+        "spaces": spaces,
     }
+
+
+def _admin_session_account_id(account_payload: dict[str, Any]) -> str:
+    return str(
+        account_payload.get("id")
+        or account_payload.get("account_id")
+        or account_payload.get("accountId")
+        or ""
+    ).strip()
+
+
+def _upsert_business_space_from_admin_session(
+    *,
+    session: Session,
+    account_payload: dict[str, Any],
+    usage_payload: dict[str, Any],
+    subscription_payload: dict[str, Any],
+    admin_session: TeamAdminSessionModel,
+    admin_email: str,
+    credential_type: str,
+    now: datetime,
+) -> SpaceModel:
+    external_space_id = _admin_session_account_id(account_payload)
+    if not external_space_id:
+        raise HTTPException(status_code=400, detail="admin session account.id is required")
+    space = session.scalars(
+        select(SpaceModel).where(
+            SpaceModel.provider == "openai_chatgpt",
+            SpaceModel.external_space_id == external_space_id,
+        )
+    ).first()
+    if space is None:
+        space = SpaceModel(
+            id=f"space-{uuid4()}",
+            provider="openai_chatgpt",
+            external_space_id=external_space_id,
+            owner_user_account_id="",
+            name="",
+            space_type="business",
+            auth_mode="backend_access_token",
+            credential_type=credential_type,
+            plan_type="",
+            seat_limit=0,
+            seats_in_use=0,
+            seats_entitled=0,
+            space_status="active",
+            source_admin_session_id=admin_session.id,
+            raw_space_json={},
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(space)
+    space.space_type = "business"
+    space.auth_mode = "backend_access_token"
+    space.credential_type = credential_type
+    space.space_status = "active"
+    space.source_admin_session_id = admin_session.id
+    space.name = str(
+        account_payload.get("name")
+        or account_payload.get("display_name")
+        or account_payload.get("displayName")
+        or admin_email
+        or external_space_id
+    ).strip()
+    space.plan_type = str(
+        subscription_payload.get("plan_type")
+        or subscription_payload.get("planType")
+        or usage_payload.get("plan_type")
+        or account_payload.get("planType")
+        or account_payload.get("plan_type")
+        or ""
+    ).strip()
+    seats_entitled = _safe_positive_int(
+        subscription_payload.get("seats_entitled") or subscription_payload.get("seatsEntitled")
+    )
+    seats_in_use = _safe_positive_int(
+        subscription_payload.get("seats_in_use") or subscription_payload.get("seatsInUse")
+    )
+    if seats_entitled:
+        space.seats_entitled = seats_entitled
+        space.seat_limit = seats_entitled
+    if seats_in_use:
+        space.seats_in_use = seats_in_use
+    space.raw_space_json = {
+        "admin_session_account": account_payload,
+        "wham_usage": usage_payload,
+        "subscription": subscription_payload,
+    }
+    if subscription_payload:
+        space.last_subscription_sync_at = now
+    space.updated_at = now
+    return space
+
+
+def _safe_positive_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_business_usage_with_admin_proxy_retry(
+    *,
+    session: Session,
+    openai_provider: OpenAIChatGPTPlugin,
+    admin_session: TeamAdminSessionModel,
+    access_token: str,
+    chatgpt_account_id: str,
+    max_attempts: int = 3,
+) -> dict:
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(max_attempts or 1))):
+        proxy_url = ensure_team_admin_static_proxy_url_in_session(
+            session=session,
+            team_admin_session_id=admin_session.id,
+            bind_reason="team_admin_session_import_usage_probe",
+        )
+        try:
+            return openai_provider.fetch_wham_usage(
+                access_token=access_token,
+                chatgpt_account_id=chatgpt_account_id,
+                cookie_header=admin_session.cookie_header,
+                proxy_url=proxy_url,
+            )
+        except Exception as exc:
+            if not _is_proxy_transport_error(exc):
+                raise
+            last_error = exc
+            reassign_team_admin_static_proxy_in_session(
+                session=session,
+                team_admin_session_id=admin_session.id,
+                error_code=f"usage_probe_proxy_error_attempt_{attempt + 1}",
+                bind_reason="team_admin_session_import_usage_probe_retry",
+            )
+            session.flush()
+    raise ProxyWorkflowError(
+        "business space usage probe proxy failed after retry: "
+        f"{type(last_error).__name__}: {last_error}"
+    )
+
+
+def _is_proxy_transport_error(exc: Exception) -> bool:
+    message = f"{type(exc).__name__}: {exc}"
+    markers = (
+        "ProxyError",
+        "CONNECT tunnel failed",
+        "Proxy CONNECT aborted",
+        "curl: (56)",
+        "UNEXPECTED_EOF",
+        "Server disconnected",
+        "Connection closed abruptly",
+    )
+    return any(marker in message for marker in markers)
 
 
 @router.get("/team-admin-sessions")
@@ -368,6 +641,7 @@ def list_team_admin_sessions(session: DbSession) -> list[dict]:
             "session_source": row.session_source,
             "has_access_token": bool(row.access_token),
             "has_cookie_header": bool(row.cookie_header),
+            "proxy_binding": _team_admin_proxy_binding_dict(session=session, team_admin_session_id=row.id),
             "expires_at": _iso(row.expires_at),
             "imported_at": _iso(row.imported_at),
             "created_at": _iso(row.created_at),
@@ -382,9 +656,38 @@ def delete_team_admin_session(team_admin_session_id: str, session: DbSession) ->
     row = session.get(TeamAdminSessionModel, team_admin_session_id)
     if row is None:
         raise HTTPException(status_code=404, detail="team admin session not found")
+    spaces = session.scalars(
+        select(SpaceModel).where(SpaceModel.source_admin_session_id == team_admin_session_id)
+    ).all()
+    deleted_space_ids = [space.id for space in spaces]
+    deleted_external_space_ids = [space.external_space_id for space in spaces]
+    deleted_space_count = len(spaces)
+    deleted_membership_count = int(
+        session.scalar(
+            select(func.count()).where(SpaceMembershipModel.space_id.in_(deleted_space_ids))
+        )
+        or 0
+    ) if deleted_space_ids else 0
+    deleted_credential_count = int(
+        session.scalar(
+            select(func.count()).where(SpaceCredentialModel.space_id.in_(deleted_space_ids))
+        )
+        or 0
+    ) if deleted_space_ids else 0
+    for space in spaces:
+        session.delete(space)
     session.delete(row)
     session.commit()
-    return {"team_admin_session_id": team_admin_session_id, "deleted": True}
+    return {
+        "team_admin_session_id": team_admin_session_id,
+        "deleted": True,
+        "deleted_space_count": deleted_space_count,
+        "deleted_space_ids": deleted_space_ids,
+        "deleted_external_space_ids": deleted_external_space_ids,
+        "deleted_membership_count": deleted_membership_count,
+        "deleted_credential_count": deleted_credential_count,
+        "preserved_push_records": True,
+    }
 
 
 @router.get("/memberships")
@@ -393,6 +696,7 @@ def list_memberships(
     space_id: str = "",
     user_account_id: str = "",
     membership_status: str = "",
+    session_account_detected: str = "",
 ) -> list[dict]:
     stmt = (
         select(SpaceMembershipModel, UserAccountModel, SpaceModel)
@@ -406,6 +710,11 @@ def list_memberships(
         stmt = stmt.where(SpaceMembershipModel.user_account_id == user_account_id.strip())
     if membership_status.strip():
         stmt = stmt.where(SpaceMembershipModel.membership_status == membership_status.strip())
+    detected_filter = session_account_detected.strip().lower()
+    if detected_filter in {"yes", "true", "1"}:
+        stmt = stmt.where(SpaceMembershipModel.session_account_detected.is_(True))
+    if detected_filter in {"no", "false", "0"}:
+        stmt = stmt.where(SpaceMembershipModel.session_account_detected.is_(False))
     rows = session.execute(stmt).all()
     return [
         {
@@ -416,12 +725,14 @@ def list_memberships(
             "space_type": space.space_type,
             "credential_type": space.credential_type,
             "user_account_id": membership.user_account_id,
+            "user_email": account.email,
             "email": account.email,
             "role": membership.role,
             "membership_status": membership.membership_status,
             "invite_permission": membership.invite_permission,
             "seat_status": membership.seat_status,
             "can_invite": membership.can_invite,
+            "session_account_detected": membership.session_account_detected,
             "remote_user_id": membership.remote_user_id,
             "remote_account_user_id": membership.remote_account_user_id,
             "remote_role": membership.remote_role,
@@ -520,7 +831,9 @@ def get_automation_monitor_jobs(session: DbSession) -> dict:
     rows = session.scalars(
         select(AutomationScheduleModel).order_by(AutomationScheduleModel.schedule_type)
     ).all()
-    return {"items": [_automation_monitor_job_dict(session=session, schedule=row) for row in rows]}
+    items = [_automation_monitor_job_dict(session=session, schedule=row) for row in rows]
+    session.commit()
+    return {"items": items}
 
 
 @router.get("/automation/monitor/job-runs")
@@ -546,22 +859,33 @@ def get_automation_monitor_job_runs(
 @router.get("/automation/monitor/job-console")
 def get_automation_monitor_job_console(
     session: DbSession,
+    schedule_type: str = "",
     run_id: str = "",
     job_id: str = "",
+    level: str = "",
     limit: int = 200,
+    max_bytes: int = 524288,
 ) -> dict:
     stmt = select(JobEventModel, JobRunModel, JobModel).join(
         JobRunModel, JobRunModel.id == JobEventModel.run_id
     ).join(JobModel, JobModel.id == JobRunModel.job_id)
+    if schedule_type.strip():
+        _validate_space_schedule_type(schedule_type.strip())
+        stmt = stmt.where(JobModel.type == _job_type_for_schedule_type(schedule_type.strip()))
     if run_id.strip():
         stmt = stmt.where(JobEventModel.run_id == run_id.strip())
     if job_id.strip():
         stmt = stmt.where(JobRunModel.job_id == job_id.strip())
+    if level.strip():
+        stmt = stmt.where(JobEventModel.level == level.strip().upper())
     rows = session.execute(
-        stmt.order_by(JobEventModel.ts.desc()).limit(max(1, min(int(limit or 200), 500)))
+        stmt.order_by(JobEventModel.ts.desc()).limit(max(1, min(int(limit or 200), 5000)))
     ).all()
-    items = [
-        {
+    items = []
+    returned_bytes = 0
+    byte_limit = max(4096, min(int(max_bytes or 524288), 2_097_152))
+    for event, _run, job in rows:
+        item = {
             "id": event.id,
             "run_id": event.run_id,
             "job_id": job.id,
@@ -570,16 +894,20 @@ def get_automation_monitor_job_console(
             "event_type": event.event_type,
             "message": event.message,
             "data_json": event.data_json,
+            "data_summary": _compact_json(event.data_json),
             "ts": _iso(event.ts),
         }
-        for event, _run, job in rows
-    ]
+        item_bytes = len(str(item).encode("utf-8"))
+        if items and returned_bytes + item_bytes > byte_limit:
+            break
+        items.append(item)
+        returned_bytes += item_bytes
     return {
         "items": items,
-        "truncated": False,
+        "truncated": len(items) < len(rows),
         "returned_count": len(items),
-        "returned_bytes": len(str(items).encode("utf-8")),
-        "max_bytes": 0,
+        "returned_bytes": returned_bytes,
+        "max_bytes": byte_limit,
     }
 
 
@@ -636,7 +964,7 @@ def list_downstream_channel_credential_type_balances(
     _ensure_downstream_credential_type_balances(session=session, channel=channel)
     session.commit()
     return [
-        _credential_type_balance_dict(row)
+        _credential_type_balance_dict(row, session=session)
         for row in session.scalars(
             select(DownstreamChannelCredentialTypeBalanceModel)
             .where(DownstreamChannelCredentialTypeBalanceModel.downstream_channel_id == channel_id)
@@ -665,7 +993,7 @@ def patch_downstream_channel_credential_type_balance(
         balance.balance_status = req.balance_status
     balance.updated_at = datetime.now(UTC)
     session.commit()
-    return _credential_type_balance_dict(balance)
+    return _credential_type_balance_dict(balance, session=session)
 
 
 @router.post("/downstream-channels/{channel_id}/credential-type-balances/{credential_type}/add-balance")
@@ -683,7 +1011,7 @@ def add_downstream_channel_credential_type_balance(
     balance.push_balance = max(0, int(balance.push_balance or 0) + int(req.amount or 0))
     balance.updated_at = datetime.now(UTC)
     session.commit()
-    return _credential_type_balance_dict(balance)
+    return _credential_type_balance_dict(balance, session=session)
 
 
 @router.patch("/downstream-channels/{channel_id}")
@@ -747,6 +1075,11 @@ def create_refresh_webshare_job(req: RefreshWebsharePoolRequest, session: DbSess
 @router.post("/proxies/bind-account-job")
 def create_bind_proxy_job(input_json: dict[str, Any], session: DbSession) -> dict:
     return _enqueue(session, "proxy.bind_account", input_json)
+
+
+@router.post("/proxies/bind-team-admin-job")
+def create_bind_team_admin_proxy_job(input_json: dict[str, Any], session: DbSession) -> dict:
+    return _enqueue(session, "proxy.bind_team_admin", input_json)
 
 
 @router.post("/proxies/{proxy_id}/healthcheck-job")
@@ -842,6 +1175,7 @@ def _user_account_dict(row: UserAccountModel) -> dict:
         "account_status": row.account_status,
         "session_status": row.session_status,
         "has_password": bool(row.password),
+        "has_access_token": bool(row.access_token),
         "has_session_token": bool(row.session_token),
         "has_cookie_header": bool(row.cookie_header),
         "last_session_refresh_at": _iso(row.last_session_refresh_at),
@@ -849,6 +1183,29 @@ def _user_account_dict(row: UserAccountModel) -> dict:
         "last_login_error_message": row.last_login_error_message,
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
+    }
+
+
+def _team_admin_proxy_binding_dict(*, session: Session, team_admin_session_id: str) -> dict:
+    row = session.execute(
+        select(TeamAdminProxyBindingModel, ProxyInventoryModel)
+        .join(ProxyInventoryModel, ProxyInventoryModel.id == TeamAdminProxyBindingModel.proxy_id)
+        .where(TeamAdminProxyBindingModel.team_admin_session_id == team_admin_session_id)
+    ).first()
+    if row is None:
+        return {}
+    binding, proxy = row
+    return {
+        "id": binding.id,
+        "proxy_id": binding.proxy_id,
+        "bind_status": binding.bind_status,
+        "bind_reason": binding.bind_reason,
+        "proxy_type": proxy.proxy_type,
+        "proxy_status": proxy.proxy_status,
+        "provider_valid": proxy.provider_valid,
+        "bound_at": _iso(binding.bound_at),
+        "last_used_at": _iso(binding.last_used_at),
+        "last_error_code": binding.last_error_code,
     }
 
 
@@ -929,6 +1286,151 @@ def _usage_state_dict(row: SpaceCredentialUsageStateModel) -> dict:
     }
 
 
+def _create_pending_business_access_token_work_job(
+    *,
+    session: Session,
+    work_count: int,
+    created_by: str,
+    credential_name_prefix: str,
+) -> dict:
+    active_job = _active_work_job_for_type(
+        session=session,
+        job_type="space.business_access_token.create.bulk",
+    )
+    if active_job is not None:
+        summary = _work_summary(session, active_job.id)
+        return {
+            "job_id": active_job.id,
+            "job_status": active_job.job_status,
+            "run_id": "",
+            "work_count": sum(summary.values()),
+            "queued": summary["queued"],
+            "running": summary["running"],
+            "succeeded": summary["succeeded"],
+            "failed": summary["failed"],
+            "cancelled": summary["cancelled"],
+            "skipped_reason": "active_authorize_job_exists",
+            "selected": [],
+        }
+    worker_count = max(1, int(work_count or 5))
+    selected = _select_pending_business_access_token_items(session=session)
+    if not selected:
+        return {
+            "job_id": "",
+            "job_status": "skipped",
+            "run_id": "",
+            "work_count": 0,
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "selected": [],
+        }
+    job, run = _start_work_job(
+        session=session,
+        job_type="space.business_access_token.create.bulk",
+        input_json={
+            "space_membership_ids": [item["space_membership_id"] for item in selected],
+            "work_count": worker_count,
+            "selected_count": len(selected),
+        },
+        created_by=created_by,
+    )
+    work_queue = WorkQueue(session)
+    for item in selected:
+        proxy_url = ensure_account_proxy_url(
+            _session_factory_from_session(session),
+            item["user_account_id"],
+            bind_reason="space_business_access_token_create",
+        )
+        work_queue.enqueue(
+            job_id=job.id,
+            work_type="space.business_access_token.create.account",
+            input_json={
+                "user_account_id": item["user_account_id"],
+                "external_space_id": item["external_space_id"],
+                "session_access_token": "",
+                "credential_name": f"{credential_name_prefix}-{item['user_account_id']}",
+                "cookie_header": item["cookie_header"],
+                "space_name": item["space_name"],
+                "owner_user_account_id": item["owner_user_account_id"],
+                "source_admin_session_id": item["source_admin_session_id"],
+                "proxy_url": proxy_url,
+                "_run_id": run.id,
+            },
+        )
+    session.commit()
+    result = _run_work_job_now_and_summarize(
+        session=session,
+        job_id=job.id,
+        run_id=run.id,
+        worker_count=worker_count * max(1, len({item["external_space_id"] for item in selected})),
+        work_count=len(selected),
+    )
+    result["selected"] = [
+        {
+            "space_membership_id": item["space_membership_id"],
+            "space_id": item["space_id"],
+            "user_account_id": item["user_account_id"],
+            "external_space_id": item["external_space_id"],
+        }
+        for item in selected
+    ]
+    return result
+
+
+def _select_pending_business_access_token_items(*, session: Session) -> list[dict]:
+    credential_join_condition = and_(
+        SpaceCredentialModel.space_id == SpaceMembershipModel.space_id,
+        SpaceCredentialModel.user_account_id == SpaceMembershipModel.user_account_id,
+        SpaceCredentialModel.credential_status == "active",
+    )
+    rows = session.execute(
+        select(SpaceMembershipModel, SpaceModel, UserAccountModel)
+        .join(SpaceModel, SpaceModel.id == SpaceMembershipModel.space_id)
+        .join(UserAccountModel, UserAccountModel.id == SpaceMembershipModel.user_account_id)
+        .outerjoin(SpaceCredentialModel, credential_join_condition)
+        .where(
+            SpaceMembershipModel.membership_status == "active",
+            SpaceMembershipModel.session_account_detected.is_(True),
+            SpaceModel.provider == "openai_chatgpt",
+            SpaceModel.space_type == "business",
+            SpaceModel.space_status == "active",
+            SpaceModel.credential_type.in_(("team_5h_weekly", "team_monthly")),
+            UserAccountModel.account_status == "active",
+            UserAccountModel.session_status == "active",
+            or_(UserAccountModel.cookie_header != "", UserAccountModel.session_token != ""),
+            SpaceCredentialModel.id.is_(None),
+        )
+        .order_by(SpaceMembershipModel.updated_at.asc())
+    ).all()
+    return [
+        {
+            "space_membership_id": membership.id,
+            "space_id": space.id,
+            "user_account_id": account.id,
+            "external_space_id": space.external_space_id,
+            "access_token": account.access_token,
+            "cookie_header": _web_session_cookie_header(account),
+            "space_name": space.name,
+            "owner_user_account_id": space.owner_user_account_id,
+            "source_admin_session_id": space.source_admin_session_id,
+        }
+        for membership, space, account in rows
+    ]
+
+
+def _web_session_cookie_header(account: UserAccountModel) -> str:
+    cookie_header = str(account.cookie_header or "").strip()
+    session_token = str(account.session_token or "").strip()
+    if not session_token or "__Secure-next-auth.session-token=" in cookie_header:
+        return cookie_header
+    if not cookie_header:
+        return f"__Secure-next-auth.session-token={session_token}"
+    return f"__Secure-next-auth.session-token={session_token}; {cookie_header}"
+
+
 def _create_business_access_token_work_job(
     *,
     req: CreateBusinessAccessTokenCredentialsJobRequest,
@@ -937,21 +1439,26 @@ def _create_business_access_token_work_job(
     user_account_ids = _validated_user_account_ids(session=session, ids=req.user_account_ids)
     if not req.external_space_id.strip():
         raise HTTPException(status_code=400, detail="external_space_id is required")
-    if not req.session_access_token.strip():
-        raise HTTPException(status_code=400, detail="session_access_token is required")
-    concurrency = _bounded_concurrency(req.concurrency)
+    if not req.cookie_header.strip():
+        raise HTTPException(status_code=400, detail="cookie_header is required")
     job, run = _start_work_job(
         session=session,
         job_type="space.business_access_token.create.bulk",
         input_json={
             "user_account_ids": user_account_ids,
             "external_space_id": req.external_space_id,
-            "concurrency": concurrency,
+            "work_count": max(1, int(req.work_count or 5)),
+            "selected_count": len(user_account_ids),
         },
         created_by=req.created_by,
     )
     work_queue = WorkQueue(session)
     for user_account_id in user_account_ids:
+        proxy_url = ensure_account_proxy_url(
+            _session_factory_from_session(session),
+            user_account_id,
+            bind_reason="space_business_access_token_create_manual",
+        )
         work_queue.enqueue(
             job_id=job.id,
             work_type="space.business_access_token.create.account",
@@ -964,17 +1471,19 @@ def _create_business_access_token_work_job(
                 "space_name": req.space_name,
                 "owner_user_account_id": req.owner_user_account_id,
                 "source_admin_session_id": req.source_admin_session_id,
+                "proxy_url": proxy_url,
                 "_run_id": run.id,
             },
         )
     session.commit()
-    return _run_work_job_now_and_summarize(
+    result = _run_work_job_now_and_summarize(
         session=session,
         job_id=job.id,
         run_id=run.id,
-        concurrency=min(concurrency, len(user_account_ids)),
+        worker_count=max(1, int(req.work_count or 5)),
         work_count=len(user_account_ids),
     )
+    return result
 
 
 def _create_space_push_work_job(
@@ -994,13 +1503,12 @@ def _create_space_push_work_job(
     missing_ids = [item for item in credential_ids if item not in found_ids]
     if missing_ids:
         raise HTTPException(status_code=404, detail={"space_credential_ids": missing_ids})
-    concurrency = _bounded_concurrency(req.concurrency)
     return _create_space_push_job_for_ids(
         session=session,
         credential_ids=credential_ids,
         downstream_channel_id=req.downstream_channel_id,
         created_by=req.created_by,
-        concurrency=concurrency,
+        worker_count=max(1, int(req.work_count or 5)),
         retry_ids=set(),
     )
 
@@ -1018,7 +1526,6 @@ def _create_pending_space_push_work_job(
     selected = _select_pending_space_push_items(
         session=session,
         channel=channel,
-        limit=max(1, int(req.limit or 1)),
     )
     if not selected:
         return {
@@ -1026,7 +1533,6 @@ def _create_pending_space_push_work_job(
             "job_status": "skipped",
             "run_id": "",
             "work_count": 0,
-            "concurrency": 0,
             "queued": 0,
             "running": 0,
             "succeeded": 0,
@@ -1039,7 +1545,7 @@ def _create_pending_space_push_work_job(
         credential_ids=[item["space_credential_id"] for item in selected],
         downstream_channel_id=req.downstream_channel_id,
         created_by=req.created_by,
-        concurrency=_bounded_concurrency(req.concurrency),
+        worker_count=max(1, int(req.work_count or 5)),
         retry_ids={item["space_credential_id"] for item in selected if item.get("is_retry")},
         selected=selected,
     )
@@ -1051,7 +1557,7 @@ def _create_space_push_job_for_ids(
     credential_ids: list[str],
     downstream_channel_id: str,
     created_by: str,
-    concurrency: int,
+    worker_count: int,
     retry_ids: set[str],
     selected: list[dict] | None = None,
 ) -> dict:
@@ -1061,7 +1567,8 @@ def _create_space_push_job_for_ids(
         input_json={
             "space_credential_ids": credential_ids,
             "downstream_channel_id": downstream_channel_id,
-            "concurrency": concurrency,
+            "work_count": max(1, int(worker_count or 5)),
+            "selected_count": len(credential_ids),
         },
         created_by=created_by,
     )
@@ -1082,7 +1589,7 @@ def _create_space_push_job_for_ids(
         session=session,
         job_id=job.id,
         run_id=run.id,
-        concurrency=min(concurrency, len(credential_ids)),
+        worker_count=max(1, int(worker_count or 5)),
         work_count=len(credential_ids),
     )
     if selected is not None:
@@ -1098,11 +1605,15 @@ def _create_account_work_job(
     work_type: str,
 ) -> dict:
     user_account_ids = _validated_user_account_ids(session=session, ids=req.user_account_ids)
-    concurrency = _bounded_concurrency(req.concurrency)
+    worker_count = max(1, int(req.work_count or 10))
     job, run = _start_work_job(
         session=session,
         job_type=job_type,
-        input_json={"user_account_ids": user_account_ids, "concurrency": concurrency},
+        input_json={
+            "user_account_ids": user_account_ids,
+            "work_count": worker_count,
+            "selected_count": len(user_account_ids),
+        },
         created_by=req.created_by,
     )
     work_queue = WorkQueue(session)
@@ -1117,7 +1628,7 @@ def _create_account_work_job(
         session=session,
         job_id=job.id,
         run_id=run.id,
-        concurrency=min(concurrency, len(user_account_ids)),
+        worker_count=worker_count,
         work_count=len(user_account_ids),
     )
 
@@ -1126,7 +1637,6 @@ def _select_pending_space_push_items(
     *,
     session: Session,
     channel: DownstreamChannelModel,
-    limit: int,
 ) -> list[dict]:
     selected: list[dict] = []
     selected_ids: set[str] = set()
@@ -1138,15 +1648,13 @@ def _select_pending_space_push_items(
         )
     ).all()
     for balance in balances:
-        if len(selected) >= limit:
-            break
         credential_type = balance.credential_type
         active_slots = _active_space_push_slot_count(
             session=session,
             downstream_channel_id=channel.id,
             credential_type=credential_type,
         )
-        allowed_slots = max(0, int(balance.max_active_slots or channel.max_active_slots or 0))
+        allowed_slots = _allowed_space_push_slots(session=session, balance=balance)
         remaining_slots = max(0, allowed_slots - active_slots)
         if remaining_slots <= 0:
             continue
@@ -1155,13 +1663,13 @@ def _select_pending_space_push_items(
             downstream_channel_id=channel.id,
             credential_type=credential_type,
             excluded_ids=selected_ids,
-            limit=min(remaining_slots, limit - len(selected)),
+            limit=remaining_slots,
         )
         for credential_id in retry_ids:
             selected.append({"space_credential_id": credential_id, "credential_type": credential_type, "is_retry": True})
             selected_ids.add(credential_id)
         remaining_slots = max(0, remaining_slots - len(retry_ids))
-        new_limit = min(remaining_slots, limit - len(selected), int(balance.push_balance or 0))
+        new_limit = min(remaining_slots, int(balance.push_balance or 0))
         if new_limit <= 0:
             continue
         new_ids = _select_new_space_credential_ids(
@@ -1201,6 +1709,8 @@ def _select_retryable_failed_space_credential_ids(
     )
     if excluded_ids:
         stmt = stmt.where(~SpaceCredentialModel.id.in_(excluded_ids))
+    if credential_type == "personal_account":
+        stmt = stmt.where(SpaceCredentialModel.refresh_token != "")
     return [str(row) for row in session.scalars(stmt).all()]
 
 
@@ -1227,6 +1737,8 @@ def _select_new_space_credential_ids(
     )
     if excluded_ids:
         stmt = stmt.where(~SpaceCredentialModel.id.in_(excluded_ids))
+    if credential_type == "personal_account":
+        stmt = stmt.where(SpaceCredentialModel.refresh_token != "")
     return [str(row) for row in session.scalars(stmt).all()]
 
 
@@ -1248,6 +1760,41 @@ def _active_space_push_slot_count(
         )
     )
     return int(value or 0)
+
+
+def _allowed_space_push_slots(
+    *,
+    session: Session,
+    balance: DownstreamChannelCredentialTypeBalanceModel,
+) -> int:
+    max_slots = max(0, int(balance.max_active_slots or 0))
+    if max_slots <= 0:
+        return 0
+    base_slots = max(1, max_slots // 2)
+    high_usage_count = int(
+        session.scalar(
+            select(func.count(func.distinct(SpacePushBindingModel.space_credential_id)))
+            .select_from(SpacePushBindingModel)
+            .join(
+                SpaceCredentialModel,
+                SpaceCredentialModel.id == SpacePushBindingModel.space_credential_id,
+            )
+            .join(SpaceModel, SpaceModel.id == SpaceCredentialModel.space_id)
+            .join(
+                SpaceCredentialUsageStateModel,
+                SpaceCredentialUsageStateModel.space_credential_id
+                == SpacePushBindingModel.space_credential_id,
+            )
+            .where(
+                SpacePushBindingModel.downstream_channel_id == balance.downstream_channel_id,
+                SpacePushBindingModel.push_status.in_(("pushing", "pushed", "failed")),
+                SpaceModel.credential_type == balance.credential_type,
+                SpaceCredentialUsageStateModel.usage_percent >= 70,
+            )
+        )
+        or 0
+    )
+    return min(max_slots, base_slots + high_usage_count)
 
 
 def _start_work_job(
@@ -1277,23 +1824,97 @@ def _start_work_job(
     return job, run
 
 
+def _active_work_job_for_type(*, session: Session, job_type: str) -> JobModel | None:
+    jobs = session.scalars(
+        select(JobModel)
+        .where(
+            JobModel.type == job_type,
+            JobModel.job_status.in_(("queued", "running")),
+        )
+        .order_by(JobModel.created_at.asc())
+        .limit(10)
+    ).all()
+    for job in jobs:
+        _finalize_work_job_if_complete(session=session, job=job)
+        if job.job_status == "queued":
+            return job
+        if job.job_status == "running":
+            summary = _work_summary(session, job.id)
+            if summary["queued"] > 0 or summary["running"] > 0:
+                return job
+    return None
+
+
 def _run_work_job_now_and_summarize(
     *,
     session: Session,
     job_id: str,
     run_id: str,
-    concurrency: int,
+    worker_count: int,
     work_count: int,
 ) -> dict:
-    local_session_factory = sessionmaker(bind=session.get_bind(), autoflush=False, expire_on_commit=False)
+    local_session_factory = _session_factory_from_session(session)
     _run_job_work_now(
         session_factory=local_session_factory,
         job_id=job_id,
-        concurrency=max(1, int(concurrency or 1)),
+        worker_count=worker_count,
     )
+    session.expire_all()
     summary = _work_summary(session, job_id)
     job = session.get(JobModel, job_id)
     run = session.get(JobRunModel, run_id)
+    _apply_work_job_summary(job=job, run=run, summary=summary)
+    session.commit()
+    return {
+        "job_id": job.id if job is not None else "",
+        "job_status": job.job_status if job is not None else "",
+        "run_id": run.id if run is not None else "",
+        "work_count": work_count,
+        **summary,
+    }
+
+def _run_job_work_now(*, session_factory, job_id: str, worker_count: int) -> None:
+    def run_loop() -> None:
+        runner = JobRunner(session_factory)
+        register_core_handlers(runner, session_factory=session_factory, settings=get_settings())
+        while runner.run_one_work_for_job(job_id) is not None:
+            pass
+
+    bounded_worker_count = max(1, int(worker_count or 1))
+    if bounded_worker_count <= 1:
+        run_loop()
+        return
+    with ThreadPoolExecutor(max_workers=bounded_worker_count) as executor:
+        futures = [executor.submit(run_loop) for _ in range(bounded_worker_count)]
+        for future in as_completed(futures):
+            future.result()
+
+
+def _work_summary(session: Session, job_id: str) -> dict[str, int]:
+    summary = {
+        "queued": 0,
+        "running": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    rows = session.execute(
+        select(WorkItemModel.work_status, func.count())
+        .where(WorkItemModel.job_id == job_id)
+        .group_by(WorkItemModel.work_status)
+    ).all()
+    for status, count in rows:
+        if status in summary:
+            summary[status] = int(count or 0)
+    return summary
+
+
+def _apply_work_job_summary(
+    *,
+    job: JobModel | None,
+    run: JobRunModel | None,
+    summary: dict[str, int],
+) -> None:
     now = datetime.now(UTC)
     if job is not None:
         if summary["queued"] == 0 and summary["running"] == 0 and summary["failed"] == 0:
@@ -1304,48 +1925,36 @@ def _run_work_job_now_and_summarize(
             job.job_status = "running"
         job.updated_at = now
     if run is not None:
-        run.run_status = "succeeded" if job is not None and job.job_status == "succeeded" else "failed"
-        run.finished_at = now
+        if summary["queued"] == 0 and summary["running"] == 0:
+            run.run_status = "succeeded" if job is not None and job.job_status == "succeeded" else "failed"
+            run.finished_at = now
+        else:
+            run.run_status = "running"
+            run.finished_at = None
         run.output_json = summary
         if run.run_status == "failed":
             run.error_code = "work_failed"
-            run.error_message = f"failed={summary['failed']} queued={summary['queued']} running={summary['running']}"
-    session.commit()
-    return {
-        "job_id": job.id if job is not None else "",
-        "job_status": job.job_status if job is not None else "",
-        "run_id": run.id if run is not None else "",
-        "work_count": work_count,
-        "concurrency": concurrency,
-        **summary,
-    }
+            run.error_message = (
+                f"failed={summary['failed']} queued={summary['queued']} running={summary['running']}"
+            )
+        elif run.run_status == "succeeded":
+            run.error_code = ""
+            run.error_message = ""
 
 
-def _run_job_work_now(*, session_factory, job_id: str, concurrency: int) -> None:
-    def run_loop() -> None:
-        runner = JobRunner(session_factory)
-        register_core_handlers(runner, session_factory=session_factory, settings=get_settings())
-        while runner.run_one_work_for_job(job_id) is not None:
-            pass
-
-    if concurrency <= 1:
-        run_loop()
+def _finalize_work_job_if_complete(*, session: Session, job: JobModel | None) -> None:
+    if job is None or job.job_status != "running":
         return
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(run_loop) for _ in range(concurrency)]
-        for future in as_completed(futures):
-            future.result()
-
-
-def _work_summary(session: Session, job_id: str) -> dict[str, int]:
-    rows = session.scalars(select(WorkItemModel).where(WorkItemModel.job_id == job_id)).all()
-    return {
-        "queued": sum(1 for row in rows if row.work_status == "queued"),
-        "running": sum(1 for row in rows if row.work_status == "running"),
-        "succeeded": sum(1 for row in rows if row.work_status == "succeeded"),
-        "failed": sum(1 for row in rows if row.work_status == "failed"),
-        "cancelled": sum(1 for row in rows if row.work_status == "cancelled"),
-    }
+    summary = _work_summary(session, job.id)
+    if summary["queued"] > 0 or summary["running"] > 0:
+        return
+    run = session.scalars(
+        select(JobRunModel)
+        .where(JobRunModel.job_id == job.id)
+        .order_by(JobRunModel.started_at.desc().nullslast())
+        .limit(1)
+    ).first()
+    _apply_work_job_summary(job=job, run=run, summary=summary)
 
 
 def _validated_user_account_ids(*, session: Session, ids: list[str]) -> list[str]:
@@ -1366,7 +1975,7 @@ def _downstream_channel_dict(channel: DownstreamChannelModel, *, session: Sessio
     if session is not None:
         _ensure_downstream_credential_type_balances(session=session, channel=channel)
         balances = [
-            _credential_type_balance_dict(row)
+            _credential_type_balance_dict(row, session=session)
             for row in session.scalars(
                 select(DownstreamChannelCredentialTypeBalanceModel)
                 .where(DownstreamChannelCredentialTypeBalanceModel.downstream_channel_id == channel.id)
@@ -1442,12 +2051,32 @@ def _ensure_downstream_credential_type_balance(
     return row
 
 
-def _credential_type_balance_dict(row: DownstreamChannelCredentialTypeBalanceModel) -> dict:
+def _credential_type_balance_dict(
+    row: DownstreamChannelCredentialTypeBalanceModel,
+    *,
+    session: Session | None = None,
+) -> dict:
+    active_slot_count = 0
+    allowed_active_slots = 0
+    if session is not None:
+        active_slot_count = _active_space_push_slot_count(
+            session=session,
+            downstream_channel_id=row.downstream_channel_id,
+            credential_type=row.credential_type,
+        )
+        allowed_active_slots = _allowed_space_push_slots(session=session, balance=row)
     return {
         "downstream_channel_id": row.downstream_channel_id,
         "credential_type": row.credential_type,
         "max_active_slots": row.max_active_slots,
+        "allowed_active_slots": allowed_active_slots,
+        "active_slot_count": active_slot_count,
+        "remaining_active_slots": max(0, allowed_active_slots - active_slot_count),
         "push_balance": row.push_balance,
+        "remaining_push_count": min(
+            max(0, allowed_active_slots - active_slot_count),
+            max(0, int(row.push_balance or 0)),
+        ),
         "claimed_push_count": row.claimed_push_count,
         "pushed_count": row.pushed_count,
         "failed_push_count": row.failed_push_count,
@@ -1485,9 +2114,24 @@ def _automation_schedule_dict(row: AutomationScheduleModel | None) -> dict:
 def _ensure_default_space_automation_schedules(*, session: Session) -> None:
     now = datetime.now(UTC)
     defaults = {
+        "automation.space_membership_invite_sync": {
+            "interval_seconds": 60,
+            "config_json": {
+                "space_limit": 1,
+                "invite_limit_per_space": 350,
+                "work_count": 350,
+                "membership_cap_per_space": 1000,
+                "page_size": 100,
+                "barrier_timeout_s": 30,
+            },
+        },
+        "automation.space_authorize": {
+            "interval_seconds": 60,
+            "config_json": {"work_count": 5},
+        },
         "automation.space_downstream_push": {
             "interval_seconds": 60,
-            "config_json": {"limit": 1, "concurrency": 5},
+            "config_json": {"work_count": 5},
         },
         "automation.space_recycle_sweep": {
             "interval_seconds": 300,
@@ -1523,11 +2167,37 @@ def _automation_monitor_job_dict(*, session: Session, schedule: AutomationSchedu
     latest_job = session.scalars(
         select(JobModel).where(JobModel.type == job_type).order_by(JobModel.created_at.desc()).limit(1)
     ).first()
+    latest_run = None
+    if latest_job is not None:
+        _finalize_work_job_if_complete(session=session, job=latest_job)
+        latest_run = session.scalars(
+            select(JobRunModel)
+            .where(JobRunModel.job_id == latest_job.id)
+            .order_by(JobRunModel.started_at.desc().nullslast())
+            .limit(1)
+        ).first()
+    output = latest_run.output_json if latest_run is not None and isinstance(latest_run.output_json, dict) else {}
+    duration_ms = 0
+    if latest_run is not None and latest_run.started_at and latest_run.finished_at:
+        duration_ms = int((latest_run.finished_at - latest_run.started_at).total_seconds() * 1000)
+    if latest_job is not None and schedule.last_job_id == latest_job.id:
+        latest_status = latest_run.run_status if latest_run is not None else latest_job.job_status
+        if schedule.last_run_status != latest_status:
+            schedule.last_run_status = latest_status
+            schedule.updated_at = datetime.now(UTC)
+        if latest_run is not None and latest_run.started_at and schedule.last_run_at != latest_run.started_at:
+            schedule.last_run_at = latest_run.started_at
     return {
         **_automation_schedule_dict(schedule),
         "job_type": job_type,
         "latest_job_id": latest_job.id if latest_job is not None else "",
         "latest_job_status": latest_job.job_status if latest_job is not None else "",
+        "last_job_status": latest_job.job_status if latest_job is not None else "",
+        "last_run_id": latest_run.id if latest_run is not None else "",
+        "duration_ms": duration_ms,
+        "succeeded": int(output.get("succeeded") or output.get("invited_count") or 0),
+        "failed": int(output.get("failed") or output.get("failed_invite_count") or 0),
+        "skipped": int(output.get("skipped") or output.get("skipped_space_count") or 0),
     }
 
 
@@ -1555,6 +2225,42 @@ def _execute_space_automation_schedule(*, session: Session, schedule: Automation
     schedule.next_run_at = now + timedelta(seconds=max(5, int(schedule.interval_seconds or 60)))
     schedule.updated_at = now
     try:
+        if schedule.schedule_type == "automation.space_membership_invite_sync":
+            job = JobQueue(session).enqueue(
+                job_type="space.membership_invite_sync",
+                input_json={
+                    "space_limit": 1,
+                    "invite_limit_per_space": int(
+                        schedule.config_json.get("invite_limit_per_space") or 350
+                    ),
+                    "work_count": int(schedule.config_json.get("work_count") or 350),
+                    "membership_cap_per_space": int(
+                        schedule.config_json.get("membership_cap_per_space") or 1000
+                    ),
+                    "page_size": int(schedule.config_json.get("page_size") or 100),
+                    "barrier_timeout_s": float(schedule.config_json.get("barrier_timeout_s") or 30),
+                },
+                created_by=str(schedule.config_json.get("created_by") or f"scheduler:{schedule.id}"),
+            )
+            schedule.last_job_id = job.id
+            schedule.last_run_status = "queued"
+            return {"job_id": job.id, "job_status": job.job_status}
+        if schedule.schedule_type == "automation.space_authorize":
+            result = _create_pending_business_access_token_work_job(
+                session=session,
+                work_count=int(
+                    schedule.config_json.get("work_count")
+                    or schedule.config_json.get("limit")
+                    or 5
+                ),
+                created_by=str(schedule.config_json.get("created_by") or f"scheduler:{schedule.id}"),
+                credential_name_prefix=str(
+                    schedule.config_json.get("credential_name_prefix") or "codex"
+                ),
+            )
+            schedule.last_job_id = str(result.get("job_id") or "")
+            schedule.last_run_status = str(result.get("job_status") or "queued")
+            return result
         if schedule.schedule_type == "automation.space_recycle_sweep":
             job = JobQueue(session).enqueue(
                 job_type="space.recycle.sweep",
@@ -1564,7 +2270,6 @@ def _execute_space_automation_schedule(*, session: Session, schedule: Automation
             schedule.last_job_id = job.id
             schedule.last_run_status = "queued"
             return {"job_id": job.id, "job_status": job.job_status}
-        limit = int(schedule.config_json.get("limit") or 1)
         downstream_channel_id = str(schedule.config_json.get("downstream_channel_id") or "")
         channels_stmt = select(DownstreamChannelModel).where(DownstreamChannelModel.enabled.is_(True))
         if downstream_channel_id:
@@ -1574,9 +2279,8 @@ def _execute_space_automation_schedule(*, session: Session, schedule: Automation
             result = _create_pending_space_push_work_job(
                 req=PushPendingSpaceCredentialsRequest(
                     downstream_channel_id=channel.id,
-                    limit=limit,
                     created_by=str(schedule.config_json.get("created_by") or f"scheduler:{schedule.id}"),
-                    concurrency=int(schedule.config_json.get("concurrency") or 5),
+                    work_count=int(schedule.config_json.get("work_count") or 5),
                 ),
                 session=session,
             )
@@ -1647,6 +2351,8 @@ def _fixed_automation_schedule_id(schedule_type: str) -> str:
     return {
         "automation.space_recycle_sweep": "automation-schedule-space-recycle-sweep",
         "automation.space_downstream_push": "automation-schedule-space-downstream-push",
+        "automation.space_membership_invite_sync": "automation-schedule-space-membership-invite-sync",
+        "automation.space_authorize": "automation-schedule-space-authorize",
     }[schedule_type]
 
 
@@ -1655,6 +2361,8 @@ def _job_type_for_schedule_type(schedule_type: str) -> str:
     return {
         "automation.space_recycle_sweep": "space.recycle.sweep",
         "automation.space_downstream_push": "space_credential.push.bulk",
+        "automation.space_membership_invite_sync": "space.membership_invite_sync",
+        "automation.space_authorize": "space.business_access_token.create.bulk",
     }[schedule_type]
 
 
@@ -1664,8 +2372,8 @@ def _enqueue(session: Session, job_type: str, input_json: dict[str, Any]) -> dic
     return {"job_id": job.id, "job_status": job.job_status}
 
 
-def _bounded_concurrency(value: int) -> int:
-    return max(1, min(int(value or 1), get_settings().worker_max_concurrency))
+def _session_factory_from_session(session: Session):
+    return sessionmaker(bind=session.get_bind(), autoflush=False, expire_on_commit=False)
 
 
 def _session_access_token(raw: dict[str, Any]) -> str:
@@ -1689,6 +2397,18 @@ def _summarize_secret(value: str) -> str:
     if len(value) <= 8:
         return "***"
     return f"{value[:4]}...{value[-4:]}"
+
+
+def _compact_json(value: Any, *, max_chars: int = 700) -> str:
+    if value in (None, "", {}):
+        return ""
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except TypeError:
+        text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}..."
 
 
 def _iso(value: datetime | None) -> str:

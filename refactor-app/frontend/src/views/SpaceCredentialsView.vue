@@ -11,7 +11,7 @@ const router = useRouter();
 const store = useOpsStore();
 const selectedRows = ref<Row[]>([]);
 const selectedCount = ref(0);
-const pushConcurrency = ref(5);
+const pushWorkCount = ref(5);
 const downstreamChannelId = ref("");
 const downstreamChannels = ref<Row[]>([]);
 
@@ -64,11 +64,11 @@ async function pushSelected() {
     space_credential_ids: ids,
     downstream_channel_id: downstreamChannelId.value,
     created_by: "ops-ui",
-    concurrency: pushConcurrency.value,
+    work_count: pushWorkCount.value,
   });
   store.toast(
     "下游推送完成",
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
+    `work=${result.work_count} 成功=${result.succeeded} 失败=${result.failed}`,
     result.failed > 0 ? "warning" : "success",
   );
   await router.push(`/jobs/${result.job_id}`);
@@ -105,8 +105,8 @@ async function pushSelected() {
             </select>
           </label>
           <label class="field">
-            <span>推送并发</span>
-            <input v-model.number="pushConcurrency" class="input small-input" type="number" min="1" max="500" />
+            <span>同时 Work 数</span>
+            <input v-model.number="pushWorkCount" class="input small-input" type="number" min="1" max="500" />
           </label>
           <button class="btn primary" :disabled="selectedCount === 0 || !downstreamChannelId" @click="pushSelected">
             推送选中凭证（{{ selectedCount }}）

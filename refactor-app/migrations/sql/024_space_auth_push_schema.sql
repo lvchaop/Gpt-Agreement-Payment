@@ -290,7 +290,7 @@ VALUES
   ('space-recycle-rule-personal-monthly', 'personal_account', 'monthly', 95, 'mark_used', TRUE, NOW(), NOW()),
   ('space-recycle-rule-team-5h', 'team_5h_weekly', 'five_hour', 95, 'mark_used', FALSE, NOW(), NOW()),
   ('space-recycle-rule-team-weekly', 'team_5h_weekly', 'weekly', 95, 'mark_used', TRUE, NOW(), NOW()),
-  ('space-recycle-rule-team-monthly', 'team_monthly', 'monthly', 95, 'mark_used', FALSE, NOW(), NOW())
+  ('space-recycle-rule-team-monthly', 'team_monthly', 'monthly', 95, 'mark_used', TRUE, NOW(), NOW())
 ON CONFLICT (credential_type, quota_window_kind) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS space_account_cooldowns (

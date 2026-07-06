@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+from http.cookies import SimpleCookie
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from curl_cffi import requests as curl_requests
@@ -214,6 +216,56 @@ class OpenAIChatGPTClient:
         _assert_codex_heartbeat_http_ok(response)
         return {"status": "ok", "token_chatgpt_account_id": claims.token_chatgpt_account_id}
 
+    def probe_codex_responses_usage(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str = "",
+        model: str = "",
+    ) -> dict:
+        claims = decode_access_token_claims(access_token)
+        if team_id and claims.token_chatgpt_account_id != team_id:
+            raise WorkspaceMismatchError(expected=team_id, actual=claims.token_chatgpt_account_id)
+        response = self._chatgpt_post(
+            CODEX_RESPONSES_PATH,
+            headers=_codex_responses_headers(access_token=access_token, team_id=team_id),
+            json={
+                "model": str(model or DEFAULT_CODEX_HEARTBEAT_MODEL),
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    }
+                ],
+                "stream": True,
+                "store": False,
+                "instructions": _openai_codex_instructions(),
+            },
+            proxy_url=proxy_url,
+            stream=True,
+        )
+        headers = {
+            str(key).lower(): str(value) for key, value in dict(response.headers).items()
+        }
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code < 200 or status_code >= 300:
+            return {
+                "status": "failed",
+                "token_chatgpt_account_id": claims.token_chatgpt_account_id,
+                "headers": headers,
+                "http_status": status_code,
+                "error_code": f"http_{status_code}",
+                "payment_required": status_code == 402,
+                "unauthorized": status_code == 401,
+            }
+        _assert_codex_heartbeat_http_ok(response)
+        return {
+            "status": "ok",
+            "token_chatgpt_account_id": claims.token_chatgpt_account_id,
+            "headers": headers,
+        }
+
     def fetch_wham_usage(
         self,
         *,
@@ -233,10 +285,67 @@ class OpenAIChatGPTClient:
         )
         return _response_payload(response)
 
-    def create_wham_auth_credential(
+    def fetch_subscription(
         self,
         *,
         access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        response = self._chatgpt_get(
+            f"/backend-api/subscriptions?account_id={account_id}",
+            headers=_team_headers(
+                access_token=access_token,
+                team_id=account_id,
+                cookie_header=cookie_header,
+            ),
+            proxy_url=proxy_url,
+        )
+        return _response_payload(response)
+
+    def list_account_users(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]:
+        return self._list_account_items(
+            path=f"/backend-api/accounts/{account_id}/users",
+            item_keys=("items", "users", "data"),
+            access_token=access_token,
+            account_id=account_id,
+            cookie_header=cookie_header,
+            page_size=page_size,
+            proxy_url=proxy_url,
+        )
+
+    def list_account_invites(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]:
+        return self._list_account_items(
+            path=f"/backend-api/accounts/{account_id}/invites",
+            item_keys=("items", "invites", "data"),
+            access_token=access_token,
+            account_id=account_id,
+            cookie_header=cookie_header,
+            page_size=page_size,
+            proxy_url=proxy_url,
+        )
+
+    def create_wham_auth_credential(
+        self,
+        *,
+        access_token: str = "",
         chatgpt_account_id: str,
         name: str,
         ttl_seconds: int = 7_776_000,
@@ -251,21 +360,170 @@ class OpenAIChatGPTClient:
         ttl = int(ttl_seconds or 0)
         if ttl <= 0:
             raise OpenAIChatGPTClientError("ttl_seconds must be positive")
-        response = self._chatgpt_post(
-            WHAM_AUTH_CREDENTIALS_PATH,
-            headers=_wham_headers(
-                access_token=access_token,
-                chatgpt_account_id=chatgpt_account_id,
-                cookie_header=cookie_header,
-            ),
+        headers = _wham_headers(
+            access_token=access_token,
+            chatgpt_account_id=chatgpt_account_id,
+            cookie_header="" if access_token else cookie_header,
+            device_id=_cookie_value(cookie_header, "oai-did"),
+            referer="https://chatgpt.com/admin/access-tokens?modal=create",
+            target_path=WHAM_AUTH_CREDENTIALS_PATH,
+        )
+        if access_token or self._chatgpt_http_client_injected:
+            exchanged_access_token = ""
+            if cookie_header and not access_token:
+                exchanged_access_token = self._exchange_workspace_web_session_httpx(
+                    chatgpt_account_id=chatgpt_account_id,
+                    cookie_header=cookie_header,
+                    proxy_url=proxy_url,
+                )
+                if not exchanged_access_token:
+                    raise OpenAIChatGPTClientError("workspace_session_access_token_missing")
+                headers = _wham_headers(
+                    access_token=exchanged_access_token,
+                    chatgpt_account_id=chatgpt_account_id,
+                    cookie_header="",
+                    device_id=_cookie_value(cookie_header, "oai-did"),
+                    referer="https://chatgpt.com/admin/access-tokens?modal=create",
+                    target_path=WHAM_AUTH_CREDENTIALS_PATH,
+                )
+            response = self._chatgpt_post(
+                WHAM_AUTH_CREDENTIALS_PATH,
+                headers=headers,
+                json={
+                    "name": credential_name,
+                    "scopes": [WHAM_CODEX_LOCAL_ACCESS_SCOPE],
+                    "ttl": ttl,
+                },
+                proxy_url=proxy_url,
+            )
+            return _response_payload(response)
+
+        session = self._curl_session(proxy_url)
+        web_session_cookie_header = _minimal_web_session_cookie_header(cookie_header)
+        _seed_cookie_header(session, web_session_cookie_header)
+        exchanged_access_token = self._exchange_workspace_web_session(
+            session=session,
+            chatgpt_account_id=chatgpt_account_id,
+            cookie_header=web_session_cookie_header,
+        )
+        if not exchanged_access_token:
+            raise OpenAIChatGPTClientError("workspace_session_access_token_missing")
+        headers = _wham_headers(
+            access_token=exchanged_access_token,
+            chatgpt_account_id=chatgpt_account_id,
+            cookie_header="",
+            device_id=_cookie_value(cookie_header, "oai-did"),
+            referer="https://chatgpt.com/admin/access-tokens?modal=create",
+            target_path=WHAM_AUTH_CREDENTIALS_PATH,
+        )
+        response = session.post(
+            f"{self._config.chatgpt_base_url}{WHAM_AUTH_CREDENTIALS_PATH}",
+            headers=headers,
             json={
                 "name": credential_name,
                 "scopes": [WHAM_CODEX_LOCAL_ACCESS_SCOPE],
                 "ttl": ttl,
             },
-            proxy_url=proxy_url,
+            timeout=self._config.timeout_s,
         )
         return _response_payload(response)
+
+    def _warm_chatgpt_web_session(self, *, session, cookie_header: str) -> None:
+        headers = _wham_headers(
+            access_token="",
+            cookie_header=cookie_header,
+            allow_session_cookies=not cookie_header,
+            referer="https://chatgpt.com/",
+        )
+        for path in (
+            "/api/auth/providers",
+            "/api/auth/csrf",
+            "/api/auth/session",
+        ):
+            response = session.get(
+                f"{self._config.chatgpt_base_url}{path}",
+                headers=headers,
+                timeout=self._config.timeout_s,
+            )
+            if int(response.status_code or 0) >= 400:
+                body = str(getattr(response, "text", "") or "")
+                raise OpenAIChatGPTClientError(
+                    "chatgpt web session warmup failed: "
+                    f"path={path} http_status={response.status_code} body_snippet={body[:500]}"
+                )
+
+    def _exchange_workspace_web_session_httpx(
+        self,
+        *,
+        chatgpt_account_id: str,
+        cookie_header: str,
+        proxy_url: str,
+    ) -> str:
+        path = _exchange_workspace_session_path(chatgpt_account_id)
+        response = self._chatgpt_get(
+            path,
+            headers=_wham_headers(
+                access_token="",
+                cookie_header=cookie_header,
+                allow_session_cookies=not cookie_header,
+                referer="https://chatgpt.com/",
+            ),
+            proxy_url=proxy_url,
+        )
+        return _session_access_token_from_payload(_response_payload(response))
+
+    def _exchange_workspace_web_session(
+        self,
+        *,
+        session,
+        chatgpt_account_id: str,
+        cookie_header: str,
+    ) -> str:
+        path = _exchange_workspace_session_path(chatgpt_account_id)
+        response = session.get(
+            f"{self._config.chatgpt_base_url}{path}",
+            headers=_wham_headers(
+                access_token="",
+                cookie_header=cookie_header,
+                allow_session_cookies=not cookie_header,
+                referer="https://chatgpt.com/",
+            ),
+            timeout=self._config.timeout_s,
+        )
+        return _session_access_token_from_payload(_response_payload(response))
+
+    def _list_account_items(
+        self,
+        *,
+        path: str,
+        item_keys: tuple[str, ...],
+        access_token: str,
+        account_id: str,
+        cookie_header: str,
+        page_size: int,
+        proxy_url: str,
+    ) -> list[dict]:
+        safe_page_size = max(1, min(int(page_size or 100), 200))
+        items: list[dict] = []
+        for offset in range(0, 100000, safe_page_size):
+            response = self._chatgpt_get(
+                f"{path}?offset={offset}&limit={safe_page_size}&query=",
+                headers=_team_headers(
+                    access_token=access_token,
+                    team_id=account_id,
+                    cookie_header=cookie_header,
+                ),
+                proxy_url=proxy_url,
+            )
+            payload = _response_payload(response)
+            batch = _list_items(payload, item_keys)
+            items.extend(batch)
+            total = _response_total(payload)
+            if not batch or len(batch) < safe_page_size:
+                break
+            if total is not None and len(items) >= total:
+                break
+        return items
 
     def _chatgpt_post(
         self,
@@ -299,7 +557,7 @@ class OpenAIChatGPTClient:
         if proxy_url == "" and self._chatgpt_http_client_injected:
             return self._chatgpt_client.get(path, headers=headers)
         proxies = _curl_proxies(proxy_url)
-        with curl_requests.Session(impersonate="chrome136", proxies=proxies) as session:
+        with curl_requests.Session(impersonate="chrome120", proxies=proxies) as session:
             return session.get(
                 f"{self._config.chatgpt_base_url}{path}",
                 headers=headers,
@@ -311,7 +569,7 @@ class OpenAIChatGPTClient:
         existing = self._curl_sessions.get(key)
         if existing is not None:
             return existing
-        session = curl_requests.Session(impersonate="chrome136", proxies=_curl_proxies(proxy_url))
+        session = curl_requests.Session(impersonate="chrome120", proxies=_curl_proxies(proxy_url))
         self._curl_sessions[key] = session
         return session
 
@@ -399,11 +657,8 @@ def _accept_headers(*, access_token: str, device_id: str = "") -> dict[str, str]
 def _codex_responses_headers(*, access_token: str, team_id: str) -> dict[str, str]:
     if not access_token:
         raise OpenAIChatGPTClientError("access_token is required")
-    if not team_id:
-        raise OpenAIChatGPTClientError("team_id is required")
-    return {
+    headers = {
         "authorization": f"Bearer {access_token}",
-        "chatgpt-account-id": team_id,
         "content-type": "application/json",
         "accept": "text/event-stream",
         "host": "chatgpt.com",
@@ -415,36 +670,48 @@ def _codex_responses_headers(*, access_token: str, team_id: str) -> dict[str, st
             "Chrome/148.0.0.0 Safari/537.36"
         ),
     }
+    if team_id:
+        headers["chatgpt-account-id"] = team_id
+    return headers
 
 
 def _wham_headers(
     *,
-    access_token: str,
+    access_token: str = "",
     chatgpt_account_id: str = "",
     cookie_header: str = "",
+    device_id: str = "",
+    referer: str = "https://chatgpt.com/",
+    target_path: str = "",
+    allow_session_cookies: bool = False,
 ) -> dict[str, str]:
-    if not access_token:
-        raise OpenAIChatGPTClientError("access_token is required")
+    if not access_token and not cookie_header and not allow_session_cookies:
+        raise OpenAIChatGPTClientError("access_token or cookie_header is required")
     headers = {
-        "authorization": f"Bearer {access_token}",
         "content-type": "application/json",
         "accept": "*/*",
         "host": "chatgpt.com",
         "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/",
+        "referer": referer,
         "user-agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/148.0.0.0 Safari/537.36"
         ),
     }
+    if access_token:
+        headers["authorization"] = f"Bearer {access_token}"
     if chatgpt_account_id:
         headers["chatgpt-account-id"] = chatgpt_account_id
     if cookie_header:
         headers["cookie"] = cookie_header
-        device_id = _cookie_value(cookie_header, "oai-did")
-        if device_id:
-            headers["oai-device-id"] = device_id
+        if not device_id:
+            device_id = _cookie_value(cookie_header, "oai-did")
+    if device_id:
+        headers["oai-device-id"] = device_id
+    if target_path:
+        headers["x-openai-target-path"] = target_path
+        headers["x-openai-target-route"] = target_path
     return headers
 
 
@@ -477,6 +744,55 @@ def _curl_proxies(proxy_url: str) -> dict[str, str] | None:
     return {"http": proxy, "https": proxy}
 
 
+def _seed_cookie_header(session, cookie_header: str) -> None:
+    if not cookie_header:
+        return
+    try:
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+    except Exception:
+        cookie = SimpleCookie()
+    required_cookie_names = {
+        "__Secure-next-auth.session-token",
+        "__Host-next-auth.csrf-token",
+        "oai-did",
+    }
+    for name, morsel in cookie.items():
+        if name not in required_cookie_names:
+            continue
+        value = morsel.value
+        if not name or value is None:
+            continue
+        try:
+            session.cookies.set(name, value, domain=".chatgpt.com", path="/")
+        except Exception:
+            try:
+                session.cookies.set(name, value)
+            except Exception:
+                pass
+
+
+def _minimal_web_session_cookie_header(cookie_header: str) -> str:
+    if not cookie_header:
+        return ""
+    try:
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+    except Exception:
+        return cookie_header
+    names = (
+        "__Secure-next-auth.session-token",
+        "__Host-next-auth.csrf-token",
+        "oai-did",
+    )
+    parts = []
+    for name in names:
+        morsel = cookie.get(name)
+        if morsel is not None and morsel.value:
+            parts.append(f"{name}={morsel.value}")
+    return "; ".join(parts) or cookie_header
+
+
 def _response_payload(response) -> dict:
     text = response.text
     try:
@@ -497,6 +813,50 @@ def _response_payload(response) -> dict:
             f"http_status={response.status_code} body_snippet={snippet}"
         )
     return body
+
+
+def _exchange_workspace_session_path(chatgpt_account_id: str) -> str:
+    query = urlencode(
+        {
+            "exchange_workspace_token": "true",
+            "workspace_id": chatgpt_account_id,
+            "reason": "setCurrentAccount",
+        }
+    )
+    return f"/api/auth/session?{query}"
+
+
+def _session_access_token_from_payload(payload: dict) -> str:
+    for key in ("accessToken", "access_token"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    user = payload.get("user")
+    if isinstance(user, dict):
+        for key in ("accessToken", "access_token"):
+            value = user.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _list_items(payload: dict, keys: tuple[str, ...]) -> list[dict]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _response_total(payload: dict) -> int | None:
+    for key in ("total", "total_count", "totalCount", "count"):
+        value = payload.get(key)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _cookie_value(cookie_header: str, name: str) -> str:

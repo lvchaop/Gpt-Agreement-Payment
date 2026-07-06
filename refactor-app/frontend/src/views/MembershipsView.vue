@@ -18,8 +18,9 @@ const userEmail = ref("");
 const spaceFilter = ref("");
 const membershipStatus = ref("");
 const hasSpaceCredential = ref("");
+const sessionAccountDetected = ref("");
 const sessionOtpStatus = ref("");
-const sessionConcurrency = ref(10);
+const sessionWorkCount = ref(10);
 const spaces = ref<Row[]>([]);
 const selectedAccountCount = computed(() =>
   new Set(selectedRows.value.map((row) => String(row.user_account_id || "")).filter(Boolean)).size,
@@ -33,6 +34,7 @@ const columns = [
   { key: "space_name", label: "空间名称" },
   { key: "space_plan_type", label: "空间订阅类型", summary: 24 },
   { key: "membership_status", label: "成员状态", badge: true },
+  { key: "session_account_detected", label: "Session识别空间", badge: true },
   { key: "has_space_credential", label: "是否有空间凭证", badge: true },
   { key: "session_otp_status", label: "验证码状态", badge: true },
   { key: "session_otp_code_len", label: "验证码长度" },
@@ -47,6 +49,7 @@ async function loadMemberships() {
     user_email: userEmail.value,
     space: spaceFilter.value,
     membership_status: membershipStatus.value,
+    session_account_detected: sessionAccountDetected.value,
     has_space_credential: hasSpaceCredential.value,
     session_otp_status: sessionOtpStatus.value,
   });
@@ -74,11 +77,11 @@ async function backfillSessionForMemberships(rows: Row[]) {
   const result = await resourcesApi.backfillSession({
     user_account_ids: ids,
     created_by: "ops-ui",
-    concurrency: sessionConcurrency.value,
+    work_count: sessionWorkCount.value,
   });
   store.toast(
     "补 Session 执行完成",
-    `账号=${ids.length} work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
+    `账号=${ids.length} work=${result.work_count} 成功=${result.succeeded} 失败=${result.failed}`,
     result.failed > 0 ? "warning" : "success",
   );
   await router.push({ name: "job-trace", params: { jobId: result.job_id } });
@@ -153,6 +156,14 @@ onMounted(loadSpaces);
             </select>
           </label>
           <label class="field">
+            <span>Session识别空间</span>
+            <select v-model="sessionAccountDetected" class="select">
+              <option value="">全部</option>
+              <option value="yes">已识别</option>
+              <option value="no">未识别</option>
+            </select>
+          </label>
+          <label class="field">
             <span>是否授权</span>
             <select v-model="hasSpaceCredential" class="select">
               <option value="">全部</option>
@@ -184,8 +195,8 @@ onMounted(loadSpaces);
         </div>
         <div class="action-row">
           <label class="inline-control">
-            <span>补 Session 并发</span>
-            <input v-model.number="sessionConcurrency" class="input small-input" type="number" min="1" max="500" />
+            <span>同时 Work 数</span>
+            <input v-model.number="sessionWorkCount" class="input small-input" type="number" min="1" max="500" />
           </label>
           <button class="btn" :disabled="selectedCount === 0" @click="backfillSessionForMemberships(selectedRows)">
             补选中账号 Session（{{ selectedAccountCount }}）

@@ -22,6 +22,7 @@ class UserAccountModel(Base):
     phone_country: Mapped[str] = mapped_column(Text, nullable=False, default="")
     openai_user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     password: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    access_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     session_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
     cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
     auth_cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -194,6 +195,7 @@ class SpaceMembershipModel(Base):
     remote_seat_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
     remote_role: Mapped[str] = mapped_column(Text, nullable=False, default="")
     remote_synced_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    session_account_detected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_probe_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
     last_probe_at: Mapped[datetime | None] = mapped_column(nullable=True)
     failure_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -254,15 +256,9 @@ class DownstreamChannelCredentialTypeBalanceModel(Base):
 class SpacePushBindingModel(Base):
     __tablename__ = "space_push_bindings"
 
-    space_credential_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("space_credentials.id", ondelete="CASCADE"), primary_key=True
-    )
-    space_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
-    )
-    downstream_channel_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("downstream_channels.id", ondelete="SET NULL")
-    )
+    space_credential_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_id: Mapped[str] = mapped_column(Text, nullable=False)
+    downstream_channel_id: Mapped[str | None] = mapped_column(Text)
     push_status: Mapped[str] = mapped_column(Text, nullable=False, default="none")
     downstream_external_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     pushed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -295,15 +291,9 @@ class SpacePushAttemptModel(Base):
     __tablename__ = "space_push_attempts"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
-    space_credential_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("space_credentials.id", ondelete="CASCADE"), nullable=False
-    )
-    space_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
-    )
-    downstream_channel_id: Mapped[str | None] = mapped_column(
-        Text, ForeignKey("downstream_channels.id", ondelete="SET NULL")
-    )
+    space_credential_id: Mapped[str] = mapped_column(Text, nullable=False)
+    space_id: Mapped[str] = mapped_column(Text, nullable=False)
+    downstream_channel_id: Mapped[str | None] = mapped_column(Text)
     payload_type: Mapped[str] = mapped_column(Text, nullable=False)
     request_endpoint: Mapped[str] = mapped_column(Text, nullable=False, default="")
     request_body_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -591,7 +581,9 @@ class TeamAdminProxyBindingModel(Base):
     team_admin_session_id: Mapped[str] = mapped_column(
         Text, ForeignKey("team_admin_sessions.id", ondelete="CASCADE"), nullable=False
     )
-    proxy_id: Mapped[str] = mapped_column(Text, nullable=False)
+    proxy_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("proxy_inventory.id", ondelete="RESTRICT"), nullable=False
+    )
     bind_status: Mapped[str] = mapped_column(Text, nullable=False)
     bind_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     bound_at: Mapped[datetime] = mapped_column(nullable=False)

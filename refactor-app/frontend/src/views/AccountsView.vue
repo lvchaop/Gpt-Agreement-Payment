@@ -48,7 +48,7 @@ const filters = [
 
 const selectedCount = ref(0);
 const selectedRows = ref<Row[]>([]);
-const backfillConcurrency = ref(10);
+const backfillWorkCount = ref(10);
 
 function updateSelection(rows: Record<string, unknown>[]) {
   selectedRows.value = rows as Row[];
@@ -64,12 +64,12 @@ async function runSelectedAccountJob() {
   const payload = {
     user_account_ids: ids,
     created_by: "ops-ui",
-    concurrency: backfillConcurrency.value,
+    work_count: backfillWorkCount.value,
   };
   const result = await resourcesApi.backfillSession(payload);
   store.toast(
     "补 Session 执行完成",
-    `work=${result.work_count} 并发=${result.concurrency} 成功=${result.succeeded} 失败=${result.failed}`,
+    `work=${result.work_count} 成功=${result.succeeded} 失败=${result.failed}`,
     result.failed > 0 ? "warning" : "success",
   );
   await router.push({ name: "job-trace", params: { jobId: result.job_id } });
@@ -114,8 +114,8 @@ async function deleteAccount(row: Row, reload: () => Promise<void>) {
         </div>
         <div class="account-action-body">
           <label class="inline-control">
-            <span>并发 Work</span>
-            <input v-model.number="backfillConcurrency" class="input small-input" type="number" min="1" max="500" />
+            <span>同时 Work 数</span>
+            <input v-model.number="backfillWorkCount" class="input small-input" type="number" min="1" max="500" />
           </label>
           <button class="btn" :disabled="selectedCount === 0" @click="runSelectedAccountJob">
             补 Session

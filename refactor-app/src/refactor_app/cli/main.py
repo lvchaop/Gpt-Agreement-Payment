@@ -41,18 +41,60 @@ def migrate() -> None:
     sql_dir = Path(__file__).resolve().parents[3] / "migrations" / "sql"
     sql_paths = sorted(sql_dir.glob("*.sql"))
     engine = make_engine(Settings())
-    with engine.connect() as connection:
+    with engine.begin() as connection:
         has_base_schema = connection.execute(
             text("SELECT to_regclass('public.user_accounts') IS NOT NULL")
         ).scalar_one()
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                  filename TEXT PRIMARY KEY,
+                  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        )
+        applied = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT filename FROM schema_migrations")
+            ).all()
+        }
+        if has_base_schema and not applied:
+            legacy_names = [
+                path.name
+                for path in sql_paths
+                if path.name < "029_user_account_access_token_and_space_jobs.sql"
+            ]
+            for filename in legacy_names:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO schema_migrations(filename)
+                        VALUES (:filename)
+                        ON CONFLICT (filename) DO NOTHING
+                        """
+                    ),
+                    {"filename": filename},
+                )
+            applied.update(legacy_names)
     for sql_path in sql_paths:
-        if has_base_schema and sql_path.name == "001_initial_schema.sql":
+        if sql_path.name in applied:
             typer.echo(f"skip {sql_path.name}")
             continue
         connection = engine.raw_connection()
         try:
             with connection.cursor() as cursor:
                 cursor.execute(sql_path.read_text())
+                cursor.execute(
+                    """
+                    INSERT INTO schema_migrations(filename)
+                    VALUES (%s)
+                    ON CONFLICT (filename) DO NOTHING
+                    """,
+                    (sql_path.name,),
+                )
             connection.commit()
         finally:
             connection.close()

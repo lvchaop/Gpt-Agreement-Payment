@@ -45,10 +45,10 @@ def test_user_accounts_contains_login_recovery_fields() -> None:
         "auth_cookie_header",
         "device_id",
         "csrf_token",
+        "access_token",
         "session_status",
         "last_session_refresh_at",
     }.issubset(table.columns.keys())
-    assert "access_token" not in table.columns
     assert "refresh_token" not in table.columns
     assert "id_token" not in table.columns
 

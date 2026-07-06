@@ -20,7 +20,7 @@ const labels: Record<string, { title: string; desc: string }> = {
   },
   "automation.space_recycle_sweep": {
     title: "Space 回收扫描",
-    desc: "从已推送 Space 绑定开始检查用量，达到规则阈值后只做本地 used 标记。",
+    desc: "从已推送 Space 绑定开始检查用量；95% 或最终不可用时本地结算为 used/skipped 并释放坑位。",
   },
 };
 

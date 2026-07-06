@@ -125,7 +125,45 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
 
     def probe_membership(self, *, access_token: str, team_id: str) -> dict: ...
 
+    def fetch_subscription(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def list_account_users(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]: ...
+
+    def list_account_invites(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]: ...
+
     def heartbeat_codex_credential(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str = "",
+        model: str = "",
+    ) -> dict: ...
+
+    def probe_codex_responses_usage(
         self,
         *,
         access_token: str,
@@ -146,7 +184,7 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
     def create_wham_auth_credential(
         self,
         *,
-        access_token: str,
+        access_token: str = "",
         chatgpt_account_id: str,
         name: str,
         ttl_seconds: int = 7_776_000,

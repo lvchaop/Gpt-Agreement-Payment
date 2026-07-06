@@ -22,6 +22,7 @@ from refactor_app.infrastructure.db.repositories import (
     SpaceRecycleRuleRepository,
     SpaceRepository,
     SpaceUsageCheckRepository,
+    TeamAdminProxyBindingRepository,
     UserAccountProxyBindingRepository,
     UserAccountRepository,
 )
@@ -47,6 +48,7 @@ class UnitOfWork:
         self.downstream_channels: DownstreamChannelRepository | None = None
         self.proxy_inventory: ProxyInventoryRepository | None = None
         self.user_account_proxy_bindings: UserAccountProxyBindingRepository | None = None
+        self.team_admin_proxy_bindings: TeamAdminProxyBindingRepository | None = None
         self.external_mail_leases: ExternalMailLeaseRepository | None = None
         self.jobs: JobRepository | None = None
         self.job_runs: JobRunRepository | None = None
@@ -71,6 +73,7 @@ class UnitOfWork:
         self.downstream_channels = DownstreamChannelRepository(self.session)
         self.proxy_inventory = ProxyInventoryRepository(self.session)
         self.user_account_proxy_bindings = UserAccountProxyBindingRepository(self.session)
+        self.team_admin_proxy_bindings = TeamAdminProxyBindingRepository(self.session)
         self.external_mail_leases = ExternalMailLeaseRepository(self.session)
         self.jobs = JobRepository(self.session)
         self.job_runs = JobRunRepository(self.session)

@@ -4,7 +4,6 @@ export type Row = Record<string, unknown> & { id?: string };
 export type JobCreated = { job_id: string; job_status: string };
 export type AccountWorkJobResult = JobCreated & {
   work_count: number;
-  concurrency: number;
   queued: number;
   running: number;
   succeeded: number;
@@ -40,6 +39,8 @@ export const resourcesApi = {
   deleteTeamAdminSession: (id: string) =>
     deleteJson<Row>(`/team-admin-sessions/${encodeURIComponent(id)}`),
   spaces: () => listItems("/spaces"),
+  syncRemoteSpaceMemberships: (id: string, body: Record<string, unknown> = {}) =>
+    postJson<Row>(`/spaces/${encodeURIComponent(id)}/memberships/sync-remote`, body),
   createBusinessAccessTokenCredentials: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>(
       "/space-credentials/business-access-token-job",

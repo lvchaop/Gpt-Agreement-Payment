@@ -59,6 +59,7 @@ class JobRunner:
             session.flush()
             events = EventWriter(session)
             events.write(run_id=run.id, event_type="job.started", message=f"job {job.type} started")
+            session.commit()
 
             handler = self._handlers.get(job.type)
             if handler is None:
@@ -79,7 +80,7 @@ class JobRunner:
                 return job.id
 
             try:
-                input_json = {**job.input_json, "_job_id": job.id}
+                input_json = {**job.input_json, "_job_id": job.id, "_run_id": run.id}
                 output = handler(session, input_json) or {}
             except Exception as exc:
                 run.run_status = "failed"

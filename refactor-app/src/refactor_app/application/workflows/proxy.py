@@ -8,7 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from refactor_app.domain.enums import ProxyBindStatus, ProxyStatus
-from refactor_app.infrastructure.db.models import ProxyInventoryModel, UserAccountProxyBindingModel
+from refactor_app.infrastructure.db.models import (
+    ProxyInventoryModel,
+    TeamAdminProxyBindingModel,
+    TeamAdminSessionModel,
+    UserAccountProxyBindingModel,
+)
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
 from refactor_app.plugins.contracts import ProxyNode, ProxyProvider
 
@@ -91,19 +96,207 @@ class BindAccountProxyWorkflow:
             return binding.id
 
 
+class BindTeamAdminProxyWorkflow:
+    def __init__(self, *, session_factory: Callable[[], Session]) -> None:
+        self._session_factory = session_factory
+
+    def run(
+        self,
+        *,
+        team_admin_session_id: str,
+        bind_reason: str = "",
+    ) -> str:
+        with self._session_factory() as session:
+            binding = bind_team_admin_static_proxy_in_session(
+                session=session,
+                team_admin_session_id=team_admin_session_id,
+                bind_reason=bind_reason,
+            )
+            session.commit()
+            return binding.id
+
+
+def bind_team_admin_static_proxy_in_session(
+    *,
+    session: Session,
+    team_admin_session_id: str,
+    bind_reason: str = "",
+) -> TeamAdminProxyBindingModel:
+    now = datetime.now(UTC)
+    admin_session = session.get(TeamAdminSessionModel, team_admin_session_id)
+    if admin_session is None:
+        raise ProxyWorkflowError(f"team admin session not found: {team_admin_session_id}")
+
+    pending = _pending_team_admin_proxy_binding(session, team_admin_session_id)
+    if pending is not None and pending.bind_status == ProxyBindStatus.ACTIVE.value:
+        return pending
+
+    existing = _active_team_admin_proxy_binding(session, team_admin_session_id)
+    if existing is not None:
+        return existing
+
+    proxy = _least_bound_static_proxy_for_update(session)
+    if proxy is None:
+        raise ProxyWorkflowError("no available static webshare proxy")
+
+    binding = pending or session.scalars(
+        select(TeamAdminProxyBindingModel)
+        .where(TeamAdminProxyBindingModel.team_admin_session_id == team_admin_session_id)
+        .with_for_update()
+    ).first()
+    if binding is None:
+        binding = TeamAdminProxyBindingModel(
+            id=f"team-admin-proxy-binding-{uuid4()}",
+            team_admin_session_id=team_admin_session_id,
+            proxy_id=proxy.id,
+            bind_status=ProxyBindStatus.ACTIVE.value,
+            bind_reason=bind_reason,
+            bound_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(binding)
+    else:
+        binding.proxy_id = proxy.id
+        binding.bind_status = ProxyBindStatus.ACTIVE.value
+        binding.bind_reason = bind_reason
+        binding.bound_at = now
+        binding.last_error_code = ""
+        binding.updated_at = now
+    proxy.proxy_status = ProxyStatus.BOUND.value
+    proxy.updated_at = now
+    return binding
+
+
+def reassign_team_admin_static_proxy_in_session(
+    *,
+    session: Session,
+    team_admin_session_id: str,
+    error_code: str,
+    bind_reason: str = "",
+) -> TeamAdminProxyBindingModel:
+    now = datetime.now(UTC)
+    binding = _pending_team_admin_proxy_binding(session, team_admin_session_id) or session.scalars(
+        select(TeamAdminProxyBindingModel)
+        .where(TeamAdminProxyBindingModel.team_admin_session_id == team_admin_session_id)
+        .with_for_update()
+    ).first()
+    if binding is not None:
+        old_proxy = session.get(ProxyInventoryModel, binding.proxy_id)
+        if old_proxy is not None:
+            old_proxy.proxy_status = ProxyStatus.ERROR.value
+            old_proxy.provider_valid = False
+            old_proxy.updated_at = now
+        binding.bind_status = ProxyBindStatus.RELEASED.value
+        binding.last_error_code = error_code[:200]
+        binding.updated_at = now
+    return bind_team_admin_static_proxy_in_session(
+        session=session,
+        team_admin_session_id=team_admin_session_id,
+        bind_reason=bind_reason,
+    )
+
+
+def _pending_team_admin_proxy_binding(
+    session: Session,
+    team_admin_session_id: str,
+) -> TeamAdminProxyBindingModel | None:
+    for obj in session.new:
+        if (
+            isinstance(obj, TeamAdminProxyBindingModel)
+            and obj.team_admin_session_id == team_admin_session_id
+        ):
+            return obj
+    return None
+
+
+def ensure_team_admin_static_proxy_url_in_session(
+    *,
+    session: Session,
+    team_admin_session_id: str,
+    bind_reason: str = "",
+) -> str:
+    binding = bind_team_admin_static_proxy_in_session(
+        session=session,
+        team_admin_session_id=team_admin_session_id,
+        bind_reason=bind_reason,
+    )
+    proxy = session.get(ProxyInventoryModel, binding.proxy_id)
+    if proxy is None:
+        raise ProxyWorkflowError("team admin proxy disappeared")
+    return proxy_url_from_inventory(proxy)
+
+
+def _active_team_admin_proxy_binding(
+    session: Session,
+    team_admin_session_id: str,
+) -> TeamAdminProxyBindingModel | None:
+    row = session.execute(
+        select(TeamAdminProxyBindingModel, ProxyInventoryModel)
+        .join(ProxyInventoryModel, ProxyInventoryModel.id == TeamAdminProxyBindingModel.proxy_id)
+        .where(
+            TeamAdminProxyBindingModel.team_admin_session_id == team_admin_session_id,
+            TeamAdminProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value,
+            ProxyInventoryModel.provider == "webshare",
+            ProxyInventoryModel.proxy_type == "static_proxy",
+            ProxyInventoryModel.proxy_status.in_(
+                (ProxyStatus.AVAILABLE.value, ProxyStatus.BOUND.value)
+            ),
+            ProxyInventoryModel.provider_valid.is_(True),
+        )
+        .with_for_update(of=TeamAdminProxyBindingModel)
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    binding, _proxy = row
+    return binding
+
+
+def _least_bound_static_proxy_for_update(session: Session) -> ProxyInventoryModel | None:
+    from sqlalchemy import func
+
+    bind_counts = (
+        select(
+            TeamAdminProxyBindingModel.proxy_id.label("proxy_id"),
+            func.count(TeamAdminProxyBindingModel.id).label("active_bind_count"),
+        )
+        .where(TeamAdminProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value)
+        .group_by(TeamAdminProxyBindingModel.proxy_id)
+        .subquery()
+    )
+    active_bind_count = func.coalesce(bind_counts.c.active_bind_count, 0)
+    stmt = (
+        select(ProxyInventoryModel)
+        .outerjoin(bind_counts, bind_counts.c.proxy_id == ProxyInventoryModel.id)
+        .where(
+            ProxyInventoryModel.provider == "webshare",
+            ProxyInventoryModel.proxy_type == "static_proxy",
+            ProxyInventoryModel.proxy_status.in_(
+                (ProxyStatus.AVAILABLE.value, ProxyStatus.BOUND.value)
+            ),
+            ProxyInventoryModel.provider_valid.is_(True),
+        )
+        .order_by(active_bind_count.asc(), ProxyInventoryModel.updated_at.asc())
+        .with_for_update(of=ProxyInventoryModel, skip_locked=True)
+        .limit(1)
+    )
+    return session.scalars(stmt).first()
+
+
 class HealthcheckProxyWorkflow:
     def __init__(self, *, session_factory: Callable[[], Session]) -> None:
         self._session_factory = session_factory
 
     def run(self, *, proxy_id: str) -> dict:
-        from refactor_app.application.workflows.account_auth import _probe_proxy_alive, _proxy_url
+        from refactor_app.application.workflows.account_auth import _probe_proxy_alive
 
         now = datetime.now(UTC)
         with self._session_factory() as session:
             proxy = session.get(ProxyInventoryModel, proxy_id)
             if proxy is None:
                 raise ProxyWorkflowError(f"proxy not found: {proxy_id}")
-            proxy_url = _proxy_url(proxy)
+            proxy_url = proxy_url_from_inventory(proxy)
 
         alive = _probe_proxy_alive(proxy_url)
         released_bind_count = 0
@@ -167,6 +360,19 @@ def proxy_inventory_values(
         "created_at": now,
         "updated_at": now,
     }
+
+
+def proxy_url_from_inventory(proxy: ProxyInventoryModel) -> str:
+    from urllib.parse import quote
+
+    scheme = proxy.proxy_scheme or "http"
+    host = proxy.proxy_host
+    port = proxy.proxy_port
+    if proxy.proxy_username:
+        username = quote(proxy.proxy_username, safe="")
+        password = quote(proxy.proxy_password or "", safe="")
+        return f"{scheme}://{username}:{password}@{host}:{port}"
+    return f"{scheme}://{host}:{port}"
 
 
 def proxy_inventory_model_from_node(proxy: ProxyNode, now: datetime) -> ProxyInventoryModel:

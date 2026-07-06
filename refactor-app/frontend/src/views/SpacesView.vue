@@ -26,7 +26,7 @@ const credentialSpaceName = ref("");
 const credentialOwnerUserAccountId = ref("");
 const credentialSourceAdminSessionId = ref("");
 const credentialNamePrefix = ref("codex");
-const credentialConcurrency = ref(5);
+const syncingSpaceId = ref("");
 
 const columns = [
   { key: "id", label: "空间 ID", mono: true, summary: 26 },
@@ -40,6 +40,51 @@ const columns = [
   { key: "seat_limit", label: "席位上限" },
   { key: "space_status", label: "状态", badge: true },
   { key: "source_admin_session_id", label: "管理员 Session", mono: true, summary: 26 },
+];
+
+const filters = [
+  {
+    key: "space_type",
+    label: "空间类型",
+    options: [
+      { label: "personal", value: "personal" },
+      { label: "business", value: "business" },
+    ],
+  },
+  {
+    key: "credential_type",
+    label: "凭证类型",
+    options: [
+      { label: "personal_account", value: "personal_account" },
+      { label: "team_5h_weekly", value: "team_5h_weekly" },
+      { label: "team_monthly", value: "team_monthly" },
+    ],
+  },
+  {
+    key: "auth_mode",
+    label: "授权模式",
+    options: [
+      { label: "codex_oauth", value: "codex_oauth" },
+      { label: "backend_access_token", value: "backend_access_token" },
+    ],
+  },
+  {
+    key: "space_status",
+    label: "状态",
+    options: [
+      { label: "active", value: "active" },
+      { label: "inactive", value: "inactive" },
+      { label: "disabled", value: "disabled" },
+      { label: "deleted", value: "deleted" },
+    ],
+  },
+  {
+    key: "provider",
+    label: "来源",
+    options: [
+      { label: "openai_chatgpt", value: "openai_chatgpt" },
+    ],
+  },
 ];
 
 const adminSessionColumns = [
@@ -134,8 +179,8 @@ async function createBusinessCredentials(reload: () => Promise<void>) {
     store.toast("缺少空间 ID", "请填写 Business Space 的 chatgpt-account-id。", "warning");
     return;
   }
-  if (!credentialSessionAccessToken.value.trim()) {
-    store.toast("缺少 Session Access Token", "请填写管理员登录后的 session access_token。", "warning");
+  if (!credentialCookieHeader.value.trim()) {
+    store.toast("缺少 Cookie Header", "创建 Business AT 需要成员账号当前登录 Cookie。", "warning");
     return;
   }
   const result = await resourcesApi.createBusinessAccessTokenCredentials({
@@ -148,7 +193,6 @@ async function createBusinessCredentials(reload: () => Promise<void>) {
     source_admin_session_id: credentialSourceAdminSessionId.value,
     credential_name_prefix: credentialNamePrefix.value || "codex",
     created_by: "ops-ui-space",
-    concurrency: credentialConcurrency.value,
   });
   store.toast(
     "Business Access Token 创建完成",
@@ -157,6 +201,34 @@ async function createBusinessCredentials(reload: () => Promise<void>) {
   );
   await reload();
   await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+}
+
+async function syncRemoteMemberships(row: Record<string, unknown>, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  const name = String(row.name || row.external_space_id || id);
+  if (!id) return;
+  const confirmed = window.confirm(
+    [
+      "确认同步该 Business 空间远端成员？",
+      `空间：${name}`,
+      "会调用远端 users / invites / subscription。",
+      "会物理剔除本地有但远端没有的 active / invited / accepted 成员关系。",
+      "不会发送邀请。",
+    ].join("\n"),
+  );
+  if (!confirmed) return;
+  syncingSpaceId.value = id;
+  try {
+    const result = await resourcesApi.syncRemoteSpaceMemberships(id, { page_size: 100 });
+    store.toast(
+      "远端成员同步完成",
+      `active=${result.synced_active_count ?? 0} invited=${result.synced_invited_count ?? 0} 剔除=${result.deleted_stale_count ?? 0}`,
+      "success",
+    );
+    await reload();
+  } finally {
+    syncingSpaceId.value = "";
+  }
 }
 
 onMounted(loadAdminSessions);
@@ -168,6 +240,7 @@ onMounted(loadAdminSessions);
     description="系统只有一套 Space 逻辑：个人空间和 Business 空间统一展示。"
     :columns="columns"
     :loader="resourcesApi.spaces"
+    :filters="filters"
     empty-text="暂无空间。"
   >
     <template #actions>
@@ -187,7 +260,7 @@ onMounted(loadAdminSessions);
         <div class="panel-heading">
           <div>
             <h2>创建 Business Access Token 凭证</h2>
-            <p>触发新流程：用管理员 session access_token 调 WHAM auth-credentials，按 usage 推导 credential_type，再写入 Space 凭证。</p>
+            <p>手动创建单个/少量成员 Business AT；要求 Space 已存在、credential_type 已写入、membership 已是 active。该动作不创建 Space、不推导 credential_type。</p>
           </div>
           <button class="btn" type="button" @click="showCredentialPanel = false">关闭</button>
         </div>
@@ -200,12 +273,12 @@ onMounted(loadAdminSessions);
           <input v-model="credentialExternalSpaceId" class="input" required placeholder="例如 acct_xxx / UUID" />
         </label>
         <label class="field wide">
-          <span>管理员 session access_token</span>
-          <textarea v-model="credentialSessionAccessToken" class="input textarea small-textarea" required placeholder="登录后拿到的 session access_token"></textarea>
+          <span>成员 session access_token（可选）</span>
+          <textarea v-model="credentialSessionAccessToken" class="input textarea small-textarea" placeholder="当前流程主要使用 Cookie；该字段保留兼容。"></textarea>
         </label>
         <label class="field wide">
-          <span>管理员 Cookie Header（可选）</span>
-          <input v-model="credentialCookieHeader" class="input" placeholder="__Secure-next-auth.session-token=..." />
+          <span>成员 Cookie Header</span>
+          <input v-model="credentialCookieHeader" class="input" required placeholder="__Secure-next-auth.session-token=..." />
         </label>
         <label class="field">
           <span>空间名称（可选）</span>
@@ -222,10 +295,6 @@ onMounted(loadAdminSessions);
         <label class="field">
           <span>凭证名前缀</span>
           <input v-model="credentialNamePrefix" class="input" placeholder="codex" />
-        </label>
-        <label class="field">
-          <span>并发</span>
-          <input v-model.number="credentialConcurrency" class="input small-input" type="number" min="1" max="500" />
         </label>
         <button class="btn primary">创建凭证 Job</button>
       </form>
@@ -284,6 +353,18 @@ onMounted(loadAdminSessions);
           </template>
         </DataTable>
       </section>
+    </template>
+    <template #rowActions="{ row, reload }">
+      <div class="row-actions">
+        <button
+          v-if="String(row.space_type || '') === 'business'"
+          class="btn small"
+          :disabled="syncingSpaceId === String(row.id || '')"
+          @click.stop="syncRemoteMemberships(row, reload)"
+        >
+          {{ syncingSpaceId === String(row.id || "") ? "同步中..." : "同步远端成员" }}
+        </button>
+      </div>
     </template>
   </ResourcePage>
 </template>

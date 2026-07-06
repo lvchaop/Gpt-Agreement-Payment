@@ -9,8 +9,7 @@ import { useOpsStore } from "../stores/ops";
 
 const store = useOpsStore();
 const router = useRouter();
-const pendingPushLimit = ref(1);
-const pendingPushConcurrency = ref(5);
+const pendingPushWorkCount = ref(5);
 const balanceAmounts = ref<Record<string, number>>({});
 const editingChannel = ref<Row | null>(null);
 const editSaving = ref(false);
@@ -28,7 +27,6 @@ const form = ref({
   sub2api_concurrency: 0,
   sub2api_group_ids: "",
   max_active_slots: 1,
-  push_balance: 0,
 });
 const editForm = ref({
   provider_type: "sub2api",
@@ -43,7 +41,6 @@ const editForm = ref({
   timeout_s: 30,
   sub2api_concurrency: 0,
   sub2api_group_ids: "",
-  max_active_slots: 1,
 });
 const isLocalSub2api = computed(() => form.value.provider_type === "local_sub2api");
 const isCustomHttp = computed(() => form.value.provider_type === "custom_http");
@@ -119,20 +116,16 @@ const columns: Column[] = [
   { key: "enabled", label: "启用", badge: true },
   { key: "update_existing", label: "更新已有", badge: true },
   { key: "timeout_s", label: "超时" },
-  { key: "sub2api_concurrency", label: "sub2api 并发" },
+  { key: "sub2api_concurrency", label: "sub2api 同时账号数" },
   { key: "sub2api_group_ids", label: "sub2api 分组" },
-  { key: "max_active_slots", label: "同时占用上限" },
-  { key: "allowed_active_slots", label: "当前开放坑位" },
-  { key: "active_slot_count", label: "当前占用" },
-  { key: "remaining_active_slots", label: "剩余坑位" },
-  { key: "push_balance", label: "推送余额" },
-  { key: "remaining_push_count", label: "本轮可推" },
-  { key: "claimed_push_count", label: "已消耗余额" },
-  { key: "pushed_count", label: "成功" },
-  { key: "failed_push_count", label: "失败" },
-  { key: "used_count", label: "已使用" },
   { key: "updated_at", label: "更新时间", mono: true, summary: 28 },
 ];
+
+const credentialTypeLabels: Record<string, string> = {
+  personal_account: "个人账号",
+  team_5h_weekly: "Team 5h/周",
+  team_monthly: "Team 月",
+};
 
 async function loader() {
   return resourcesApi.downstreamChannels();
@@ -202,7 +195,6 @@ function openEditChannel(row: Row) {
     timeout_s: Number(row.timeout_s || 30),
     sub2api_concurrency: Number(row.sub2api_concurrency || 0),
     sub2api_group_ids: String(row.sub2api_group_ids || ""),
-    max_active_slots: Number(row.max_active_slots || 0),
   };
 }
 
@@ -264,7 +256,6 @@ async function saveEditChannel(reload: () => Promise<void>) {
     timeout_s: Number(editForm.value.timeout_s || 30),
     sub2api_concurrency: Number(editForm.value.sub2api_concurrency || 0),
     sub2api_group_ids: editForm.value.sub2api_group_ids,
-    max_active_slots: Number(editForm.value.max_active_slots || 0),
   };
   if (nextLocal || nextCustom) {
     body.admin_key = "";
@@ -292,25 +283,71 @@ async function saveEditChannel(reload: () => Promise<void>) {
   }
 }
 
-async function addBalance(row: Row, reload: () => Promise<void>) {
+function credentialTypeName(value: unknown) {
+  const key = String(value || "");
+  return credentialTypeLabels[key] || key;
+}
+
+function credentialTypeBalances(row: Row) {
+  const value = row.credential_type_balances;
+  return Array.isArray(value) ? (value as Row[]) : [];
+}
+
+function balanceInputKey(row: Row, balance: Row) {
+  return `${String(row.id || "")}:${String(balance.credential_type || "")}`;
+}
+
+async function addBalance(row: Row, balance: Row, reload: () => Promise<void>) {
   const id = String(row.id || "");
+  const credentialType = String(balance.credential_type || "");
   if (!id) return;
-  const amount = Number(balanceAmounts.value[id] || 0);
+  if (!credentialType) return;
+  const key = balanceInputKey(row, balance);
+  const amount = Number(balanceAmounts.value[key] || 0);
   if (!Number.isFinite(amount) || amount <= 0) {
     store.toast("参数错误", "添加余额必须大于 0。", "warning");
     return;
   }
   try {
-    const result = await resourcesApi.addDownstreamChannelBalance(id, { amount });
+    const result = await resourcesApi.addDownstreamChannelBalance(id, {
+      credential_type: credentialType,
+      amount,
+    });
     store.toast(
       "余额已添加",
-      `${String(row.name || id)} 当前余额=${String(result.push_balance ?? "")}`,
+      `${String(row.name || id)} / ${credentialTypeName(credentialType)} 当前余额=${String(result.push_balance ?? "")}`,
       "success",
     );
-    balanceAmounts.value[id] = 0;
+    balanceAmounts.value[key] = 0;
     await reload();
   } catch (err) {
     store.toast("添加余额失败", String((err as Error).message ?? err), "error");
+  }
+}
+
+async function configureTypeBalance(row: Row, balance: Row, reload: () => Promise<void>) {
+  const id = String(row.id || "");
+  const credentialType = String(balance.credential_type || "");
+  if (!id || !credentialType) return;
+  const currentSlots = Number(balance.max_active_slots || 0);
+  const nextSlotsText = window.prompt(
+    `${credentialTypeName(credentialType)} 最大坑位`,
+    String(currentSlots),
+  );
+  if (nextSlotsText === null) return;
+  const nextSlots = Number(nextSlotsText);
+  if (!Number.isFinite(nextSlots) || nextSlots < 0) {
+    store.toast("参数错误", "最大坑位必须是非负数字。", "warning");
+    return;
+  }
+  try {
+    await resourcesApi.patchDownstreamChannelCredentialTypeBalance(id, credentialType, {
+      max_active_slots: nextSlots,
+    });
+    store.toast("凭证类型规则已更新", `${credentialTypeName(credentialType)} 最大坑位=${nextSlots}`, "success");
+    await reload();
+  } catch (err) {
+    store.toast("更新失败", String((err as Error).message ?? err), "error");
   }
 }
 
@@ -320,8 +357,7 @@ async function pushPending(row: Row) {
   try {
     const result = await resourcesApi.pushPendingCredentials({
       downstream_channel_id: id,
-      limit: pendingPushLimit.value,
-      concurrency: pendingPushConcurrency.value,
+      work_count: pendingPushWorkCount.value,
       created_by: "ops-ui-channel",
     });
     store.toast(
@@ -442,15 +478,11 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
                 <input v-model.number="form.timeout_s" type="number" min="1" />
               </label>
               <label>
-                <span>同时占用上限</span>
+                <span>默认坑位上限</span>
                 <input v-model.number="form.max_active_slots" type="number" min="0" />
               </label>
               <label>
-                <span>推送余额</span>
-                <input v-model.number="form.push_balance" type="number" min="0" />
-              </label>
-              <label>
-                <span>sub2api 账号并发</span>
+                <span>sub2api 同时账号数</span>
                 <input
                   v-model.number="form.sub2api_concurrency"
                   type="number"
@@ -474,16 +506,12 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
       <div class="action-card">
         <div>
           <h2>待推送处理</h2>
-          <p>推送需要同时满足：还有推送余额、当前占用小于同时占用上限。开始推送即消耗余额。</p>
+          <p>推送数量由每个 credential_type 的余额和坑位缺口决定；同时 Work 数控制本轮最多同时运行多少个 work。</p>
         </div>
         <div class="form-grid">
           <label>
-            <span>默认推送数量</span>
-            <input v-model.number="pendingPushLimit" type="number" min="1" />
-          </label>
-          <label>
-            <span>默认并发</span>
-            <input v-model.number="pendingPushConcurrency" type="number" min="1" max="500" />
+            <span>同时 Work 数</span>
+            <input v-model.number="pendingPushWorkCount" type="number" min="1" max="500" />
           </label>
         </div>
       </div>
@@ -492,17 +520,34 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
       <button class="btn compact-action" @click="openEditChannel(row)">
         编辑
       </button>
-      <div class="inline-balance">
-        <input
-          v-model.number="balanceAmounts[String(row.id || '')]"
-          class="compact-number"
-          type="number"
-          min="1"
-          placeholder="余额"
-        />
-        <button class="btn compact-action" @click="addBalance(row, reload)">
-          加余额
-        </button>
+      <div class="type-balance-list">
+        <div
+          v-for="balance in credentialTypeBalances(row)"
+          :key="String(balance.credential_type)"
+          class="type-balance-card"
+        >
+          <div class="type-balance-main">
+            <strong>{{ credentialTypeName(balance.credential_type) }}</strong>
+            <span>
+              余额 {{ balance.push_balance ?? 0 }} /
+              占用 {{ balance.active_slot_count ?? 0 }} /
+              最大 {{ balance.max_active_slots ?? 0 }}
+            </span>
+          </div>
+          <input
+            v-model.number="balanceAmounts[balanceInputKey(row, balance)]"
+            class="compact-number"
+            type="number"
+            min="1"
+            placeholder="+余额"
+          />
+          <button class="btn compact-action" @click="addBalance(row, balance, reload)">
+            加余额
+          </button>
+          <button class="btn compact-action" @click="configureTypeBalance(row, balance, reload)">
+            坑位
+          </button>
+        </div>
       </div>
       <button class="btn compact-action" @click="toggleEnabled(row, reload)">
         {{ row.enabled ? "禁用" : "启用" }}
@@ -606,11 +651,7 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
                     <input v-model.number="editForm.timeout_s" class="input" type="number" min="1" />
                   </label>
                   <label>
-                    <span>同时占用上限</span>
-                    <input v-model.number="editForm.max_active_slots" class="input" type="number" min="0" />
-                  </label>
-                  <label>
-                    <span>sub2api 账号并发</span>
+                    <span>sub2api 同时账号数</span>
                     <input
                       v-model.number="editForm.sub2api_concurrency"
                       class="input"
@@ -640,25 +681,23 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
 
               <section class="edit-section readonly-section">
                 <div class="section-title">
-                  <h3>余额与占用</h3>
-                  <p>余额用“加余额”动作增量处理，避免误覆盖。</p>
+                  <h3>按凭证类型的余额与占用</h3>
+                  <p>余额、坑位、占用都按 personal_account / team_5h_weekly / team_monthly 分开维护。</p>
                 </div>
-                <div class="metric-grid">
-                  <div>
-                    <span>当前余额</span>
-                    <strong>{{ editingChannel.push_balance }}</strong>
-                  </div>
-                  <div>
-                    <span>已消耗余额</span>
-                    <strong>{{ editingChannel.claimed_push_count }}</strong>
-                  </div>
-                  <div>
-                    <span>当前占用</span>
-                    <strong>{{ editingChannel.active_slot_count }}</strong>
-                  </div>
-                  <div>
-                    <span>剩余坑位</span>
-                    <strong>{{ editingChannel.remaining_active_slots }}</strong>
+                <div class="type-balance-modal-list">
+                  <div
+                    v-for="balance in credentialTypeBalances(editingChannel)"
+                    :key="String(balance.credential_type)"
+                    class="type-balance-modal-card"
+                  >
+                    <strong>{{ credentialTypeName(balance.credential_type) }}</strong>
+                    <span>最大坑位 {{ balance.max_active_slots ?? 0 }}</span>
+                    <span>开放坑位 {{ balance.allowed_active_slots ?? 0 }}</span>
+                    <span>当前占用 {{ balance.active_slot_count ?? 0 }}</span>
+                    <span>剩余坑位 {{ balance.remaining_active_slots ?? 0 }}</span>
+                    <span>推送余额 {{ balance.push_balance ?? 0 }}</span>
+                    <span>已消耗 {{ balance.claimed_push_count ?? 0 }}</span>
+                    <span>已使用 {{ balance.used_count ?? 0 }}</span>
                   </div>
                 </div>
               </section>
@@ -767,6 +806,40 @@ label span {
   align-items: center;
   display: inline-flex;
   gap: 6px;
+}
+
+.type-balance-list {
+  display: grid;
+  gap: 6px;
+  min-width: 360px;
+}
+
+.type-balance-card {
+  align-items: center;
+  background: rgba(13, 20, 38, 0.66);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(150px, 1fr) 82px auto auto;
+  padding: 6px;
+}
+
+.type-balance-main {
+  display: grid;
+  gap: 3px;
+}
+
+.type-balance-main strong,
+.type-balance-modal-card strong {
+  font-size: 12px;
+}
+
+.type-balance-main span,
+.type-balance-modal-card span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .compact-number {
@@ -898,6 +971,21 @@ label span {
   font-size: 18px;
 }
 
+.type-balance-modal-list {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.type-balance-modal-card {
+  background: rgba(13, 20, 38, 0.66);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: grid;
+  gap: 6px;
+  padding: 11px;
+}
+
 .edit-footer {
   background: rgba(17, 24, 39, 0.98);
   border-top: 1px solid var(--border);
@@ -924,7 +1012,9 @@ label span {
 
   .edit-grid,
   .compact-grid,
-  .metric-grid {
+  .metric-grid,
+  .type-balance-card,
+  .type-balance-modal-list {
     grid-template-columns: 1fr;
   }
 

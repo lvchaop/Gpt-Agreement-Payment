@@ -234,7 +234,7 @@ def _validate_pushable(
         session=session,
         downstream_channel_id=channel.id,
         credential_type=space.credential_type,
-    ) > max(0, int(balance.max_active_slots or 0)):
+    ) > _allowed_space_active_slots(session=session, balance=balance):
         raise SpaceDirectPushWorkflowError("downstream_channel_active_slots_exhausted")
 
 
@@ -367,7 +367,7 @@ def _allowed_space_active_slots(
     base_slots = max(1, max_slots // 2)
     high_usage_count = int(
         session.scalar(
-            select(func.count())
+            select(func.count(func.distinct(SpacePushBindingModel.space_credential_id)))
             .select_from(SpacePushBindingModel)
             .join(
                 SpaceCredentialModel,
