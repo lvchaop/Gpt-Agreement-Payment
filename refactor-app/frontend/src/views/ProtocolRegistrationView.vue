@@ -1,0 +1,200 @@
+<script setup lang="ts">
+import { ref } from "vue";
+import { useRouter } from "vue-router";
+
+import PageHeader from "../components/PageHeader.vue";
+import { resourcesApi } from "../api/resources";
+import { useOpsStore } from "../stores/ops";
+
+const store = useOpsStore();
+const router = useRouter();
+
+const mode = ref("email_protocol_no_phone");
+const count = ref(1);
+const workCount = ref(1);
+const mailProvider = ref("outlook");
+const emailDomain = ref("");
+const projectKey = ref("openai-register");
+const callerId = ref("refactor-app-protocol-registration");
+
+const phoneBaseUrl = ref("https://hero-sms.com/stubs/handler_api.php");
+const phoneApiKeyEnv = ref("HERO_SMS_API_KEY");
+const phoneService = ref("tg");
+const phoneCountry = ref("2");
+const phoneCountries = ref("");
+const phoneMaxPrice = ref("");
+const phoneMaxNumberAttempts = ref(3);
+const phoneOtpTimeoutS = ref(180);
+const phoneOtpPollIntervalS = ref(3);
+const submitting = ref(false);
+
+function parseCountries(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function submitJob() {
+  submitting.value = true;
+  try {
+    const result = await resourcesApi.createProtocolRegistrationJob({
+      mode: mode.value,
+      count: count.value,
+      work_count: workCount.value,
+      mail_provider: mailProvider.value,
+      email_domain: emailDomain.value,
+      project_key: projectKey.value,
+      caller_id: callerId.value,
+      phone_provider: "hero_sms",
+      phone_base_url: phoneBaseUrl.value,
+      phone_api_key_env: phoneApiKeyEnv.value,
+      phone_service: phoneService.value,
+      phone_country: phoneCountry.value,
+      phone_countries: parseCountries(phoneCountries.value),
+      phone_max_price: phoneMaxPrice.value,
+      phone_country_max_prices: {},
+      phone_max_number_attempts: phoneMaxNumberAttempts.value,
+      phone_otp_timeout_s: phoneOtpTimeoutS.value,
+      phone_otp_poll_interval_s: phoneOtpPollIntervalS.value,
+      created_by: "ops-ui",
+    });
+    store.toast("注册任务已创建", `job=${result.job_id}`, "success");
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } finally {
+    submitting.value = false;
+  }
+}
+</script>
+
+<template>
+  <div>
+    <PageHeader
+      title="账号注册"
+      description="纯协议账号注册入口：邮箱注册不绑手机号；手机号注册完成后绑定邮箱。"
+    />
+
+    <section class="panel registration-panel">
+      <div class="grid">
+        <label>
+          <span>模式</span>
+          <select v-model="mode" class="input">
+            <option value="email_protocol_no_phone">邮箱纯协议注册，不绑手机号</option>
+            <option value="phone_protocol_bind_email">手机号纯协议注册，绑定邮箱</option>
+          </select>
+        </label>
+        <label>
+          <span>总数量 count</span>
+          <input v-model.number="count" class="input" min="1" type="number" />
+        </label>
+        <label>
+          <span>同时 Work 数</span>
+          <input v-model.number="workCount" class="input" min="1" max="500" type="number" />
+        </label>
+        <label>
+          <span>邮箱 provider</span>
+          <select v-model="mailProvider" class="input">
+            <option value="outlook">outlook（outlook/hotmail/live）</option>
+            <option value="imap">imap</option>
+            <option value="custom">custom</option>
+            <option value="cloudflare_temp_mail">cloudflare_temp_mail</option>
+          </select>
+        </label>
+        <label>
+          <span>邮箱域名</span>
+          <input v-model="emailDomain" class="input" placeholder="可空" />
+        </label>
+        <label>
+          <span>project_key</span>
+          <input v-model="projectKey" class="input" />
+        </label>
+        <label>
+          <span>caller_id</span>
+          <input v-model="callerId" class="input" />
+        </label>
+      </div>
+    </section>
+
+    <section v-if="mode === 'phone_protocol_bind_email'" class="panel registration-panel">
+      <h2>Hero SMS 配置</h2>
+      <div class="grid">
+        <label>
+          <span>base_url</span>
+          <input v-model="phoneBaseUrl" class="input" />
+        </label>
+        <label>
+          <span>API Key 环境变量</span>
+          <input v-model="phoneApiKeyEnv" class="input" />
+        </label>
+        <label>
+          <span>service</span>
+          <input v-model="phoneService" class="input" />
+        </label>
+        <label>
+          <span>country</span>
+          <input v-model="phoneCountry" class="input" />
+        </label>
+        <label>
+          <span>countries</span>
+          <input v-model="phoneCountries" class="input" placeholder="逗号分隔，可空" />
+        </label>
+        <label>
+          <span>maxPrice</span>
+          <input v-model="phoneMaxPrice" class="input" placeholder="可空" />
+        </label>
+        <label>
+          <span>max_number_attempts</span>
+          <input v-model.number="phoneMaxNumberAttempts" class="input" min="1" type="number" />
+        </label>
+        <label>
+          <span>OTP timeout 秒</span>
+          <input v-model.number="phoneOtpTimeoutS" class="input" min="1" type="number" />
+        </label>
+        <label>
+          <span>OTP poll 间隔秒</span>
+          <input v-model.number="phoneOtpPollIntervalS" class="input" min="1" type="number" />
+        </label>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button class="btn primary" :disabled="submitting" @click="submitJob">
+        {{ submitting ? "创建中..." : "创建注册任务" }}
+      </button>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.registration-panel {
+  margin-bottom: 14px;
+  padding: 16px;
+}
+
+.registration-panel h2 {
+  font-size: 15px;
+  margin: 0 0 14px;
+}
+
+.grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+label {
+  display: grid;
+  gap: 6px;
+}
+
+label span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+}
+</style>

@@ -302,6 +302,20 @@ class DbEmailAccountPool:
             return account_from_row(row)
         raise RuntimeError("邮箱池没有 unused 账号: sqlite:mail_accounts")
 
+    def reserve_email(self, email: str) -> EmailAccount:
+        target = (email or "").strip().lower()
+        if not target:
+            raise RuntimeError("指定邮箱为空")
+        row = self._db().reserve_mail_account_by_email(target)
+        if not row:
+            raise RuntimeError(f"邮箱池找不到指定邮箱: {target}")
+        status = (row.get("status") or "").strip().lower()
+        if status != "reserved":
+            raise RuntimeError(
+                f"指定邮箱不是 unused，不能用于本次注册: {target} status={status or '(empty)'}"
+            )
+        return account_from_row(row)
+
     def find(self, email: str) -> EmailAccount | None:
         row = self._db().find_mail_account(email)
         return account_from_row(row) if row else None

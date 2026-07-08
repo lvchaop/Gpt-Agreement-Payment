@@ -184,8 +184,10 @@ class MailProvider:
             self.last_persona = None  # resume 路径无法回推 first/last
             return addr
         if self.mode == "imap_list":
-            account = self._email_pool().reserve_next()
-            self._reserved_account = account
+            account = self._reserved_account
+            if account is None:
+                account = self._email_pool().reserve_next()
+                self._reserved_account = account
             self.last_persona = account.to_persona()
             logger.info(
                 f"邮箱池取号: {account.email} | provider={account.provider} "
@@ -325,6 +327,18 @@ class MailProvider:
     def mark_unused(self, email_addr: str) -> None:
         if self.mode == "imap_list":
             self._email_pool().mark(email_addr, "unused")
+
+    def reserve_email(self, email_addr: str) -> str:
+        if self.mode != "imap_list":
+            raise RuntimeError("指定邮箱注册只支持 mail.mode=imap_list")
+        account = self._email_pool().reserve_email(email_addr)
+        self._reserved_account = account
+        self.last_persona = account.to_persona()
+        logger.info(
+            f"邮箱池指定取号: {account.email} | provider={account.provider} "
+            f"(路径: IMAP account list)"
+        )
+        return account.email
 
     def _email_pool(self):
         if self._pool is None:

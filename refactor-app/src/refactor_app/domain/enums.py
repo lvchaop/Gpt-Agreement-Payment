@@ -6,6 +6,7 @@ from enum import StrEnum
 class AccountStatus(StrEnum):
     ACTIVE = "active"
     INVALID = "invalid"
+    REGISTERING = "registering"
 
 
 class WorkspaceStatus(StrEnum):

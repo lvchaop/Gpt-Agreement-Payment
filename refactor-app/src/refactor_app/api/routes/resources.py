@@ -18,7 +18,6 @@ from refactor_app.api.dependencies import get_db_session
 from refactor_app.application.jobs.handlers import register_core_handlers
 from refactor_app.application.jobs.queue import JobQueue, WorkQueue
 from refactor_app.application.jobs.runner import JobRunner
-from refactor_app.application.workflows.account_auth import ensure_account_proxy_url
 from refactor_app.application.workflows.proxy import (
     ProxyWorkflowError,
     bind_team_admin_static_proxy_in_session,
@@ -26,12 +25,15 @@ from refactor_app.application.workflows.proxy import (
     reassign_team_admin_static_proxy_in_session,
 )
 from refactor_app.application.workflows.space_membership_invite_sync import (
+    SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S,
+    SPACE_MEMBERSHIP_INVITE_WORK_COUNT,
     SpaceMembershipInviteSyncWorkflow,
     SpaceMembershipInviteSyncWorkflowError,
 )
 from refactor_app.application.workflows.space_recycle import (
     SpaceRecycleSweepInput,
     SpaceRecycleSweepWorkflow,
+    manually_settle_pushed_binding_from_usage_state,
 )
 from refactor_app.application.workflows.space_usage import SpaceUsageError, infer_credential_type
 from refactor_app.config.settings import get_settings
@@ -52,6 +54,7 @@ from refactor_app.infrastructure.db.models import (
     SpaceMembershipModel,
     SpaceModel,
     SpacePushBindingModel,
+    SpacePushAttemptModel,
     TeamAdminProxyBindingModel,
     TeamAdminSessionModel,
     UserAccountModel,
@@ -128,6 +131,35 @@ class PushPendingSpaceCredentialsRequest(BaseModel):
 class SpaceRecycleSweepJobRequest(BaseModel):
     created_by: str = ""
     limit: int = 100
+    work_count: int = 5
+
+
+class ManualSettleSpacePushRecordsRequest(BaseModel):
+    space_credential_ids: list[str]
+    created_by: str = ""
+
+
+class ProtocolRegistrationJobRequest(BaseModel):
+    mode: str
+    count: int = 1
+    work_count: int = 1
+    use_proxy: bool = True
+    mail_provider: str = "outlook"
+    email_domain: str = ""
+    project_key: str = "openai-register"
+    caller_id: str = "refactor-app-protocol-registration"
+    phone_provider: str = "hero_sms"
+    phone_base_url: str = "https://hero-sms.com/stubs/handler_api.php"
+    phone_api_key_env: str = "HERO_SMS_API_KEY"
+    phone_service: str = "tg"
+    phone_country: str = "2"
+    phone_countries: list[str] = []
+    phone_max_price: str = ""
+    phone_country_max_prices: dict[str, str] = {}
+    phone_max_number_attempts: int = 3
+    phone_otp_timeout_s: int = 180
+    phone_otp_poll_interval_s: float = 3.0
+    created_by: str = ""
 
 
 class SyncRemoteSpaceMembershipsRequest(BaseModel):
@@ -153,7 +185,7 @@ class CreateDownstreamChannelRequest(BaseModel):
     enabled: bool = True
     update_existing: bool = False
     timeout_s: int = 30
-    sub2api_concurrency: int = 0
+    sub2api_concurrency: int = 10
     sub2api_group_ids: str = ""
     max_push_count: int = 2
     max_active_slots: int = 2
@@ -161,6 +193,7 @@ class CreateDownstreamChannelRequest(BaseModel):
 
 
 class PatchDownstreamChannelRequest(BaseModel):
+    provider_type: str | None = None
     name: str | None = None
     base_url: str | None = None
     admin_key: str | None = None
@@ -340,6 +373,57 @@ def list_space_credentials(session: DbSession) -> dict:
     return {"items": [_space_credential_dict(session=session, credential=row) for row in rows]}
 
 
+@router.get("/space-push-records")
+def list_space_push_records(session: DbSession) -> dict:
+    rows = session.scalars(
+        select(SpacePushBindingModel).order_by(SpacePushBindingModel.updated_at.desc())
+    ).all()
+    return {"items": [_space_push_record_dict(session=session, binding=row) for row in rows]}
+
+
+@router.post("/space-push-records/manual-settle")
+def manual_settle_space_push_records(
+    req: ManualSettleSpacePushRecordsRequest,
+    session: DbSession,
+) -> dict:
+    credential_ids = [item.strip() for item in req.space_credential_ids if item.strip()]
+    if not credential_ids:
+        raise HTTPException(status_code=400, detail="space_credential_ids is required")
+    results = [
+        manually_settle_pushed_binding_from_usage_state(
+            session=session,
+            space_credential_id=space_credential_id,
+        )
+        for space_credential_id in credential_ids
+    ]
+    session.commit()
+    summary = {
+        "used": 0,
+        "skipped": 0,
+        "ignored": 0,
+        "failed": 0,
+    }
+    items = []
+    for result in results:
+        if result.push_status in summary:
+            summary[result.push_status] += 1
+        else:
+            summary["failed"] += 1
+        items.append(
+            {
+                "space_credential_id": result.space_credential_id,
+                "push_status": result.push_status,
+                "reason": result.reason,
+                "usage_percent": result.usage_percent,
+            }
+        )
+    return {
+        "selected_count": len(credential_ids),
+        **summary,
+        "items": items,
+    }
+
+
 @router.post("/space-credentials/business-access-token-job")
 def create_business_access_token_credentials_job(
     req: CreateBusinessAccessTokenCredentialsJobRequest,
@@ -365,7 +449,43 @@ def create_pending_space_credentials_push_job(
 def create_space_recycle_sweep_job(req: SpaceRecycleSweepJobRequest, session: DbSession) -> dict:
     job = JobQueue(session).enqueue(
         job_type="space.recycle.sweep",
-        input_json={"limit": max(1, int(req.limit or 100))},
+        input_json={
+            "limit": max(1, int(req.limit or 100)),
+            "work_count": max(1, int(req.work_count or 5)),
+        },
+        created_by=req.created_by,
+    )
+    session.commit()
+    return {"job_id": job.id, "job_status": job.job_status}
+
+
+@router.post("/account-protocol-registration/jobs")
+def create_protocol_registration_job(req: ProtocolRegistrationJobRequest, session: DbSession) -> dict:
+    if req.mode not in ("email_protocol_no_phone", "phone_protocol_bind_email"):
+        raise HTTPException(status_code=400, detail=f"unsupported protocol registration mode: {req.mode}")
+    job = JobQueue(session).enqueue(
+        job_type="account.protocol_register",
+        input_json={
+            "mode": req.mode,
+            "count": max(1, int(req.count or 1)),
+            "work_count": max(1, int(req.work_count or 1)),
+            "use_proxy": bool(req.use_proxy),
+            "mail_provider": req.mail_provider,
+            "email_domain": req.email_domain,
+            "project_key": req.project_key,
+            "caller_id": req.caller_id,
+            "phone_provider": req.phone_provider,
+            "phone_base_url": req.phone_base_url,
+            "phone_api_key_env": req.phone_api_key_env,
+            "phone_service": req.phone_service,
+            "phone_country": req.phone_country,
+            "phone_countries": req.phone_countries,
+            "phone_max_price": req.phone_max_price,
+            "phone_country_max_prices": req.phone_country_max_prices,
+            "phone_max_number_attempts": max(1, int(req.phone_max_number_attempts or 3)),
+            "phone_otp_timeout_s": max(1, int(req.phone_otp_timeout_s or 180)),
+            "phone_otp_poll_interval_s": max(1.0, float(req.phone_otp_poll_interval_s or 3.0)),
+        },
         created_by=req.created_by,
     )
     session.commit()
@@ -694,6 +814,8 @@ def delete_team_admin_session(team_admin_session_id: str, session: DbSession) ->
 def list_memberships(
     session: DbSession,
     space_id: str = "",
+    space: str = "",
+    external_space_id: str = "",
     user_account_id: str = "",
     membership_status: str = "",
     session_account_detected: str = "",
@@ -704,8 +826,11 @@ def list_memberships(
         .join(SpaceModel, SpaceModel.id == SpaceMembershipModel.space_id)
         .order_by(SpaceMembershipModel.created_at.desc())
     )
-    if space_id.strip():
-        stmt = stmt.where(SpaceMembershipModel.space_id == space_id.strip())
+    selected_space_id = space_id.strip() or space.strip()
+    if selected_space_id:
+        stmt = stmt.where(SpaceMembershipModel.space_id == selected_space_id)
+    if external_space_id.strip():
+        stmt = stmt.where(SpaceModel.external_space_id == external_space_id.strip())
     if user_account_id.strip():
         stmt = stmt.where(SpaceMembershipModel.user_account_id == user_account_id.strip())
     if membership_status.strip():
@@ -938,7 +1063,7 @@ def create_downstream_channel(req: CreateDownstreamChannelRequest, session: DbSe
         enabled=bool(req.enabled),
         update_existing=bool(req.update_existing),
         timeout_s=max(1, int(req.timeout_s or 30)),
-        sub2api_concurrency=max(0, int(req.sub2api_concurrency or 0)),
+        sub2api_concurrency=max(0, int(req.sub2api_concurrency if req.sub2api_concurrency is not None else 10)),
         sub2api_group_ids=req.sub2api_group_ids,
         max_push_count=max(0, int(req.max_push_count or 0)),
         max_active_slots=max(0, int(req.max_active_slots or 0)),
@@ -1023,7 +1148,12 @@ def patch_downstream_channel(
     channel = session.get(DownstreamChannelModel, channel_id)
     if channel is None:
         raise HTTPException(status_code=404, detail="downstream channel not found")
+    if req.provider_type is not None and req.provider_type not in DOWNSTREAM_PROVIDER_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported downstream provider_type")
+    if req.custom_payload_type is not None and req.custom_payload_type not in CUSTOM_HTTP_PAYLOAD_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported custom_payload_type")
     for field_name in (
+        "provider_type",
         "name",
         "base_url",
         "admin_key",
@@ -1286,6 +1416,98 @@ def _usage_state_dict(row: SpaceCredentialUsageStateModel) -> dict:
     }
 
 
+def _space_push_record_dict(*, session: Session, binding: SpacePushBindingModel) -> dict:
+    credential = session.get(SpaceCredentialModel, binding.space_credential_id)
+    space = session.get(SpaceModel, binding.space_id)
+    user = session.get(UserAccountModel, credential.user_account_id) if credential is not None else None
+    channel = (
+        session.get(DownstreamChannelModel, binding.downstream_channel_id)
+        if binding.downstream_channel_id
+        else None
+    )
+    usage_states = session.scalars(
+        select(SpaceCredentialUsageStateModel)
+        .where(SpaceCredentialUsageStateModel.space_credential_id == binding.space_credential_id)
+        .order_by(SpaceCredentialUsageStateModel.quota_window_kind)
+    ).all()
+    usage_by_kind = {row.quota_window_kind: row for row in usage_states}
+    latest_attempt = session.scalars(
+        select(SpacePushAttemptModel)
+        .where(SpacePushAttemptModel.space_credential_id == binding.space_credential_id)
+        .order_by(SpacePushAttemptModel.created_at.desc())
+        .limit(1)
+    ).first()
+    last_usage_checked_at = max(
+        [row.last_checked_at for row in usage_states if row.last_checked_at],
+        default=None,
+    )
+    return {
+        "id": binding.space_credential_id,
+        "space_credential_id": binding.space_credential_id,
+        "space_id": binding.space_id,
+        "external_space_id": space.external_space_id if space is not None else "",
+        "space_name": space.name if space is not None else "",
+        "space_type": space.space_type if space is not None else "",
+        "credential_type": space.credential_type if space is not None else "",
+        "user_account_id": credential.user_account_id if credential is not None else "",
+        "email": user.email if user is not None else "",
+        "credential_status": credential.credential_status if credential is not None else "",
+        "downstream_channel_id": binding.downstream_channel_id or "",
+        "downstream_channel_name": channel.name if channel is not None else "",
+        "downstream_provider": channel.provider_type if channel is not None else "",
+        "downstream_external_id": binding.downstream_external_id,
+        "push_status": binding.push_status,
+        "recycle_status": binding.recycle_status,
+        "pushed_count": binding.pushed_count,
+        "failed_push_count": binding.failed_push_count,
+        "used_count": binding.used_count,
+        "usage_summary": _usage_summary(usage_by_kind),
+        "five_hour_usage_percent": _usage_percent(usage_by_kind, "five_hour"),
+        "five_hour_usage_status": _usage_status(usage_by_kind, "five_hour"),
+        "weekly_usage_percent": _usage_percent(usage_by_kind, "weekly"),
+        "weekly_usage_status": _usage_status(usage_by_kind, "weekly"),
+        "monthly_usage_percent": _usage_percent(usage_by_kind, "monthly"),
+        "monthly_usage_status": _usage_status(usage_by_kind, "monthly"),
+        "last_usage_checked_at": _iso(last_usage_checked_at),
+        "latest_attempt_status": latest_attempt.attempt_status if latest_attempt is not None else "",
+        "latest_attempt_payload_type": latest_attempt.payload_type if latest_attempt is not None else "",
+        "latest_attempt_endpoint": latest_attempt.request_endpoint if latest_attempt is not None else "",
+        "latest_attempt_error_code": latest_attempt.error_code if latest_attempt is not None else "",
+        "latest_attempt_error_message": latest_attempt.error_message if latest_attempt is not None else "",
+        "latest_attempt_started_at": _iso(latest_attempt.started_at) if latest_attempt is not None else "",
+        "latest_attempt_finished_at": _iso(latest_attempt.finished_at) if latest_attempt is not None else "",
+        "error_code": binding.error_code,
+        "error_message": binding.error_message,
+        "created_at": _iso(binding.created_at),
+        "updated_at": _iso(binding.updated_at),
+    }
+
+
+def _usage_summary(usage_by_kind: dict[str, SpaceCredentialUsageStateModel]) -> str:
+    parts: list[str] = []
+    for kind, label in (("five_hour", "5h"), ("weekly", "周"), ("monthly", "月")):
+        state = usage_by_kind.get(kind)
+        if state is not None:
+            parts.append(f"{label}:{int(state.usage_percent or 0)}%/{state.usage_status}")
+    return " ".join(parts)
+
+
+def _usage_percent(
+    usage_by_kind: dict[str, SpaceCredentialUsageStateModel],
+    kind: str,
+) -> int:
+    state = usage_by_kind.get(kind)
+    return int(state.usage_percent or 0) if state is not None else 0
+
+
+def _usage_status(
+    usage_by_kind: dict[str, SpaceCredentialUsageStateModel],
+    kind: str,
+) -> str:
+    state = usage_by_kind.get(kind)
+    return state.usage_status if state is not None else ""
+
+
 def _create_pending_business_access_token_work_job(
     *,
     session: Session,
@@ -1312,7 +1534,7 @@ def _create_pending_business_access_token_work_job(
             "skipped_reason": "active_authorize_job_exists",
             "selected": [],
         }
-    worker_count = max(1, int(work_count or 5))
+    worker_count = max(1, int(work_count or 1))
     selected = _select_pending_business_access_token_items(session=session)
     if not selected:
         return {
@@ -1327,27 +1549,24 @@ def _create_pending_business_access_token_work_job(
             "cancelled": 0,
             "selected": [],
         }
-    job, run = _start_work_job(
-        session=session,
+    job = JobQueue(session).enqueue(
         job_type="space.business_access_token.create.bulk",
         input_json={
             "space_membership_ids": [item["space_membership_id"] for item in selected],
             "work_count": worker_count,
             "selected_count": len(selected),
+            "credential_name_prefix": credential_name_prefix,
         },
         created_by=created_by,
     )
     work_queue = WorkQueue(session)
     for item in selected:
-        proxy_url = ensure_account_proxy_url(
-            _session_factory_from_session(session),
-            item["user_account_id"],
-            bind_reason="space_business_access_token_create",
-        )
         work_queue.enqueue(
             job_id=job.id,
             work_type="space.business_access_token.create.account",
             input_json={
+                "space_membership_id": item["space_membership_id"],
+                "space_id": item["space_id"],
                 "user_account_id": item["user_account_id"],
                 "external_space_id": item["external_space_id"],
                 "session_access_token": "",
@@ -1356,28 +1575,30 @@ def _create_pending_business_access_token_work_job(
                 "space_name": item["space_name"],
                 "owner_user_account_id": item["owner_user_account_id"],
                 "source_admin_session_id": item["source_admin_session_id"],
-                "proxy_url": proxy_url,
-                "_run_id": run.id,
+                "proxy_bind_reason": "space_business_access_token_create",
             },
         )
     session.commit()
-    result = _run_work_job_now_and_summarize(
-        session=session,
-        job_id=job.id,
-        run_id=run.id,
-        worker_count=worker_count * max(1, len({item["external_space_id"] for item in selected})),
-        work_count=len(selected),
-    )
-    result["selected"] = [
-        {
-            "space_membership_id": item["space_membership_id"],
-            "space_id": item["space_id"],
-            "user_account_id": item["user_account_id"],
-            "external_space_id": item["external_space_id"],
-        }
-        for item in selected
-    ]
-    return result
+    return {
+        "job_id": job.id,
+        "job_status": job.job_status,
+        "run_id": "",
+        "work_count": len(selected),
+        "queued": len(selected),
+        "running": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "selected": [
+            {
+                "space_membership_id": item["space_membership_id"],
+                "space_id": item["space_id"],
+                "user_account_id": item["user_account_id"],
+                "external_space_id": item["external_space_id"],
+            }
+            for item in selected
+        ],
+    }
 
 
 def _select_pending_business_access_token_items(*, session: Session) -> list[dict]:
@@ -1441,24 +1662,20 @@ def _create_business_access_token_work_job(
         raise HTTPException(status_code=400, detail="external_space_id is required")
     if not req.cookie_header.strip():
         raise HTTPException(status_code=400, detail="cookie_header is required")
-    job, run = _start_work_job(
-        session=session,
+    worker_count = max(1, int(req.work_count or 5))
+    job = JobQueue(session).enqueue(
         job_type="space.business_access_token.create.bulk",
         input_json={
             "user_account_ids": user_account_ids,
             "external_space_id": req.external_space_id,
-            "work_count": max(1, int(req.work_count or 5)),
+            "work_count": worker_count,
             "selected_count": len(user_account_ids),
+            "credential_name_prefix": req.credential_name_prefix,
         },
         created_by=req.created_by,
     )
     work_queue = WorkQueue(session)
     for user_account_id in user_account_ids:
-        proxy_url = ensure_account_proxy_url(
-            _session_factory_from_session(session),
-            user_account_id,
-            bind_reason="space_business_access_token_create_manual",
-        )
         work_queue.enqueue(
             job_id=job.id,
             work_type="space.business_access_token.create.account",
@@ -1471,19 +1688,21 @@ def _create_business_access_token_work_job(
                 "space_name": req.space_name,
                 "owner_user_account_id": req.owner_user_account_id,
                 "source_admin_session_id": req.source_admin_session_id,
-                "proxy_url": proxy_url,
-                "_run_id": run.id,
+                "proxy_bind_reason": "space_business_access_token_create_manual",
             },
         )
     session.commit()
-    result = _run_work_job_now_and_summarize(
-        session=session,
-        job_id=job.id,
-        run_id=run.id,
-        worker_count=max(1, int(req.work_count or 5)),
-        work_count=len(user_account_ids),
-    )
-    return result
+    return {
+        "job_id": job.id,
+        "job_status": job.job_status,
+        "run_id": "",
+        "work_count": len(user_account_ids),
+        "queued": len(user_account_ids),
+        "running": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
 
 
 def _create_space_push_work_job(
@@ -1655,20 +1874,17 @@ def _select_pending_space_push_items(
             credential_type=credential_type,
         )
         allowed_slots = _allowed_space_push_slots(session=session, balance=balance)
-        remaining_slots = max(0, allowed_slots - active_slots)
-        if remaining_slots <= 0:
-            continue
         retry_ids = _select_retryable_failed_space_credential_ids(
             session=session,
             downstream_channel_id=channel.id,
             credential_type=credential_type,
             excluded_ids=selected_ids,
-            limit=remaining_slots,
+            limit=allowed_slots,
         )
         for credential_id in retry_ids:
             selected.append({"space_credential_id": credential_id, "credential_type": credential_type, "is_retry": True})
             selected_ids.add(credential_id)
-        remaining_slots = max(0, remaining_slots - len(retry_ids))
+        remaining_slots = max(0, allowed_slots - active_slots)
         new_limit = min(remaining_slots, int(balance.push_balance or 0))
         if new_limit <= 0:
             continue
@@ -2119,15 +2335,15 @@ def _ensure_default_space_automation_schedules(*, session: Session) -> None:
             "config_json": {
                 "space_limit": 1,
                 "invite_limit_per_space": 350,
-                "work_count": 350,
+                "work_count": SPACE_MEMBERSHIP_INVITE_WORK_COUNT,
                 "membership_cap_per_space": 1000,
                 "page_size": 100,
-                "barrier_timeout_s": 30,
+                "barrier_timeout_s": SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S,
             },
         },
         "automation.space_authorize": {
             "interval_seconds": 60,
-            "config_json": {"work_count": 5},
+            "config_json": {"work_count": 1},
         },
         "automation.space_downstream_push": {
             "interval_seconds": 60,
@@ -2135,7 +2351,7 @@ def _ensure_default_space_automation_schedules(*, session: Session) -> None:
         },
         "automation.space_recycle_sweep": {
             "interval_seconds": 300,
-            "config_json": {"limit": 100},
+            "config_json": {"limit": 100, "work_count": 5},
         },
     }
     for schedule_type, values in defaults.items():
@@ -2233,12 +2449,12 @@ def _execute_space_automation_schedule(*, session: Session, schedule: Automation
                     "invite_limit_per_space": int(
                         schedule.config_json.get("invite_limit_per_space") or 350
                     ),
-                    "work_count": int(schedule.config_json.get("work_count") or 350),
+                    "work_count": SPACE_MEMBERSHIP_INVITE_WORK_COUNT,
                     "membership_cap_per_space": int(
                         schedule.config_json.get("membership_cap_per_space") or 1000
                     ),
                     "page_size": int(schedule.config_json.get("page_size") or 100),
-                    "barrier_timeout_s": float(schedule.config_json.get("barrier_timeout_s") or 30),
+                    "barrier_timeout_s": SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S,
                 },
                 created_by=str(schedule.config_json.get("created_by") or f"scheduler:{schedule.id}"),
             )
@@ -2251,7 +2467,7 @@ def _execute_space_automation_schedule(*, session: Session, schedule: Automation
                 work_count=int(
                     schedule.config_json.get("work_count")
                     or schedule.config_json.get("limit")
-                    or 5
+                    or 1
                 ),
                 created_by=str(schedule.config_json.get("created_by") or f"scheduler:{schedule.id}"),
                 credential_name_prefix=str(
@@ -2264,7 +2480,10 @@ def _execute_space_automation_schedule(*, session: Session, schedule: Automation
         if schedule.schedule_type == "automation.space_recycle_sweep":
             job = JobQueue(session).enqueue(
                 job_type="space.recycle.sweep",
-                input_json={"limit": int(schedule.config_json.get("limit") or 100)},
+                input_json={
+                    "limit": int(schedule.config_json.get("limit") or 100),
+                    "work_count": max(1, int(schedule.config_json.get("work_count") or 5)),
+                },
                 created_by=str(schedule.config_json.get("created_by") or f"scheduler:{schedule.id}"),
             )
             schedule.last_job_id = job.id

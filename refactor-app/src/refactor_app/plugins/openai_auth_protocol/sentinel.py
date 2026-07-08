@@ -178,8 +178,26 @@ def fetch_sentinel_challenge(
         kwargs["impersonate"] = impersonate
     try:
         response = session.post(SENTINEL_REQ_URL, **kwargs)
+        body_preview = (getattr(response, "text", "") or "").replace("\n", " ").replace("\r", " ")[:500]
+        logger.info(
+            "[SENTINEL DEBUG] python /req flow=%s status=%s p_len=%s body=%s",
+            flow,
+            getattr(response, "status_code", "N/A"),
+            len(str(req_body.get("p") or "")),
+            body_preview,
+        )
         if response.status_code == 200:
-            return response.json()
+            payload = response.json()
+            if isinstance(payload, dict):
+                pow_data = payload.get("proofofwork") or {}
+                logger.info(
+                    "[SENTINEL DEBUG] python /req parsed token_len=%s pow_required=%s pow_seed_len=%s difficulty=%s",
+                    len(str(payload.get("token") or "")),
+                    bool(pow_data.get("required")),
+                    len(str(pow_data.get("seed") or "")),
+                    str(pow_data.get("difficulty") or ""),
+                )
+            return payload
         logger.warning(f"Sentinel /req 非 200: {response.status_code}")
     except Exception as exc:
         logger.warning(f"Sentinel /req 异常: {exc}")
@@ -208,11 +226,12 @@ def build_sentinel_token(
         impersonate=impersonate,
     )
     if not challenge:
+        logger.warning("[SENTINEL DEBUG] python build_sentinel_token no challenge flow=%s", flow)
         return None
 
     c_value = str(challenge.get("token") or "").strip()
     if not c_value:
-        logger.warning("Sentinel 响应缺 token 字段")
+        logger.warning("[SENTINEL DEBUG] python challenge missing token flow=%s keys=%s", flow, sorted(challenge.keys()))
         return None
 
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
@@ -253,11 +272,12 @@ def build_sentinel_tokens(
         impersonate=impersonate,
     )
     if not challenge:
+        logger.warning("[SENTINEL DEBUG] python build_sentinel_tokens no challenge flow=%s", flow)
         return None
 
     c_value = str(challenge.get("token") or "").strip()
     if not c_value:
-        logger.warning("Sentinel 响应缺 token 字段")
+        logger.warning("[SENTINEL DEBUG] python challenge missing token flow=%s keys=%s", flow, sorted(challenge.keys()))
         return None
 
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)

@@ -423,8 +423,11 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
     if session_otp_submit:
         cmd.append("--session-otp-submit")
     if target_emails:
-        joined = ",".join(e.strip() for e in target_emails if e and e.strip())
-        if joined:
+        cleaned_emails = [e.strip() for e in target_emails if e and e.strip()]
+        joined = ",".join(cleaned_emails)
+        if joined and register_only and uses_registration and not pay_only and len(cleaned_emails) == 1:
+            cmd.extend(["--register-email", cleaned_emails[0]])
+        elif joined:
             cmd.extend(["--target-emails", joined])
     return cmd
 

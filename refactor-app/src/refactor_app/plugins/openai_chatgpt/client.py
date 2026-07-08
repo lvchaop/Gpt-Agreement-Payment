@@ -224,9 +224,11 @@ class OpenAIChatGPTClient:
         proxy_url: str = "",
         model: str = "",
     ) -> dict:
-        claims = decode_access_token_claims(access_token)
-        if team_id and claims.token_chatgpt_account_id != team_id:
-            raise WorkspaceMismatchError(expected=team_id, actual=claims.token_chatgpt_account_id)
+        claims: TokenClaims | None = None
+        if "." in access_token:
+            claims = decode_access_token_claims(access_token)
+            if team_id and claims.token_chatgpt_account_id != team_id:
+                raise WorkspaceMismatchError(expected=team_id, actual=claims.token_chatgpt_account_id)
         response = self._chatgpt_post(
             CODEX_RESPONSES_PATH,
             headers=_codex_responses_headers(access_token=access_token, team_id=team_id),
@@ -252,7 +254,7 @@ class OpenAIChatGPTClient:
         if status_code < 200 or status_code >= 300:
             return {
                 "status": "failed",
-                "token_chatgpt_account_id": claims.token_chatgpt_account_id,
+                "token_chatgpt_account_id": claims.token_chatgpt_account_id if claims is not None else team_id,
                 "headers": headers,
                 "http_status": status_code,
                 "error_code": f"http_{status_code}",
@@ -262,7 +264,7 @@ class OpenAIChatGPTClient:
         _assert_codex_heartbeat_http_ok(response)
         return {
             "status": "ok",
-            "token_chatgpt_account_id": claims.token_chatgpt_account_id,
+            "token_chatgpt_account_id": claims.token_chatgpt_account_id if claims is not None else team_id,
             "headers": headers,
         }
 

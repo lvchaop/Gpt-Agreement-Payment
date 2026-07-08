@@ -29,6 +29,7 @@
 | `15-ops-console-ui-design.md` | 当前 Ops Console 的页面结构和 UI 设计记录 |
 | `16-portal-operations-redesign.md` | Portal 运营端最终形态：导航、页面职责、操作流和后端接口改造 |
 | `17-space-auth-push-redesign.md` | Space 授权、推送、余额、用量、回收重构；目标态只有一套 Space 逻辑 |
+| `19-protocol-account-registration-design.md` | 纯协议账号注册接入设计：邮箱注册不绑手机号、手机号注册绑定邮箱、邮箱池回传、Job/Work 入口 |
 | `schema/001_initial_schema.sql` | PostgreSQL 目标表结构 |
 | `schema/ER.md` | ER 图、核心关系和约束说明 |
 

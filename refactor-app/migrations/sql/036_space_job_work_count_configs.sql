@@ -11,7 +11,7 @@ updated_at = now()
 WHERE schedule_type = 'automation.space_membership_invite_sync';
 
 UPDATE automation_schedules
-SET config_json = jsonb_build_object('work_count', 5),
+SET config_json = jsonb_build_object('work_count', 1),
 updated_at = now()
 WHERE schedule_type = 'automation.space_authorize';
 

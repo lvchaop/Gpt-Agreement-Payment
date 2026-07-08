@@ -659,9 +659,10 @@ def _register_method_from_config(path: str) -> str:
         return ""
 
 
-def register(cardw_config_path, proxy=None, python="python3", timeout=600,
+def register(cardw_config_path, proxy=None, python=None, timeout=600,
              browser: bool | None = None, register_method: str | None = None,
-             log_context: str = ""):
+             log_context: str = "", register_email: str = "",
+             mail_fetch_protocol: str = ""):
     """注册一个新 ChatGPT 账号。
 
     注册路径优先级：显式 register_method > WEBUI_REG_METHOD/WEBUI_REG_MODE >
@@ -697,6 +698,9 @@ from browser_register import browser_register
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
 mail = MailProvider.from_config(cfg.mail, config_path=config_path)
+target_email = sys.argv[3] if len(sys.argv) > 3 else ""
+if target_email:
+    mail.reserve_email(target_email)
 result = browser_register(cfg, mail)
 try:
     mail.mark_used(result.get("email", ""))
@@ -716,6 +720,9 @@ from phone_register import phone_register
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
 mail = MailProvider.from_config(cfg.mail, config_path=config_path)
+target_email = sys.argv[3] if len(sys.argv) > 3 else ""
+if target_email:
+    mail.reserve_email(target_email)
 result = phone_register(cfg, mail)
 try:
     mail.mark_used(result.get("email", ""))
@@ -740,6 +747,9 @@ try:
 except Exception:
     pass
 mail = MailProvider.from_config(cfg.mail, config_path=config_path)
+target_email = sys.argv[3] if len(sys.argv) > 3 else ""
+if target_email:
+    mail.reserve_email(target_email)
 phone = PhoneProvider.from_config(cfg.phone)
 flow = AuthFlow(cfg)
 result = flow.run_phone_register(mail, phone)
@@ -761,6 +771,9 @@ from mail_provider import MailProvider
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
 mail = MailProvider.from_config(cfg.mail, config_path=config_path)
+target_email = sys.argv[3] if len(sys.argv) > 3 else ""
+if target_email:
+    mail.reserve_email(target_email)
 flow = AuthFlow(cfg)
 result = flow.run_register(mail)
 try:
@@ -779,11 +792,17 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         # 代理通过配置文件传递，不通过环境变量
 
         pass
+    fetch_protocol = (mail_fetch_protocol or "").strip().lower()
+    if fetch_protocol:
+        env["MAIL_FETCH_PROTOCOL"] = fetch_protocol
 
     register_tag = _log_tag("register", log_context)
     reg_tag = _log_tag("reg", log_context)
-    cmd = [python, "-c", script, auth_bundle_dir, cardw_config_path]
-    print(f"{register_tag} 注册新账号 (method={method}, config={os.path.basename(cardw_config_path)}) ...")
+    target_register_email = (register_email or "").strip()
+    child_python = str(python or sys.executable)
+    cmd = [child_python, "-c", script, auth_bundle_dir, cardw_config_path, target_register_email]
+    email_note = f", email={target_register_email}" if target_register_email else ""
+    print(f"{register_tag} 注册新账号 (method={method}, config={os.path.basename(cardw_config_path)}{email_note}) ...")
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -6083,6 +6102,11 @@ def main():
     parser.add_argument("--register-method", default="",
                         choices=("", "browser", "protocol", "phone_browser", "phone_protocol"),
                         help="注册路径：browser / protocol / phone_browser / phone_protocol；空则读 WEBUI_REG_MODE 或注册配置")
+    parser.add_argument("--register-email", default="", metavar="EMAIL",
+                        help="指定本次注册使用的邮箱；仅支持注册配置 mail.mode=imap_list")
+    parser.add_argument("--mail-fetch-protocol", default="auto",
+                        choices=("auto", "imap", "graph"),
+                        help="imap_list 收信协议：auto=Outlook token 优先 Graph 后降级 IMAP；imap=强制 IMAP；graph=保留给显式 Graph")
     parser.add_argument("--pay-only", action="store_true",
                         help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,
@@ -6319,7 +6343,12 @@ def main():
                     temp_cardw = _rewrite_cardw_with_domain(cardw_cfg, "", plan.register, plan)
                     effective_cardw = temp_cardw
                     print(f"[ProxyStage] register-only 阶段代理: {_describe_stage_plan(plan)}")
-                result = register(effective_cardw, register_method=args.register_method or None)
+                result = register(
+                    effective_cardw,
+                    register_method=args.register_method or None,
+                    register_email=args.register_email,
+                    mail_fetch_protocol=args.mail_fetch_protocol,
+                )
                 if plan.has_any():
                     result["proxy_stage_plan"] = plan.to_dict()
             except Exception as e:

@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from .config import Config
@@ -85,8 +85,9 @@ class EmailAlreadyInUseError(RuntimeError):
 class AuthFlow:
     """注册/登录协议流"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, trace_callback: Optional[Callable[[dict[str, Any]], None]] = None):
         self.config = config
+        self._trace_callback = trace_callback
         self._impersonate_candidates = ["chrome136", "chrome124", "chrome120"]
         self._impersonate_idx = 0
         self.session = create_http_session(
@@ -114,6 +115,8 @@ class AuthFlow:
         self._last_sentinel_token: str = ""
         self._last_sentinel_so_token: str = ""
         self._last_otp_sent_at: float = 0.0
+        self._last_auth_oauth_init_url: str = ""
+        self._last_auth_session_logging_id: str = ""
         self._trace_dump_enabled = bool(getattr(config, "auth_trace_dump_enabled", False)) or str(
             os.getenv("AUTH_TRACE_DUMP", "0")
         ).lower() in ("1", "true", "yes", "on")
@@ -378,7 +381,7 @@ class AuthFlow:
             if name in seen:
                 continue
             try:
-                value = self.session.cookies.get(name, "")
+                value = self._get_oai_did_cookie() if name == "oai-did" else self.session.cookies.get(name, "")
             except Exception:
                 value = ""
             if value:
@@ -389,7 +392,7 @@ class AuthFlow:
 
     def _trace_http(self, step: str, resp, extra_request: dict | None = None):
         """可选 HTTP 细粒度追踪（用于协议调试）"""
-        if (not self._http_trace_enabled and not self._trace_dump_enabled) or resp is None:
+        if resp is None:
             return
         try:
             req = getattr(resp, "request", None)
@@ -457,6 +460,50 @@ class AuthFlow:
             req_headers_lc = {(str(k).lower()): v for k, v in (req_headers or {}).items()}
             sentinel_header = str(req_headers_lc.get("openai-sentinel-token", "") or "")
             sentinel_so_header = str(req_headers_lc.get("openai-sentinel-so-token", "") or "")
+            safe_req_url = self._redact_trace_text(str(req_url))
+            safe_final_url = self._redact_trace_text(final_url)
+            safe_location = self._redact_trace_text(location)
+            safe_body = self._redact_trace_text(body)
+            safe_req_body = self._redact_trace_text((req_body or "").replace("\n", " ").replace("\r", " "))
+
+            if self._trace_callback is not None:
+                try:
+                    self._trace_callback(
+                        {
+                            "step": step,
+                            "email": self.result.email,
+                            "method": method,
+                            "request_url": safe_req_url[:500],
+                            "request_body": safe_req_body[:500],
+                            "status_code": status,
+                            "response_url": safe_final_url[:500],
+                            "location": safe_location[:180],
+                            "x_request_id": req_id,
+                            "content_type": ctype,
+                            "body": safe_body[:500],
+                            "openai_sentinel_token_len": len(sentinel_header),
+                            "openai_sentinel_so_token_len": len(sentinel_so_header),
+                            "has_set_cookie": bool(set_cookie_raw),
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"HTTP trace callback failed: {e}")
+
+            if str(os.getenv("AUTH_DEBUG_HTTP", "1")).lower() not in ("0", "false", "no", "off"):
+                logger.info(
+                    "[AUTH DEBUG] %s | %s %s -> %s | final=%s | location=%s | req_body=%s | body=%s",
+                    step,
+                    method,
+                    safe_req_url[:300],
+                    status,
+                    safe_final_url[:300],
+                    safe_location[:180],
+                    safe_req_body[:500],
+                    safe_body[:500],
+                )
+
+            if not self._http_trace_enabled and not self._trace_dump_enabled:
+                return
 
             if self._http_trace_enabled:
                 logger.info(
@@ -533,6 +580,56 @@ class AuthFlow:
                     logger.debug(f"HTTP 抓包写入失败: {e}")
         except Exception as e:
             logger.debug(f"HTTP trace 输出失败: {e}")
+
+    @staticmethod
+    def _redact_trace_text(text: str) -> str:
+        """Redact token-like values before writing protocol traces to job_events."""
+        if not text:
+            return ""
+        redacted = str(text)
+        redacted = re.sub(
+            r'("?(?:access_token|id_token|refresh_token|session_token|authorization|code)"?\s*[:=]\s*")([^"]{8,})(")',
+            r"\1<redacted>\3",
+            redacted,
+            flags=re.IGNORECASE,
+        )
+        redacted = re.sub(
+            r"((?:access_token|id_token|refresh_token|session_token|code|authorization)=)([^&\s]{8,})",
+            r"\1<redacted>",
+            redacted,
+            flags=re.IGNORECASE,
+        )
+        redacted = re.sub(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", "Bearer <redacted>", redacted)
+        return redacted
+
+    def _get_oai_did_cookie(self) -> str:
+        """Read oai-did without triggering CookieConflict when multiple domains set it."""
+        cookie_jar = getattr(self.session, "cookies", None)
+        if cookie_jar is None:
+            return ""
+        for domain in (".openai.com", "auth.openai.com", ".chatgpt.com", "chatgpt.com"):
+            try:
+                value = cookie_jar.get("oai-did", "", domain=domain)
+            except Exception:
+                value = ""
+            if value:
+                return str(value)
+        try:
+            jar_iter = list(cookie_jar)
+        except Exception:
+            jar_iter = []
+        for preferred in ("openai.com", "chatgpt.com"):
+            for cookie in jar_iter:
+                try:
+                    if getattr(cookie, "name", "") != "oai-did":
+                        continue
+                    domain = (getattr(cookie, "domain", "") or "").lower()
+                    value = getattr(cookie, "value", "") or ""
+                    if preferred in domain and value:
+                        return str(value)
+                except Exception:
+                    continue
+        return ""
 
     def _sniff_login_verifier(self, text: str, source: str = ""):
         """从任意文本中提取 login_verifier/code_verifier。"""
@@ -969,7 +1066,7 @@ class AuthFlow:
         password = (self.result.password or "").strip() or self._default_password_from_email(email)
         self.result.password = password
 
-        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        device_id = (self.result.device_id or "").strip() or self._get_oai_did_cookie().strip()
         if not device_id:
             device_id = str(uuid.uuid4())
             self.result.device_id = device_id
@@ -1032,7 +1129,7 @@ class AuthFlow:
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json"
         headers["Origin"] = "https://auth.openai.com"
-        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        device_id = (self.result.device_id or "").strip() or self._get_oai_did_cookie().strip()
         if device_id:
             headers["oai-device-id"] = device_id
         return headers
@@ -1319,7 +1416,7 @@ class AuthFlow:
         verifier, challenge = self._build_pkce_pair()
         state = self._b64url_no_pad(secrets.token_bytes(40))
         nonce = self._b64url_no_pad(secrets.token_bytes(40))
-        device_id = (self.result.device_id or self.session.cookies.get("oai-did", "") or str(uuid.uuid4())).strip()
+        device_id = (self.result.device_id or self._get_oai_did_cookie() or str(uuid.uuid4())).strip()
         self.result.device_id = device_id
         params = {
             "issuer": "https://auth.openai.com",
@@ -1367,7 +1464,7 @@ class AuthFlow:
         except Exception as e:
             logger.debug("Platform callback 页面请求失败，继续 token exchange: %s", e)
         headers = {
-            "Accept": "*/*",
+            "Accept": "application/json",
             "Content-Type": "application/json",
             "auth0-client": "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9",
             "Origin": "https://platform.openai.com",
@@ -1956,11 +2053,14 @@ class AuthFlow:
 
         headers = {
             "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9",
+            "Cache-Control": "no-cache",
             "Referer": referer,
             "Origin": origin,
+            "Pragma": "no-cache",
             "User-Agent": USER_AGENT,
-            "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+            "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
             "Sec-Fetch-Dest": "empty",
@@ -1975,7 +2075,7 @@ class AuthFlow:
         except Exception:
             host = ""
         if "auth.openai.com" in host:
-            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+            device_id = (self.result.device_id or "").strip() or self._get_oai_did_cookie().strip()
             if device_id:
                 headers["oai-device-id"] = device_id
 
@@ -2049,15 +2149,12 @@ class AuthFlow:
                         "请切换可直连 chatgpt.com 的网络或在界面中配置可用代理后重试。"
                     ) from e
                 raise
-            if resp.status_code == 403:
-                if attempt < 2:
+                if resp.status_code == 403 and attempt < 2:
                     wait = (attempt + 1) * 5
                     logger.warning(f"Cloudflare 403, {wait}s 后重试 ({attempt + 1}/3)...")
                     import time
                     time.sleep(wait)
                     continue
-                self._trace_http("chatgpt_csrf", resp)
-                raise RuntimeError("cloudflare_csrf_403_after_3_retries")
             resp.raise_for_status()
             break
 
@@ -2138,6 +2235,7 @@ class AuthFlow:
                 self._trace_http("auth_oauth_init_after_browser_warmup", resp)
             if self._is_cloudflare_challenge_response(resp):
                 raise RuntimeError("auth_oauth_init 被 Cloudflare challenge 拦截，浏览器 warmup 后仍未建立 auth session")
+        self._last_auth_oauth_init_url = str(getattr(resp, "url", "") or "")
 
         # 从 cookie 获取 oai-did
         device_id = ""
@@ -2147,13 +2245,13 @@ class AuthFlow:
                     device_id = cookie.value
                     break
             elif isinstance(cookie, str) and cookie == "oai-did":
-                device_id = self.session.cookies.get("oai-did", "")
+                device_id = self._get_oai_did_cookie()
                 break
 
         # curl_cffi cookies 访问方式
         if not device_id:
             try:
-                device_id = self.session.cookies.get("oai-did", "")
+                device_id = self._get_oai_did_cookie()
             except Exception:
                 pass
 
@@ -2266,7 +2364,7 @@ class AuthFlow:
         fresh_sentinel_token = sentinel_token
         fresh_so_token = self._last_sentinel_so_token
         try:
-            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+            device_id = (self.result.device_id or "").strip() or self._get_oai_did_cookie().strip()
         except Exception:
             device_id = (self.result.device_id or "").strip()
         if device_id:
@@ -2539,16 +2637,6 @@ class AuthFlow:
         3) email-otp/send
         """
         mode_lc = (mode or "").strip().lower()
-        if mode_lc == "codex_login_need_otp":
-            if self.resend_otp("https://auth.openai.com/email-verification"):
-                return True
-            try:
-                self.send_otp()
-                return True
-            except Exception as e:
-                logger.warning(f"send_otp 兜底失败(mode={mode_lc}): {e}")
-                return False
-
         if self.send_passwordless_otp("https://auth.openai.com/create-account/password"):
             return True
         if self.resend_otp("https://auth.openai.com/email-verification"):

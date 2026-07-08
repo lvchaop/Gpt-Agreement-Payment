@@ -8,6 +8,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from refactor_app.application.workflows.account_auth import ensure_account_proxy_url
 from refactor_app.application.workflows.space_usage import usage_status_from_percent
 from refactor_app.infrastructure.db.models import (
     DownstreamChannelCredentialTypeBalanceModel,
@@ -37,6 +38,20 @@ class SpaceRecycleSweepResult:
     used_count: int
     skipped_count: int
     failed_count: int
+
+
+@dataclass(frozen=True)
+class SpaceRecycleBindingResult:
+    space_credential_id: str
+    status: str
+
+
+@dataclass(frozen=True)
+class ManualSettlePushBindingResult:
+    space_credential_id: str
+    push_status: str
+    reason: str
+    usage_percent: int = 0
 
 
 class SpaceRecycleSweepWorkflow:
@@ -78,6 +93,7 @@ class SpaceRecycleSweepWorkflow:
                 checked_count += 1
                 try:
                     status = _process_binding(
+                        session_factory=self._session_factory,
                         session=session,
                         openai_provider=self._openai_provider,
                         space_credential_id=str(binding_id),
@@ -102,9 +118,110 @@ class SpaceRecycleSweepWorkflow:
             failed_count=failed_count,
         )
 
+    def select_binding_ids(
+        self,
+        input_: SpaceRecycleSweepInput = SpaceRecycleSweepInput(),
+    ) -> list[str]:
+        with self._session_factory() as session:
+            return [
+                str(item)
+                for item in session.scalars(
+                    select(SpacePushBindingModel.space_credential_id)
+                    .join(
+                        SpaceCredentialModel,
+                        SpaceCredentialModel.id == SpacePushBindingModel.space_credential_id,
+                    )
+                    .join(SpaceModel, SpaceModel.id == SpaceCredentialModel.space_id)
+                    .where(
+                        SpacePushBindingModel.push_status == "pushed",
+                        SpaceModel.space_status == "active",
+                    )
+                    .order_by(SpacePushBindingModel.updated_at.asc())
+                    .limit(max(1, int(input_.limit or 100)))
+                ).all()
+            ]
+
+    def run_binding(self, *, space_credential_id: str) -> SpaceRecycleBindingResult:
+        with self._session_factory() as session:
+            status = _process_binding(
+                session_factory=self._session_factory,
+                session=session,
+                openai_provider=self._openai_provider,
+                space_credential_id=space_credential_id,
+            )
+            session.commit()
+            return SpaceRecycleBindingResult(
+                space_credential_id=space_credential_id,
+                status=status,
+            )
+
+
+def manually_settle_pushed_binding_from_usage_state(
+    *,
+    session: Session,
+    space_credential_id: str,
+) -> ManualSettlePushBindingResult:
+    now = datetime.now(UTC)
+    binding = session.get(SpacePushBindingModel, space_credential_id)
+    if binding is None:
+        return ManualSettlePushBindingResult(
+            space_credential_id=space_credential_id,
+            push_status="ignored",
+            reason="missing_push_binding",
+        )
+    if binding.push_status != "pushed":
+        return ManualSettlePushBindingResult(
+            space_credential_id=space_credential_id,
+            push_status="ignored",
+            reason=f"push_status_{binding.push_status}",
+        )
+    credential = session.get(SpaceCredentialModel, space_credential_id)
+    if credential is None:
+        return ManualSettlePushBindingResult(
+            space_credential_id=space_credential_id,
+            push_status="ignored",
+            reason="missing_space_credential",
+        )
+    space = session.get(SpaceModel, credential.space_id)
+    if space is None:
+        return ManualSettlePushBindingResult(
+            space_credential_id=space_credential_id,
+            push_status="ignored",
+            reason="missing_space",
+        )
+    usage_state = _highest_usage_state(session=session, credential=credential)
+    if usage_state is None:
+        return ManualSettlePushBindingResult(
+            space_credential_id=space_credential_id,
+            push_status="ignored",
+            reason="missing_usage_state",
+        )
+    usage_percent = _max_usage_percent(session=session, credential=credential, windows=[])
+    push_status = _settle_binding_locally(
+        session=session,
+        binding=binding,
+        credential=credential,
+        space=space,
+        usage_state=usage_state,
+        usage_percent=usage_percent,
+        now=now,
+        reason=f"manual_settle.usage_percent={usage_percent}",
+        error_message=(
+            "manual settle pushed binding from existing usage state; "
+            "remote member is not removed"
+        ),
+    )
+    return ManualSettlePushBindingResult(
+        space_credential_id=space_credential_id,
+        push_status=push_status,
+        reason=f"usage_percent={usage_percent}",
+        usage_percent=usage_percent,
+    )
+
 
 def _process_binding(
     *,
+    session_factory: Callable[[], Session],
     session: Session,
     openai_provider: OpenAIChatGPTProvider,
     space_credential_id: str,
@@ -118,9 +235,15 @@ def _process_binding(
     if space is None or space.space_status != "active":
         return "ignored"
     try:
+        proxy_url = ensure_account_proxy_url(
+            session_factory,
+            credential.user_account_id,
+            bind_reason="space_recycle_usage_probe",
+        )
         probe = openai_provider.probe_codex_responses_usage(
             access_token=credential.access_token,
             team_id=space.external_space_id if space.space_type == "business" else "",
+            proxy_url=proxy_url,
         )
     except Exception as exc:
         _record_failed_usage_check(

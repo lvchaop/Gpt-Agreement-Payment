@@ -29,6 +29,7 @@ const filters = [
     options: [
       { label: "active", value: "active" },
       { label: "invalid", value: "invalid" },
+      { label: "registering", value: "registering" },
     ],
   },
   {

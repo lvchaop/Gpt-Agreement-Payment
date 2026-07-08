@@ -414,6 +414,55 @@ class Database:
         out["updated_at"] = str(out.get("updated_at") or "")
         return out
 
+    def reserve_mail_account_by_email(self, email: str) -> dict:
+        target = _email(email)
+        if not target:
+            return {}
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute(
+                    """
+                    SELECT id, email, mail_password, provider, imap_host, imap_port,
+                           imap_ssl, account_id, access_token, refresh_token,
+                           openai_password, first, last, status, fail_reason,
+                           created_at, updated_at
+                    FROM mail_accounts
+                    WHERE email = ?
+                    LIMIT 1
+                    """,
+                    (target,),
+                ).fetchone()
+                if not row:
+                    c.execute("COMMIT")
+                    return {}
+                status = _text(row["status"]).strip().lower()
+                if status not in ("", "unused"):
+                    out = dict(row)
+                    c.execute("COMMIT")
+                else:
+                    updated_at = time.time()
+                    c.execute(
+                        """
+                        UPDATE mail_accounts
+                        SET status = 'reserved', fail_reason = '', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (updated_at, int(row["id"])),
+                    )
+                    out = dict(row)
+                    out["status"] = "reserved"
+                    out["fail_reason"] = ""
+                    out["updated_at"] = updated_at
+                    c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        out["imap_ssl"] = "true" if _bool_int(out.get("imap_ssl"), True) else "false"
+        out["imap_port"] = str(_int(out.get("imap_port"), 993))
+        out["updated_at"] = str(out.get("updated_at") or "")
+        return out
+
     def mark_mail_account(self, email: str, status: str, fail_reason: str = "") -> bool:
         target = _email(email)
         if not target:

@@ -26,6 +26,9 @@ class ExternalMailApiPaths:
     release: str = "/mailbox/{external_lease_id}/release"
     ensure_email: str = "/api/external/temp-emails/ensure"
     verification_code: str = "/api/external/verification-code"
+    claim_random: str = "/api/external/pool/claim-random"
+    claim_release: str = "/api/external/pool/claim-release"
+    claim_complete: str = "/api/external/pool/claim-complete"
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,17 @@ class ExternalMailApiClientConfig:
             raise ExternalMailApiClientError("external mail api timeout_s must be positive")
         if self.poll_interval_s <= 0:
             raise ExternalMailApiClientError("external mail api poll_interval_s must be positive")
+
+
+@dataclass(frozen=True)
+class ClaimedMailAccount:
+    account_id: str
+    email: str
+    claim_token: str
+    caller_id: str
+    task_id: str
+    email_domain: str = ""
+    raw: dict[str, Any] | None = None
 
 
 class ExternalMailApiClient:
@@ -96,6 +110,52 @@ class ExternalMailApiClient:
             )
         return data
 
+    def claim_random(
+        self,
+        *,
+        caller_id: str,
+        task_id: str,
+        provider: str = "",
+        project_key: str = "",
+        email_domain: str = "",
+    ) -> ClaimedMailAccount:
+        if not caller_id:
+            raise ExternalMailApiClientError("claim_random requires caller_id")
+        if not task_id:
+            raise ExternalMailApiClientError("claim_random requires task_id")
+        body: dict[str, Any] = {"caller_id": caller_id, "task_id": task_id}
+        if provider:
+            body["provider"] = provider
+        if project_key:
+            body["project_key"] = project_key
+        if email_domain:
+            body["email_domain"] = email_domain
+        payload = self._request_json("POST", self._config.paths.claim_random, json=body)
+        if payload.get("success") is not True:
+            raise ExternalMailApiClientError(f"claim-random failed: {_error_message(payload)}")
+        data = _payload_data(payload)
+        account_id = _first_text(data, "account_id")
+        email = _first_text(data, "email", "address", "mailbox")
+        claim_token = _first_text(data, "claim_token")
+        if not account_id:
+            raise ExternalMailApiClientError("claim-random response missing account_id")
+        if not email:
+            raise ExternalMailApiClientError("claim-random response missing email")
+        if not claim_token:
+            raise ExternalMailApiClientError("claim-random response missing claim_token")
+        return ClaimedMailAccount(
+            account_id=account_id,
+            email=email,
+            claim_token=claim_token,
+            caller_id=caller_id,
+            task_id=task_id,
+            email_domain=_first_text(data, "email_domain"),
+            raw=payload,
+        )
+
+    def pool_stats(self) -> dict[str, Any]:
+        return self._request_json("GET", "/api/external/pool/stats")
+
     def poll_otp(self, *, external_lease_id: str, timeout_s: int) -> OtpMessage | None:
         deadline = self._monotonic() + max(0, timeout_s)
         while True:
@@ -118,7 +178,7 @@ class ExternalMailApiClient:
         issued_after: float | None = None,
         max_polls: int | None = None,
     ) -> OtpMessage:
-        normalized = (email or "").strip().lower()
+        normalized = (email or "").strip()
         if not normalized:
             raise ExternalMailApiClientError("wait_for_otp_by_email requires email")
 
@@ -139,17 +199,26 @@ class ExternalMailApiClient:
                 elapsed_from_threshold = max(0.0, time() - min_message_ts)
                 since_minutes = max(1, int(math.ceil(elapsed_from_threshold / 60.0)) + 1)
 
-            payload = self._request_json(
-                "GET",
-                self._config.paths.verification_code,
-                params={
-                    "email": normalized,
-                    "since_minutes": str(since_minutes),
-                    "code_length": "6",
-                    "code_source": "all",
-                },
-                allow_error_status=True,
-            )
+            try:
+                payload = self._request_json(
+                    "GET",
+                    self._config.paths.verification_code,
+                    params={
+                        "email": normalized,
+                        "since_minutes": str(since_minutes),
+                        "code_length": "6",
+                        "code_source": "all",
+                    },
+                    allow_error_status=True,
+                )
+            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if poll_limit and polls >= poll_limit:
+                    break
+                self._sleep(
+                    min(self._config.poll_interval_s, max(0.1, deadline - self._monotonic()))
+                )
+                continue
             data = _payload_data(payload)
             code = _first_text(data, "verification_code", "code") or _first_text(
                 payload, "verification_code"
@@ -215,6 +284,41 @@ class ExternalMailApiClient:
             json={"reason": reason},
         )
 
+    def claim_release(self, claim: ClaimedMailAccount, *, reason: str = "") -> dict[str, Any]:
+        return self._request_json(
+            "POST",
+            self._config.paths.claim_release,
+            json={
+                "account_id": _coerce_account_id(claim.account_id),
+                "claim_token": claim.claim_token,
+                "caller_id": claim.caller_id,
+                "task_id": claim.task_id,
+                "reason": reason,
+            },
+        )
+
+    def claim_complete(
+        self,
+        claim: ClaimedMailAccount,
+        *,
+        result: str,
+        detail: str = "",
+    ) -> dict[str, Any]:
+        if not result:
+            raise ExternalMailApiClientError("claim_complete requires result")
+        return self._request_json(
+            "POST",
+            self._config.paths.claim_complete,
+            json={
+                "account_id": _coerce_account_id(claim.account_id),
+                "claim_token": claim.claim_token,
+                "caller_id": claim.caller_id,
+                "task_id": claim.task_id,
+                "result": result,
+                "detail": detail,
+            },
+        )
+
     def _request_json(
         self,
         method: str,
@@ -226,9 +330,10 @@ class ExternalMailApiClient:
     ) -> dict[str, Any]:
         response = self._client.request(method, path, json=json, params=params)
         if response.is_error and not allow_error_status:
+            body = response.text[:500]
             raise ExternalMailApiClientError(
                 f"external mail api failed: method={method} path={path} "
-                f"http_status={response.status_code}"
+                f"http_status={response.status_code} body={body}"
             )
         payload = response.json()
         if not isinstance(payload, dict):
@@ -330,3 +435,10 @@ def _first_text(data: dict[str, Any], *keys: str) -> str:
         if value is not None and value != "":
             return str(value)
     return ""
+
+
+def _coerce_account_id(value: str) -> int | str:
+    text = str(value or "").strip()
+    if text.isdigit():
+        return int(text)
+    return text

@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from socket import gethostname
 from uuid import uuid4
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from refactor_app.application.jobs.queue import JobQueue, WorkQueue
 from refactor_app.infrastructure.db.models import (
+    JobModel,
     JobRunModel,
     SpaceCredentialModel,
     SpaceMembershipModel,
@@ -99,21 +101,45 @@ class JobRunner:
                 session.commit()
                 return job.id
 
-            run.run_status = "succeeded"
-            run.finished_at = datetime.now(UTC)
             run.output_json = output
-            job.job_status = "succeeded"
+            if _is_work_summary_output(output):
+                summary = _summary_from_output(output)
+                if summary["queued"] == 0 and summary["running"] == 0:
+                    run.run_status = "failed" if summary["failed"] > 0 else "succeeded"
+                    run.finished_at = datetime.now(UTC)
+                    job.job_status = run.run_status
+                    if run.run_status == "failed":
+                        run.error_code = "work_failed"
+                        run.error_message = (
+                            f"failed={summary['failed']} queued={summary['queued']} "
+                            f"running={summary['running']}"
+                        )
+                    else:
+                        run.error_code = ""
+                        run.error_message = ""
+                else:
+                    run.run_status = "running"
+                    run.finished_at = None
+                    job.job_status = "running"
+            else:
+                run.run_status = "succeeded"
+                run.finished_at = datetime.now(UTC)
+                job.job_status = "succeeded"
             job.updated_at = datetime.now(UTC)
             events.write(
                 run_id=run.id,
-                event_type="job.succeeded",
-                message=f"job {job.type} succeeded",
+                event_type=f"job.{run.run_status}",
+                message=f"job {job.type} {run.run_status}",
+                level="ERROR" if run.run_status == "failed" else "INFO",
             )
             session.commit()
             return job.id
 
     def run_one_work_for_job(self, job_id: str) -> str | None:
         return self._run_one_work(job_id=job_id)
+
+    def run_claimed_work(self, work_id: str) -> str | None:
+        return self._run_claimed_work(work_id)
 
     def _run_one_work(self, *, job_id: str = "") -> str | None:
         with self.session_factory() as session:
@@ -123,6 +149,15 @@ class JobRunner:
                 return None
 
             work_id = work.id
+            session.commit()
+        return self._run_claimed_work(work_id)
+
+    def _run_claimed_work(self, work_id: str) -> str | None:
+        with self.session_factory() as session:
+            work = session.get(WorkItemModel, work_id)
+            if work is None:
+                return None
+            job_id_value = work.job_id
             work_type = work.work_type
             input_json = {**dict(work.input_json), "_work_id": work_id}
             work_context = _work_context(session, input_json)
@@ -160,6 +195,7 @@ class JobRunner:
                             "error": "unknown_work_type",
                         },
                     )
+                _finalize_parent_work_job(session, job_id=job_id_value, run_id=run_id)
                 session.commit()
                 return work_id
 
@@ -192,6 +228,7 @@ class JobRunner:
                             "error": f"{type(exc).__name__}: {exc}",
                         },
                     )
+                _finalize_parent_work_job(session, job_id=job_id_value, run_id=run_id)
                 session.commit()
                 return work_id
 
@@ -217,6 +254,7 @@ class JobRunner:
                         "output": {**work_context, **output},
                     },
                 )
+            _finalize_parent_work_job(session, job_id=job_id_value, run_id=run_id)
             session.commit()
             return work_id
 
@@ -234,8 +272,77 @@ def _fail_work(
     work.error_code = error_code
     work.error_message = error_message[:1000]
     if output_json is not None:
-        work.output_json = output_json
+        work.output_json = {**dict(work.output_json or {}), **output_json}
     work.updated_at = now
+
+
+def _is_work_summary_output(output: dict) -> bool:
+    return all(key in output for key in ("queued", "running", "succeeded", "failed", "cancelled"))
+
+
+def _summary_from_output(output: dict) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for key in ("queued", "running", "succeeded", "failed", "cancelled"):
+        try:
+            summary[key] = int(output.get(key) or 0)
+        except (TypeError, ValueError):
+            summary[key] = 0
+    return summary
+
+
+def _finalize_parent_work_job(session: Session, *, job_id: str, run_id: str = "") -> None:
+    if not job_id:
+        return
+    summary = {
+        "queued": 0,
+        "running": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    rows = session.execute(
+        select(WorkItemModel.work_status, func.count())
+        .where(WorkItemModel.job_id == job_id)
+        .group_by(WorkItemModel.work_status)
+    ).all()
+    for status, count in rows:
+        if status in summary:
+            summary[status] = int(count or 0)
+
+    job = session.get(JobModel, job_id)
+    run = session.get(JobRunModel, run_id) if run_id else None
+    if run is None:
+        run = session.scalars(
+            select(JobRunModel)
+            .where(JobRunModel.job_id == job_id)
+            .order_by(JobRunModel.started_at.desc().nullslast())
+            .limit(1)
+        ).first()
+
+    now = datetime.now(UTC)
+    if job is not None:
+        if summary["queued"] == 0 and summary["running"] == 0:
+            job.job_status = "failed" if summary["failed"] > 0 else "succeeded"
+        else:
+            job.job_status = "running"
+        job.updated_at = now
+    if run is not None:
+        run.output_json = summary
+        if summary["queued"] == 0 and summary["running"] == 0:
+            run.run_status = "failed" if summary["failed"] > 0 else "succeeded"
+            run.finished_at = now
+            if run.run_status == "failed":
+                run.error_code = "work_failed"
+                run.error_message = (
+                    f"failed={summary['failed']} queued={summary['queued']} "
+                    f"running={summary['running']}"
+                )
+            else:
+                run.error_code = ""
+                run.error_message = ""
+        else:
+            run.run_status = "running"
+            run.finished_at = None
 
 
 def _work_context(session: Session, input_json: dict) -> dict:

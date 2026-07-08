@@ -69,6 +69,22 @@ def test_run_preview_session_only(client):
     assert "--paypal" not in body["cmd_str"]
 
 
+def test_build_cmd_register_only_uses_register_email_for_single_target(monkeypatch):
+    import webui.backend.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda name: None)
+    cmd = runner_mod.build_cmd(
+        "single", False, 0, 1, 0, True, False,
+        target_emails=["Target@outlook.com"],
+        register_mode="protocol",
+    )
+    cmd_str = " ".join(cmd)
+    assert "--register-only" in cmd_str
+    assert "--register-method protocol" in cmd_str
+    assert "--register-email Target@outlook.com" in cmd_str
+    assert "--target-emails" not in cmd_str
+
+
 def test_build_cmd_session_only_skips_register_method_even_when_phone(monkeypatch):
     import webui.backend.runner as runner_mod
 

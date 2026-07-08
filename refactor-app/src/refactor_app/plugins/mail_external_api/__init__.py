@@ -1,4 +1,5 @@
 from refactor_app.plugins.mail_external_api.client import (
+    ClaimedMailAccount,
     ExternalMailApiClient,
     ExternalMailApiClientConfig,
     ExternalMailApiClientError,
@@ -12,4 +13,5 @@ __all__ = [
     "ExternalMailApiClientError",
     "ExternalMailApiPaths",
     "ExternalMailApiPlugin",
+    "ClaimedMailAccount",
 ]

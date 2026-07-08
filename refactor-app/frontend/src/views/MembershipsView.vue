@@ -47,7 +47,7 @@ async function loadMemberships() {
     admin_email: adminEmail.value,
     external_space_id: externalSpaceId.value,
     user_email: userEmail.value,
-    space: spaceFilter.value,
+    space_id: spaceFilter.value,
     membership_status: membershipStatus.value,
     session_account_detected: sessionAccountDetected.value,
     has_space_credential: hasSpaceCredential.value,

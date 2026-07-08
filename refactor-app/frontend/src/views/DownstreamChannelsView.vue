@@ -11,6 +11,8 @@ const store = useOpsStore();
 const router = useRouter();
 const pendingPushWorkCount = ref(5);
 const balanceAmounts = ref<Record<string, number>>({});
+const channels = ref<Row[]>([]);
+const selectedEditChannelId = ref("");
 const editingChannel = ref<Row | null>(null);
 const editSaving = ref(false);
 const form = ref({
@@ -24,7 +26,7 @@ const form = ref({
   enabled: true,
   update_existing: true,
   timeout_s: 30,
-  sub2api_concurrency: 0,
+  sub2api_concurrency: 10,
   sub2api_group_ids: "",
   max_active_slots: 1,
 });
@@ -39,7 +41,7 @@ const editForm = ref({
   enabled: true,
   update_existing: true,
   timeout_s: 30,
-  sub2api_concurrency: 0,
+  sub2api_concurrency: 10,
   sub2api_group_ids: "",
 });
 const isLocalSub2api = computed(() => form.value.provider_type === "local_sub2api");
@@ -128,7 +130,12 @@ const credentialTypeLabels: Record<string, string> = {
 };
 
 async function loader() {
-  return resourcesApi.downstreamChannels();
+  const rows = await resourcesApi.downstreamChannels();
+  channels.value = rows;
+  if (selectedEditChannelId.value && !rows.some((row) => String(row.id || "") === selectedEditChannelId.value)) {
+    selectedEditChannelId.value = "";
+  }
+  return rows;
 }
 
 async function createChannel(reload: () => Promise<void>) {
@@ -160,7 +167,7 @@ async function createChannel(reload: () => Promise<void>) {
     form.value.admin_key = "";
     form.value.custom_auth_header_name = "";
     form.value.custom_auth_header_value = "";
-    form.value.sub2api_concurrency = 0;
+    form.value.sub2api_concurrency = 10;
     form.value.sub2api_group_ids = "";
     await reload();
   } catch (err) {
@@ -196,6 +203,20 @@ function openEditChannel(row: Row) {
     sub2api_concurrency: Number(row.sub2api_concurrency || 0),
     sub2api_group_ids: String(row.sub2api_group_ids || ""),
   };
+}
+
+function openSelectedEditChannel() {
+  const id = selectedEditChannelId.value;
+  if (!id) {
+    store.toast("未选择渠道", "请先选择要编辑的下游渠道。", "warning");
+    return;
+  }
+  const row = channels.value.find((item) => String(item.id || "") === id);
+  if (!row) {
+    store.toast("渠道不存在", "请刷新后重新选择。", "warning");
+    return;
+  }
+  openEditChannel(row);
 }
 
 function closeEditChannel() {
@@ -513,6 +534,26 @@ async function deleteChannel(row: Row, reload: () => Promise<void>) {
             <span>同时 Work 数</span>
             <input v-model.number="pendingPushWorkCount" type="number" min="1" max="500" />
           </label>
+        </div>
+      </div>
+      <div class="action-card">
+        <div>
+          <h2>编辑已有渠道</h2>
+          <p>选择一个下游渠道，打开编辑面板修改地址、密钥、推送规则和开关。</p>
+        </div>
+        <div class="form-grid">
+          <label>
+            <span>下游渠道</span>
+            <select v-model="selectedEditChannelId">
+              <option value="">请选择</option>
+              <option v-for="channel in channels" :key="String(channel.id)" :value="String(channel.id)">
+                {{ channel.provider_type }} / {{ channel.name }} / {{ channel.id }}
+              </option>
+            </select>
+          </label>
+          <button class="btn primary create-submit" @click="openSelectedEditChannel">
+            编辑选中渠道
+          </button>
         </div>
       </div>
     </template>

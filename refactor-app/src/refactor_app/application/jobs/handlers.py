@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from time import sleep
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from refactor_app.application.jobs.queue import WorkQueue
 from refactor_app.application.jobs.runner import JobRunner
 from refactor_app.application.workflows.account_auth import (
     BackfillRtWorkflow,
     BackfillSessionRtWorkflow,
     BackfillSessionWorkflow,
+    ensure_account_proxy_url,
 )
 from refactor_app.application.workflows.downstream_provider import provider_from_channel
 from refactor_app.application.workflows.mail import (
@@ -20,9 +25,15 @@ from refactor_app.application.workflows.mail import (
     PollMailOtpWorkflow,
     ReleaseMailLeaseWorkflow,
 )
+from refactor_app.application.workflows.protocol_registration import (
+    EMAIL_PROTOCOL_NO_PHONE,
+    PHONE_PROTOCOL_BIND_EMAIL,
+    ProtocolRegistrationInput,
+    ProtocolRegistrationWorkflow,
+)
 from refactor_app.application.workflows.proxy import (
-    BindTeamAdminProxyWorkflow,
     BindAccountProxyWorkflow,
+    BindTeamAdminProxyWorkflow,
     HealthcheckProxyWorkflow,
     RefreshWebsharePoolWorkflow,
 )
@@ -35,6 +46,8 @@ from refactor_app.application.workflows.space_direct_push import (
     SpaceDirectPushWorkflow,
 )
 from refactor_app.application.workflows.space_membership_invite_sync import (
+    SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S,
+    SPACE_MEMBERSHIP_INVITE_WORK_COUNT,
     SpaceMembershipInviteSyncInput,
     SpaceMembershipInviteSyncWorkflow,
 )
@@ -159,9 +172,11 @@ def register_core_handlers(
     )
     runner.register(
         "space.business_access_token.create.bulk",
-        lambda _session, input_json: {
-            "work_count": len(input_json.get("user_account_ids") or []),
-        },
+        lambda _session, input_json: _run_space_business_access_token_bulk_job(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
     )
     runner.register(
         "space_credential.push.bulk",
@@ -188,6 +203,14 @@ def register_core_handlers(
         },
     )
     runner.register(
+        "account.protocol_register",
+        lambda _session, input_json: _run_protocol_register_job(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
+    )
+    runner.register(
         "space.membership_invite_sync",
         lambda _session, input_json: _run_space_membership_invite_sync_job(
             session_factory=session_factory,
@@ -197,16 +220,11 @@ def register_core_handlers(
     )
     runner.register(
         "space.recycle.sweep",
-        lambda _session, input_json: SpaceRecycleSweepWorkflow(
+        lambda _session, input_json: _run_space_recycle_sweep_job(
             session_factory=session_factory,
-            openai_provider=_openai_plugin(settings),
-        )
-        .run(
-            SpaceRecycleSweepInput(
-                limit=int(input_json.get("limit") or 100),
-            )
-        )
-        .__dict__,
+            settings=settings,
+            input_json=input_json,
+        ),
     )
     runner.register_work(
         "space.membership_invite.account",
@@ -229,24 +247,11 @@ def register_core_handlers(
     )
     runner.register_work(
         "space.business_access_token.create.account",
-        lambda _session, input_json: {
-            "space_credential_id": CreateBusinessAccessTokenCredentialWorkflow(
-                session_factory=session_factory,
-                openai_provider=_openai_plugin(settings),
-            ).run(
-                CreateBusinessAccessTokenCredentialInput(
-                    user_account_id=str(input_json["user_account_id"]),
-                    external_space_id=str(input_json["external_space_id"]),
-                    session_access_token=str(input_json["session_access_token"]),
-                    credential_name=str(input_json["credential_name"]),
-                    cookie_header=str(input_json.get("cookie_header") or ""),
-                    space_name=str(input_json.get("space_name") or ""),
-                    owner_user_account_id=str(input_json.get("owner_user_account_id") or ""),
-                    source_admin_session_id=str(input_json.get("source_admin_session_id") or ""),
-                    proxy_url=str(input_json.get("proxy_url") or ""),
-                )
-            )
-        },
+        lambda _session, input_json: _run_space_business_access_token_account_work(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
     )
     runner.register_work(
         "space_credential.push.account",
@@ -265,6 +270,15 @@ def register_core_handlers(
                 )
             )
         },
+    )
+    runner.register_work(
+        "space.recycle.binding",
+        lambda _session, input_json: SpaceRecycleSweepWorkflow(
+            session_factory=session_factory,
+            openai_provider=_openai_plugin(settings),
+        )
+        .run_binding(space_credential_id=str(input_json["space_credential_id"]))
+        .__dict__,
     )
     runner.register_work(
         "account.backfill_session_rt",
@@ -302,6 +316,17 @@ def register_core_handlers(
             )
         },
     )
+    runner.register_work(
+        "account.protocol_register.one",
+        lambda _session, input_json: ProtocolRegistrationWorkflow(
+            session_factory=session_factory,
+            mail_provider=_mail_plugin(settings),
+        ).run(
+            _protocol_registration_input(input_json),
+            work_id=str(input_json.get("_work_id") or ""),
+            run_id=str(input_json.get("_run_id") or ""),
+        ),
+    )
 
 
 def _run_space_membership_invite_sync_job(
@@ -310,7 +335,7 @@ def _run_space_membership_invite_sync_job(
     settings: Settings,
     input_json: dict,
 ) -> dict:
-    work_count = max(1, int(input_json.get("work_count") or 350))
+    work_count = SPACE_MEMBERSHIP_INVITE_WORK_COUNT
     workflow_result = SpaceMembershipInviteSyncWorkflow(
         session_factory=session_factory,
         openai_provider=_openai_plugin(settings),
@@ -318,10 +343,10 @@ def _run_space_membership_invite_sync_job(
         SpaceMembershipInviteSyncInput(
             space_limit=1,
             invite_limit_per_space=int(input_json.get("invite_limit_per_space") or 350),
-            work_count=work_count,
+            work_count=SPACE_MEMBERSHIP_INVITE_WORK_COUNT,
             membership_cap_per_space=int(input_json.get("membership_cap_per_space") or 1000),
             page_size=int(input_json.get("page_size") or 100),
-            barrier_timeout_s=float(input_json.get("barrier_timeout_s") or 30),
+            barrier_timeout_s=SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S,
         ),
         job_id=str(input_json.get("_job_id") or ""),
         run_id=str(input_json.get("_run_id") or ""),
@@ -340,6 +365,8 @@ def _run_space_membership_invite_sync_job(
             settings=settings,
             job_id=str(input_json.get("_job_id") or ""),
             work_count=work_count,
+            work_type="space.membership_invite.account",
+            claim_batch_before_run=True,
         )
         work_summary = _work_summary(
             session_factory=session_factory,
@@ -351,9 +378,212 @@ def _run_space_membership_invite_sync_job(
     return {
         **output,
         "space_limit": 1,
-        "work_count": queued_invites,
+        "work_count": SPACE_MEMBERSHIP_INVITE_WORK_COUNT,
         **work_summary,
     }
+
+
+def _run_protocol_register_job(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    count = max(1, int(input_json.get("count") or 1))
+    work_count = max(1, int(input_json.get("work_count") or 1))
+    job_id = str(input_json.get("_job_id") or "")
+    run_id = str(input_json.get("_run_id") or "")
+    mode = str(input_json.get("mode") or "").strip()
+    if mode not in (EMAIL_PROTOCOL_NO_PHONE, PHONE_PROTOCOL_BIND_EMAIL):
+        raise RuntimeError(f"unsupported protocol registration mode: {mode}")
+    proxy_url = str(input_json.get("proxy_url") or settings.protocol_register_proxy_url or "")
+    _mail_plugin(settings).pool_stats()
+    with session_factory() as session:
+        queue = WorkQueue(session)
+        for index in range(count):
+            queue.enqueue(
+                job_id=job_id,
+                work_type="account.protocol_register.one",
+                input_json={
+                    **{k: v for k, v in input_json.items() if not k.startswith("_")},
+                    "proxy_url": proxy_url,
+                    "_run_id": run_id,
+                    "registration_index": index,
+                },
+            )
+        session.commit()
+    _run_job_work_now(
+        session_factory=session_factory,
+        settings=settings,
+        job_id=job_id,
+        work_count=work_count,
+    )
+    summary = _work_summary(session_factory=session_factory, job_id=job_id)
+    if int(summary.get("failed") or 0) > 0:
+        raise RuntimeError(f"protocol registration work failed: {summary}")
+    return {"count": count, "work_count": work_count, **summary}
+
+
+def _run_space_recycle_sweep_job(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    workflow = SpaceRecycleSweepWorkflow(
+        session_factory=session_factory,
+        openai_provider=_openai_plugin(settings),
+    )
+    binding_ids = workflow.select_binding_ids(
+        SpaceRecycleSweepInput(limit=int(input_json.get("limit") or 100))
+    )
+    job_id = str(input_json.get("_job_id") or "")
+    run_id = str(input_json.get("_run_id") or "")
+    with session_factory() as session:
+        queue = WorkQueue(session)
+        for space_credential_id in binding_ids:
+            queue.enqueue(
+                job_id=job_id,
+                work_type="space.recycle.binding",
+                input_json={
+                    "space_credential_id": space_credential_id,
+                    "_run_id": run_id,
+                },
+            )
+        session.commit()
+    work_count = max(1, int(input_json.get("work_count") or input_json.get("concurrency") or 5))
+    if binding_ids:
+        _run_job_work_now(
+            session_factory=session_factory,
+            settings=settings,
+            job_id=job_id,
+            work_count=work_count,
+        )
+    summary = _work_summary(session_factory=session_factory, job_id=job_id)
+    return {
+        "selected_count": len(binding_ids),
+        "work_count": work_count,
+        **summary,
+    }
+
+
+def _run_space_business_access_token_bulk_job(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    job_id = str(input_json.get("_job_id") or "")
+    run_id = str(input_json.get("_run_id") or "")
+    work_count = max(1, int(input_json.get("work_count") or 1))
+    if not job_id:
+        return {
+            "selected_count": int(input_json.get("selected_count") or 0),
+            "work_count": work_count,
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+
+    with session_factory() as session:
+        rows = session.scalars(
+            select(WorkItemModel).where(
+                WorkItemModel.job_id == job_id,
+                WorkItemModel.work_type == "space.business_access_token.create.account",
+            )
+        ).all()
+        for row in rows:
+            payload = dict(row.input_json or {})
+            if run_id and not payload.get("_run_id"):
+                payload["_run_id"] = run_id
+                row.input_json = payload
+                row.updated_at = datetime.now(UTC)
+        session.commit()
+
+    _run_job_work_now(
+        session_factory=session_factory,
+        settings=settings,
+        job_id=job_id,
+        work_count=work_count,
+    )
+    summary = _work_summary(session_factory=session_factory, job_id=job_id)
+    return {
+        "selected_count": int(input_json.get("selected_count") or sum(summary.values())),
+        "work_count": work_count,
+        **summary,
+    }
+
+
+def _run_space_business_access_token_account_work(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    sleep_s = max(0.0, float(input_json.get("startup_sleep_s") or 10.0))
+    if sleep_s:
+        sleep(sleep_s)
+    proxy_url = str(input_json.get("proxy_url") or "")
+    if not proxy_url:
+        proxy_url = ensure_account_proxy_url(
+            session_factory,
+            str(input_json["user_account_id"]),
+            bind_reason=str(
+                input_json.get("proxy_bind_reason") or "space_business_access_token_create"
+            ),
+        )
+    return {
+        "space_credential_id": CreateBusinessAccessTokenCredentialWorkflow(
+            session_factory=session_factory,
+            openai_provider=_openai_plugin(settings),
+        ).run(
+            CreateBusinessAccessTokenCredentialInput(
+                user_account_id=str(input_json["user_account_id"]),
+                external_space_id=str(input_json["external_space_id"]),
+                session_access_token=str(input_json.get("session_access_token") or ""),
+                credential_name=str(input_json["credential_name"]),
+                cookie_header=str(input_json.get("cookie_header") or ""),
+                space_name=str(input_json.get("space_name") or ""),
+                owner_user_account_id=str(input_json.get("owner_user_account_id") or ""),
+                source_admin_session_id=str(input_json.get("source_admin_session_id") or ""),
+                proxy_url=proxy_url,
+            )
+        )
+    }
+
+
+def _protocol_registration_input(input_json: dict) -> ProtocolRegistrationInput:
+    return ProtocolRegistrationInput(
+        mode=str(input_json.get("mode") or ""),
+        use_proxy=bool(input_json.get("use_proxy", True)),
+        proxy_url=str(input_json.get("proxy_url") or ""),
+        mail_provider=str(input_json.get("mail_provider") or "outlook"),
+        email_domain=str(input_json.get("email_domain") or ""),
+        project_key=str(input_json.get("project_key") or "openai-register"),
+        caller_id=str(input_json.get("caller_id") or "refactor-app-protocol-registration"),
+        phone_provider=str(input_json.get("phone_provider") or "hero_sms"),
+        phone_base_url=str(
+            input_json.get("phone_base_url") or "https://hero-sms.com/stubs/handler_api.php"
+        ),
+        phone_api_key_env=str(input_json.get("phone_api_key_env") or "HERO_SMS_API_KEY"),
+        phone_service=str(input_json.get("phone_service") or "tg"),
+        phone_country=str(input_json.get("phone_country") or "2"),
+        phone_countries=[
+            str(item).strip()
+            for item in (input_json.get("phone_countries") or [])
+            if str(item).strip()
+        ],
+        phone_max_price=str(input_json.get("phone_max_price") or ""),
+        phone_country_max_prices=dict(input_json.get("phone_country_max_prices") or {}),
+        phone_max_number_attempts=max(1, int(input_json.get("phone_max_number_attempts") or 3)),
+        phone_otp_timeout_s=max(1, int(input_json.get("phone_otp_timeout_s") or 180)),
+        phone_otp_poll_interval_s=max(
+            1.0,
+            float(input_json.get("phone_otp_poll_interval_s") or 3.0),
+        ),
+    )
 
 
 def _run_job_work_now(
@@ -362,10 +592,30 @@ def _run_job_work_now(
     settings: Settings,
     job_id: str,
     work_count: int,
+    one_work_per_runner: bool = False,
+    work_type: str = "",
+    claim_batch_before_run: bool = False,
 ) -> None:
+    if claim_batch_before_run:
+        work_ids = _claim_job_work_batch(
+            session_factory=session_factory,
+            job_id=job_id,
+            work_type=work_type,
+            limit=work_count,
+        )
+        _run_claimed_work_ids_now(
+            session_factory=session_factory,
+            settings=settings,
+            work_ids=work_ids,
+        )
+        return
+
     def run_loop() -> None:
         runner = JobRunner(session_factory)
         register_core_handlers(runner, session_factory=session_factory, settings=settings)
+        if one_work_per_runner:
+            runner.run_one_work_for_job(job_id)
+            return
         while runner.run_one_work_for_job(job_id) is not None:
             pass
 
@@ -375,6 +625,59 @@ def _run_job_work_now(
         return
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [executor.submit(run_loop) for _ in range(worker_count)]
+        for future in as_completed(futures):
+            future.result()
+
+
+def _claim_job_work_batch(
+    *,
+    session_factory: SessionFactory,
+    job_id: str,
+    work_type: str,
+    limit: int,
+) -> list[str]:
+    with session_factory() as session:
+        stmt = (
+            select(WorkItemModel)
+            .where(
+                WorkItemModel.job_id == job_id,
+                WorkItemModel.work_status == "queued",
+            )
+            .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(max(1, int(limit or 1)))
+        )
+        if work_type:
+            stmt = stmt.where(WorkItemModel.work_type == work_type)
+        rows = session.scalars(stmt).all()
+        now = datetime.now(UTC)
+        for row in rows:
+            row.work_status = "running"
+            row.claimed_by = f"batch-{uuid4()}"
+            row.claimed_at = now
+            row.started_at = now
+            row.updated_at = now
+        work_ids = [row.id for row in rows]
+        session.commit()
+        return work_ids
+
+
+def _run_claimed_work_ids_now(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    work_ids: list[str],
+) -> None:
+    if not work_ids:
+        return
+
+    def run_one(work_id: str) -> None:
+        runner = JobRunner(session_factory)
+        register_core_handlers(runner, session_factory=session_factory, settings=settings)
+        runner.run_claimed_work(work_id)
+
+    with ThreadPoolExecutor(max_workers=len(work_ids)) as executor:
+        futures = [executor.submit(run_one, work_id) for work_id in work_ids]
         for future in as_completed(futures):
             future.result()
 

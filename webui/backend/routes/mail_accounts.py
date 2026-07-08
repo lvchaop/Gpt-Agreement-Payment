@@ -20,6 +20,7 @@ from email_account_pool import (  # noqa: E402
     parse_accounts_text,
     account_from_row,
 )
+from graph_otp_provider import GraphOtpProvider  # noqa: E402
 from imap_otp_provider import ImapOtpProvider  # noqa: E402
 
 
@@ -67,6 +68,36 @@ def _safe_error(error: Exception, account=None) -> str:
     if email:
         text = text.replace(email, _mask_email(email))
     return text
+
+
+def _prefer_graph(account) -> bool:
+    provider = (getattr(account, "provider", "") or "").strip().lower()
+    return provider == "outlook" and bool(
+        getattr(account, "access_token", "") or getattr(account, "refresh_token", "")
+    )
+
+
+def _list_messages_with_graph_fallback(account, limit: int) -> tuple[list[dict], str]:
+    if _prefer_graph(account):
+        try:
+            provider = GraphOtpProvider(account)
+            messages = provider.list_messages(limit=limit)
+            logger.warning(
+                "mail.accounts.list graph_ok account=%s count=%s",
+                _safe_account(account),
+                len(messages),
+            )
+            return messages, "graph"
+        except Exception as e:
+            logger.warning(
+                "mail.accounts.list graph_failed_fallback_imap account=%s error=%s",
+                _safe_account(account),
+                _safe_error(e, account),
+            )
+
+    provider = ImapOtpProvider(account)
+    messages = provider.list_messages(limit=limit)
+    return messages, "imap"
 
 
 def _accounts_text_diagnostics(text: str) -> dict:
@@ -222,18 +253,19 @@ def list_messages(req: ListRequest, user: str = CurrentUser):
         for account in selected:
             logger.warning("mail.accounts.list selected account=%s", _safe_account(account))
             try:
-                provider = ImapOtpProvider(account)
-                messages = provider.list_messages(limit=req.limit)
+                messages, protocol = _list_messages_with_graph_fallback(account, req.limit)
                 resp = {
                     "email": account.email,
                     "provider": account.provider,
+                    "protocol": protocol,
                     "count": len(messages),
                     "messages": messages,
                 }
                 logger.warning(
-                    "mail.accounts.list out email=%s provider=%s count=%s",
+                    "mail.accounts.list out email=%s provider=%s protocol=%s count=%s",
                     _mask_email(account.email),
                     account.provider,
+                    protocol,
                     len(messages),
                 )
                 return resp

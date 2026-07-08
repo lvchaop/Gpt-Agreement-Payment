@@ -7,6 +7,10 @@ import httpx
 from refactor_app.plugins.contracts import DownstreamCodexPayload, DownstreamPushResult
 from refactor_app.plugins.downstream_common import codex_credentials_body
 from refactor_app.plugins.downstream_cpa.client import build_cpa_auth_file
+from refactor_app.plugins.downstream_sub2api.client import (
+    build_sub2api_business_access_token_import_payload,
+    build_sub2api_import_payload,
+)
 
 
 class CustomHttpClientError(RuntimeError):
@@ -64,6 +68,14 @@ class CustomHttpClient:
                 error_message=str(raw.get("message") or raw.get("error") or raw.get("body") or ""),
                 raw=raw,
             )
+        html_error = _html_response_error(raw)
+        if html_error:
+            return DownstreamPushResult(
+                pushed=False,
+                error_code="unexpected_html_response",
+                error_message=html_error,
+                raw=raw,
+            )
         return DownstreamPushResult(
             pushed=True,
             downstream_external_id=_custom_http_external_id(raw),
@@ -71,16 +83,30 @@ class CustomHttpClient:
         )
 
     def push_business_access_token(self, payload: dict) -> DownstreamPushResult:
+        body = build_custom_http_business_payload(
+            payload,
+            payload_type=self._config.payload_type,
+            sub2api_concurrency=self._config.sub2api_concurrency,
+            sub2api_group_ids=self._config.sub2api_group_ids,
+        )
         headers = {"Content-Type": "application/json"}
         if self._config.auth_header_name:
             headers[self._config.auth_header_name] = self._config.auth_header_value
-        response = self._client.post(self._config.url, json=payload, headers=headers)
+        response = self._client.post(self._config.url, json=body, headers=headers)
         raw = _safe_json(response)
         if response.is_error:
             return DownstreamPushResult(
                 pushed=False,
                 error_code=f"http_{response.status_code}",
                 error_message=str(raw.get("message") or raw.get("error") or raw.get("body") or ""),
+                raw=raw,
+            )
+        html_error = _html_response_error(raw)
+        if html_error:
+            return DownstreamPushResult(
+                pushed=False,
+                error_code="unexpected_html_response",
+                error_message=html_error,
                 raw=raw,
             )
         return DownstreamPushResult(
@@ -98,7 +124,11 @@ def build_custom_http_payload(
     sub2api_group_ids: tuple[int, ...] = (),
 ) -> dict:
     if payload_type == "sub2api":
-        return codex_credentials_body(payload)
+        return build_sub2api_import_payload(
+            payload,
+            concurrency=sub2api_concurrency,
+            group_ids=sub2api_group_ids,
+        )
     if payload_type == "sub2api_admin_accounts":
         credentials = codex_credentials_body(payload)
         plan = payload.plan_type or payload.plan_tag or "team"
@@ -120,6 +150,38 @@ def build_custom_http_payload(
     raise CustomHttpClientError("custom http payload_type must be sub2api, sub2api_admin_accounts or cpa")
 
 
+def build_custom_http_business_payload(
+    payload: dict,
+    *,
+    payload_type: str,
+    sub2api_concurrency: int = 0,
+    sub2api_group_ids: tuple[int, ...] = (),
+) -> dict:
+    if payload_type == "sub2api":
+        return build_sub2api_business_access_token_import_payload(
+            payload,
+            concurrency=sub2api_concurrency,
+            group_ids=sub2api_group_ids,
+        )
+    if payload_type == "sub2api_admin_accounts":
+        account = payload["accounts"][0]
+        body = {
+            "name": account.get("name") or f"pat-{account['credentials']['email']}",
+            "platform": account.get("platform") or "openai",
+            "type": account.get("type") or "oauth",
+            "credentials": account["credentials"],
+            "expires_at": account.get("expires_at") or account["credentials"].get("expires_at"),
+        }
+        if sub2api_concurrency > 0:
+            body["concurrency"] = int(sub2api_concurrency)
+        if sub2api_group_ids:
+            body["group_ids"] = [int(group_id) for group_id in sub2api_group_ids]
+        return body
+    if payload_type == "cpa":
+        return payload
+    raise CustomHttpClientError("custom http payload_type must be sub2api, sub2api_admin_accounts or cpa")
+
+
 def _custom_http_external_id(raw: dict) -> str:
     data = raw.get("data")
     if isinstance(data, dict):
@@ -127,6 +189,15 @@ def _custom_http_external_id(raw: dict) -> str:
         if value:
             return str(value)
     return str(raw.get("id") or raw.get("account_id") or raw.get("body") or "")
+
+
+def _html_response_error(raw: dict) -> str:
+    body = str(raw.get("body") or "").strip().lower()
+    if not body:
+        return ""
+    if body.startswith("<!doctype html") or body.startswith("<html") or "<html" in body[:200]:
+        return "custom http endpoint returned html page, not api response"
+    return ""
 
 
 def _safe_json(response: httpx.Response) -> dict:

@@ -37,7 +37,7 @@ class UserAccountModel(Base):
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
-        CheckConstraint("account_status IN ('active', 'invalid')"),
+        CheckConstraint("account_status IN ('active', 'invalid', 'registering')"),
         CheckConstraint(
             "session_status IN "
             "('unknown', 'active', 'expired', 'invalid', 'refreshing', 'dead', 'error')"

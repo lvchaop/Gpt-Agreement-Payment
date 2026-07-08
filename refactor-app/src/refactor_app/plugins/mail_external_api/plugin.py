@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from refactor_app.plugins.contracts import HealthcheckResult, MailLease, OtpMessage
 from refactor_app.plugins.mail_external_api.client import (
+    ClaimedMailAccount,
     ExternalMailApiClient,
     ExternalMailApiClientConfig,
 )
@@ -32,6 +33,9 @@ class ExternalMailApiPlugin:
             "mailbox.mark_used",
             "mailbox.mark_failed",
             "mailbox.release",
+            "pool.claim_random",
+            "pool.claim_release",
+            "pool.claim_complete",
         ]
 
     def allocate_mailbox(self, *, purpose: str = "") -> MailLease:
@@ -76,3 +80,29 @@ class ExternalMailApiPlugin:
 
     def release(self, *, external_lease_id: str, reason: str = "") -> None:
         self._client.release(external_lease_id=external_lease_id, reason=reason)
+
+    def claim_random(
+        self,
+        *,
+        caller_id: str,
+        task_id: str,
+        provider: str = "",
+        project_key: str = "",
+        email_domain: str = "",
+    ) -> ClaimedMailAccount:
+        return self._client.claim_random(
+            caller_id=caller_id,
+            task_id=task_id,
+            provider=provider,
+            project_key=project_key,
+            email_domain=email_domain,
+        )
+
+    def pool_stats(self) -> dict:
+        return self._client.pool_stats()
+
+    def claim_release(self, claim: ClaimedMailAccount, *, reason: str = "") -> dict:
+        return self._client.claim_release(claim, reason=reason)
+
+    def claim_complete(self, claim: ClaimedMailAccount, *, result: str, detail: str = "") -> dict:
+        return self._client.claim_complete(claim, result=result, detail=detail)

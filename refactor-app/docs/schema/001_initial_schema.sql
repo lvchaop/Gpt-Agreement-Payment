@@ -12,7 +12,7 @@ CREATE TABLE user_accounts (
   phone_country TEXT NOT NULL DEFAULT '',
   openai_user_id TEXT NOT NULL DEFAULT '',
   account_status TEXT NOT NULL CHECK (
-    account_status IN ('active', 'invalid')
+    account_status IN ('active', 'invalid', 'registering')
   ),
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL

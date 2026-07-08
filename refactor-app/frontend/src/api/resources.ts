@@ -24,6 +24,8 @@ export const resourcesApi = {
     postJson<AccountWorkJobResult>("/user-accounts/backfill-session-job", body),
   backfillRt: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/user-accounts/backfill-rt-job", body),
+  createProtocolRegistrationJob: (body: Record<string, unknown>) =>
+    postJson<JobCreated>("/account-protocol-registration/jobs", body),
   patchAccount: (id: string, body: Record<string, unknown>) =>
     patchJson(`/user-accounts/${encodeURIComponent(id)}`, body),
   deleteAccount: (id: string) =>
@@ -53,6 +55,9 @@ export const resourcesApi = {
     return getJson<Row[]>(`/memberships${query ? `?${query}` : ""}`);
   },
   credentials: () => listItems("/space-credentials"),
+  spacePushRecords: () => listItems("/space-push-records"),
+  manualSettleSpacePushRecords: (body: Record<string, unknown>) =>
+    postJson<Row>("/space-push-records/manual-settle", body),
   buildBusinessAccessTokenCredentials: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/space-credentials/business-access-token-job", body),
   pushCredentials: (body: Record<string, unknown>) =>

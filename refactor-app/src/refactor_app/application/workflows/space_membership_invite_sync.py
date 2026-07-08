@@ -27,16 +27,18 @@ class SpaceMembershipInviteSyncWorkflowError(RuntimeError):
 
 _INVITE_BARRIER_LOCK = Lock()
 _INVITE_BARRIERS: dict[tuple[str, str], Barrier] = {}
+SPACE_MEMBERSHIP_INVITE_WORK_COUNT = 350
+SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
 class SpaceMembershipInviteSyncInput:
     space_limit: int = 1
     invite_limit_per_space: int = 350
-    work_count: int = 350
+    work_count: int = SPACE_MEMBERSHIP_INVITE_WORK_COUNT
     membership_cap_per_space: int = 1000
     page_size: int = 100
-    barrier_timeout_s: float = 30
+    barrier_timeout_s: float = SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S
 
 
 @dataclass
@@ -260,7 +262,7 @@ class SpaceMembershipInviteSyncWorkflow:
             limit=target_count,
         )
         barrier_key = f"space-invite:{job_id}:{space.id}"
-        worker_count = max(1, int(input_.work_count or 350))
+        worker_count = SPACE_MEMBERSHIP_INVITE_WORK_COUNT
         for index, account in enumerate(candidates):
             group_index = index // worker_count
             group_start = group_index * worker_count
@@ -276,7 +278,7 @@ class SpaceMembershipInviteSyncWorkflow:
                     "_barrier_key": barrier_key,
                     "_barrier_group": str(group_index),
                     "_barrier_expected": group_expected,
-                    "_barrier_timeout_s": float(input_.barrier_timeout_s or 30),
+                    "_barrier_timeout_s": SPACE_MEMBERSHIP_INVITE_BARRIER_TIMEOUT_S,
                 },
             )
             stats["queued_invite_count"] += 1

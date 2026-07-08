@@ -15,13 +15,18 @@ JOB_WORK_COUNT_LIMITED_WORK_TYPES = {
     "account.backfill_rt",
     "space.business_access_token.create.account",
     "space_credential.push.account",
+    "space.recycle.binding",
+    "account.protocol_register.one",
 }
 
 JOB_SCOPED_WORK_TYPES = {
     "space.membership_invite.account",
     "space.business_access_token.create.account",
     "space_credential.push.account",
+    "space.recycle.binding",
+    "account.protocol_register.one",
 }
+JOB_SCOPED_CLAIM_LIMIT = 350
 
 
 class JobQueue:
@@ -94,12 +99,13 @@ class WorkQueue:
         return work
 
     def claim_next(self, *, worker_id: str, job_id: str = "") -> WorkItemModel | None:
+        claim_limit = JOB_SCOPED_CLAIM_LIMIT if job_id else 100
         stmt = (
             select(WorkItemModel)
             .where(WorkItemModel.work_status == "queued")
             .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
             .with_for_update(skip_locked=True)
-            .limit(100)
+            .limit(claim_limit)
         )
         if job_id:
             stmt = stmt.where(WorkItemModel.job_id == job_id)
