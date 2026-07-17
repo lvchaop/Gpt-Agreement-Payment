@@ -8,14 +8,9 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from refactor_app.application.workflows.space_payloads import (
-    BusinessAccessTokenPayloadInput,
-    build_team_5h_weekly_cpa_payload,
-    build_team_5h_weekly_sub2api_payload,
-    build_team_monthly_cpa_payload,
-    build_team_monthly_sub2api_payload,
+from refactor_app.application.workflows.space_credential_payload import (
+    build_space_credential_payload,
 )
-from refactor_app.application.workflows.space_usage import WhamUsageWindow
 from refactor_app.infrastructure.db.models import (
     DownstreamChannelCredentialTypeBalanceModel,
     DownstreamChannelModel,
@@ -133,12 +128,12 @@ class SpaceDirectPushWorkflow:
                 binding.error_message = ""
                 binding.updated_at = now
 
-            payload, payload_type = _build_payload(
+            payload, payload_type = build_space_credential_payload(
                 session=session,
                 user=user,
                 space=space,
                 credential=credential,
-                channel=channel,
+                provider_type=channel.provider_type,
             )
             attempt = SpacePushAttemptModel(
                 id=f"space-push-attempt-{uuid4()}",
@@ -238,54 +233,6 @@ def _validate_pushable(
         raise SpaceDirectPushWorkflowError("downstream_channel_active_slots_exhausted")
 
 
-def _build_payload(
-    *,
-    session: Session,
-    user: UserAccountModel,
-    space: SpaceModel,
-    credential: SpaceCredentialModel,
-    channel: DownstreamChannelModel,
-) -> tuple[DownstreamCodexPayload | dict, str]:
-    if space.credential_type == "personal_account":
-        return (
-            DownstreamCodexPayload(
-                access_token=credential.access_token,
-                id_token=credential.id_token,
-                refresh_token=credential.refresh_token,
-                email=user.email,
-                account_id=credential.account_id,
-                downstream_chatgpt_account_id=f"{user.id}_{space.id}",
-                token_chatgpt_account_id=credential.token_chatgpt_account_id
-                or space.external_space_id,
-                client_id=credential.codex_client_id,
-                expires_at=credential.expires_at,
-                plan_tag=space.plan_type,
-                plan_type=space.plan_type,
-            ),
-            "personal_account",
-        )
-    usage_windows = _usage_windows_for_credential(session=session, credential_id=credential.id)
-    owner_email = _owner_email(session=session, space=space)
-    payload_input = BusinessAccessTokenPayloadInput(
-        access_token=credential.access_token,
-        chatgpt_account_id=space.external_space_id,
-        chatgpt_user_id=credential.account_id or user.openai_user_id,
-        email=user.email,
-        owner_email=owner_email,
-        credential_type=space.credential_type,
-        usage_windows=tuple(usage_windows),
-    )
-    if space.credential_type == "team_5h_weekly":
-        if channel.provider_type == "cpa":
-            return build_team_5h_weekly_cpa_payload(payload_input), space.credential_type
-        return build_team_5h_weekly_sub2api_payload(payload_input), space.credential_type
-    if space.credential_type == "team_monthly":
-        if channel.provider_type == "cpa":
-            return build_team_monthly_cpa_payload(payload_input), space.credential_type
-        return build_team_monthly_sub2api_payload(payload_input), space.credential_type
-    raise SpaceDirectPushWorkflowError(f"unsupported_credential_type:{space.credential_type}")
-
-
 def _push_payload(
     *,
     provider: DownstreamProvider,
@@ -299,36 +246,6 @@ def _push_payload(
     if not isinstance(payload, dict):
         raise SpaceDirectPushWorkflowError("business_payload_type_mismatch")
     return provider.push_business_access_token(payload)
-
-
-def _usage_windows_for_credential(
-    *,
-    session: Session,
-    credential_id: str,
-) -> list[WhamUsageWindow]:
-    states = session.scalars(
-        select(SpaceCredentialUsageStateModel).where(
-            SpaceCredentialUsageStateModel.space_credential_id == credential_id
-        )
-    ).all()
-    return [
-        WhamUsageWindow(
-            quota_window_kind=state.quota_window_kind,
-            used_percent=state.usage_percent,
-            limit_window_seconds=state.limit_window_seconds,
-            reset_after_seconds=state.reset_after_seconds,
-            reset_at=state.reset_at,
-            raw_window={},
-        )
-        for state in states
-    ]
-
-
-def _owner_email(*, session: Session, space: SpaceModel) -> str:
-    if not space.owner_user_account_id:
-        return space.name
-    owner = session.get(UserAccountModel, space.owner_user_account_id)
-    return owner.email if owner is not None else space.name
 
 
 def _active_space_slot_count(

@@ -76,3 +76,26 @@ def test_infer_business_monthly_from_monthly_window() -> None:
 
     assert infer_credential_type(space_type="business", usage_payload=payload) == "team_monthly"
     assert usage_status_from_percent(95) == "used"
+
+
+def test_infer_business_monthly_from_variable_calendar_month_window() -> None:
+    payload = {
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": True,
+            "limit_reached": False,
+            "primary_window": {
+                "used_percent": 0,
+                "limit_window_seconds": 2_628_000,
+                "reset_after_seconds": 2_628_000,
+                "reset_at": 1_786_465_776,
+            },
+            "secondary_window": None,
+        },
+    }
+
+    windows = parse_wham_usage_windows(payload)
+
+    assert [item.quota_window_kind for item in windows] == ["monthly"]
+    assert windows[0].limit_window_seconds == 2_628_000
+    assert infer_credential_type(space_type="business", usage_payload=payload) == "team_monthly"

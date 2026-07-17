@@ -8,16 +8,16 @@ function normalized(value: unknown) {
 }
 
 function tone(value: string) {
-  if (["succeeded", "success", "active", "ok", "pushed", "available", "used"].includes(value)) {
+  if (["succeeded", "success", "active", "ok", "pushed", "available", "used", "enabled", "completed"].includes(value)) {
     return "success";
   }
-  if (["running", "refreshing", "queued", "pending", "token_generated"].includes(value)) {
+  if (["running", "refreshing", "queued", "pending", "token_generated", "registering", "invited"].includes(value)) {
     return "info";
   }
-  if (["partial_success", "warning", "allocated", "cooldown", "activating"].includes(value)) {
+  if (["partial_success", "warning", "allocated", "cooldown", "activating", "skipped"].includes(value)) {
     return "warning";
   }
-  if (["failed", "invalid", "error", "dead", "revoked", "banned"].includes(value)) {
+  if (["failed", "invalid", "error", "dead", "revoked", "banned", "expired", "disabled"].includes(value)) {
     return "danger";
   }
   if (["superseded", "accepted", "joined"].includes(value)) {
@@ -60,6 +60,10 @@ function displayText(value: string) {
     invited: "已邀请",
     left: "已离开",
     skipped: "已跳过",
+    enabled: "启用",
+    completed: "已完成",
+    registering: "注册中",
+    removed: "已移除",
   };
   return labels[value] ?? value;
 }
@@ -75,39 +79,39 @@ function displayText(value: string) {
 .badge {
   align-items: center;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: 4px;
   display: inline-flex;
   font-size: 12px;
-  font-weight: 800;
-  letter-spacing: 0.01em;
+  font-weight: 700;
+  letter-spacing: 0;
   line-height: 1;
-  min-height: 24px;
-  padding: 0 9px;
+  min-height: 21px;
+  padding: 0 7px;
   white-space: nowrap;
 }
 
 .success {
   background: rgba(34, 197, 94, 0.13);
   border-color: rgba(34, 197, 94, 0.28);
-  color: #86efac;
+  color: var(--success-text);
 }
 
 .info {
   background: rgba(59, 130, 246, 0.14);
   border-color: rgba(59, 130, 246, 0.3);
-  color: #93c5fd;
+  color: #9bc7f6;
 }
 
 .warning {
   background: rgba(245, 158, 11, 0.14);
   border-color: rgba(245, 158, 11, 0.3);
-  color: #fcd34d;
+  color: var(--warning-text);
 }
 
 .danger {
   background: rgba(239, 68, 68, 0.14);
   border-color: rgba(239, 68, 68, 0.32);
-  color: #fca5a5;
+  color: var(--danger-text);
 }
 
 .purple {

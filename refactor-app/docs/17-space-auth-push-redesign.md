@@ -320,6 +320,17 @@ business:
   可使用 plan_type / seat_limit / seats_* / source_admin_session_id
 ```
 
+运营状态规则：
+
+```text
+运营只允许在 active / disabled 之间切换。
+disabled 只停止后续业务处理，不删除 Space、成员、凭证和历史记录。
+disabled Space 不进入邀请、授权、推送、回收、扩席位和未推送凭证下载流程。
+管理员重新导入、Session 空间探测和个人凭证更新不得自动把 disabled 改回 active。
+已经排队但尚未调用上游的邀请和授权 Work，执行时发现 Space 非 active 则跳过。
+重新启用必须由运营显式把状态改为 active。
+```
+
 credential_type 判定规则：
 
 ```text
@@ -335,7 +346,7 @@ team_5h_weekly:
 team_monthly:
   space_type = business
   且 GET /backend-api/wham/usage 返回的窗口包含:
-    limit_window_seconds = 2592000
+    limit_window_seconds 在 2419200～2764800（28～32 天）范围内
   且不包含 five_hour / weekly 组合窗口。
 
 不能只按 plan_type 判定。
@@ -1090,7 +1101,7 @@ Space 新逻辑独有判断：
 ```text
 1. 创建/导入 business space 时可用 GET /backend-api/wham/usage 识别 spaces.credential_type：
    - 返回窗口包含 limit_window_seconds=18000 和 604800 -> team_5h_weekly
-   - 返回窗口包含 limit_window_seconds=2592000 -> team_monthly
+   - 返回窗口的 limit_window_seconds 在 2419200～2764800 范围内 -> team_monthly
 
 2. 回收阶段用 POST /backend-api/codex/responses 的 x-codex 响应头判断窗口用量：
    - x-codex-primary-window-minutes=300   -> five_hour
@@ -1180,12 +1191,12 @@ rate_limit.primary_window / rate_limit.secondary_window:
 
 limit_window_seconds = 18000   -> quota_window_kind = five_hour
 limit_window_seconds = 604800  -> quota_window_kind = weekly
-limit_window_seconds = 2592000 -> quota_window_kind = monthly
+2419200 <= limit_window_seconds <= 2764800 -> quota_window_kind = monthly
 
 credential_type 推导:
   space_type = personal -> personal_account
   space_type = business 且窗口包含 18000 + 604800 -> team_5h_weekly
-  space_type = business 且窗口包含 2592000 -> team_monthly
+  space_type = business 且窗口包含 28～32 天月周期 -> team_monthly
 
 space_credential_usage_states.usage_percent = window.used_percent
 space_credential_usage_states.quota_window_resets_at = to_timestamp(window.reset_at)
@@ -1324,19 +1335,23 @@ build_team_monthly_cpa_payload
 
 Business access token payload 固定结构：
 
+文件重复下载时必须沿用该凭证首次 `manual_export` 的时间；不得刷新
+`exported_at`、`imported_at`、`codex_usage_updated_at`，Personal payload 的
+`last_refresh` 同样保持首次文件导出时间。
+
 ```json
 {
   "exported_at": "<UTC ISO timestamp>",
   "proxies": [],
   "accounts": [
     {
-      "name": "母-<owner_email>-子-<member_email>",
+      "name": "codex-<member_email>",
       "platform": "openai",
       "type": "oauth",
       "credentials": {
         "access_token": "<space_credentials.access_token>",
         "auth_mode": "personalAccessToken",
-        "chatgpt_account_id": "<spaces.external_space_id>",
+        "chatgpt_account_id": "<user_accounts.id>_<spaces.id>",
         "chatgpt_account_is_fedramp": false,
         "chatgpt_user_id": "<member openai user id>",
         "email": "<member email>",
@@ -1355,6 +1370,9 @@ Business access token payload 固定结构：
           "gpt-5.4-2026-03-05": "gpt-5.4-2026-03-05",
           "gpt-5.4-mini": "gpt-5.4-mini",
           "gpt-5.5": "gpt-5.5",
+          "gpt-5.6-luna": "gpt-5.6-luna",
+          "gpt-5.6-sol": "gpt-5.6-sol",
+          "gpt-5.6-terra": "gpt-5.6-terra",
           "gpt-image-1": "gpt-image-1",
           "gpt-image-1.5": "gpt-image-1.5",
           "gpt-image-2": "gpt-image-2"
@@ -1400,7 +1418,8 @@ Business access token payload 固定结构：
 字段来源：
 
 ```text
-chatgpt_account_id = spaces.external_space_id。
+chatgpt_account_id = user_accounts.id + "_" + spaces.id，用作下游唯一账号 ID。
+调用 ChatGPT 上游接口时仍使用 spaces.external_space_id，不使用该拼接值。
 chatgpt_user_id = member 的 OpenAI user id，优先取 space_memberships.remote_user_id；
   不存在时取 user_accounts.openai_user_id 或 auth/session 解析到的 user_id。
 email = user_accounts.email。
@@ -1468,7 +1487,7 @@ flowchart TD
 目标：
 
 ```text
-维护 business space 的成员、邀请和席位快照。
+为一个 active business space 固定发送一批 1000 条成员邀请。
 只处理 spaces.space_type = business。
 不处理 personal space。
 ```
@@ -1476,9 +1495,6 @@ flowchart TD
 上游接口：
 
 ```text
-GET  https://chatgpt.com/backend-api/subscriptions?account_id={space.external_space_id}
-GET  https://chatgpt.com/backend-api/accounts/{space.external_space_id}/users?offset={offset}&limit={limit}&query=
-GET  https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites?offset={offset}&limit={limit}&query=
 POST https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites
 ```
 
@@ -1488,44 +1504,50 @@ POST https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites
 1. space.space_type 必须是 business。
 2. space.space_status 必须是 active。
 3. 必须存在可用 admin/session/access_token；否则跳过该 space。
-4. 不用席位数限制邀请数量；席位只做同步展示和错误诊断。
+4. 不调用 subscriptions、users、invites 查询接口；本 Job 只发邀请。
 5. 不根据 invite_permission 预判是否能邀请；当前以远端 POST invites 的结果为准。
-6. 每个 business space 的 active / invited / accepted 累计数量达到 1000 后，不再发送新邀请。
+6. 固定选满 1000 个候选；不足 1000 时本轮不创建 Work。
 7. 已经 active / invited / accepted 的 membership 不重复邀请；failed membership 不算当前占位。
 8. 不判断账号冷却期；设计上不存在邀请冷却、回收后冷却、跨 space 全局冷却。
 9. 一个 user_account 可以同时存在于多个 business space；只禁止同一个 user_account + 同一个 space 重复邀请。
 10. 邀请成功后写 space_memberships.membership_status = invited。
 11. 不主动接受邀请，不调用 invites/accept。
-12. 每轮邀请前必须先同步远端 users / invites；远端同步结果优先校正本地状态。
-13. 本地 failed 但远端 users / invites 已经出现时，统一改成 active / invited，并清空 failure_code / failure_message。
-14. 只通过成员同步接口观察 membership 是否变为 active，并更新 remote_user_id / remote_synced_at。
-15. 同步失败只标该 membership / space 的同步失败，不影响其他 space。
+12. 成员远端同步是独立的手动入口，不属于本 Job。
+13. 50 个静态代理每个固定承载 20 条 Work。
+14. 1000 条 Work 必须进入同一个内存屏障，到齐后同时请求上游。
 ```
 
 选择加入该 Space 的账号逻辑：
 
 ```text
 选择入口:
-  从单个 business space 出发，不从账号全表直接随机邀请。
+  space_id 非空时，只处理该 ID 对应的 active business space。
+  space_id 留空时，自动选择 updated_at 最早的 1 个 active business space。
+  不从账号全表脱离空间直接邀请。
 
 可邀请数量:
-  invite_limit_per_space = job.config.invite_limit_per_space，默认 350
-  work_count = job.config.work_count，默认 350
-  membership_cap_per_space = job.config.membership_cap_per_space，默认 1000
-  current_membership_count = 同一 space 下 active / invited / accepted 的累计数量
-  remaining_membership_capacity = max(0, membership_cap_per_space - current_membership_count)
-  target_count = min(invite_limit_per_space, remaining_membership_capacity, eligible_account_count)
-  每个 business space 每轮最多邀请 350 个账号。
-  同一 business space 累计 active / invited / accepted 达到 1000 后不再邀请。
-  不因为 seats_entitled / seats_in_use / remote_default_seat_count 不足而减少 target_count。
+  space_id = 可选的目标 business space ID
+  space_limit = 1
+  static_proxy_count = 50
+  invites_per_proxy = 20
+  invite_limit_per_space = 1000
+  work_count = 1000
+  target_count = 1000
+  不按 seats_entitled、seats_in_use、本地占位数减少本轮目标数。
+  候选账号不足 1000 时，本轮不创建邀请 Work。
 
 单次调度上限:
   space_limit 固定按 1 执行。
   每次 scheduler tick 最多处理 1 个 business space。
-  该 business space 最多创建 350 个 invite work。
-  同时运行的 invite work 数 = min(work_count, selected_account_count)，默认最多 350。
-  invite work 使用 barrier：按 work_count 分组；同一组 work 全部到达 barrier 后，再同时调用 POST invites。
-  实际邀请数受 invite_limit_per_space、membership_cap_per_space 剩余额度、eligible_account_count 限制。
+  必须一次创建 1000 个 invite work。
+  1000 个 invite work 使用同一个内存 barrier；全部到达后再同时调用 POST invites。
+
+静态代理分配:
+  处理空间对应的管理员必须存在有效 access_token。
+  Job 准备阶段从 proxy_inventory 选择 50 个 provider_valid=true、status=available 的 static_proxy。
+  每个代理固定分配 20 条 invite work，50 * 20 = 1000。
+  Work 只保存 invite_proxy_id，不保存带密码的代理 URL；执行时按 ID 读取代理并发请求。
+  这 50 个代理是本次邀请 Job 的 Work 分配，不修改管理员原有单代理绑定。
 
 席位来源:
   1. seats_entitled / seats_in_use 来自 subscriptions 接口。
@@ -1534,20 +1556,9 @@ POST https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites
   4. 远端 invites 只用于避免重复邀请同一邮箱，不参与邀请数量计算。
 
 远端同步:
-  1. 每轮处理 space 时，先调用 users 接口同步远端 active members。
-  2. 再调用 invites 接口同步远端 pending invites。
-  3. users / invites 同步结果 upsert 到 space_memberships：
-     - 命中远端 users 时写 membership_status = active
-     - 命中远端 invites 时写 membership_status = invited
-     - 如果本地原来是 failed，以远端结果为准改成 active / invited，并清空 failure_code / failure_message
-  4. 本地存在 active / invited / accepted，但本轮远端 users / invites 都不存在的 membership，直接物理删除该 space_memberships 行。
-     删除必须限定当前正在同步的 space_id：
-       DELETE FROM space_memberships
-       WHERE space_id = :current_space_id
-         AND user_account_id = :user_account_id
-     禁止只按 user_account_id 删除，避免误删同一账号在其它 space 下的 membership。
-  5. 删除后再计算 current_membership_count。
-  6. POST invites 成功后立即写本地 invited；下一轮远端同步负责把 invited 校正为 active / still invited / deleted。
+  固定 1000 邀请 Job 不调用 subscriptions、users、invites 查询接口。
+  每条 Work 只调用一次 POST /backend-api/accounts/{space_id}/invites。
+  POST 成功后写本地 invited；远端真值由独立的手动成员同步入口校正。
 
 账号必须满足:
   1. user_accounts.account_status = active。
@@ -1564,8 +1575,7 @@ POST https://chatgpt.com/backend-api/accounts/{space.external_space_id}/invites
   3. 不因为回收过就阻止该账号加入其它 space。
 
 排序:
-  复用旧实现的公平策略，优先选择 user_accounts.updated_at 最早的账号。
-  后续如增加 last_space_selected_at，再改为该字段；当前不新增字段。
+  数据库 random() 随机选择满足条件的 1000 个账号。
 
 failed membership:
   failed 不算当前占位。
@@ -1580,16 +1590,17 @@ flowchart TD
   A["start"] --> B["select active business spaces"]
   B --> C{"has usable admin session/access_token?"}
   C -- "no" --> C1["skip space: missing_admin_auth"]
-  C -- "yes" --> D["sync subscription/users/invites"]
-  D --> E["select target accounts"]
-  E --> F["enqueue up to 350 invite works"]
-  F --> G["run invite works with work_count pool"]
-  G --> H["barrier wait per group"]
+  C -- "yes" --> D["randomly select exactly 1000 eligible accounts"]
+  D --> E{"50 usable static proxies available?"}
+  E -- "no" --> E1["skip without creating Work"]
+  E -- "yes" --> F["assign 20 Works to each proxy"]
+  F --> G["enqueue 1000 invite Works"]
+  G --> H["one 1000-party memory barrier"]
   H --> I["POST /backend-api/accounts/{space_id}/invites"]
   I --> J{"invite ok?"}
   J -- "no" --> J1["mark invite failed"]
   J -- "yes" --> K["write membership invited"]
-  K --> L["membership sync later observes remote state"]
+  K --> L["manual membership sync later observes remote state"]
   L --> M{"remote member active?"}
   M -- "no" --> M1["keep invited / pending"]
   M -- "yes" --> N["write membership active + remote_user_id"]
@@ -2220,7 +2231,7 @@ credential_type 判定：
 ```text
 space_type = personal -> personal_account
 business usage 包含 18000 + 604800 -> team_5h_weekly
-business usage 包含 2592000 且不包含 18000 + 604800 -> team_monthly
+business usage 包含 28～32 天月周期且不包含 18000 + 604800 -> team_monthly
 ```
 
 验收：
@@ -2255,7 +2266,7 @@ Business payload 字段来源：
 
 ```text
 access_token = space_credentials.access_token
-chatgpt_account_id = spaces.external_space_id
+chatgpt_account_id = user_accounts.id + "_" + spaces.id
 chatgpt_user_id = space_memberships.remote_user_id 或 user_accounts.openai_user_id
 email = user_accounts.email
 plan_type = team
@@ -2353,7 +2364,7 @@ retry / 扣余额 / 退余额语义明确且只落在 Space 表。
 5. 当前状态写 space_credential_usage_states。
 6. 18000 -> five_hour。
 7. 604800 -> weekly。
-8. 2592000 -> monthly。
+8. 2419200～2764800 -> monthly。
 9. team_5h_weekly 同时记录 five_hour 和 weekly。
 10. team_monthly 按 HAR 窗口规则记录 monthly。
 ```

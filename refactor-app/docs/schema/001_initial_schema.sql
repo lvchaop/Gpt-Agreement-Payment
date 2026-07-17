@@ -267,14 +267,16 @@ CREATE TABLE work_items (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   work_type TEXT NOT NULL,
-  work_status TEXT NOT NULL CHECK (work_status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+  work_status TEXT NOT NULL CHECK (work_status IN ('queued', 'running', 'succeeded', 'skipped', 'failed', 'cancelled')),
   priority INTEGER NOT NULL DEFAULT 0 CHECK (priority >= 0),
+  execution_key TEXT NOT NULL DEFAULT '',
   input_json JSONB NOT NULL,
   output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   error_code TEXT NOT NULL DEFAULT '',
   error_message TEXT NOT NULL DEFAULT '',
   claimed_by TEXT NOT NULL DEFAULT '',
   claimed_at TIMESTAMPTZ,
+  lease_expires_at TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL,
@@ -367,6 +369,9 @@ CREATE INDEX idx_jobs_status_priority ON jobs(job_status, priority, created_at);
 CREATE INDEX idx_jobs_type ON jobs(type);
 CREATE INDEX idx_work_items_job_id ON work_items(job_id);
 CREATE INDEX idx_work_items_claim ON work_items(work_status, priority, created_at);
+CREATE INDEX idx_work_items_execution_claim ON work_items(
+  job_id, work_status, execution_key, priority, created_at
+);
 CREATE INDEX idx_work_items_type_status ON work_items(work_type, work_status);
 CREATE INDEX idx_job_runs_job_id ON job_runs(job_id);
 CREATE INDEX idx_job_runs_status ON job_runs(run_status);

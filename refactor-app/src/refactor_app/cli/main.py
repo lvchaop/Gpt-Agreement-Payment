@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import typer
@@ -57,9 +57,7 @@ def migrate() -> None:
         )
         applied = {
             row[0]
-            for row in connection.execute(
-                text("SELECT filename FROM schema_migrations")
-            ).all()
+            for row in connection.execute(text("SELECT filename FROM schema_migrations")).all()
         }
         if has_base_schema and not applied:
             legacy_names = [
@@ -103,28 +101,94 @@ def migrate() -> None:
 
 
 @worker_app.command("run")
-def worker_run(once: bool = True, concurrency: int = 1) -> None:
+def worker_run(
+    once: bool = True,
+    capacity: int = typer.Option(0, "--capacity"),
+) -> None:
     settings = Settings()
     session_factory = _session_factory(settings)
-    if concurrency < 1:
-        raise typer.BadParameter("concurrency must be >= 1")
-    if concurrency > settings.worker_max_concurrency:
-        raise typer.BadParameter(
-            f"concurrency must be <= {settings.worker_max_concurrency}"
-        )
-    if concurrency > 1:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [
-                executor.submit(_run_worker_loop, session_factory, settings, once)
-                for _ in range(concurrency)
-            ]
-            for future in as_completed(futures):
-                for result in future.result():
-                    typer.echo(result)
+    worker_capacity = int(capacity or settings.worker_capacity)
+    if worker_capacity < 1:
+        raise typer.BadParameter("capacity must be >= 1")
+    if worker_capacity > settings.worker_capacity:
+        raise typer.BadParameter(f"capacity must be <= {settings.worker_capacity}")
+    if once:
+        for result in _run_worker_loop(session_factory, settings, True):
+            typer.echo(result)
         return
+    _run_worker_dispatch_loop(
+        session_factory=session_factory,
+        settings=settings,
+        capacity=worker_capacity,
+    )
 
-    for result in _run_worker_loop(session_factory, settings, once):
-        typer.echo(result)
+
+def _run_worker_dispatch_loop(*, session_factory, settings: Settings, capacity: int) -> None:
+    runner = JobRunner(session_factory)
+    register_core_handlers(runner, session_factory=session_factory, settings=settings)
+    runner.requeue_expired_work()
+    futures: dict[Future, tuple[str, str]] = {}
+    last_lease_renewal = time.monotonic()
+    last_expired_requeue = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=capacity) as executor:
+        while True:
+            for future in [item for item in futures if item.done()]:
+                task_type, task_id = futures.pop(future)
+                try:
+                    future.result()
+                except Exception as exc:
+                    typer.echo(f"worker {task_type} {task_id} crashed: {type(exc).__name__}: {exc}")
+
+            now = time.monotonic()
+            if now - last_lease_renewal >= 30:
+                active_work_ids = [
+                    task_id for task_type, task_id in futures.values() if task_type == "work"
+                ]
+                runner.renew_work_leases(active_work_ids)
+                last_lease_renewal = now
+            if now - last_expired_requeue >= 60:
+                runner.requeue_expired_work()
+                last_expired_requeue = now
+
+            free_slots = capacity - len(futures)
+            made_progress = False
+            blocks_normal_dispatch = False
+            if free_slots > 0:
+                work_ids, blocks_normal_dispatch = runner.claim_all_at_once_work_batch(
+                    max_count=free_slots
+                )
+                for work_id in work_ids:
+                    future = executor.submit(runner.run_claimed_work, work_id)
+                    futures[future] = ("work", work_id)
+                free_slots -= len(work_ids)
+                if work_ids:
+                    made_progress = True
+
+            if free_slots > 0 and not blocks_normal_dispatch:
+                claimed_job = runner.claim_next_job()
+                if claimed_job is not None:
+                    job_id, run_id = claimed_job
+                    future = executor.submit(
+                        runner.run_claimed_job,
+                        job_id=job_id,
+                        run_id=run_id,
+                    )
+                    futures[future] = ("job", job_id)
+                    free_slots -= 1
+                    made_progress = True
+
+            while free_slots > 0 and not blocks_normal_dispatch:
+                work_ids = runner.claim_work_batch(max_count=free_slots)
+                if not work_ids:
+                    break
+                for work_id in work_ids:
+                    future = executor.submit(runner.run_claimed_work, work_id)
+                    futures[future] = ("work", work_id)
+                free_slots -= len(work_ids)
+                made_progress = True
+
+            time.sleep(0.05 if made_progress else 0.5)
 
 
 def _run_worker_loop(session_factory, settings: Settings, once: bool) -> list[str]:

@@ -28,6 +28,10 @@ class UserAccountModel(Base):
     auth_cookie_header: Mapped[str] = mapped_column(Text, nullable=False, default="")
     device_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     csrf_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    codex_select_channel_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    codex_select_channel_detected_at: Mapped[datetime | None] = mapped_column(nullable=True)
     session_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
     last_session_refresh_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_login_error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -46,6 +50,7 @@ class UserAccountModel(Base):
         Index("idx_user_accounts_phone_number", "phone_number"),
         Index("idx_user_accounts_openai_user_id", "openai_user_id"),
         Index("idx_user_accounts_account_status", "account_status"),
+        Index("idx_user_accounts_codex_select_channel", "codex_select_channel_required"),
     )
 
 
@@ -673,8 +678,13 @@ class AutomationScheduleModel(Base):
         UniqueConstraint("schedule_type"),
         CheckConstraint(
             "schedule_type IN ("
+            "'automation.space_membership_invite_sync', "
+            "'automation.space_membership_invite_dynamic', "
+            "'automation.space_membership_growth_round', "
+            "'automation.space_authorize', "
             "'automation.space_downstream_push', "
-            "'automation.space_recycle_sweep'"
+            "'automation.space_recycle_sweep', "
+            "'automation.space_seat_expand'"
             ")"
         ),
         CheckConstraint("schedule_status IN ('active', 'paused', 'error')"),
@@ -694,22 +704,34 @@ class WorkItemModel(Base):
     work_type: Mapped[str] = mapped_column(Text, nullable=False)
     work_status: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    execution_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     input_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     output_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     claimed_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
     claimed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
     __table_args__ = (
-        CheckConstraint("work_status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')"),
+        CheckConstraint(
+            "work_status IN ('queued', 'running', 'succeeded', 'skipped', 'failed', 'cancelled')"
+        ),
         CheckConstraint("priority >= 0"),
         Index("idx_work_items_job_id", "job_id"),
         Index("idx_work_items_claim", "work_status", "priority", "created_at"),
+        Index(
+            "idx_work_items_execution_claim",
+            "job_id",
+            "work_status",
+            "execution_key",
+            "priority",
+            "created_at",
+        ),
         Index("idx_work_items_type_status", "work_type", "work_status"),
     )
 

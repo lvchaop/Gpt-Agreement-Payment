@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -7,7 +9,10 @@ import pytest
 from sqlalchemy import delete, inspect
 
 from refactor_app.application.workflows import account_auth
-from refactor_app.application.workflows.account_auth import BackfillSessionWorkflow
+from refactor_app.application.workflows.account_auth import (
+    BackfillRtWorkflow,
+    BackfillSessionWorkflow,
+)
 from refactor_app.config.settings import Settings
 from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
 from refactor_app.infrastructure.db.models import (
@@ -16,6 +21,27 @@ from refactor_app.infrastructure.db.models import (
     UserAccountModel,
     UserAccountProxyBindingModel,
 )
+
+
+def _workspace_access_token(chatgpt_account_id: str) -> str:
+    def encode(value: dict) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "none", "typ": "JWT"}),
+            encode(
+                {
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": chatgpt_account_id,
+                        "chatgpt_user_id": "user-test",
+                    }
+                }
+            ),
+            "",
+        )
+    )
 
 
 def test_backfill_session_marks_deleted_or_deactivated_account_invalid() -> None:
@@ -103,6 +129,51 @@ def test_backfill_session_keeps_account_active_for_regular_failure() -> None:
         session.commit()
 
 
+def test_codex_select_channel_failure_sets_permanent_account_marker_only() -> None:
+    settings = Settings()
+    engine = make_engine(settings)
+    _skip_if_schema_is_not_current(engine)
+    session_factory = make_session_factory(engine)
+    account_id = "test-codex-select-channel-account"
+    now = datetime.now(UTC)
+
+    with session_factory() as session:
+        session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
+        session.add(
+            UserAccountModel(
+                id=account_id,
+                email="select-channel@example.test",
+                account_status="active",
+                session_status="active",
+                last_login_error_code="existing-session-error",
+                last_login_error_message="must remain untouched",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+    workflow = BackfillRtWorkflow(session_factory=session_factory, mail_provider=object())
+    workflow._write_rt_failure(
+        user_account_id=account_id,
+        error_code="phone_otp_select_channel",
+        error_message="select channel",
+    )
+
+    with session_factory() as session:
+        account = session.get(UserAccountModel, account_id)
+        assert account is not None
+        assert account.codex_select_channel_required is True
+        assert account.codex_select_channel_detected_at is not None
+        assert account.account_status == "active"
+        assert account.session_status == "active"
+        assert account.last_login_error_code == "existing-session-error"
+        assert account.last_login_error_message == "must remain untouched"
+
+        session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
+        session.commit()
+
+
 def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -122,13 +193,9 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
                 UserAccountProxyBindingModel.user_account_id == account_id
             )
         )
+        session.execute(delete(SpaceModel).where(SpaceModel.owner_user_account_id == account_id))
         session.execute(
-            delete(SpaceModel).where(SpaceModel.owner_user_account_id == account_id)
-        )
-        session.execute(
-            delete(ProxyInventoryModel).where(
-                ProxyInventoryModel.id.in_([proxy_1_id, proxy_2_id])
-            )
+            delete(ProxyInventoryModel).where(ProxyInventoryModel.id.in_([proxy_1_id, proxy_2_id]))
         )
         session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
         session.add(
@@ -183,6 +250,8 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
 
     monkeypatch.setattr(account_auth, "_probe_proxy_alive", lambda proxy_url: True)
     calls: list[str] = []
+    personal_space_id = "test-personal-space-after-proxy-reassign"
+    personal_access_token = _workspace_access_token(personal_space_id)
 
     def fake_acquire_chatgpt_session(**kwargs):
         calls.append(str(kwargs["proxy"]))
@@ -190,14 +259,14 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
             raise RuntimeError("cloudflare_csrf_403_after_3_retries")
         auth_result = SimpleNamespace(
             session_token="session-token",
-            access_token="access-token",
+            access_token=personal_access_token,
             refresh_token="",
             id_token="",
             cookie_header="",
             device_id="device-id",
             csrf_token="csrf-token",
             chatgpt_account_structure="personal",
-            chatgpt_account_id="test-personal-space-after-proxy-reassign",
+            chatgpt_account_id=personal_space_id,
         )
         return SimpleNamespace(
             ok=True,
@@ -227,6 +296,7 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
         assert proxy_2.proxy_status == "bound"
         assert account is not None
         assert account.session_status == "active"
+        assert account.access_token == personal_access_token
         assert account.last_login_error_code == ""
         assert len(calls) == 2
         assert ":18081" in calls[0]
@@ -237,13 +307,9 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
                 UserAccountProxyBindingModel.user_account_id == account_id
             )
         )
+        session.execute(delete(SpaceModel).where(SpaceModel.owner_user_account_id == account_id))
         session.execute(
-            delete(SpaceModel).where(SpaceModel.owner_user_account_id == account_id)
-        )
-        session.execute(
-            delete(ProxyInventoryModel).where(
-                ProxyInventoryModel.id.in_([proxy_1_id, proxy_2_id])
-            )
+            delete(ProxyInventoryModel).where(ProxyInventoryModel.id.in_([proxy_1_id, proxy_2_id]))
         )
         session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
         session.commit()
@@ -251,5 +317,10 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
 
 def _skip_if_schema_is_not_current(engine) -> None:
     columns = {column["name"] for column in inspect(engine).get_columns("user_accounts")}
-    if {"password", "session_status", "last_login_error_code"} - columns:
+    if {
+        "password",
+        "session_status",
+        "last_login_error_code",
+        "codex_select_channel_required",
+    } - columns:
         pytest.skip("local Postgres schema has not applied Space migrations")

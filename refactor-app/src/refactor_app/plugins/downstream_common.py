@@ -24,7 +24,11 @@ def validate_codex_payload(payload: DownstreamCodexPayload) -> None:
         raise DownstreamPayloadError("token_chatgpt_account_id is required")
 
 
-def codex_credentials_body(payload: DownstreamCodexPayload) -> dict:
+def codex_credentials_body(
+    payload: DownstreamCodexPayload,
+    *,
+    last_refresh: datetime | None = None,
+) -> dict:
     validate_codex_payload(payload)
     expires_at = int(payload.expires_at.timestamp()) if payload.expires_at else None
     return {
@@ -33,7 +37,7 @@ def codex_credentials_body(payload: DownstreamCodexPayload) -> dict:
         "refresh_token": payload.refresh_token,
         "account_id": payload.account_id,
         "email": payload.email,
-        "last_refresh": now_iso(),
+        "last_refresh": (last_refresh or datetime.now(UTC)).isoformat(),
         "expired": expires_at,
         "type": "codex",
         "chatgpt_account_id": payload.downstream_chatgpt_account_id,

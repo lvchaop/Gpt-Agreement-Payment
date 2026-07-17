@@ -151,6 +151,12 @@ def acquire_codex_rt_with_existing_browser_session(
                         failure_message="已有 cookie 未通过 auth.openai.com 登录态校验，回落到登录页",
                         final_url=final_url,
                     )
+                phone_failure = _phone_verification_failure(page, final_url)
+                if phone_failure:
+                    return _phone_failure_result(phone_failure, final_url=final_url)
+                if _is_add_phone_url(final_url):
+                    time.sleep(1)
+                    continue
                 if target_workspace_id or target_workspace_name:
                     if _select_workspace_if_visible(
                         page,
@@ -244,13 +250,6 @@ def acquire_codex_rt_with_browser_login(
             failure_code="missing_email",
             failure_message="补 RT browser login 需要账号邮箱",
         )
-    if not password:
-        return CodexBrowserRtResult(
-            ok=False,
-            failure_code="missing_password",
-            failure_message="补 RT browser login 需要账号密码",
-        )
-
     try:
         from browserforge.fingerprints import Screen
         from camoufox.sync_api import Camoufox
@@ -327,7 +326,8 @@ def acquire_codex_rt_with_browser_login(
 
             _submit_email_if_visible(page, email)
             otp_sent_at = time.time()
-            _submit_password_if_visible(page, password)
+            if password:
+                _submit_password_if_visible(page, password)
 
             end = time.time() + max(30, timeout_s)
             while time.time() < end:
@@ -340,17 +340,24 @@ def acquire_codex_rt_with_browser_login(
                     time.sleep(2)
                     continue
 
-                if _submit_password_if_visible(page, password):
+                if password and _submit_password_if_visible(page, password):
                     time.sleep(3)
                     continue
 
-                if _is_phone_required(page, final_url):
+                if not password and _has_password_input(page):
                     return CodexBrowserRtResult(
                         ok=False,
-                        failure_code="phone_verification_required",
-                        failure_message="auth.openai.com 要求手机号验证，补 RT browser login 无法继续",
+                        failure_code="login_password_required_by_upstream",
+                        failure_message="auth.openai.com 当前登录分支要求密码，但该账号未保存密码",
                         final_url=final_url,
                     )
+
+                phone_failure = _phone_verification_failure(page, final_url)
+                if phone_failure:
+                    return _phone_failure_result(phone_failure, final_url=final_url)
+                if _is_add_phone_url(final_url):
+                    time.sleep(1)
+                    continue
 
                 if _is_otp_page(page, final_url):
                     if not _has_otp_input(page):
@@ -366,7 +373,7 @@ def acquire_codex_rt_with_browser_login(
                             continue
                     if not otp_fetched:
                         otp = mail_provider.wait_for_otp_by_email(
-                            email=email.strip().lower(),
+                            email=email.strip(),
                             timeout_s=180,
                             issued_after=otp_sent_at,
                         )
@@ -596,6 +603,8 @@ def _submit_email_if_visible(page, email: str) -> bool:
 
 
 def _submit_password_if_visible(page, password: str) -> bool:
+    if not password:
+        return False
     try:
         password_input = page.query_selector('input[type="password"]:visible')
         if not password_input:
@@ -606,6 +615,13 @@ def _submit_password_if_visible(page, password: str) -> bool:
             page,
             ['button[type="submit"]', 'button:has-text("Continue")'],
         )
+    except Exception:
+        return False
+
+
+def _has_password_input(page) -> bool:
+    try:
+        return bool(page.query_selector('input[type="password"]:visible'))
     except Exception:
         return False
 
@@ -701,24 +717,52 @@ def _fill_otp(page, code: str) -> bool:
     return False
 
 
-def _is_phone_required(page, current_url: str) -> bool:
-    if "phone-otp/select-channel" in current_url or "add-phone" in current_url or "phone-number" in current_url:
-        try:
-            if _click_first_visible(
-                page,
-                [
-                    'a:has-text("Skip")',
-                    'button:has-text("Skip")',
-                    'a:has-text("Not now")',
-                    'button:has-text("Not now")',
-                    '[data-testid*="skip"]',
-                ],
-            ):
-                return False
-        except Exception:
-            pass
-        return True
-    return False
+def _phone_verification_failure(page, current_url: str) -> str:
+    url = str(current_url or "")
+    if "phone-otp/select-channel" in url:
+        return "phone_otp_select_channel"
+    if not _is_add_phone_url(url):
+        return ""
+    try:
+        if _click_first_visible(
+            page,
+            [
+                'a:has-text("Skip")',
+                'button:has-text("Skip")',
+                'a:has-text("Not now")',
+                'button:has-text("Not now")',
+                'a:has-text("Maybe later")',
+                'button:has-text("Maybe later")',
+                'a:has-text("Skip for now")',
+                'button:has-text("Skip for now")',
+                '[data-testid*="skip"]',
+                'a[href*="skip"]',
+            ],
+        ):
+            return ""
+    except Exception:
+        pass
+    return "add_phone_blocked"
+
+
+def _is_add_phone_url(current_url: str) -> bool:
+    value = str(current_url or "")
+    return "/add-phone" in value or "phone-number" in value
+
+
+def _phone_failure_result(failure_code: str, *, final_url: str) -> CodexBrowserRtResult:
+    messages = {
+        "phone_otp_select_channel": (
+            "auth.openai.com 进入 phone-otp/select-channel，Personal Codex 授权永久跳过"
+        ),
+        "add_phone_blocked": "auth.openai.com 要求添加手机号且没有可用跳过入口",
+    }
+    return CodexBrowserRtResult(
+        ok=False,
+        failure_code=failure_code,
+        failure_message=messages.get(failure_code, failure_code),
+        final_url=final_url,
+    )
 
 
 def _is_workspace_or_consent_page(current_url: str) -> bool:

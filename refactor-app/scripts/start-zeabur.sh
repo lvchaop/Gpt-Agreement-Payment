@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${PORT:-8080}"
-WORKER_CONCURRENCY="${REFACTOR_APP_WORKER_CONCURRENCY:-50}"
+WORKER_CAPACITY="${REFACTOR_APP_WORKER_CAPACITY:-2000}"
 RUN_MIGRATIONS="${REFACTOR_APP_RUN_MIGRATIONS:-1}"
 
 cd "$APP_DIR"
@@ -13,7 +13,7 @@ if [ "$RUN_MIGRATIONS" = "1" ]; then
   python -m refactor_app.cli.main db migrate
 fi
 
-python -m refactor_app.cli.main worker run --no-once --concurrency "$WORKER_CONCURRENCY" &
+python -m refactor_app.cli.main worker run --no-once --capacity "$WORKER_CAPACITY" &
 WORKER_PID="$!"
 
 cleanup() {

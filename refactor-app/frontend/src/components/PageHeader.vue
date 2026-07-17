@@ -23,21 +23,21 @@ defineProps<{
   display: flex;
   gap: 18px;
   justify-content: space-between;
-  margin-bottom: 18px;
+  margin-bottom: 12px;
 }
 
 h1 {
-  font-size: 26px;
-  letter-spacing: -0.03em;
-  line-height: 1.12;
+  font-size: 20px;
+  letter-spacing: 0;
+  line-height: 1.2;
   margin: 0;
 }
 
 p {
   color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1.55;
-  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 5px 0 0;
   max-width: 760px;
 }
 

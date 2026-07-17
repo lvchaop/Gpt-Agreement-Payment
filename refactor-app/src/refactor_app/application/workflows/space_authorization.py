@@ -5,8 +5,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from refactor_app.infrastructure.db.models import (
+    SpaceCredentialModel,
+    SpaceMembershipModel,
+    SpaceModel,
+    UserAccountModel,
+)
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
 from refactor_app.plugins.contracts import OpenAIChatGPTProvider
 
@@ -36,11 +43,80 @@ class UpsertPersonalCodexSpaceCredentialInput:
     id_token: str
     refresh_token: str
     codex_client_id: str
-    account_id: str
     token_chatgpt_account_id: str
     expires_at: datetime | None
     raw_credential_json: dict | None = None
     space_name: str = ""
+
+
+@dataclass(frozen=True)
+class PersonalCodexAuthorizationTarget:
+    space_membership_id: str
+    space_id: str
+    user_account_id: str
+    external_space_id: str
+
+
+def resolve_personal_codex_authorization_target(
+    *,
+    session: Session,
+    space_membership_id: str,
+) -> tuple[PersonalCodexAuthorizationTarget | None, str]:
+    membership = session.get(SpaceMembershipModel, space_membership_id)
+    if membership is None:
+        return None, "membership_not_found"
+    space = session.get(SpaceModel, membership.space_id)
+    if space is None:
+        return None, "space_not_found"
+    account = session.get(UserAccountModel, membership.user_account_id)
+    if account is None:
+        return None, "account_not_found"
+    if space.provider != "openai_chatgpt":
+        return None, "space_provider_not_openai_chatgpt"
+    if space.space_type != "personal":
+        return None, "space_type_not_personal"
+    if space.auth_mode != "codex_oauth":
+        return None, "personal_space_auth_mode_mismatch"
+    if space.credential_type != "personal_account":
+        return None, "personal_space_credential_type_mismatch"
+    if space.space_status != "active":
+        return None, "personal_space_not_active"
+    if space.owner_user_account_id != account.id:
+        return None, "personal_space_owner_mismatch"
+    if not str(space.external_space_id or "").strip():
+        return None, "missing_personal_chatgpt_account_id"
+    if membership.membership_status != "active":
+        return None, "space_membership_not_active"
+    if not membership.session_account_detected:
+        return None, "space_membership_session_account_not_detected"
+    if account.account_status != "active":
+        return None, "account_not_active"
+    if account.codex_select_channel_required:
+        return None, "phone_otp_select_channel_permanent_skip"
+    if not str(account.openai_user_id or "").strip():
+        return None, "missing_user_openai_user_id"
+    cookie_header = str(account.cookie_header or "").strip()
+    auth_cookie_header = str(account.auth_cookie_header or "").strip()
+    if not (cookie_header or auth_cookie_header):
+        return None, "missing_session_cookie"
+    active_credential_id = session.scalar(
+        select(SpaceCredentialModel.id).where(
+            SpaceCredentialModel.space_id == space.id,
+            SpaceCredentialModel.user_account_id == account.id,
+            SpaceCredentialModel.credential_status == "active",
+        )
+    )
+    if active_credential_id:
+        return None, "credential_already_active"
+    return (
+        PersonalCodexAuthorizationTarget(
+            space_membership_id=membership.id,
+            space_id=space.id,
+            user_account_id=account.id,
+            external_space_id=space.external_space_id,
+        ),
+        "",
+    )
 
 
 class UpsertPersonalCodexSpaceCredentialWorkflow:
@@ -56,31 +132,26 @@ class UpsertPersonalCodexSpaceCredentialWorkflow:
             user = uow.user_accounts.get(input_.user_account_id)
             if user is None:
                 raise SpaceAuthorizationWorkflowError("missing_user_account")
-            if input_.account_id and user.openai_user_id != input_.account_id:
-                user.openai_user_id = input_.account_id
-                user.updated_at = now
-            space = uow.spaces.upsert_from_values(
-                {
-                    "id": f"space-{uuid4()}",
-                    "provider": "openai_chatgpt",
-                    "external_space_id": input_.external_space_id,
-                    "owner_user_account_id": input_.user_account_id,
-                    "name": input_.space_name or user.email,
-                    "space_type": "personal",
-                    "auth_mode": "codex_oauth",
-                    "credential_type": "personal_account",
-                    "plan_type": "",
-                    "seat_limit": 0,
-                    "seats_in_use": 0,
-                    "seats_entitled": 0,
-                    "space_status": "active",
-                    "source_admin_session_id": "",
-                    "raw_space_json": {},
-                    "last_probe_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                }
+            account_id = user.openai_user_id.strip()
+            if not account_id:
+                raise SpaceAuthorizationWorkflowError("missing_user_openai_user_id")
+            existing_space = uow.spaces.get_by_provider_external_id(
+                provider="openai_chatgpt",
+                external_space_id=input_.external_space_id,
             )
+            if existing_space is None:
+                raise SpaceAuthorizationWorkflowError("missing_personal_space")
+            if existing_space.owner_user_account_id != input_.user_account_id:
+                raise SpaceAuthorizationWorkflowError("personal_space_owner_mismatch")
+            if existing_space.space_type != "personal":
+                raise SpaceAuthorizationWorkflowError("space_type_not_personal")
+            if existing_space.auth_mode != "codex_oauth":
+                raise SpaceAuthorizationWorkflowError("personal_space_auth_mode_mismatch")
+            if existing_space.credential_type != "personal_account":
+                raise SpaceAuthorizationWorkflowError("personal_space_credential_type_mismatch")
+            if existing_space.space_status != "active":
+                raise SpaceAuthorizationWorkflowError("personal_space_not_active")
+            space = existing_space
             credential = uow.space_credentials.upsert_from_values(
                 {
                     "id": f"space-credential-{uuid4()}",
@@ -93,7 +164,7 @@ class UpsertPersonalCodexSpaceCredentialWorkflow:
                     "id_token": input_.id_token,
                     "refresh_token": input_.refresh_token,
                     "codex_client_id": input_.codex_client_id,
-                    "account_id": input_.account_id,
+                    "account_id": account_id,
                     "token_chatgpt_account_id": input_.token_chatgpt_account_id,
                     "expires_at": input_.expires_at,
                     "last_authorized_at": now,
@@ -140,6 +211,8 @@ class CreateBusinessAccessTokenCredentialWorkflow:
                 raise SpaceAuthorizationWorkflowError("missing_business_space")
             if space.space_type != "business":
                 raise SpaceAuthorizationWorkflowError("space_type_not_business")
+            if space.space_status != "active":
+                raise SpaceAuthorizationWorkflowError("space_not_active")
             if space.credential_type not in {"team_5h_weekly", "team_monthly"}:
                 raise SpaceAuthorizationWorkflowError("invalid_space_credential_type")
             membership = uow.space_memberships.get_by_user_and_space(
@@ -151,7 +224,9 @@ class CreateBusinessAccessTokenCredentialWorkflow:
             if membership.membership_status != "active":
                 raise SpaceAuthorizationWorkflowError("space_membership_not_active")
             if not membership.session_account_detected:
-                raise SpaceAuthorizationWorkflowError("space_membership_session_account_not_detected")
+                raise SpaceAuthorizationWorkflowError(
+                    "space_membership_session_account_not_detected"
+                )
             existing = uow.space_credentials.get_current(
                 space_id=space.id,
                 user_account_id=input_.user_account_id,
@@ -159,8 +234,9 @@ class CreateBusinessAccessTokenCredentialWorkflow:
             if existing is not None and existing.credential_status == "active":
                 return existing.id
             space_id = space.id
-            membership_id = membership.id
             remote_user_id = membership.remote_user_id
+            if not remote_user_id:
+                raise SpaceAuthorizationWorkflowError("missing_membership_remote_user_id")
 
         credential_payload = self._openai_provider.create_wham_auth_credential(
             access_token="",
@@ -200,11 +276,9 @@ class CreateBusinessAccessTokenCredentialWorkflow:
             if membership.membership_status != "active":
                 raise SpaceAuthorizationWorkflowError("space_membership_not_active")
             if not membership.session_account_detected:
-                raise SpaceAuthorizationWorkflowError("space_membership_session_account_not_detected")
-
-            if remote_user_id and user.openai_user_id != remote_user_id:
-                user.openai_user_id = remote_user_id
-                user.updated_at = now
+                raise SpaceAuthorizationWorkflowError(
+                    "space_membership_session_account_not_detected"
+                )
 
             credential = uow.space_credentials.upsert_from_values(
                 {
@@ -253,7 +327,6 @@ def _validate_personal_input(input_: UpsertPersonalCodexSpaceCredentialInput) ->
         "access_token",
         "refresh_token",
         "codex_client_id",
-        "account_id",
         "token_chatgpt_account_id",
     ):
         if not str(getattr(input_, field_name) or "").strip():

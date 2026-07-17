@@ -12,7 +12,7 @@ router = APIRouter(tags=["ops-ui"])
 def ops_index() -> Response:
     dist_index = _frontend_dist() / "index.html"
     if dist_index.exists():
-        return FileResponse(dist_index)
+        return FileResponse(dist_index, headers={"Cache-Control": "no-store"})
     html_path = _legacy_ops_html()
     return HTMLResponse(html_path.read_text())
 
@@ -25,7 +25,7 @@ def ops_asset(asset_path: str) -> Response:
         return FileResponse(target)
     dist_index = dist / "index.html"
     if dist_index.exists():
-        return FileResponse(dist_index)
+        return FileResponse(dist_index, headers={"Cache-Control": "no-store"})
     return HTMLResponse(_legacy_ops_html().read_text())
 
 

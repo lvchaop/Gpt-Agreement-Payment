@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 
 from refactor_app.application.workflows.space_usage import WhamUsageWindow
 
-
 BUSINESS_PAT_MODEL_MAPPING = {
     "codex-auto-review": "codex-auto-review",
     "gpt-4o-audio-preview": "gpt-4o-audio-preview",
@@ -22,6 +21,9 @@ BUSINESS_PAT_MODEL_MAPPING = {
     "gpt-5.4-2026-03-05": "gpt-5.4-2026-03-05",
     "gpt-5.4-mini": "gpt-5.4-mini",
     "gpt-5.5": "gpt-5.5",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt-5.6-terra": "gpt-5.6-terra",
     "gpt-image-1": "gpt-image-1",
     "gpt-image-1.5": "gpt-image-1.5",
     "gpt-image-2": "gpt-image-2",
@@ -38,7 +40,6 @@ class BusinessAccessTokenPayloadInput:
     chatgpt_account_id: str
     chatgpt_user_id: str
     email: str
-    owner_email: str
     credential_type: str
     usage_windows: tuple[WhamUsageWindow, ...] = ()
     exported_at: datetime | None = None
@@ -76,7 +77,7 @@ def _business_access_token_export_body(input_: BusinessAccessTokenPayloadInput) 
         "proxies": [],
         "accounts": [
             {
-                "name": f"母-{input_.owner_email}-子-{input_.email}",
+                "name": f"codex-{input_.email}",
                 "platform": "openai",
                 "type": "oauth",
                 "credentials": {

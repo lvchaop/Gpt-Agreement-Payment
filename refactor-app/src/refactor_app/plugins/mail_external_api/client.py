@@ -177,10 +177,16 @@ class ExternalMailApiClient:
         timeout_s: int = 180,
         issued_after: float | None = None,
         max_polls: int | None = None,
+        code_source: str = "content",
     ) -> OtpMessage:
         normalized = (email or "").strip()
         if not normalized:
             raise ExternalMailApiClientError("wait_for_otp_by_email requires email")
+        normalized_code_source = str(code_source or "content").strip().lower()
+        if normalized_code_source not in {"subject", "content", "html", "all"}:
+            raise ExternalMailApiClientError(
+                f"unsupported verification code_source: {code_source}"
+            )
 
         effective_timeout = max(1, int(timeout_s or 180))
         start = self._monotonic()
@@ -206,8 +212,8 @@ class ExternalMailApiClient:
                     params={
                         "email": normalized,
                         "since_minutes": str(since_minutes),
-                        "code_length": "6",
-                        "code_source": "all",
+                        "code_length": "6-6",
+                        "code_source": normalized_code_source,
                     },
                     allow_error_status=True,
                 )

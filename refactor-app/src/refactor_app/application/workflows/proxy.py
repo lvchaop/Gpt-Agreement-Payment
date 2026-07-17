@@ -13,6 +13,7 @@ from refactor_app.infrastructure.db.models import (
     TeamAdminProxyBindingModel,
     TeamAdminSessionModel,
     UserAccountProxyBindingModel,
+    WorkItemModel,
 )
 from refactor_app.infrastructure.db.unit_of_work import UnitOfWork
 from refactor_app.plugins.contracts import ProxyNode, ProxyProvider
@@ -227,6 +228,43 @@ def ensure_team_admin_static_proxy_url_in_session(
     return proxy_url_from_inventory(proxy)
 
 
+def allocate_team_admin_invite_static_proxies_in_session(
+    *,
+    session: Session,
+    team_admin_session_id: str,
+    count: int,
+) -> list[ProxyInventoryModel]:
+    if count < 1:
+        raise ProxyWorkflowError("invite static proxy count must be positive")
+    if session.get(TeamAdminSessionModel, team_admin_session_id) is None:
+        raise ProxyWorkflowError(f"team admin session not found: {team_admin_session_id}")
+
+    proxies = list(
+        session.scalars(
+            select(ProxyInventoryModel)
+            .where(
+                ProxyInventoryModel.provider == "webshare",
+                ProxyInventoryModel.proxy_type == "static_proxy",
+                ProxyInventoryModel.proxy_status == ProxyStatus.AVAILABLE.value,
+                ProxyInventoryModel.provider_valid.is_(True),
+                ~ProxyInventoryModel.id.in_(_active_invite_proxy_ids()),
+            )
+            .order_by(ProxyInventoryModel.updated_at.asc(), ProxyInventoryModel.id.asc())
+            .with_for_update(of=ProxyInventoryModel, skip_locked=True)
+            .limit(count)
+        ).all()
+    )
+    if len(proxies) != count:
+        raise ProxyWorkflowError(
+            f"not enough available static webshare proxies: required={count} actual={len(proxies)}"
+        )
+
+    now = datetime.now(UTC)
+    for proxy in proxies:
+        proxy.updated_at = now
+    return proxies
+
+
 def _active_team_admin_proxy_binding(
     session: Session,
     team_admin_session_id: str,
@@ -243,6 +281,7 @@ def _active_team_admin_proxy_binding(
                 (ProxyStatus.AVAILABLE.value, ProxyStatus.BOUND.value)
             ),
             ProxyInventoryModel.provider_valid.is_(True),
+            ~ProxyInventoryModel.id.in_(_active_invite_proxy_ids()),
         )
         .with_for_update(of=TeamAdminProxyBindingModel)
         .limit(1)
@@ -284,6 +323,14 @@ def _least_bound_static_proxy_for_update(session: Session) -> ProxyInventoryMode
     return session.scalars(stmt).first()
 
 
+def _active_invite_proxy_ids():
+    return select(WorkItemModel.input_json["invite_proxy_id"].astext).where(
+        WorkItemModel.work_type == "space.membership_invite.account",
+        WorkItemModel.work_status.in_(("queued", "running")),
+        WorkItemModel.input_json["invite_proxy_id"].astext != "",
+    )
+
+
 class HealthcheckProxyWorkflow:
     def __init__(self, *, session_factory: Callable[[], Session]) -> None:
         self._session_factory = session_factory
@@ -307,19 +354,28 @@ class HealthcheckProxyWorkflow:
                 raise ProxyWorkflowError(f"proxy not found: {proxy_id}")
             proxy.last_healthcheck_at = now
             proxy.provider_valid = alive
-            proxy.proxy_status = ProxyStatus.BOUND.value if alive else ProxyStatus.ERROR.value
+            user_bindings = session.scalars(
+                select(UserAccountProxyBindingModel).where(
+                    UserAccountProxyBindingModel.proxy_id == proxy_id,
+                    UserAccountProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value,
+                )
+            ).all()
+            admin_bindings = session.scalars(
+                select(TeamAdminProxyBindingModel).where(
+                    TeamAdminProxyBindingModel.proxy_id == proxy_id,
+                    TeamAdminProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value,
+                )
+            ).all()
+            active_bindings = [*user_bindings, *admin_bindings]
+            proxy.proxy_status = _proxy_status_after_healthcheck(
+                alive=alive,
+                has_active_binding=bool(active_bindings),
+            )
             proxy.updated_at = now
 
             if not alive:
-                bindings = session.scalars(
-                    select(UserAccountProxyBindingModel)
-                    .where(
-                        UserAccountProxyBindingModel.proxy_id == proxy_id,
-                        UserAccountProxyBindingModel.bind_status == ProxyBindStatus.ACTIVE.value,
-                    )
-                ).all()
-                released_bind_count = len(bindings)
-                for binding in bindings:
+                released_bind_count = len(active_bindings)
+                for binding in active_bindings:
                     binding.bind_status = ProxyBindStatus.RELEASED.value
                     binding.last_error_code = "proxy_healthcheck_failed"
                     binding.updated_at = now
@@ -330,6 +386,12 @@ class HealthcheckProxyWorkflow:
             "alive": alive,
             "released_bind_count": released_bind_count,
         }
+
+
+def _proxy_status_after_healthcheck(*, alive: bool, has_active_binding: bool) -> str:
+    if not alive:
+        return ProxyStatus.ERROR.value
+    return ProxyStatus.BOUND.value if has_active_binding else ProxyStatus.AVAILABLE.value
 
 
 def proxy_inventory_values(

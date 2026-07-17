@@ -28,8 +28,11 @@ class OpenAIChatGPTPlugin:
             "openai_chatgpt.oauth.refresh_workspace_token",
             "openai_chatgpt.jwt.decode_access_token",
             "openai_chatgpt.team_workspace.invite_member",
+            "openai_chatgpt.team_workspace.invite_members",
             "openai_chatgpt.team_workspace.subscription",
+            "openai_chatgpt.team_workspace.subscription.update_seats",
             "openai_chatgpt.team_workspace.users.list",
+            "openai_chatgpt.team_workspace.users.remove",
             "openai_chatgpt.team_workspace.invites.list",
             "openai_chatgpt.team_workspace.accept_invite",
             "openai_chatgpt.team_workspace.probe_membership",
@@ -37,6 +40,7 @@ class OpenAIChatGPTPlugin:
             "openai_chatgpt.codex.responses_usage_probe",
             "openai_chatgpt.wham.usage",
             "openai_chatgpt.wham.auth_credentials.create",
+            "openai_chatgpt.account.change_email",
         ]
 
     def refresh_workspace_token(
@@ -64,6 +68,7 @@ class OpenAIChatGPTPlugin:
         cookie_header: str = "",
         seat_type: str = "default",
         proxy_url: str = "",
+        proxy_resolve: tuple[str, ...] = (),
     ) -> dict:
         return self._client.invite_member(
             access_token=access_token,
@@ -72,6 +77,28 @@ class OpenAIChatGPTPlugin:
             cookie_header=cookie_header,
             seat_type=seat_type,
             proxy_url=proxy_url,
+            proxy_resolve=proxy_resolve,
+        )
+
+    def invite_members(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        emails: list[str],
+        cookie_header: str = "",
+        seat_type: str = "default",
+        proxy_url: str = "",
+        proxy_resolve: tuple[str, ...] = (),
+    ) -> dict:
+        return self._client.invite_members(
+            access_token=access_token,
+            team_id=team_id,
+            emails=emails,
+            cookie_header=cookie_header,
+            seat_type=seat_type,
+            proxy_url=proxy_url,
+            proxy_resolve=proxy_resolve,
         )
 
     def accept_invite(
@@ -107,6 +134,23 @@ class OpenAIChatGPTPlugin:
             proxy_url=proxy_url,
         )
 
+    def update_subscription_seats(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        updated_seats: int,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.update_subscription_seats(
+            access_token=access_token,
+            account_id=account_id,
+            updated_seats=updated_seats,
+            cookie_header=cookie_header,
+            proxy_url=proxy_url,
+        )
+
     def list_account_users(
         self,
         *,
@@ -138,6 +182,23 @@ class OpenAIChatGPTPlugin:
             account_id=account_id,
             cookie_header=cookie_header,
             page_size=page_size,
+            proxy_url=proxy_url,
+        )
+
+    def remove_account_user(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        user_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.remove_account_user(
+            access_token=access_token,
+            account_id=account_id,
+            user_id=user_id,
+            cookie_header=cookie_header,
             proxy_url=proxy_url,
         )
 
@@ -202,5 +263,65 @@ class OpenAIChatGPTPlugin:
             name=name,
             ttl_seconds=ttl_seconds,
             cookie_header=cookie_header,
+            proxy_url=proxy_url,
+        )
+
+    def fetch_web_session_payload(
+        self,
+        *,
+        cookie_header: str,
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.fetch_web_session_payload(
+            cookie_header=cookie_header,
+            proxy_url=proxy_url,
+        )
+
+    def check_change_email_eligibility(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.check_change_email_eligibility(
+            access_token=access_token,
+            cookie_header=cookie_header,
+            proxy_url=proxy_url,
+        )
+
+    def begin_change_email(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        email: str,
+        remove_social_subscriptions: bool = False,
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.begin_change_email(
+            access_token=access_token,
+            cookie_header=cookie_header,
+            email=email,
+            remove_social_subscriptions=remove_social_subscriptions,
+            proxy_url=proxy_url,
+        )
+
+    def verify_change_email(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        email: str,
+        code: str,
+        remove_social_subscriptions: bool = False,
+        proxy_url: str = "",
+    ) -> dict:
+        return self._client.verify_change_email(
+            access_token=access_token,
+            cookie_header=cookie_header,
+            email=email,
+            code=code,
+            remove_social_subscriptions=remove_social_subscriptions,
             proxy_url=proxy_url,
         )

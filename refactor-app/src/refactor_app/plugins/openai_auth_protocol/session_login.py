@@ -54,9 +54,15 @@ def acquire_chatgpt_session(
         config.auth_trace_dump_path = trace_dump_path
 
     flow = AuthFlow(config)
-    adapter = ExternalMailOtpAdapter(mail_provider, ensure_before_wait=False)
+    mailbox_email = email.strip()
+    openai_email = mailbox_email.lower()
+    adapter = ExternalMailOtpAdapter(
+        mail_provider,
+        ensure_before_wait=False,
+        mailbox_email=mailbox_email,
+    )
     result = flow.run_protocol_login(
-        email=email.strip().lower(),
+        email=openai_email,
         password=password,
         mail_provider=adapter,
         existing_only=True,
@@ -97,14 +103,21 @@ def prepare_chatgpt_session_otp(
         config.auth_trace_dump_path = trace_dump_path
 
     flow = AuthFlow(config)
-    adapter = ExternalMailOtpAdapter(mail_provider, ensure_before_wait=False)
+    mailbox_email = email.strip()
+    openai_email = mailbox_email.lower()
+    adapter = ExternalMailOtpAdapter(
+        mail_provider,
+        ensure_before_wait=False,
+        mailbox_email=mailbox_email,
+    )
     snapshot = flow.run_protocol_login_prepare_otp(
         adapter,
-        email.strip().lower(),
+        openai_email,
         password,
         existing_only=True,
     )
-    snapshot["email"] = email.strip().lower()
+    snapshot["email"] = openai_email
+    snapshot["mailbox_email"] = mailbox_email
     snapshot["mail_events"] = adapter.events
     return SessionOtpPrepareResult(
         ok=str(snapshot.get("phase") or "") in {"otp_collected", "otp_pending"},
@@ -118,6 +131,7 @@ def submit_prepared_chatgpt_session_otp(
     proxy: str = "",
     mail_provider: OtpProvider,
     before_validate=None,
+    before_skip=None,
 ) -> SessionOtpSubmitResult:
     config = Config()
     config.proxy = proxy or str(snapshot.get("proxy") or "") or None
@@ -129,13 +143,20 @@ def submit_prepared_chatgpt_session_otp(
         "SKIP_OAUTH_TOKEN_EXCHANGE": "1",
     }
     flow = AuthFlow(config)
-    adapter = ExternalMailOtpAdapter(mail_provider, ensure_before_wait=False)
+    mailbox_email = str(snapshot.get("mailbox_email") or snapshot.get("email") or "").strip()
+    adapter = ExternalMailOtpAdapter(
+        mail_provider,
+        ensure_before_wait=False,
+        mailbox_email=mailbox_email,
+    )
     updated = flow.run_protocol_login_submit_prepared_otp(
         dict(snapshot),
         before_validate=before_validate,
+        before_skip=before_skip,
         mail_provider=adapter,
     )
     updated["email"] = str(snapshot.get("email") or updated.get("email") or "").strip().lower()
+    updated["mailbox_email"] = mailbox_email
     updated["mail_events"] = adapter.events
     return SessionOtpSubmitResult(
         ok=str(updated.get("phase") or "") in {"otp_validated", "otp_missing"},

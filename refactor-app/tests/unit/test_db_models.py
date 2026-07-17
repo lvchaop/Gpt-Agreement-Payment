@@ -48,6 +48,8 @@ def test_user_accounts_contains_login_recovery_fields() -> None:
         "access_token",
         "session_status",
         "last_session_refresh_at",
+        "codex_select_channel_required",
+        "codex_select_channel_detected_at",
     }.issubset(table.columns.keys())
     assert "refresh_token" not in table.columns
     assert "id_token" not in table.columns
@@ -77,3 +79,15 @@ def test_non_space_runtime_tables_are_not_target_schema() -> None:
     }
 
     assert non_space_runtime_tables.isdisjoint(set(Base.metadata.tables))
+
+
+def test_work_items_contains_unified_dispatch_fields() -> None:
+    table = Base.metadata.tables["work_items"]
+
+    assert {"execution_key", "lease_expires_at"}.issubset(table.columns.keys())
+    checks = {
+        str(constraint.sqltext)
+        for constraint in table.constraints
+        if hasattr(constraint, "sqltext")
+    }
+    assert any("'skipped'" in check and "work_status" in check for check in checks)

@@ -67,6 +67,10 @@ def create_app() -> FastAPI:
         response.delete_cookie(WEB_SESSION_COOKIE, path="/")
         return response
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def _favicon() -> Response:
+        return Response(status_code=204)
+
     app.include_router(health_router)
     app.include_router(jobs_router)
     app.include_router(resources_router)
@@ -126,13 +130,13 @@ def _login_html(next_value: str, error: str = "") -> str:
   <style>
     :root {{
       color-scheme: dark;
-      --bg: #070b16;
-      --panel: #111827;
-      --line: #273449;
-      --text: #e5e7eb;
-      --muted: #94a3b8;
-      --blue: #3b82f6;
-      --red: #fca5a5;
+      --bg: #151719;
+      --panel: #202326;
+      --line: #484e55;
+      --text: #f2f3f4;
+      --muted: #a8adb4;
+      --blue: #3478ca;
+      --red: #f09a9a;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -140,7 +144,7 @@ def _login_html(next_value: str, error: str = "") -> str:
       min-height: 100vh;
       display: grid;
       place-items: center;
-      background: radial-gradient(circle at top, #18213a 0, var(--bg) 52%);
+      background: var(--bg);
       color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
@@ -148,9 +152,9 @@ def _login_html(next_value: str, error: str = "") -> str:
       width: min(420px, calc(100vw - 32px));
       padding: 28px;
       border: 1px solid var(--line);
-      border-radius: 18px;
-      background: rgba(17, 24, 39, 0.92);
-      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
     }}
     h1 {{ margin: 0 0 8px; font-size: 24px; }}
     p {{ margin: 0 0 24px; color: var(--muted); }}
@@ -160,8 +164,8 @@ def _login_html(next_value: str, error: str = "") -> str:
       height: 48px;
       padding: 0 14px;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: #0b1220;
+      border-radius: 4px;
+      background: #191c1f;
       color: var(--text);
       font-size: 16px;
       outline: none;
@@ -172,7 +176,7 @@ def _login_html(next_value: str, error: str = "") -> str:
       height: 46px;
       margin-top: 18px;
       border: 0;
-      border-radius: 12px;
+      border-radius: 4px;
       background: var(--blue);
       color: white;
       font-size: 16px;
@@ -183,7 +187,7 @@ def _login_html(next_value: str, error: str = "") -> str:
       margin-bottom: 14px;
       padding: 10px 12px;
       border: 1px solid rgba(248, 113, 113, 0.45);
-      border-radius: 10px;
+      border-radius: 4px;
       color: var(--red);
       background: rgba(127, 29, 29, 0.28);
     }}
@@ -191,8 +195,8 @@ def _login_html(next_value: str, error: str = "") -> str:
 </head>
 <body>
   <main>
-    <h1>Web 控制台登录</h1>
-    <p>输入环境变量 REFACTOR_APP_WEB_LOGIN_PASSWORD 配置的密码。</p>
+    <h1>运营控制台登录</h1>
+    <p>输入运营访问密码。</p>
     {error_html}
     <form method="post" action="/login">
       <input type="hidden" name="next" value="{safe_next}" />

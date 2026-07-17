@@ -1,4 +1,6 @@
 import { getJson, postJson } from "./client";
+import type { PagedResult, PageQuery } from "./types";
+import { withQuery } from "./types";
 
 export type Job = Record<string, unknown> & {
   id: string;
@@ -36,8 +38,8 @@ export type WorkItem = Record<string, unknown> & {
   work_status: string;
 };
 
-export function listJobs() {
-  return getJson<Job[]>("/jobs");
+export function listJobs(params: PageQuery = {}) {
+  return getJson<PagedResult<Job>>(withQuery("/jobs", params));
 }
 
 export function getJob(jobId: string) {
@@ -52,8 +54,10 @@ export function listRuns(jobId: string) {
   return getJson<JobRun[]>(`/jobs/${encodeURIComponent(jobId)}/runs`);
 }
 
-export function listWorkItems(jobId: string) {
-  return getJson<WorkItem[]>(`/jobs/${encodeURIComponent(jobId)}/work-items`);
+export function listWorkItems(jobId: string, params: PageQuery = {}) {
+  return getJson<PagedResult<WorkItem>>(
+    withQuery(`/jobs/${encodeURIComponent(jobId)}/work-items`, params),
+  );
 }
 
 export function cancelWorkItem(workItemId: string) {
@@ -64,8 +68,12 @@ export function listSteps(runId: string) {
   return getJson<JobStep[]>(`/runs/${encodeURIComponent(runId)}/steps`);
 }
 
-export function listEvents(runId: string) {
-  return getJson<JobEvent[]>(`/runs/${encodeURIComponent(runId)}/events`);
+export function listEvents(runId: string, params: PageQuery = {}) {
+  return getJson<PagedResult<JobEvent>>(withQuery(`/runs/${encodeURIComponent(runId)}/events`, params));
+}
+
+export function getJobSummary(jobId: string) {
+  return getJson<Record<string, unknown>>(`/jobs/${encodeURIComponent(jobId)}/summary`);
 }
 
 export function createJob(type: string, inputJson: Record<string, unknown>) {

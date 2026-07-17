@@ -1,12 +1,14 @@
-# 19. 纯协议账号注册接入设计
+# 19. 账号注册接入设计
 
-更新时间：2026-07-07
+更新时间：2026-07-11
 
-本文固化“纯协议邮箱注册能力接入平台”的设计。目标是把注册能力接入 `refactor-app` 的账号、代理、邮箱池、Job/Work 体系，不再靠临时口头约定。
+本文固化邮箱浏览器注册与纯协议注册接入平台的设计。目标是把注册能力接入 `refactor-app` 的账号、代理、邮箱池、Job/Work 体系，不再靠临时口头约定。
+
+浏览器邮箱注册复用同一套账号、代理、邮箱、Job/Work 和注册后 v4 探测流程，仅替换 OpenAI 注册执行器。
 
 ## 0. 范围
 
-只实现两种模式：
+实现三种模式：
 
 ```text
 1. phone_protocol_bind_email
@@ -14,7 +16,26 @@
 
 2. email_protocol_no_phone
    邮箱纯协议注册，注册完成即结束，不绑定手机号。
+
+3. email_browser_no_phone
+   邮箱通过 Camoufox 浏览器注册，不绑定手机号。
 ```
+
+`email_browser_no_phone` 的 Work 流程：
+
+```text
+创建 registering 账号
+→ 分配账号代理
+→ 领取邮箱
+→ Camoufox 完成邮箱、密码、OTP、姓名和生日页面
+→ GET /api/auth/session 获取 Web 登录态
+→ 写 user_accounts
+→ 使用同一账号代理调用 accounts/check v4
+→ 创建个人空间并标记可见空间成员
+→ 邮箱 complete
+```
+
+浏览器模式不调用手机号接口，不执行 Codex OAuth。
 
 明确不做：
 
@@ -22,7 +43,6 @@
 邮箱注册模式不判断“是否要求手机号”。
 邮箱注册模式不切换手机号兜底。
 邮箱注册模式不绑定手机号。
-注册成功时不创建 Space。
 注册成功时不做 Codex 授权。
 注册成功时不推送下游。
 ```
@@ -307,10 +327,10 @@ Job 输入：
   "phone_provider": "hero_sms",
   "phone_base_url": "https://hero-sms.com/stubs/handler_api.php",
   "phone_api_key_env": "HERO_SMS_API_KEY",
-  "phone_service": "tg",
-  "phone_country": "2",
-  "phone_countries": [],
-  "phone_max_price": "",
+  "phone_service": "dr",
+  "phone_country": "",
+  "phone_countries": ["151", "73", "16"],
+  "phone_max_price": "0.05",
   "phone_country_max_prices": {},
   "phone_max_number_attempts": 3,
   "phone_otp_timeout_s": 180,
@@ -332,7 +352,9 @@ flowchart TD
   F -- "是" --> I["写 user_accounts 登录态和账号信息"]
   I --> J["account_status=active, session_status=active"]
   J --> K["claim-complete result=success"]
-  K --> L["work succeeded"]
+  K --> L["调用 accounts/check v4"]
+  L --> M["创建 personal space / 标记可见空间成员"]
+  M --> N["work succeeded"]
 ```
 
 规则：
@@ -342,7 +364,7 @@ flowchart TD
 不调用 phone_provider。
 不判断是否要求手机号。
 不绑定手机号。
-不创建 Space。
+调用 accounts/check v4，创建 personal space，并标记本地已存在的可见空间成员。
 不创建凭证。
 不推送下游。
 ```
@@ -380,8 +402,12 @@ flowchart TD
   C --> D["构造 HeroSmsPhoneProviderAdapter"]
   D --> E["AuthFlow.run_phone_register(mail_provider, phone_provider)"]
   E --> F["phone_provider.allocate 获取手机号"]
-  F --> G["手机号注册"]
-  G --> H["短信 OTP 验证"]
+  F --> G{"上游是否识别为已有账号"}
+  G -- "是" --> W["phone setStatus=8"]
+  W --> X["删除 user_accounts 占位行"]
+  X --> Y["work failed，不换号重试"]
+  G -- "否" --> Z["手机号注册"]
+  Z --> H["短信 OTP 验证"]
   H --> I["领取邮箱"]
   I --> J["Platform add-email"]
   J --> K["邮箱 OTP 验证"]
@@ -393,7 +419,9 @@ flowchart TD
   P --> Q["account_status=active, session_status=active"]
   Q --> R["phone mark_verified"]
   R --> S["claim-complete result=success"]
-  S --> T["work succeeded"]
+  S --> T["调用 accounts/check v4"]
+  T --> U["创建 personal space / 标记可见空间成员"]
+  U --> V["work succeeded"]
 ```
 
 规则：
@@ -404,7 +432,12 @@ flowchart TD
 user_accounts.email 写绑定邮箱。
 user_accounts.phone_number / phone_dial_code / phone_country 写手机号信息。
 绑定邮箱失败，整个 work 失败。
-不创建 Space。
+绑定邮箱等待验证码 120 秒超时后，释放当前邮箱并领取新邮箱重试。
+单个账号最多尝试绑定 10 个邮箱；连续 10 个邮箱都超时后 work 失败。
+发验证码、验证码校验等明确错误不换邮箱，直接失败。
+手机号进入 login_password、email_otp_verification 或 /log-in 分支时，判定为已有账号。
+已有账号直接 mark_failed 并结束当前 work，不重新领取手机号。
+调用 accounts/check v4，创建 personal space，并标记本地已存在的可见空间成员。
 不创建凭证。
 不推送下游。
 ```
@@ -503,6 +536,16 @@ outlook.com / hotmail.com / live.com / live.cn
 
 只有需要 CF 临时邮箱池时，才传 provider = cloudflare_temp_mail。
 
+需要 iCloud Hide My Email 邮箱池时，传 provider = icloud_hide_my_email。
+注册和验证码查询始终使用 claim-random 返回的 iCloud 地址；
+Outlook 转发邮箱由邮箱服务内部解析，注册平台不保存、不传递。
+iCloud 模式不传 email_domain。
+
+账号注册流程只获取 ChatGPT Web 登录态：
+完成 ChatGPT callback 后调用 /api/auth/session，保存 session_token 和 access_token。
+注册流程不执行 Codex OAuth、不调用 /oauth/token 换取 Codex refresh_token；
+Codex 授权由注册完成后的独立授权流程处理。
+
 当前外部邮箱池接口只支持按 provider 筛选；
 不支持按邮箱域名、分组、标签进一步筛选。
 所以 email_domain 只作为预留配置，不能依赖它选择 outlook/hotmail/live。
@@ -568,10 +611,10 @@ mark_failed(lease_id, reason)
 provider = hero_sms
 base_url = https://hero-sms.com/stubs/handler_api.php
 api_key 或 api_key_env = HERO_SMS_API_KEY
-service = tg
-country = 2
-countries = []                         可选，多国家轮询
-maxPrice / max_price = ""              可选，统一最高价
+service = dr
+country = ""                           countries 为空时才使用
+countries = [151, 73, 16]              优先；默认随机排序后轮询
+maxPrice / max_price = "0.05"          默认统一最高价
 country_max_prices = {}                可选，按国家最高价
 max_number_attempts = 3
 request_timeout_s = 20
@@ -603,6 +646,19 @@ phoneNumber -> phone_e164 / phone_national
 countryPhoneCode -> phone_dial_code
 country -> phone_country/provider_country
 activationEndTime -> expires_at
+```
+
+运行规则：
+
+```text
+phoneNumber 必须是完整号码；脱敏号码直接失败。
+countryPhoneCode 存在时，移除本地号码前导 0 后再拼 E.164。
+getStatusV2 同时解析 sms 和 call 验证码。
+getNumberV2 / getStatusV2 的临时 HTTP、连接和限流错误按老实现重试。
+BAD_KEY / NO_BALANCE 等确定错误不重试。
+OTP 超时取消号码时，如 Hero 返回 EARLY_CANCEL_DENIED，按配置延迟重试 setStatus=8。
+手机号被识别为已有 OpenAI 账号时直接失败，不换号。
+HERO_SMS_API_KEY 由 Settings 注入 Work，禁止写入 jobs.input_json。
 ```
 
 证据：
@@ -649,14 +705,16 @@ activationId、phoneNumber、countryPhoneCode 等只保存在当前 work output_
 1. work 开始后创建 user_accounts 占位行，account_status=registering。
 2. 按 user_account_id 分配代理。
 3. AuthFlow 使用该代理。
-4. 注册成功后账号转 active。
-5. 注册失败后删除 user_accounts 占位行，不保留 invalid 账号。
+4. 注册成功后的 accounts/check v4 继续使用同一账号代理。
+5. 注册成功后账号转 active。
+6. 注册失败后删除 user_accounts 占位行，不保留 invalid 账号。
 ```
 
 说明：
 
 ```text
 这里使用账号代理逻辑。
+不把全局 protocol_register_proxy_url 作为默认代理覆盖账号绑定。
 不使用 team admin 静态住宅代理。
 team admin 静态住宅代理只属于空间管理员操作。
 ```
@@ -716,27 +774,28 @@ OpenAI 不会返回邮箱已被注册。
 
 ## 9. 和现有 Space 流程的关系
 
-注册流程只生产 `user_accounts`。
-
-不在注册成功时直接创建 personal space。
-
 注册成功后：
 
 ```text
 注册流程已经拿到 session / access_token / cookie。
 user_accounts.account_status = active。
 user_accounts.session_status = active。
-不自动触发现有 session / account 探测流程。
-不在注册流程内创建 personal space。
+使用同一账号代理调用 GET /backend-api/accounts/check/v4-2023-04-27。
+按 v4 返回创建或更新 personal space。
+对 v4 可见且本地已存在的 Business Space，写入或更新 space_memberships。
+space_memberships.membership_status = active。
+space_memberships.session_account_detected = true。
 ```
 
-后续如果要进入 Space 授权 / 推送 / 回收，由既有 Space 流程自行处理，不属于注册流程。
+注册流程不创建 Space Credential，不执行 Codex 授权，不推送下游。
 
 注册成功后的结束状态：
 
 ```text
 user_accounts(account_status=active, session_status=active)
 session_token / access_token / cookie_header 已写入
+personal space 已按 v4 返回创建或更新
+可见的本地 Business Space membership 已标记
 registration work succeeded
 ```
 
@@ -836,6 +895,8 @@ GET  /account-protocol-registration/works?job_id=...
 4. 支持 allocate / poll_otp / mark_verified / mark_failed。
 5. 接入 mode=phone_protocol_bind_email。
 6. 失败时调用 mark_failed，再删除 user_accounts 占位行。
+7. 已有手机号直接失败，不重新领取手机号。
+8. 对齐老项目号码格式、sms/call 取码、临时错误重试和 setStatus 结算规则。
 ```
 
 ### 11.6 Portal 页面
@@ -854,7 +915,7 @@ GET  /account-protocol-registration/works?job_id=...
 1. 邮箱池提供新邮箱；不设计 OpenAI 邮箱已占用分支。
 2. count / work_count / project_key / email_domain 留配置。
 3. Hero SMS API Key 使用 HERO_SMS_API_KEY 环境变量。
-4. 注册成功后已有 session，不自动触发现有 session / account 探测流程。
+4. 注册成功后使用账号代理调用 accounts/check v4，创建个人空间并标记可见空间成员。
 ```
 
 当前剩余待确认：

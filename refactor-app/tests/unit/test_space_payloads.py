@@ -37,7 +37,6 @@ def test_build_team_5h_weekly_business_access_token_payload() -> None:
         chatgpt_account_id="workspace-1",
         chatgpt_user_id="user-1",
         email="child@example.test",
-        owner_email="owner@example.test",
         credential_type="team_5h_weekly",
         usage_windows=usage_windows,
         exported_at=datetime(2026, 7, 4, 5, 48, 27, tzinfo=UTC),
@@ -49,13 +48,17 @@ def test_build_team_5h_weekly_business_access_token_payload() -> None:
     account = sub2api["accounts"][0]
     assert cpa == sub2api
     assert sub2api["exported_at"] == "2026-07-04T05:48:27Z"
-    assert account["name"] == "母-owner@example.test-子-child@example.test"
+    assert account["name"] == "codex-child@example.test"
     assert account["credentials"]["access_token"] == "at-1"
     assert account["credentials"]["auth_mode"] == "personalAccessToken"
     assert account["credentials"]["chatgpt_account_id"] == "workspace-1"
     assert account["credentials"]["chatgpt_user_id"] == "user-1"
     assert account["credentials"]["openai_auth_mode"] == "personal_access_token"
     assert account["credentials"]["token_type"] == "Bearer"
+    assert account["credentials"]["model_mapping"]["gpt-5.3-codex"] == "gpt-5.3-codex"
+    assert account["credentials"]["model_mapping"]["gpt-5.6-luna"] == "gpt-5.6-luna"
+    assert account["credentials"]["model_mapping"]["gpt-5.6-sol"] == "gpt-5.6-sol"
+    assert account["credentials"]["model_mapping"]["gpt-5.6-terra"] == "gpt-5.6-terra"
     assert account["extra"]["auth_provider"] == "codex_personal_access_token"
     assert account["extra"]["codex_5h_used_percent"] == 100
     assert account["extra"]["codex_7d_used_percent"] == 46
@@ -83,7 +86,6 @@ def test_build_team_monthly_business_access_token_payload_without_weekly_window(
             chatgpt_account_id="workspace-1",
             chatgpt_user_id="user-1",
             email="child@example.test",
-            owner_email="owner@example.test",
             credential_type="team_monthly",
             usage_windows=usage_windows,
             exported_at=datetime(2026, 7, 4, 5, 48, 27, tzinfo=UTC),

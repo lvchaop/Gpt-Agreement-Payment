@@ -12,8 +12,9 @@ class SpaceUsageError(RuntimeError):
 WINDOW_SECONDS_TO_KIND = {
     18_000: "five_hour",
     604_800: "weekly",
-    2_592_000: "monthly",
 }
+MONTHLY_WINDOW_MIN_SECONDS = 28 * 24 * 60 * 60
+MONTHLY_WINDOW_MAX_SECONDS = 32 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -53,12 +54,12 @@ def infer_credential_type(*, space_type: str, usage_payload: dict[str, Any]) -> 
     if normalized_space_type != "business":
         raise SpaceUsageError(f"unsupported space_type: {space_type}")
 
-    window_seconds = {item.limit_window_seconds for item in parse_wham_usage_windows(usage_payload)}
-    if {18_000, 604_800}.issubset(window_seconds):
+    window_kinds = {item.quota_window_kind for item in parse_wham_usage_windows(usage_payload)}
+    if {"five_hour", "weekly"}.issubset(window_kinds):
         return "team_5h_weekly"
-    if 2_592_000 in window_seconds:
+    if "monthly" in window_kinds:
         return "team_monthly"
-    raise SpaceUsageError(f"unsupported business usage windows: {sorted(window_seconds)}")
+    raise SpaceUsageError(f"unsupported business usage windows: {sorted(window_kinds)}")
 
 
 def usage_status_from_percent(used_percent: int, *, threshold_percent: int = 95) -> str:
@@ -76,7 +77,7 @@ def _parse_window(raw_window: dict[str, Any]) -> WhamUsageWindow | None:
         raw_window.get("limit_window_seconds"),
         field_name="limit_window_seconds",
     )
-    quota_window_kind = WINDOW_SECONDS_TO_KIND.get(limit_window_seconds)
+    quota_window_kind = _quota_window_kind(limit_window_seconds)
     if quota_window_kind is None:
         return None
     return WhamUsageWindow(
@@ -93,6 +94,15 @@ def _parse_window(raw_window: dict[str, Any]) -> WhamUsageWindow | None:
         reset_at=_epoch_seconds(raw_window.get("reset_at")),
         raw_window=dict(raw_window),
     )
+
+
+def _quota_window_kind(limit_window_seconds: int) -> str | None:
+    exact_kind = WINDOW_SECONDS_TO_KIND.get(limit_window_seconds)
+    if exact_kind is not None:
+        return exact_kind
+    if MONTHLY_WINDOW_MIN_SECONDS <= limit_window_seconds <= MONTHLY_WINDOW_MAX_SECONDS:
+        return "monthly"
+    return None
 
 
 def _int_value(value: Any, *, field_name: str) -> int:

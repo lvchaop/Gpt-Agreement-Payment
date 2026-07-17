@@ -30,6 +30,12 @@
 | `16-portal-operations-redesign.md` | Portal 运营端最终形态：导航、页面职责、操作流和后端接口改造 |
 | `17-space-auth-push-redesign.md` | Space 授权、推送、余额、用量、回收重构；目标态只有一套 Space 逻辑 |
 | `19-protocol-account-registration-design.md` | 纯协议账号注册接入设计：邮箱注册不绑手机号、手机号注册绑定邮箱、邮箱池回传、Job/Work 入口 |
+| `20-unified-job-work-scheduling.md` | Job/Work 唯一调度规则：Work 总量、同时运行数、精确领取、补位、空间互斥、租约与取消 |
+| `21-space-seat-expansion.md` | Business 空间扩席位 Job：固定 999 目标、增长规则、管理员代理、重试和无进展上限 |
+| `22-space-dynamic-batch-invite.md` | 按本地席位余额批量邀请：一个空间一个 Work、单次批量请求、按邮箱结算业务结果 |
+| `23-space-session-otp-staged-submit.md` | Space 有效成员 OTP 分阶段提交：Prepare 可配置 Work 数、Submit 按快照数单屏障同时提交 |
+| `24-space-membership-growth-round.md` | Business Space 单轮倍增邀请：批量邀请、账号补 Session、远端确认、部分成功仍剔除 1 人 |
+| `25-account-email-change.md` | CSV 一一对应换绑邮箱：账号代理、Session 登录、三接口换绑、原账号记录更新与失败状态 |
 | `schema/001_initial_schema.sql` | PostgreSQL 目标表结构 |
 | `schema/ER.md` | ER 图、核心关系和约束说明 |
 

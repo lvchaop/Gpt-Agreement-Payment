@@ -1,5 +1,7 @@
 # 15. Ops Console UI Design
 
+> 历史记录：本文档不再作为 Portal 实施依据。当前唯一目标设计见 `16-portal-operations-redesign.md`。
+
 本文档是 `/ops` 运维台重设计稿。  
 当前阶段只设计，不实现。
 

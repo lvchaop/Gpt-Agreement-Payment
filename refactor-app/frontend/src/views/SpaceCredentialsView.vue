@@ -3,6 +3,7 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import ResourcePage from "../components/ResourcePage.vue";
+import type { Column, TableFilter } from "../components/DataTable.vue";
 import type { Row } from "../api/resources";
 import { resourcesApi } from "../api/resources";
 import { useOpsStore } from "../stores/ops";
@@ -15,9 +16,14 @@ const pushWorkCount = ref(5);
 const downstreamChannelId = ref("");
 const downstreamChannels = ref<Row[]>([]);
 
-const columns = [
-  { key: "id", label: "空间凭证 ID", mono: true, summary: 28 },
-  { key: "email", label: "账号邮箱", summary: 30 },
+const filters: TableFilter[] = [{ key: "credential_status", label: "凭证状态", options: [
+  { label: "有效", value: "active" }, { label: "无效", value: "invalid" },
+  { label: "过期", value: "expired" }, { label: "错误", value: "error" },
+] }];
+
+const columns: Column[] = [
+  { key: "id", label: "空间凭证 ID", mono: true, summary: 24, copyable: true },
+  { key: "email", label: "账号邮箱", summary: 30, copyable: true },
   { key: "user_account_id", label: "账号 ID", mono: true, summary: 28 },
   { key: "space_id", label: "空间 ID", mono: true, summary: 28 },
   { key: "external_space_id", label: "外部空间 ID", mono: true, summary: 28 },
@@ -29,10 +35,10 @@ const columns = [
   { key: "token_chatgpt_account_id", label: "Token Account ID", mono: true, summary: 28 },
   { key: "has_access_token", label: "Access Token", badge: true },
   { key: "has_refresh_token", label: "Refresh Token", badge: true },
-  { key: "expires_at", label: "过期时间", summary: 30 },
+  { key: "expires_at", label: "过期时间", type: "datetime", relativeTime: true, sortable: true },
   { key: "last_probe_status", label: "探测状态", badge: true },
-  { key: "last_authorized_at", label: "最近授权时间", summary: 30 },
-  { key: "updated_at", label: "更新时间", summary: 30 },
+  { key: "last_authorized_at", label: "最近授权时间", type: "datetime", relativeTime: true },
+  { key: "updated_at", label: "更新时间", type: "datetime", relativeTime: true, sortable: true },
 ];
 
 function updateSelection(rows: Record<string, unknown>[]) {
@@ -42,7 +48,7 @@ function updateSelection(rows: Record<string, unknown>[]) {
 
 onMounted(async () => {
   try {
-    downstreamChannels.value = await resourcesApi.downstreamChannels();
+    downstreamChannels.value = (await resourcesApi.downstreamChannels({ page_size: 100, sort: "name" })).items;
     const firstEnabled = downstreamChannels.value.find((row) => Boolean(row.enabled));
     downstreamChannelId.value = String(firstEnabled?.id || downstreamChannels.value[0]?.id || "");
   } catch {
@@ -81,20 +87,13 @@ async function pushSelected() {
     description="每个账号在某个 Space 下的当前凭证；payload 和余额按 spaces.credential_type 分支。"
     :columns="columns"
     :loader="resourcesApi.credentials"
+    :filters="filters"
     empty-text="暂无空间凭证。"
     selectable
     @selection-change="updateSelection"
   >
-    <template #actionCards>
-      <section class="panel credential-action-card">
-        <div class="credential-action-heading">
-          <div>
-            <h2>下游推送</h2>
-            <p>按下游渠道的 credential_type 余额和坑位推送选中的 Space 凭证。</p>
-          </div>
-          <span class="selected-hint">已选 {{ selectedCount }} 条凭证</span>
-        </div>
-        <div class="credential-action-body push-action-body">
+    <template #actions>
+      <div class="push-action-body">
           <label class="field">
             <span>下游渠道</span>
             <select v-model="downstreamChannelId" class="input">
@@ -105,78 +104,24 @@ async function pushSelected() {
             </select>
           </label>
           <label class="field">
-            <span>同时 Work 数</span>
+            <span>Work 数</span>
             <input v-model.number="pushWorkCount" class="input small-input" type="number" min="1" max="500" />
           </label>
-          <button class="btn primary" :disabled="selectedCount === 0 || !downstreamChannelId" @click="pushSelected">
-            推送选中凭证（{{ selectedCount }}）
-          </button>
-        </div>
-      </section>
+        <button class="btn primary" :disabled="selectedCount === 0 || !downstreamChannelId" @click="pushSelected">推送选中凭证（{{ selectedCount }}）</button>
+      </div>
     </template>
   </ResourcePage>
 </template>
 
 <style scoped>
-.credential-action-card {
-  margin-bottom: 14px;
-  overflow: hidden;
-  padding: 0;
-}
-
-.credential-action-heading {
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 12px;
-  justify-content: space-between;
-  padding: 14px 16px;
-}
-
-.credential-action-heading h2 {
-  font-size: 14px;
-  letter-spacing: -0.01em;
-  margin: 0;
-}
-
-.credential-action-heading p,
-.selected-hint {
-  color: var(--text-muted);
-}
-
-.credential-action-heading p {
-  font-size: 12px;
-  line-height: 1.45;
-  margin: 5px 0 0;
-}
-
-.selected-hint {
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.credential-action-body {
-  align-items: end;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  padding: 14px 16px 16px;
-  width: 100%;
-}
-
 .push-action-body {
   align-items: end;
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) 140px auto;
+  grid-template-columns: minmax(220px, 1fr) 100px auto;
+  width: 100%;
 }
 
 @media (max-width: 767px) {
-  .credential-action-heading,
-  .credential-action-body {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
   .push-action-body {
     grid-template-columns: 1fr;
   }

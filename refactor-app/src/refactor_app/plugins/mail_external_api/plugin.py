@@ -54,12 +54,14 @@ class ExternalMailApiPlugin:
         timeout_s: int = 180,
         issued_after: float | None = None,
         max_polls: int | None = None,
+        code_source: str = "content",
     ) -> OtpMessage:
         return self._client.wait_for_otp_by_email(
             email=email,
             timeout_s=timeout_s,
             issued_after=issued_after,
             max_polls=max_polls,
+            code_source=code_source,
         )
 
     def mark_used(self, *, external_lease_id: str) -> None:

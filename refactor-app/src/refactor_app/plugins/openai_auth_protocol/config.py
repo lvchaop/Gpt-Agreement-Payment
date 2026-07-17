@@ -104,10 +104,10 @@ class PhoneConfig:
     base_url: str = ""
     api_key: str = ""
     api_key_env: str = "PHONE_PROVIDER_API_KEY"
-    country: str = "US"
-    countries: list = field(default_factory=list)
-    service: str = "tg"
-    maxPrice: str = ""
+    country: str = ""
+    countries: list = field(default_factory=lambda: ["151", "73", "16"])
+    service: str = "dr"
+    maxPrice: str = "0.05"
     max_price: str = ""
     country_max_prices: dict = field(default_factory=dict)
     lease_ttl_s: int = 300

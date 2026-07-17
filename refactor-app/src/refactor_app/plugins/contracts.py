@@ -112,6 +112,19 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
         cookie_header: str = "",
         seat_type: str = "default",
         proxy_url: str = "",
+        proxy_resolve: tuple[str, ...] = (),
+    ) -> dict: ...
+
+    def invite_members(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        emails: list[str],
+        cookie_header: str = "",
+        seat_type: str = "default",
+        proxy_url: str = "",
+        proxy_resolve: tuple[str, ...] = (),
     ) -> dict: ...
 
     def accept_invite(
@@ -130,6 +143,16 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
         *,
         access_token: str,
         account_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def update_subscription_seats(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        updated_seats: int,
         cookie_header: str = "",
         proxy_url: str = "",
     ) -> dict: ...
@@ -153,6 +176,16 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
         page_size: int = 100,
         proxy_url: str = "",
     ) -> list[dict]: ...
+
+    def remove_account_user(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        user_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
 
     def heartbeat_codex_credential(
         self,
@@ -189,6 +222,42 @@ class OpenAIChatGPTProvider(PluginContract, Protocol):
         name: str,
         ttl_seconds: int = 7_776_000,
         cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def fetch_web_session_payload(
+        self,
+        *,
+        cookie_header: str,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def check_change_email_eligibility(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def begin_change_email(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        email: str,
+        remove_social_subscriptions: bool = False,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def verify_change_email(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        email: str,
+        code: str,
+        remove_social_subscriptions: bool = False,
         proxy_url: str = "",
     ) -> dict: ...
 

@@ -145,12 +145,13 @@ WHERE space_id = :current_space_id
 ### 2.4 邀请数量规则
 
 ```text
-invite_limit_per_space = 350
-work_count = 350
-membership_cap_per_space = 1000
-current_membership_count = 当前 space 下 active / invited / accepted 数量
-remaining = 1000 - current_membership_count
-target_count = min(350, remaining, eligible_account_count)
+space_limit = 1
+space_id = 可选；指定时只处理该 active Business Space，留空自动选择
+static_proxy_count = 50
+invites_per_proxy = 20
+invite_limit_per_space = 1000
+work_count = 1000
+target_count = 1000
 ```
 
 明确：
@@ -158,10 +159,11 @@ target_count = min(350, remaining, eligible_account_count)
 ```text
 不按剩余席位减少邀请数量。
 席位只做展示和诊断。
-达到 1000 后不再发新邀请。
 每轮最多处理 1 个 space。
-该 space 下最多启动 350 个 invite work。
-invite work 使用 barrier，同一批 work 到齐后再同时发 POST invites。
+候选不足 1000 时，本轮不创建邀请 Work。
+该 space 固定启动 1000 个 invite work。
+所有 invite work 直接使用本机网络，不选择或绑定代理。
+1000 个 invite work 使用同一个内存 barrier，全部到齐后再同时发 POST invites。
 ```
 
 ### 2.5 选账号规则
@@ -635,7 +637,7 @@ downstream_channel_credential_type_balances.claimed_push_count -= 1
 2. users 命中写 active。
 3. invites 命中写 invited。
 4. 本地 active/invited/accepted 但远端 users/invites 都不存在时，按当前 space_id 物理删除 membership。
-5. 邀请数量实现 min(350, 1000-current_count, eligible_account_count)。
+5. 空间邀请固定实现 1000 条直连 Work，并使用一个内存屏障。
 6. 去掉 cooldown / other-space 排除。
 7. 不调用 invites/accept。
 ```

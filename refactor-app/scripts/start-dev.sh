@@ -8,7 +8,9 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
-WORKER_CONCURRENCY="${WORKER_CONCURRENCY:-50}"
+START_FRONTEND="${START_FRONTEND:-0}"
+WORKER_CAPACITY="${WORKER_CAPACITY:-2000}"
+WORKER_MAX_OPEN_FILES="${WORKER_MAX_OPEN_FILES:-4096}"
 START_WORKER="${START_WORKER:-1}"
 KILL_EXISTING="${KILL_EXISTING:-0}"
 LOG_DIR="${LOG_DIR:-$APP_DIR/runtime/logs}"
@@ -66,7 +68,9 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 ensure_port_free "backend" "$BACKEND_PORT"
-ensure_port_free "frontend" "$FRONTEND_PORT"
+if [ "$START_FRONTEND" = "1" ]; then
+  ensure_port_free "frontend" "$FRONTEND_PORT"
+fi
 kill_existing_workers
 
 cd "$APP_DIR"
@@ -75,7 +79,7 @@ export PYTHONPATH="$APP_DIR/src"
 echo "check db..."
 "$PYTHON_BIN" -m refactor_app.cli.main db check
 
-if [ ! -d "$APP_DIR/frontend/node_modules" ]; then
+if [ "$START_FRONTEND" = "1" ] && [ ! -d "$APP_DIR/frontend/node_modules" ]; then
   echo "frontend dependencies missing, running npm install..."
   (cd "$APP_DIR/frontend" && npm install)
 fi
@@ -89,20 +93,27 @@ echo "start backend: http://$BACKEND_HOST:$BACKEND_PORT"
 BACKEND_PID="$!"
 
 if [ "$START_WORKER" = "1" ]; then
-  echo "start worker: concurrency=$WORKER_CONCURRENCY"
-  "$PYTHON_BIN" -m refactor_app.cli.main worker run \
-    --no-once \
-    --concurrency "$WORKER_CONCURRENCY" \
-    >"$LOG_DIR/worker.log" 2>&1 &
+  echo "start worker: capacity=$WORKER_CAPACITY max_open_files=$WORKER_MAX_OPEN_FILES"
+  (
+    ulimit -n "$WORKER_MAX_OPEN_FILES"
+    echo "worker max open files: $(ulimit -n)"
+    exec "$PYTHON_BIN" -m refactor_app.cli.main worker run \
+      --no-once \
+      --capacity "$WORKER_CAPACITY"
+  ) >"$LOG_DIR/worker.log" 2>&1 &
   WORKER_PID="$!"
 fi
 
-echo "start frontend: http://$FRONTEND_HOST:$FRONTEND_PORT/ops/"
-(cd "$APP_DIR/frontend" && npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT") \
-  >"$LOG_DIR/frontend.log" 2>&1 &
-FRONTEND_PID="$!"
+if [ "$START_FRONTEND" = "1" ]; then
+  echo "start frontend dev server: http://$FRONTEND_HOST:$FRONTEND_PORT/ops/"
+  (cd "$APP_DIR/frontend" && npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT") \
+    >"$LOG_DIR/frontend.log" 2>&1 &
+  FRONTEND_PID="$!"
+else
+  echo "serve frontend from backend: http://$BACKEND_HOST:$BACKEND_PORT/ops/"
+fi
 
-echo "open: http://$FRONTEND_HOST:$FRONTEND_PORT/ops/"
+echo "open: http://$BACKEND_HOST:$BACKEND_PORT/ops/"
 echo "press Ctrl+C to stop all started processes"
 
 wait

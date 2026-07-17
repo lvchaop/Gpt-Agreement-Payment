@@ -9,80 +9,28 @@ defineProps<{
 
 <template>
   <article class="metric" :class="tone ?? 'neutral'">
-    <span class="label">{{ label }}</span>
+    <span class="metric-accent" />
+    <div><span class="label">{{ label }}</span><small v-if="helper">{{ helper }}</small></div>
     <strong>{{ value }}</strong>
-    <small>{{ helper }}</small>
   </article>
 </template>
 
 <style scoped>
 .metric {
-  background: linear-gradient(180deg, rgba(23, 32, 51, 0.94), rgba(17, 24, 39, 0.94));
+  align-items: center;
+  background: var(--panel-bg);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  min-height: 116px;
-  padding: 16px;
-  position: relative;
-  overflow: hidden;
+  border-radius: var(--radius-md);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 3px 1fr auto;
+  min-height: 76px;
+  padding: 12px;
 }
-
-.metric::after {
-  background: currentColor;
-  border-radius: 999px;
-  content: "";
-  height: 56px;
-  opacity: 0.13;
-  position: absolute;
-  right: -16px;
-  top: -18px;
-  width: 56px;
-}
-
-.label {
-  color: var(--text-muted);
-  display: block;
-  font-size: 12px;
-  font-weight: 800;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-strong {
-  display: block;
-  font-size: 30px;
-  letter-spacing: -0.04em;
-  line-height: 1;
-  margin-top: 16px;
-}
-
-small {
-  color: var(--text-muted);
-  display: block;
-  font-size: 12px;
-  margin-top: 9px;
-}
-
-.success {
-  color: var(--success);
-}
-
-.warning {
-  color: var(--warning);
-}
-
-.danger {
-  color: var(--danger);
-}
-
-.info {
-  color: var(--accent);
-}
-
-.purple {
-  color: var(--purple);
-}
-
-.neutral {
-  color: #94a3b8;
-}
+.metric-accent { background: currentColor; border-radius: 2px; height: 34px; width: 3px; }
+.label { color: var(--text-muted); display: block; font-size: 11px; font-weight: 700; }
+strong { color: var(--text-primary); font-size: 24px; font-variant-numeric: tabular-nums; }
+small { color: var(--text-faint); display: block; font-size: 10px; margin-top: 3px; }
+.success { color: var(--success); }.warning { color: var(--warning); }.danger { color: var(--danger); }
+.info { color: var(--accent); }.purple { color: var(--purple); }.neutral { color: var(--text-faint); }
 </style>

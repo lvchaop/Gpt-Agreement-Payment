@@ -14,7 +14,7 @@ def sample_business_payload() -> dict:
         "proxies": [],
         "accounts": [
             {
-                "name": "母-owner@example.test-子-child@example.test",
+                "name": "codex-child@example.test",
                 "platform": "openai",
                 "type": "oauth",
                 "credentials": {
