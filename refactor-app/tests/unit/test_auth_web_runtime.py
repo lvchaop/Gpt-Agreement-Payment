@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -282,6 +283,47 @@ def test_auth_flow_document_navigation_uses_browser_navigation_headers(
     ]
 
 
+def test_telemetry_transport_times_out_before_node_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _RawSession()
+    runtime = AuthWebRuntime.__new__(AuthWebRuntime)
+    runtime.session = session
+    runtime.assets = SimpleNamespace(
+        bootstrap={
+            "statsigClientInitData": {
+                "identity": {
+                    "locale": "en-US",
+                    "userAgent": "Mozilla/5.0",
+                }
+            }
+        }
+    )
+    runtime._page_url = "https://auth.openai.com/create-account/password"
+    runtime._business_responses = {}
+    runtime._business_errors = {}
+    runtime._telemetry_transport_counts = Counter()
+    sent: list[dict] = []
+    runtime._send = sent.append
+    monkeypatch.setenv("AUTH_WEB_TELEMETRY_HTTP_TIMEOUT_SECONDS", "12")
+
+    runtime._handle_transport_request(
+        {
+            "transportId": "transport-rum",
+            "method": "POST",
+            "url": "https://auth.openai.com/awe/api/v2/rum?source=browser",
+            "headers": {"content-type": "text/plain"},
+            "bodyBase64": "",
+            "timeoutMs": 60_000,
+            "allowRedirects": True,
+        }
+    )
+
+    assert session.calls[0][2]["timeout"] == 12
+    assert sent[0]["type"] == "transport_response"
+    assert sent[0]["transportId"] == "transport-rum"
+
+
 @pytest.mark.parametrize(
     ("page_type", "page_url", "expected"),
     [
@@ -391,6 +433,17 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
             )
             is True
         )
+        register_response = runtime.request(
+            "POST",
+            "https://auth.openai.com/api/accounts/user/register",
+            headers={
+                "Content-Type": "application/json",
+                "x-access-flow-invocation-id": "register-invocation-test",
+            },
+            json={"username": "new@example.test", "password": "candidate-password"},
+            timeout=5,
+            allow_redirects=False,
+        )
         assert (
             runtime.navigate(
                 page_url="https://auth.openai.com/email-verification",
@@ -441,6 +494,7 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
         statsig_event_names = {event.get("eventName") for event in statsig_events}
 
         assert response is not None and response.status_code == 200
+        assert register_response is not None and register_response.status_code == 200
         assert create_response is not None and create_response.status_code == 200
         assert runtime.runtime_info["datadogSessionReady"] is True
         assert runtime.runtime_info["statsigSessionReady"] is True
@@ -495,6 +549,7 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
             "bootstrap_parse_duration_ms",
             "statsig_initialize_duration_ms",
             "client_entry_duration_ms",
+            "login_web_register_user",
             "login_web_validate_otp",
             "login_web_onboarding_user_info_complete",
             "login_web_sentinel_sdk_request_start_ms",

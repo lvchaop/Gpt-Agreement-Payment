@@ -528,32 +528,6 @@ class AuthWebRuntime:
             if name.lower() not in lower_names:
                 headers[name] = value
         body = base64.b64decode(str(message.get("bodyBase64") or ""))
-        parsed_url = urlparse(url)
-        telemetry_kind = ""
-        if parsed_url.hostname == "ab.chatgpt.com" and parsed_url.path.endswith(
-            "/initialize"
-        ):
-            telemetry_kind = "statsig_initialize"
-        elif parsed_url.path == "/ces/v1/rgstr":
-            telemetry_kind = "statsig_events"
-        elif parsed_url.path == "/awe/api/v2/rum":
-            telemetry_kind = "datadog_rum"
-        requested_timeout_seconds = max(
-            5,
-            int(float(message.get("timeoutMs") or 60_000) / 1_000),
-        )
-        if telemetry_kind:
-            try:
-                telemetry_timeout_seconds = max(
-                    5,
-                    int(os.getenv("AUTH_WEB_TELEMETRY_HTTP_TIMEOUT_SECONDS", "12")),
-                )
-            except ValueError:
-                telemetry_timeout_seconds = 12
-            requested_timeout_seconds = min(
-                requested_timeout_seconds,
-                telemetry_timeout_seconds,
-            )
         try:
             requester = getattr(self.session, "request", None)
             if callable(requester):
@@ -562,7 +536,7 @@ class AuthWebRuntime:
                     url,
                     headers=headers,
                     data=body if method not in ("GET", "HEAD") else None,
-                    timeout=requested_timeout_seconds,
+                    timeout=max(5, int(float(message.get("timeoutMs") or 60_000) / 1_000)),
                     allow_redirects=bool(message.get("allowRedirects", True)),
                 )
             else:
@@ -570,11 +544,21 @@ class AuthWebRuntime:
                     url,
                     headers=headers,
                     data=body if method not in ("GET", "HEAD") else None,
-                    timeout=requested_timeout_seconds,
+                    timeout=max(5, int(float(message.get("timeoutMs") or 60_000) / 1_000)),
                     allow_redirects=bool(message.get("allowRedirects", True)),
                 )
             if bridge_request_id:
                 self._business_responses[bridge_request_id] = response
+            parsed_url = urlparse(url)
+            telemetry_kind = ""
+            if parsed_url.hostname == "ab.chatgpt.com" and parsed_url.path.endswith(
+                "/initialize"
+            ):
+                telemetry_kind = "statsig_initialize"
+            elif parsed_url.path == "/ces/v1/rgstr":
+                telemetry_kind = "statsig_events"
+            elif parsed_url.path == "/awe/api/v2/rum":
+                telemetry_kind = "datadog_rum"
             response_status = int(getattr(response, "status_code", 0) or 0)
             if telemetry_kind:
                 self._telemetry_transport_counts[f"{telemetry_kind}:{response_status}"] += 1

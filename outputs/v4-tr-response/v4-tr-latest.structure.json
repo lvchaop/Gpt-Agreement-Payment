@@ -1,0 +1,369 @@
+{
+  "accounts": {
+    "9f0a4dce-fd22-4140-845f-7cc3abce8177": {
+      "account": {
+        "account_user_role": "<string>",
+        "account_user_id": "<string>",
+        "account_owner_id": "<string>",
+        "account_residency_region": "<string>",
+        "account_compute_residency": "<string>",
+        "account_compute_residency_display_name": "<string>",
+        "account_compute_residency_description": "<string>",
+        "processor": {
+          "a001": {
+            "has_customer_object": "<boolean>",
+            "processor_entity": "<null>"
+          },
+          "b001": {
+            "has_transaction_history": "<boolean>"
+          },
+          "c001": {
+            "has_transaction_history": "<boolean>"
+          }
+        },
+        "account_id": "<string>",
+        "created_time": "<string>",
+        "organization_id": "<null>",
+        "is_most_recent_expired_subscription_gratis": "<boolean>",
+        "has_previously_paid_subscription": "<boolean>",
+        "name": "<null>",
+        "profile_picture_id": "<null>",
+        "profile_picture_url": "<null>",
+        "structure": "<string>",
+        "workspace_type": "<null>",
+        "is_usage_based_seat_enabled": "<boolean>",
+        "plan_type": "<string>",
+        "pthdnu": "<string>",
+        "is_deactivated": "<boolean>",
+        "eligible_for_reactivation": "<boolean>",
+        "promo_data": {},
+        "user_segmentation_info": "<null>",
+        "reseller_hosted_account": "<boolean>",
+        "reseller_id": "<null>",
+        "ekm_config": "<null>",
+        "is_hipaa_compliant_workspace": "<boolean>",
+        "hipaa_workspace_baa_metadata": "<null>",
+        "is_finserv_enabled_workspace": "<boolean>",
+        "is_fedramp_compliant_workspace": "<boolean>",
+        "is_conversation_classifier_enabled_for_workspace": "<boolean>",
+        "started_as_free_workspace": "<boolean>",
+        "disable_account_switching": "<boolean>",
+        "enable_account_switching": "<boolean>"
+      },
+      "features": [
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>"
+      ],
+      "entitlement": {
+        "subscription_id": "<null>",
+        "has_active_subscription": "<boolean>",
+        "is_active_subscription_gratis": "<boolean>",
+        "subscription_plan": "<string>",
+        "expires_at": "<null>",
+        "renews_at": "<null>",
+        "cancels_at": "<null>",
+        "billing_period": "<null>",
+        "scheduled_plan_change": "<null>",
+        "billing_currency": "<null>",
+        "discount": "<null>",
+        "applied_discounts": [],
+        "trial": "<null>",
+        "is_eligible_for_cp": "<boolean>",
+        "is_delinquent": "<boolean>",
+        "became_delinquent_timestamp": "<null>",
+        "grace_period_end_timestamp": "<null>",
+        "grace_period_id": "<null>"
+      },
+      "last_active_subscription": {
+        "subscription_id": "<null>",
+        "purchase_origin_platform": "<string>",
+        "will_renew": "<boolean>",
+        "cancellation_outcome": "<null>"
+      },
+      "is_eligible_for_yearly_plus_subscription": "<boolean>",
+      "is_eligible_for_yearly_plus_new_user_subscription": "<boolean>",
+      "is_eligible_for_yearly_plus_existing_user_subscription": "<boolean>",
+      "can_access_with_session": "<boolean>",
+      "sso_connection_name": "<null>",
+      "eligible_promo_campaigns": {},
+      "eligible_offers": {
+        "offers": [
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>",
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>",
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": []
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": []
+          }
+        ],
+        "default_offer_id": "<string>"
+      }
+    },
+    "default": {
+      "account": {
+        "account_user_role": "<string>",
+        "account_user_id": "<string>",
+        "account_owner_id": "<string>",
+        "account_residency_region": "<string>",
+        "account_compute_residency": "<string>",
+        "account_compute_residency_display_name": "<string>",
+        "account_compute_residency_description": "<string>",
+        "processor": {
+          "a001": {
+            "has_customer_object": "<boolean>",
+            "processor_entity": "<null>"
+          },
+          "b001": {
+            "has_transaction_history": "<boolean>"
+          },
+          "c001": {
+            "has_transaction_history": "<boolean>"
+          }
+        },
+        "account_id": "<string>",
+        "created_time": "<string>",
+        "organization_id": "<null>",
+        "is_most_recent_expired_subscription_gratis": "<boolean>",
+        "has_previously_paid_subscription": "<boolean>",
+        "name": "<null>",
+        "profile_picture_id": "<null>",
+        "profile_picture_url": "<null>",
+        "structure": "<string>",
+        "workspace_type": "<null>",
+        "is_usage_based_seat_enabled": "<boolean>",
+        "plan_type": "<string>",
+        "pthdnu": "<string>",
+        "is_deactivated": "<boolean>",
+        "eligible_for_reactivation": "<boolean>",
+        "promo_data": {},
+        "user_segmentation_info": "<null>",
+        "reseller_hosted_account": "<boolean>",
+        "reseller_id": "<null>",
+        "ekm_config": "<null>",
+        "is_hipaa_compliant_workspace": "<boolean>",
+        "hipaa_workspace_baa_metadata": "<null>",
+        "is_finserv_enabled_workspace": "<boolean>",
+        "is_fedramp_compliant_workspace": "<boolean>",
+        "is_conversation_classifier_enabled_for_workspace": "<boolean>",
+        "started_as_free_workspace": "<boolean>",
+        "disable_account_switching": "<boolean>",
+        "enable_account_switching": "<boolean>"
+      },
+      "features": [
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>",
+        "<string>"
+      ],
+      "entitlement": {
+        "subscription_id": "<null>",
+        "has_active_subscription": "<boolean>",
+        "is_active_subscription_gratis": "<boolean>",
+        "subscription_plan": "<string>",
+        "expires_at": "<null>",
+        "renews_at": "<null>",
+        "cancels_at": "<null>",
+        "billing_period": "<null>",
+        "scheduled_plan_change": "<null>",
+        "billing_currency": "<null>",
+        "discount": "<null>",
+        "applied_discounts": [],
+        "trial": "<null>",
+        "is_eligible_for_cp": "<boolean>",
+        "is_delinquent": "<boolean>",
+        "became_delinquent_timestamp": "<null>",
+        "grace_period_end_timestamp": "<null>",
+        "grace_period_id": "<null>"
+      },
+      "last_active_subscription": {
+        "subscription_id": "<null>",
+        "purchase_origin_platform": "<string>",
+        "will_renew": "<boolean>",
+        "cancellation_outcome": "<null>"
+      },
+      "is_eligible_for_yearly_plus_subscription": "<boolean>",
+      "is_eligible_for_yearly_plus_new_user_subscription": "<boolean>",
+      "is_eligible_for_yearly_plus_existing_user_subscription": "<boolean>",
+      "can_access_with_session": "<boolean>",
+      "sso_connection_name": "<null>",
+      "eligible_promo_campaigns": {},
+      "eligible_offers": {
+        "offers": [
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>",
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": [
+              "<string>",
+              "<string>"
+            ]
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": []
+          },
+          {
+            "id": "<string>",
+            "epl_enabled": "<boolean>",
+            "revenuecat_offering_ids": []
+          }
+        ],
+        "default_offer_id": "<string>"
+      }
+    }
+  },
+  "account_ordering": [
+    "<string>"
+  ]
+}

@@ -77,8 +77,6 @@ class RuntimeStorage {
 let relaySequence = 0;
 const relayWaiters = new Map();
 const pendingTransports = new Set();
-const TELEMETRY_RELAY_TIMEOUT_MS = 20_000;
-const TRANSPORT_DRAIN_TIMEOUT_MS = 2_000;
 let datadogRum = null;
 let statsigClient = null;
 let currentPageUrl = "https://auth.openai.com/";
@@ -171,14 +169,6 @@ const ABOUT_YOU_FEATURE_READS = {
   },
 };
 
-const CREATE_ACCOUNT_PASSWORD_FEATURE_READS = {
-  layers: {
-    passwordless_login_and_signup: {
-      signup_password_variant: "no_passwordless",
-    },
-  },
-};
-
 function replaceRuntimeCookies(headerValue) {
   runtimeCookieValues = new Map();
   for (const part of String(headerValue || "").split(";")) {
@@ -218,20 +208,11 @@ async function bodyToBase64(body) {
 
 function relayTransport(request) {
   const transportId = `transport-${++relaySequence}`;
-  let timeoutMs = Math.max(5_000, Number(request.timeoutMs || 60_000));
-  try {
-    const url = new URL(String(request.url), currentPageUrl);
-    const isTelemetry =
-      url.hostname === "ab.chatgpt.com" ||
-      url.pathname === "/ces/v1/rgstr" ||
-      url.pathname === "/awe/api/v2/rum";
-    if (isTelemetry) timeoutMs = Math.min(timeoutMs, TELEMETRY_RELAY_TIMEOUT_MS);
-  } catch {}
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       relayWaiters.delete(transportId);
       reject(new Error(`transport response timeout: ${request.url}`));
-    }, timeoutMs);
+    }, Math.max(5_000, Number(request.timeoutMs || 60_000)));
     relayWaiters.set(transportId, {
       resolve: (response) => {
         clearTimeout(timeout);
@@ -241,14 +222,6 @@ function relayTransport(request) {
     });
     emit({ type: "transport_request", transportId, ...request });
   });
-}
-
-function trackPendingTransport(task) {
-  pendingTransports.add(task);
-  void task.then(
-    () => pendingTransports.delete(task),
-    () => pendingTransports.delete(task),
-  );
 }
 
 async function normalizeFetchRequest(input, init = {}) {
@@ -358,7 +331,8 @@ class RuntimeXMLHttpRequest extends RuntimeEventTarget {
       this.onloadend?.(loadEndEvent);
       this.dispatchEvent(loadEndEvent);
     })();
-    trackPendingTransport(task);
+    pendingTransports.add(task);
+    task.finally(() => pendingTransports.delete(task));
   }
 
   abort() {}
@@ -442,7 +416,8 @@ function installWebApis(options) {
         timeoutMs: 60_000,
         });
       })();
-      trackPendingTransport(task);
+      pendingTransports.add(task);
+      task.finally(() => pendingTransports.delete(task));
       return true;
     },
   };
@@ -640,8 +615,6 @@ function recordPageLifecycle(routeId, { initial = false } = {}) {
     readFeatureConfiguration(EMAIL_VERIFICATION_FEATURE_READS);
   } else if (routeId === "ABOUT_YOU") {
     readFeatureConfiguration(ABOUT_YOU_FEATURE_READS);
-  } else if (routeId === "CREATE_ACCOUNT_PASSWORD") {
-    readFeatureConfiguration(CREATE_ACCOUNT_PASSWORD_FEATURE_READS);
   }
 }
 
@@ -654,8 +627,6 @@ function recordRequestStartTelemetry(url, headers) {
       kind: "email",
       routeId: "email_otp_verification",
     });
-  } else if (path === "/api/accounts/user/register") {
-    statsigClient.logEvent("login_web_register_user", "email");
   } else if (path === "/api/accounts/create_account") {
     logUserAction("ACCESS_FLOW_USER_ACTION_TYPE_INPUT", {
       field: "ACCESS_FLOW_FIELD_NAME",
@@ -776,11 +747,8 @@ async function flushRuntime({ toggleVisibility = true } = {}) {
     ]).catch(() => {});
   }
   await new Promise((resolve) => setTimeout(resolve, 30));
-  if (pendingTransports.size > 0) {
-    await Promise.race([
-      Promise.allSettled([...pendingTransports]),
-      new Promise((resolve) => setTimeout(resolve, TRANSPORT_DRAIN_TIMEOUT_MS)),
-    ]);
+  while (pendingTransports.size > 0) {
+    await Promise.allSettled([...pendingTransports]);
   }
   if (toggleVisibility && runtimeDocument) {
     runtimeDocument.visibilityState = "visible";

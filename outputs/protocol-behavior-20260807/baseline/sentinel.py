@@ -389,7 +389,6 @@ def get_sentinel_tokens(
     device_id: str,
     flow: str = "authorize_continue",
     user_agent: str = DEFAULT_UA,
-    initialize_first: bool = False,
 ) -> tuple[str, str]:
     """Return real-SDK Sentinel headers; synthetic fallback is opt-in only."""
     disabled = _env_enabled("OPENAI_SENTINEL_DISABLE_QUICKJS")
@@ -402,7 +401,6 @@ def get_sentinel_tokens(
                 session,
                 device_id=device_id,
                 flow=flow,
-                initialize_first=initialize_first,
                 log=lambda m: logger.info(m),
             )
             if qtokens:

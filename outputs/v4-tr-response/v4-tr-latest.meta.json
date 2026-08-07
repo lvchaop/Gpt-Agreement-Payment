@@ -1,0 +1,15 @@
+{
+  "captured_at": "2026-08-07T11:36:03.380595+00:00",
+  "endpoint": "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480",
+  "proxy_endpoint_id": "backbone-18470",
+  "proxy_country": "TR",
+  "personal_account_id": "9f0a4dce-fd22-4140-845f-7cc3abce8177",
+  "top_level_keys": [
+    "accounts",
+    "account_ordering"
+  ],
+  "account_keys": [
+    "9f0a4dce-fd22-4140-845f-7cc3abce8177",
+    "default"
+  ]
+}

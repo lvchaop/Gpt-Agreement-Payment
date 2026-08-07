@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import random
-import selectors
 import shutil
 import subprocess
 import tempfile
@@ -521,24 +520,37 @@ def _fetch_sentinel_challenge(
     return payload
 
 
-def _build_sentinel_runner_command(
+def _run_sentinel_runner(
     *,
+    challenge: dict[str, Any],
     sdk_file: Path,
     device_id: str,
     flow: str,
     page_url: str,
     cookie: str,
     context: SentinelRuntimeContext,
-    mode_args: list[str],
-) -> tuple[Path, list[str], dict[str, str]]:
+    timeout_ms: int,
+    request_p: str = "",
+) -> str:
     runner = _runner_script_path()
     if not runner.is_file():
         raise RuntimeError(f"sentinel_runner.js is missing: {runner}")
     profile = context.browser_profile
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix=f"sentinel-challenge-{flow}-",
+        delete=False,
+        encoding="utf-8",
+    ) as challenge_file:
+        json.dump(challenge, challenge_file, ensure_ascii=False)
+        challenge_path = Path(challenge_file.name)
+
     cmd = [
         _resolve_node_binary(),
         str(runner),
-        *mode_args,
+        "--challenge-file",
+        str(challenge_path),
         "--flow",
         flow,
         "--device-id",
@@ -612,19 +624,31 @@ def _build_sentinel_runner_command(
         "--cookie",
         cookie,
     ]
+    if request_p:
+        cmd.extend(["--request-p", request_p])
     env = os.environ.copy()
     env["SENTINEL_CONFIG"] = "__none__"
     env["TZ"] = str(profile["timezone_iana"])
-    return runner, cmd, env
-
-
-def _validate_sentinel_runner_token(
-    token_text: str,
-    *,
-    device_id: str,
-    flow: str,
-    challenge: dict[str, Any],
-) -> str:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=str(runner.parent),
+            timeout=max(10, int(timeout_ms / 1000) + 5),
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"sentinel_runner.js timed out for flow={flow}") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Node executable was not found: {_resolve_node_binary()}") from exc
+    finally:
+        challenge_path.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown error").strip()[:1000]
+        raise RuntimeError(f"sentinel_runner.js exited {proc.returncode}: {detail}")
+    token_text = (proc.stdout or "").strip()
     if not token_text:
         raise RuntimeError("sentinel_runner.js returned empty output")
     try:
@@ -652,208 +676,11 @@ def _validate_sentinel_runner_token(
     return json.dumps(token, ensure_ascii=False, separators=(",", ":"))
 
 
-def _run_sentinel_runner(
-    *,
-    challenge: dict[str, Any],
-    sdk_file: Path,
-    device_id: str,
-    flow: str,
-    page_url: str,
-    cookie: str,
-    context: SentinelRuntimeContext,
-    timeout_ms: int,
-    request_p: str = "",
-) -> str:
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".json",
-        prefix=f"sentinel-challenge-{flow}-",
-        delete=False,
-        encoding="utf-8",
-    ) as challenge_file:
-        json.dump(challenge, challenge_file, ensure_ascii=False)
-        challenge_path = Path(challenge_file.name)
-
-    mode_args = ["--challenge-file", str(challenge_path)]
-    if request_p:
-        mode_args.extend(["--request-p", request_p])
-    runner, cmd, env = _build_sentinel_runner_command(
-        sdk_file=sdk_file,
-        device_id=device_id,
-        flow=flow,
-        page_url=page_url,
-        cookie=cookie,
-        context=context,
-        mode_args=mode_args,
-    )
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            cwd=str(runner.parent),
-            timeout=max(10, int(timeout_ms / 1000) + 5),
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"sentinel_runner.js timed out for flow={flow}") from exc
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Node executable was not found: {_resolve_node_binary()}") from exc
-    finally:
-        challenge_path.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "unknown error").strip()[:1000]
-        raise RuntimeError(f"sentinel_runner.js exited {proc.returncode}: {detail}")
-    token_text = (proc.stdout or "").strip()
-    return _validate_sentinel_runner_token(
-        token_text,
-        device_id=device_id,
-        flow=flow,
-        challenge=challenge,
-    )
-
-
-def _run_sentinel_lifecycle_runner(
-    *,
-    session: Any,
-    sdk_file: Path,
-    device_id: str,
-    flow: str,
-    page_url: str,
-    cookie: str,
-    context: SentinelRuntimeContext,
-    timeout_ms: int,
-) -> str:
-    runner, cmd, env = _build_sentinel_runner_command(
-        sdk_file=sdk_file,
-        device_id=device_id,
-        flow=flow,
-        page_url=page_url,
-        cookie=cookie,
-        context=context,
-        mode_args=["--challenge-relay"],
-    )
-    process: subprocess.Popen[str] | None = None
-    selector: selectors.BaseSelector | None = None
-    token_text = ""
-    last_challenge: dict[str, Any] = {}
-    request_kinds: list[str] = []
-    stderr_text = ""
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            cwd=str(runner.parent),
-            env=env,
-        )
-        if process.stdin is None or process.stdout is None:
-            raise RuntimeError("sentinel lifecycle runner pipes were not created")
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + max(20.0, (timeout_ms / 1000) * 2 + 10)
-        while time.monotonic() < deadline:
-            events = selector.select(timeout=min(0.25, max(0.0, deadline - time.monotonic())))
-            if not events:
-                if process.poll() is not None:
-                    break
-                continue
-            line = process.stdout.readline()
-            if not line:
-                break
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    f"sentinel lifecycle runner returned invalid JSON: {line[:200]}"
-                ) from exc
-            message_type = str(message.get("type") or "")
-            if message_type == "challenge_request":
-                request_id = str(message.get("requestId") or "")
-                request_kind = str(message.get("requestKind") or "")
-                request_p = str(message.get("proof") or "")
-                if not request_id or request_kind not in {"init", "token"} or not request_p:
-                    raise RuntimeError(
-                        f"sentinel lifecycle challenge request was invalid: {line[:300]}"
-                    )
-                challenge = _fetch_sentinel_challenge(
-                    session,
-                    device_id=device_id,
-                    flow=flow,
-                    request_p=request_p,
-                    context=context,
-                    timeout_ms=timeout_ms,
-                )
-                last_challenge = challenge
-                request_kinds.append(request_kind)
-                process.stdin.write(
-                    json.dumps(
-                        {
-                            "type": "challenge_response",
-                            "requestId": request_id,
-                            "challenge": challenge,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                )
-                process.stdin.flush()
-                continue
-            if message_type == "result":
-                token_text = str(message.get("token") or "").strip()
-                break
-
-        if not token_text:
-            raise RuntimeError(
-                "sentinel lifecycle runner did not return a token before timeout "
-                f"flow={flow} observed={request_kinds}"
-            )
-        process.stdin.close()
-        process.wait(timeout=5)
-        if process.stderr is not None:
-            stderr_text = process.stderr.read()
-        if process.returncode != 0:
-            detail = (stderr_text or "unknown error").strip()[:1000]
-            raise RuntimeError(
-                f"sentinel lifecycle runner exited {process.returncode}: {detail}"
-            )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Node executable was not found: {_resolve_node_binary()}") from exc
-    finally:
-        if selector is not None:
-            selector.close()
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
-    if request_kinds[:2] != ["init", "token"]:
-        raise RuntimeError(
-            f"sentinel lifecycle order mismatch flow={flow} observed={request_kinds}"
-        )
-    logger.info("Sentinel SDK lifecycle completed flow=%s order=%s", flow, request_kinds)
-    return _validate_sentinel_runner_token(
-        token_text,
-        device_id=device_id,
-        flow=flow,
-        challenge=last_challenge,
-    )
-
-
 def get_sentinel_tokens_via_quickjs(
     session: Any,
     device_id: str,
     *,
     flow: str = "authorize_continue",
-    initialize_first: bool = False,
     timeout_ms: int = 45_000,
     log: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, str]:
@@ -866,40 +693,27 @@ def get_sentinel_tokens_via_quickjs(
     context = get_sentinel_runtime_context(session)
     _ensure_oai_did_cookies(session, did)
     sdk_file = _ensure_sdk_file(session, timeout_ms)
+    request_p = _generate_requirements_token(context)
+    challenge = _fetch_sentinel_challenge(
+        session,
+        device_id=did,
+        flow=flow,
+        request_p=request_p,
+        context=context,
+        timeout_ms=timeout_ms,
+    )
     page_url = _FLOW_PAGE_URL.get(flow, "https://auth.openai.com/create-account/password")
-    cookie = _cookie_header_for_domain(session, "auth.openai.com", did)
-    if initialize_first:
-        token_text = _run_sentinel_lifecycle_runner(
-            session=session,
-            sdk_file=sdk_file,
-            device_id=did,
-            flow=flow,
-            page_url=page_url,
-            cookie=cookie,
-            context=context,
-            timeout_ms=timeout_ms,
-        )
-    else:
-        request_p = _generate_requirements_token(context)
-        challenge = _fetch_sentinel_challenge(
-            session,
-            device_id=did,
-            flow=flow,
-            request_p=request_p,
-            context=context,
-            timeout_ms=timeout_ms,
-        )
-        token_text = _run_sentinel_runner(
-            challenge=challenge,
-            sdk_file=sdk_file,
-            device_id=did,
-            flow=flow,
-            page_url=page_url,
-            cookie=cookie,
-            context=context,
-            timeout_ms=timeout_ms,
-            request_p=request_p,
-        )
+    token_text = _run_sentinel_runner(
+        challenge=challenge,
+        sdk_file=sdk_file,
+        device_id=did,
+        flow=flow,
+        page_url=page_url,
+        cookie=_cookie_header_for_domain(session, "auth.openai.com", did),
+        context=context,
+        timeout_ms=timeout_ms,
+        request_p=request_p,
+    )
     parsed = json.loads(token_text)
     so_token = ""
     if parsed.get("so"):
@@ -916,7 +730,6 @@ def get_sentinel_tokens_via_quickjs(
     emit(
         "Sentinel real SDK succeeded "
         f"flow={flow} country={context.country_code} "
-        f"initialize_first={str(initialize_first).lower()} "
         f"p_len={len(str(parsed.get('p') or ''))} "
         f"t_len={len(str(parsed.get('t') or ''))} so_len={len(so_token)}"
     )

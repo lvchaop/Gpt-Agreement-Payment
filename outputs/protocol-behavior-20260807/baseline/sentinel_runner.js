@@ -5,7 +5,6 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const crypto = require("node:crypto");
-const readline = require("node:readline");
 const { performance } = require("node:perf_hooks");
 
 const SESSION_OBSERVER_EXPORT_PATTERN =
@@ -15,13 +14,6 @@ const SESSION_OBSERVER_EXPORT_REPLACEMENT =
 
 function exposeSessionObserverToken(sdkCode) {
   if (!sdkCode.includes(SESSION_OBSERVER_EXPORT_PATTERN)) {
-    if (
-      sdkCode.includes("__codexBindProof") &&
-      sdkCode.includes("__codexTurnstileToken") &&
-      sdkCode.includes("__codexSessionObserverToken")
-    ) {
-      return sdkCode;
-    }
     throw new Error("SDK 中未找到 Session Observer 导出点");
   }
   return sdkCode.replace(
@@ -171,65 +163,6 @@ function normalizeChallenge(raw) {
   }
 
   throw new Error("challenge 缺少 cachedChatReq/proofofwork/token 字段，无法喂给 SDK");
-}
-
-function createChallengeRelay() {
-  const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  const waiters = new Map();
-  let sequence = 0;
-
-  input.on("line", (line) => {
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (message?.type !== "challenge_response") return;
-    const waiter = waiters.get(String(message.requestId || ""));
-    if (!waiter) return;
-    waiters.delete(String(message.requestId || ""));
-    clearTimeout(waiter.timeout);
-    if (message.error) {
-      waiter.reject(new Error(String(message.error)));
-      return;
-    }
-    try {
-      waiter.resolve(normalizeChallenge(message.challenge));
-    } catch (error) {
-      waiter.reject(error);
-    }
-  });
-
-  return {
-    request({ requestKind, flow, proof }) {
-      const requestId = `challenge-${++sequence}`;
-      return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          waiters.delete(requestId);
-          reject(new Error(`challenge relay timeout: ${requestKind} ${flow}`));
-        }, 55_000);
-        waiters.set(requestId, { resolve, reject, timeout });
-        process.stdout.write(
-          `${JSON.stringify({
-            type: "challenge_request",
-            requestId,
-            requestKind,
-            flow,
-            proof,
-          })}\n`,
-        );
-      });
-    },
-    close() {
-      for (const waiter of waiters.values()) {
-        clearTimeout(waiter.timeout);
-        waiter.reject(new Error("challenge relay closed"));
-      }
-      waiters.clear();
-      input.close();
-    },
-  };
 }
 
 function readChallengeFile(filePath) {
@@ -1359,13 +1292,11 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
   const sdkPath = path.resolve(pick(args["sdk"], cfg("sdk", "sdkPath"), process.env.SENTINEL_SDK_PATH, defaultSdkPath));
   const flow = pick(args.flow, cfg("flow"), process.env.SENTINEL_FLOW, "checkout_session_approval");
   const challengeFile = pick(args["challenge-file"], cfg("challengeFile", "challenge_file"), process.env.SENTINEL_CHALLENGE_FILE);
-  const challengeRelayEnabled = truthy(args["challenge-relay"]);
-  const challengeRelay = challengeRelayEnabled ? createChallengeRelay() : null;
   const officialMode =
     args.official === "1" ||
     truthy(cfg("official")) ||
     process.env.SENTINEL_OFFICIAL === "1" ||
-    (!challengeFile && !challengeRelayEnabled && !args["challenge-url"] && !cfg("challengeUrl", "challenge_url") && !process.env.SENTINEL_CHALLENGE_URL);
+    (!challengeFile && !args["challenge-url"] && !cfg("challengeUrl", "challenge_url") && !process.env.SENTINEL_CHALLENGE_URL);
   const challengeUrl =
     pick(args["challenge-url"], cfg("challengeUrl", "challenge_url"), process.env.SENTINEL_CHALLENGE_URL) ||
     (officialMode ? OFFICIAL_CHALLENGE_URL : "");
@@ -1380,8 +1311,8 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     "8a5ad769-e9e7-4461-ae3a-6755d7f46b0b";
 
   if (!fs.existsSync(sdkPath)) throw new Error(`找不到 SDK 文件：${sdkPath}`);
-  if (!challengeFile && !challengeUrl && !challengeRelayEnabled) {
-    throw new Error("请提供 --challenge-file、--challenge-relay、--challenge-url 或 --official，用于把题目服务器 challenge 喂回 SDK。");
+  if (!challengeFile && !challengeUrl) {
+    throw new Error("请提供 --challenge-file、--challenge-url 或 --official，用于把题目服务器 challenge 喂回 SDK。");
   }
 
   let cachedChallenge = null;
@@ -1465,13 +1396,7 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
       }
       const proof = message.p;
       cachedProof = externalProof || String(proof || "");
-      if (challengeRelay) {
-        cachedChallenge = await challengeRelay.request({
-          requestKind: message.type,
-          flow,
-          proof: String(proof || ""),
-        });
-      } else if (challengeFile) {
+      if (challengeFile) {
         cachedChallenge ||= readChallengeFile(challengeFile);
       } else {
         cachedChallenge = await fetchChallenge(challengeUrl, flow, proof, deviceId, {
@@ -1517,13 +1442,6 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     throw new Error("SDK 加载后没有暴露 SentinelSDK.token");
   }
 
-  if (challengeRelay) {
-    if (typeof context.SentinelSDK.init !== "function") {
-      throw new Error("SDK 加载后没有暴露 SentinelSDK.init");
-    }
-    await context.SentinelSDK.init(flow);
-  }
-
   let tokenText = await context.SentinelSDK.token(flow);
   const token = parseJson(tokenText, "Sentinel Token");
   if (cachedChallenge?.turnstile?.dx) {
@@ -1563,13 +1481,6 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     tokenText = JSON.stringify(token);
   }
   clearTimers();
-  if (challengeRelay) {
-    challengeRelay.close();
-    if (writeOutput) {
-      process.stdout.write(`${JSON.stringify({ type: "result", token: tokenText })}\n`);
-    }
-    return tokenText;
-  }
   if (!writeOutput) return tokenText;
   if (args.pretty || process.env.SENTINEL_PRETTY === "1") {
     process.stdout.write(`${JSON.stringify(JSON.parse(tokenText), null, 2)}\n`);

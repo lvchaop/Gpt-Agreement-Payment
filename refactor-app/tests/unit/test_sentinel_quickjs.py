@@ -199,6 +199,95 @@ def test_real_sdk_flow_passes_page_cookie_and_context_to_runner(
     assert session.cookies.get("oai-did", domain="sentinel.openai.com") == "device-id"
 
 
+def test_lifecycle_runner_executes_init_before_token_in_one_sdk_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sdk_file = tmp_path / "sdk.js"
+    sdk_file.write_text(
+        """
+var SentinelSDK = (() => {
+  let iframe = null;
+  let sequence = 0;
+  const waiters = new Map();
+  window.addEventListener("message", (event) => {
+    const message = event.data || {};
+    if (message.type !== "response") return;
+    const waiter = waiters.get(message.requestId);
+    if (!waiter) return;
+    waiters.delete(message.requestId);
+    if (message.error) waiter.reject(new Error(message.error));
+    else waiter.resolve(message.result);
+  });
+  function request(type, flow, proof) {
+    if (!iframe) {
+      iframe = document.createElement("iframe");
+      document.body.appendChild(iframe);
+    }
+    const requestId = `fake-${++sequence}`;
+    return new Promise((resolve, reject) => {
+      waiters.set(requestId, { resolve, reject });
+      iframe.contentWindow.postMessage({ type, flow, requestId, p: proof }, "https://sentinel.openai.com");
+    });
+  }
+  return {
+    async init(flow) {
+      await request("init", flow, "proof-init");
+    },
+    async token(flow) {
+      const result = await request("token", flow, "proof-token");
+      return JSON.stringify({
+        p: "enforcement-proof",
+        t: "",
+        c: result.cachedChatReq.token,
+        id: "device-id",
+        flow,
+      });
+    },
+    __codexBindProof() {},
+    async __codexTurnstileToken() { return ""; },
+    async __codexSessionObserverToken() { return ""; },
+  };
+})();
+// getRequirementsToken getEnforcementToken
+""",
+        encoding="utf-8",
+    )
+    session = SimpleNamespace(cookies=RequestsCookieJar())
+    context = sentinel_quickjs.bind_sentinel_runtime_context(session, country_code="JP")
+    observed_proofs: list[str] = []
+
+    def fake_fetch(_session: object, **kwargs: object) -> dict[str, object]:
+        proof = str(kwargs["request_p"])
+        observed_proofs.append(proof)
+        return {
+            "token": f"challenge-{proof}",
+            "proofofwork": {"required": False},
+        }
+
+    monkeypatch.setattr(sentinel_quickjs, "_fetch_sentinel_challenge", fake_fetch)
+
+    token = sentinel_quickjs._run_sentinel_lifecycle_runner(
+        session=session,
+        sdk_file=sdk_file,
+        device_id="device-id",
+        flow="username_password_create",
+        page_url="https://auth.openai.com/create-account/password",
+        cookie="oai-did=device-id",
+        context=context,
+        timeout_ms=5_000,
+    )
+
+    assert observed_proofs == ["proof-init", "proof-token"]
+    assert json.loads(token) == {
+        "p": "enforcement-proof",
+        "t": "",
+        "c": "challenge-proof-token",
+        "id": "device-id",
+        "flow": "username_password_create",
+    }
+
+
 def test_runner_command_contains_complete_browser_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

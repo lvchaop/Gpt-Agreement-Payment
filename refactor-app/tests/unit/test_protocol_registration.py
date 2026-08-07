@@ -2117,6 +2117,7 @@ def test_email_password_registration_does_not_retry_non_transient_failure(monkey
 def test_registration_state_mutations_send_sentinel_so_and_invocation_id() -> None:
     requests: list[tuple[str, dict[str, str]]] = []
     sentinel_flows: list[str] = []
+    sentinel_options: list[dict[str, object]] = []
 
     class Response:
         status_code = 200
@@ -2154,6 +2155,7 @@ def test_registration_state_mutations_send_sentinel_so_and_invocation_id() -> No
 
     def refresh(flow_name: str, **_kwargs) -> tuple[str, str]:
         sentinel_flows.append(flow_name)
+        sentinel_options.append(dict(_kwargs))
         return f"sentinel-{flow_name}", f"so-{flow_name}"
 
     flow._refresh_sentinel_tokens = refresh
@@ -2167,6 +2169,7 @@ def test_registration_state_mutations_send_sentinel_so_and_invocation_id() -> No
         "email_otp_validate",
         "oauth_create_account",
     ]
+    assert sentinel_options == [{"initialize_first": True}, {}, {}]
     assert [url.rsplit("/", 1)[-1] for url, _headers in requests] == [
         "register",
         "validate",

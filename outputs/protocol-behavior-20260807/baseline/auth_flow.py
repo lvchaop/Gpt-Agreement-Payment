@@ -2886,7 +2886,6 @@ class AuthFlow:
         flow: str,
         *,
         device_id: str = "",
-        initialize_first: bool = False,
     ) -> tuple[str, str]:
         from .sentinel import get_sentinel_tokens
 
@@ -2898,7 +2897,6 @@ class AuthFlow:
             self.session,
             device_id=resolved_device_id,
             flow=flow,
-            initialize_first=initialize_first,
         )
         self._record_auth_web_sentinel_timing("ready")
         self._last_sentinel_token = token or ""
@@ -3201,8 +3199,7 @@ class AuthFlow:
         if self.result.device_id:
             try:
                 fresh_sentinel_token, fresh_so_token = self._refresh_sentinel_tokens(
-                    "username_password_create",
-                    initialize_first=True,
+                    "username_password_create"
                 )
             except Exception as e:
                 raise RuntimeError("注册密码前 Sentinel real SDK 刷新失败") from e
