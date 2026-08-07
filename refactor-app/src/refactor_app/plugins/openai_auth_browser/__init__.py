@@ -1,8 +1,3 @@
-from refactor_app.plugins.openai_auth_browser.account_security import (
-    AccountSecuritySetupResult,
-    BrowserAccountSecurityConfig,
-    CamoufoxAccountSecurity,
-)
 from refactor_app.plugins.openai_auth_browser.email_registration import (
     BrowserAccountDeactivatedError,
     BrowserBusinessCredential,
@@ -20,9 +15,7 @@ from refactor_app.plugins.openai_auth_browser.personal_payment_method import (
 )
 
 __all__ = [
-    "AccountSecuritySetupResult",
     "BrowserAccountDeactivatedError",
-    "BrowserAccountSecurityConfig",
     "BrowserBusinessCredential",
     "BrowserChatGPTAccountMissingError",
     "BrowserEmailRegistrationConfig",
@@ -32,6 +25,5 @@ __all__ = [
     "BrowserPaymentMethodConfirmError",
     "BrowserPaymentMethodResult",
     "BrowserPersonalPaymentMethodError",
-    "CamoufoxAccountSecurity",
     "CamoufoxEmailRegistration",
 ]

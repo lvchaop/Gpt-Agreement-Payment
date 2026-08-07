@@ -25,7 +25,9 @@ from refactor_app.config.browser_fingerprint import (
 from refactor_app.config.settings import Settings
 from refactor_app.plugins.contracts import OtpMessage
 from refactor_app.plugins.mail_external_api.client import ClaimedMailAccount
-from refactor_app.plugins.openai_auth_browser import AccountSecuritySetupResult
+from refactor_app.plugins.openai_auth_protocol.account_security import (
+    AccountSecuritySetupResult,
+)
 from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthFlow, AuthResult
 from refactor_app.plugins.openai_auth_protocol.config import Config, PhoneConfig
 
@@ -876,7 +878,7 @@ def test_icloud_security_exception_keeps_registration_successful(monkeypatch) ->
 
     twofauth_client = object()
     monkeypatch.setattr(protocol_registration, "AuthFlow", FakeAuthFlow)
-    monkeypatch.setattr(protocol_registration, "CamoufoxAccountSecurity", FailingSecurity)
+    monkeypatch.setattr(protocol_registration, "ProtocolAccountSecurity", FailingSecurity)
     monkeypatch.setattr(
         protocol_registration,
         "resolve_registration_backbone_proxy",
@@ -913,6 +915,7 @@ def test_icloud_security_exception_keeps_registration_successful(monkeypatch) ->
     assert calls["security_run"]["auth_result"].auth_cookie_header == (
         "auth-session=auth-cookie-value"
     )
+    assert calls["security_run"]["http_session"] is not None
     assert calls["claim_complete"] == ("success", "icloud-user@example.test")
     assert "delete_placeholder" not in calls
     assert "claim_release" not in calls

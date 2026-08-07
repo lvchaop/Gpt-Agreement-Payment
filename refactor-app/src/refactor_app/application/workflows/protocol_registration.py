@@ -30,11 +30,13 @@ from refactor_app.plugins.mail_external_api.plugin import (
     prepare_domain_mailbox,
 )
 from refactor_app.plugins.openai_auth_browser import (
-    AccountSecuritySetupResult,
-    BrowserAccountSecurityConfig,
     BrowserEmailRegistrationConfig,
-    CamoufoxAccountSecurity,
     CamoufoxEmailRegistration,
+)
+from refactor_app.plugins.openai_auth_protocol.account_security import (
+    AccountSecuritySetupResult,
+    ProtocolAccountSecurity,
+    ProtocolAccountSecurityConfig,
 )
 from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthFlow, AuthResult
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import BrowserPhoneOtpProvider
@@ -231,7 +233,7 @@ class ProtocolRegistrationWorkflow:
             security_setup = self._run_post_registration_security(
                 input_,
                 result=result,
-                mail=mail,
+                flow=attempt.flow,
                 proxy_url=attempt.proxy_url,
                 emit=emit,
             )
@@ -603,7 +605,7 @@ class ProtocolRegistrationWorkflow:
         input_: ProtocolRegistrationInput,
         *,
         result: AuthResult,
-        mail: RegistrationMailProviderAdapter,
+        flow: AuthFlow | None,
         proxy_url: str,
         emit: TraceEmitter,
     ) -> AccountSecuritySetupResult | None:
@@ -614,23 +616,25 @@ class ProtocolRegistrationWorkflow:
             "account_security.started",
             {
                 "email": result.email,
-                "password_preconfigured": bool(result.password_configured),
+                "password_configured_by_registration": bool(result.password_configured),
                 "twofauth_configured": self._twofauth_client is not None,
+                "transport": "protocol",
             },
         )
         try:
-            setup = CamoufoxAccountSecurity(
-                BrowserAccountSecurityConfig(
+            setup = ProtocolAccountSecurity(
+                ProtocolAccountSecurityConfig(
                     proxy_url=proxy_url,
-                    headless=bool(input_.browser_headless),
-                    password_timeout_s=max(1, int(input_.browser_otp_timeout_s or 180)),
+                    request_timeout_s=min(
+                        60,
+                        max(1, int(input_.browser_otp_timeout_s or 30)),
+                    ),
                 ),
                 event_callback=emit,
             ).run(
                 auth_result=result,
-                mail_provider=mail,
                 twofauth_client=self._twofauth_client,
-                password_preconfigured=bool(result.password_configured),
+                http_session=flow.session if flow is not None else None,
             )
         except Exception as exc:
             error_message = _safe_security_error(exc)

@@ -1,0 +1,29 @@
+{
+  "executed_at_utc": "2026-08-07T12:01:11.409245+00:00",
+  "account_id": "protocol-registered-account-c1fb0b21-6e72-4029-863b-637e9bacc655",
+  "email": "vial_footer_9g@icloud.com",
+  "personal_space_id": "47c65628-0c35-4c23-acb7-8e7d276dbbbd",
+  "proxy": {
+    "endpoint_id": "backbone-5763",
+    "configured_country": "TR",
+    "exit_http_status": 200,
+    "exit_country": "TR",
+    "exit_city": "İzmir",
+    "exit_timezone": "Europe/Istanbul"
+  },
+  "session": {
+    "request_path": "/api/auth/session",
+    "http_status": 200,
+    "access_token_present": true,
+    "access_token_sha256": "d685b5a52ff3c0cd3260537743de01be2ffc4a1921c63d3d2e289ea83d17ff6c",
+    "access_token_sha256_prefix": "d685b5a52ff3c0cd",
+    "same_as_db_access_token": true
+  },
+  "v4": {
+    "request_url": "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480",
+    "http_status": 200,
+    "token_source": "immediate /api/auth/session response",
+    "response_sha256": "bc6ccea7b91b8f8a8274fbc84cae1b3400c88e4bad0f4669137c6ba7d4a217bf",
+    "response_path": "/Users/chaopenglv/data/me/Gpt-Agreement-Payment/outputs/v4-tr-response/v4-tr-session-token-vial-footer-9g-20260807T120101Z.raw.json"
+  }
+}
