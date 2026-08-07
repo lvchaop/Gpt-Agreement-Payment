@@ -1292,6 +1292,7 @@ def list_spaces(
     session_recency: str = "",
     payment_method_status: str = "",
     has_payment_method: bool | None = None,
+    has_promotion: bool | None = None,
 ) -> dict:
     page, page_size = page_values(page, page_size)
     space_session_at = case(
@@ -1330,6 +1331,8 @@ def list_spaces(
             stmt = stmt.where(column.in_(_csv_values(value)))
     if has_payment_method is not None:
         stmt = stmt.where(SpaceModel.has_payment_method.is_(has_payment_method))
+    if has_promotion is not None:
+        stmt = stmt.where(SpaceModel.has_promotion.is_(has_promotion))
     stmt = _apply_plan_type_filter(stmt, column=SpaceModel.plan_type, value=plan_type)
     stmt = _apply_session_recency_filter(
         stmt,
@@ -2027,6 +2030,11 @@ def create_personal_payment_method_bind_job(
         raise HTTPException(
             status_code=400,
             detail="payment method binding requires an active personal space",
+        )
+    if not space.has_promotion or not str(space.promotion_id or "").strip():
+        raise HTTPException(
+            status_code=409,
+            detail="payment method binding requires an eligible promotion",
         )
     if space.has_payment_method and space.payment_method_status == "bound":
         raise HTTPException(status_code=409, detail="personal space already has a payment method")
@@ -4106,6 +4114,7 @@ def _space_dict(
 ) -> dict:
     if session is not None and last_session_refresh_at is None:
         last_session_refresh_at = _space_last_session_refresh_at(session=session, space=space)
+    payment_method_attempt_count = int(space.payment_method_attempt_count or 0)
     return {
         "id": space.id,
         "provider": space.provider,
@@ -4120,15 +4129,17 @@ def _space_dict(
         "seats_in_use": space.seats_in_use,
         "seats_entitled": space.seats_entitled,
         "auto_replenish_enabled": space.auto_replenish_enabled,
+        "has_promotion": bool(space.has_promotion),
+        "promotion_id": str(space.promotion_id or ""),
         "has_payment_method": space.has_payment_method,
         "payment_method_status": space.payment_method_status,
-        "payment_method_attempt_count": space.payment_method_attempt_count,
+        "payment_method_attempt_count": payment_method_attempt_count,
         "payment_method_id": space.payment_method_id,
         "payment_method_last4": space.payment_method_last4,
         "payment_method_last_attempt_at": _iso(space.payment_method_last_attempt_at),
         "payment_method_cooldown_until": _iso(space.payment_method_cooldown_until),
         "payment_method_cooldown_active": bool(
-            space.payment_method_attempt_count >= PAYMENT_METHOD_MAX_ATTEMPTS
+            payment_method_attempt_count >= PAYMENT_METHOD_MAX_ATTEMPTS
             and (
                 space.payment_method_cooldown_until is None
                 or space.payment_method_cooldown_until > datetime.now(UTC)
@@ -5272,6 +5283,8 @@ def _select_personal_payment_method_bind_spaces(
             reason = "payment_method_personal_space_required"
         elif space.space_status != "active":
             reason = "payment_method_space_not_active"
+        elif not space.has_promotion or not str(space.promotion_id or "").strip():
+            reason = "payment_method_promotion_required"
         elif space.has_payment_method or space.payment_method_status == "bound":
             reason = "payment_method_already_bound"
         elif (

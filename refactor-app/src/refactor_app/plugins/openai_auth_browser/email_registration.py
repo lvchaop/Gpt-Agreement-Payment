@@ -253,6 +253,10 @@ class CamoufoxEmailRegistration:
                 os="windows",
                 screen=Screen(max_width=1920, max_height=1080),
                 proxy=_camoufox_proxy(self.config.proxy_url),
+                # Stripe.js is attached to the page's main world. Camoufox
+                # evaluates automation scripts in an isolated world unless
+                # this bridge is explicitly enabled.
+                main_world_eval=True,
                 # The proxy already determines the egress location. GeoIP is
                 # only fingerprint data here and otherwise causes a 66 MB
                 # database download before the first page can render.

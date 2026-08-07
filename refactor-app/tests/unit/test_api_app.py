@@ -230,6 +230,8 @@ def test_payment_method_pool_import_and_personal_job_api(
                 space_type="personal",
                 auth_mode="codex_oauth",
                 credential_type="personal_account",
+                has_promotion=True,
+                promotion_id="plus-1-month-free",
                 space_status="active",
                 created_at=now,
                 updated_at=now,
@@ -362,6 +364,8 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
             credential_type=(
                 "personal_account" if space_type == "personal" else "team_5h_weekly"
             ),
+            has_promotion=space_type == "personal",
+            promotion_id=("plus-1-month-free" if space_type == "personal" else ""),
             has_payment_method=has_payment_method,
             payment_method_status=payment_method_status,
             payment_method_attempt_count=payment_method_attempt_count,
@@ -671,6 +675,8 @@ def test_personal_payment_method_tick_only_enqueues_eligible_spaces() -> None:
             credential_type=(
                 "personal_account" if space_type == "personal" else "team_5h_weekly"
             ),
+            has_promotion=space_type == "personal",
+            promotion_id=("plus-1-month-free" if space_type == "personal" else ""),
             space_status=space_status,
             has_payment_method=has_payment_method,
             payment_method_status=payment_method_status,

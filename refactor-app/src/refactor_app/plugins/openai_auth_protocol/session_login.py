@@ -61,30 +61,33 @@ def acquire_chatgpt_session(
     openai_email = mailbox_email
     prepare_domain_mailbox(mail_provider, email=mailbox_email)
     flow = AuthFlow(config)
-    adapter = ExternalMailOtpAdapter(
-        mail_provider,
-        ensure_before_wait=False,
-        mailbox_email=mailbox_email,
-    )
-    result = flow.run_protocol_login(
-        email=openai_email,
-        password=password,
-        mail_provider=adapter,
-        existing_only=True,
-        totp_code_provider=totp_code_provider,
-    )
-    result.cookie_header = flow._build_chatgpt_cookie_header()
-    auth_cookie_header = _cookie_header_from_session(flow, "openai.com")
-    if not auth_cookie_header and trace_dump_path:
-        auth_cookie_header = _cookie_header_from_trace_dump(trace_dump_path)
-    ok = bool(result.session_token and result.access_token)
-    return SessionLoginResult(
-        ok=ok,
-        auth_result=result,
-        cookie_header=result.cookie_header,
-        auth_cookie_header=auth_cookie_header,
-        snapshot=flow.export_protocol_snapshot(mail_events=adapter.events),
-    )
+    try:
+        adapter = ExternalMailOtpAdapter(
+            mail_provider,
+            ensure_before_wait=False,
+            mailbox_email=mailbox_email,
+        )
+        result = flow.run_protocol_login(
+            email=openai_email,
+            password=password,
+            mail_provider=adapter,
+            existing_only=True,
+            totp_code_provider=totp_code_provider,
+        )
+        result.cookie_header = flow._build_chatgpt_cookie_header()
+        auth_cookie_header = _cookie_header_from_session(flow, "openai.com")
+        if not auth_cookie_header and trace_dump_path:
+            auth_cookie_header = _cookie_header_from_trace_dump(trace_dump_path)
+        ok = bool(result.session_token and result.access_token)
+        return SessionLoginResult(
+            ok=ok,
+            auth_result=result,
+            cookie_header=result.cookie_header,
+            auth_cookie_header=auth_cookie_header,
+            snapshot=flow.export_protocol_snapshot(mail_events=adapter.events),
+        )
+    finally:
+        flow.close()
 
 
 def prepare_chatgpt_session_otp(
@@ -112,24 +115,27 @@ def prepare_chatgpt_session_otp(
     openai_email = mailbox_email
     prepare_domain_mailbox(mail_provider, email=mailbox_email)
     flow = AuthFlow(config)
-    adapter = ExternalMailOtpAdapter(
-        mail_provider,
-        ensure_before_wait=False,
-        mailbox_email=mailbox_email,
-    )
-    snapshot = flow.run_protocol_login_prepare_otp(
-        adapter,
-        openai_email,
-        password,
-        existing_only=True,
-    )
-    snapshot["email"] = openai_email
-    snapshot["mailbox_email"] = mailbox_email
-    snapshot["mail_events"] = adapter.events
-    return SessionOtpPrepareResult(
-        ok=str(snapshot.get("phase") or "") in {"otp_collected", "otp_pending"},
-        snapshot=snapshot,
-    )
+    try:
+        adapter = ExternalMailOtpAdapter(
+            mail_provider,
+            ensure_before_wait=False,
+            mailbox_email=mailbox_email,
+        )
+        snapshot = flow.run_protocol_login_prepare_otp(
+            adapter,
+            openai_email,
+            password,
+            existing_only=True,
+        )
+        snapshot["email"] = openai_email
+        snapshot["mailbox_email"] = mailbox_email
+        snapshot["mail_events"] = adapter.events
+        return SessionOtpPrepareResult(
+            ok=str(snapshot.get("phase") or "") in {"otp_collected", "otp_pending"},
+            snapshot=snapshot,
+        )
+    finally:
+        flow.close()
 
 
 def submit_prepared_chatgpt_session_otp(
@@ -150,25 +156,28 @@ def submit_prepared_chatgpt_session_otp(
         "SKIP_OAUTH_TOKEN_EXCHANGE": "1",
     }
     flow = AuthFlow(config)
-    mailbox_email = str(snapshot.get("mailbox_email") or snapshot.get("email") or "").strip()
-    adapter = ExternalMailOtpAdapter(
-        mail_provider,
-        ensure_before_wait=False,
-        mailbox_email=mailbox_email,
-    )
-    updated = flow.run_protocol_login_submit_prepared_otp(
-        dict(snapshot),
-        before_validate=before_validate,
-        before_skip=before_skip,
-        mail_provider=adapter,
-    )
-    updated["email"] = str(snapshot.get("email") or updated.get("email") or "").strip()
-    updated["mailbox_email"] = mailbox_email
-    updated["mail_events"] = adapter.events
-    return SessionOtpSubmitResult(
-        ok=str(updated.get("phase") or "") in {"otp_validated", "otp_missing"},
-        snapshot=updated,
-    )
+    try:
+        mailbox_email = str(snapshot.get("mailbox_email") or snapshot.get("email") or "").strip()
+        adapter = ExternalMailOtpAdapter(
+            mail_provider,
+            ensure_before_wait=False,
+            mailbox_email=mailbox_email,
+        )
+        updated = flow.run_protocol_login_submit_prepared_otp(
+            dict(snapshot),
+            before_validate=before_validate,
+            before_skip=before_skip,
+            mail_provider=adapter,
+        )
+        updated["email"] = str(snapshot.get("email") or updated.get("email") or "").strip()
+        updated["mailbox_email"] = mailbox_email
+        updated["mail_events"] = adapter.events
+        return SessionOtpSubmitResult(
+            ok=str(updated.get("phase") or "") in {"otp_validated", "otp_missing"},
+            snapshot=updated,
+        )
+    finally:
+        flow.close()
 
 
 def _cookie_header_from_session(flow: AuthFlow, domain_keyword: str) -> str:

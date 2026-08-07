@@ -32,6 +32,7 @@ from refactor_app.plugins.openai_auth_browser import (
     BrowserEmailRegistrationConfig,
     BrowserEmailRegistrationError,
     BrowserPaymentCard,
+    BrowserPaymentMethodConfirmError,
     BrowserPaymentMethodResult,
     CamoufoxEmailRegistration,
 )
@@ -51,6 +52,7 @@ _NETWORK_ERROR_MARKERS = (
     "proxy",
     "eof",
     "fetch failed",
+    "failed to fetch",
     "load_failed",
     "temporarily unavailable",
     "service unavailable",
@@ -84,9 +86,16 @@ _NETWORK_ERROR_MARKERS = (
 
 
 class PersonalPaymentMethodBindError(RuntimeError):
-    def __init__(self, error_code: str, error_message: str = "") -> None:
+    def __init__(
+        self,
+        error_code: str,
+        error_message: str = "",
+        *,
+        diagnostics: dict[str, str] | None = None,
+    ) -> None:
         self.error_code = str(error_code or "personal_payment_method_bind_failed")
         self.error_message = str(error_message or "")
+        self.diagnostics = dict(diagnostics or {})
         super().__init__(
             f"{self.error_code}: {self.error_message}".rstrip(": ")
         )
@@ -178,30 +187,48 @@ class PersonalPaymentMethodBindWorkflow:
                         "payment_method_authentication_failed",
                         f"{type(exc).__name__}: {str(exc)[:900]}",
                     )
+                network_error = _is_network_payment_method_error(last_error)
+                confirm_failure = isinstance(exc, BrowserPaymentMethodConfirmError)
+                attempt_consumed = confirm_failure and not network_error
+                if not attempt_consumed:
                     self._release_pre_payment_failure(
                         context=context,
                         attempt=attempt,
                         error=last_error,
                     )
+                    authentication_failure = isinstance(
+                        exc,
+                        BrowserEmailRegistrationError,
+                    )
                     self._event(
                         run_id=run_id,
-                        event_type="personal_payment_method.authentication_failed",
-                        message="personal payment method authentication failed before card submit",
+                        event_type=(
+                            "personal_payment_method.authentication_failed"
+                            if authentication_failure
+                            else "personal_payment_method.attempt_released"
+                        ),
+                        message=(
+                            "personal payment method authentication failed before confirm"
+                            if authentication_failure
+                            else "personal payment method attempt failed without consuming card"
+                        ),
                         level="ERROR",
                         data_json={
                             "space_id": context.space_id,
                             "card_id": attempt.card_id,
                             "card_last4": attempt.card_last4,
                             "attempt_count": attempt.attempt_count,
+                            "confirm_failure": confirm_failure,
+                            "network_error": network_error,
                             "attempt_consumed": False,
                             "card_invalidated": False,
                             "error_code": last_error.error_code,
                             "error_message": last_error.error_message[:500],
+                            "stripe_diagnostics": last_error.diagnostics,
                             "work_id": work_id,
                         },
                     )
                     raise last_error from exc
-                network_error = _is_network_payment_method_error(last_error)
                 self._record_failure(
                     context=context,
                     attempt=attempt,
@@ -219,8 +246,11 @@ class PersonalPaymentMethodBindWorkflow:
                         "attempt_count": attempt.attempt_count,
                         "error_code": last_error.error_code,
                         "error_message": last_error.error_message[:500],
-                        "network_error": network_error,
-                        "card_invalidated": not network_error,
+                        "stripe_diagnostics": last_error.diagnostics,
+                        "confirm_failure": True,
+                        "network_error": False,
+                        "attempt_consumed": True,
+                        "card_invalidated": True,
                         "work_id": work_id,
                     },
                 )
@@ -255,6 +285,11 @@ class PersonalPaymentMethodBindWorkflow:
                 raise PersonalPaymentMethodBindError(
                     "payment_method_space_not_active",
                     space.space_status,
+                )
+            if not space.has_promotion or not str(space.promotion_id or "").strip():
+                raise PersonalPaymentMethodBindError(
+                    "payment_method_promotion_required",
+                    space.id,
                 )
             account = session.get(UserAccountModel, space.owner_user_account_id)
             if account is None:
@@ -301,6 +336,11 @@ class PersonalPaymentMethodBindWorkflow:
             space = session.get(SpaceModel, space_id, with_for_update=True)
             if space is None:
                 raise PersonalPaymentMethodBindError("space_not_found", space_id)
+            if not space.has_promotion or not str(space.promotion_id or "").strip():
+                raise PersonalPaymentMethodBindError(
+                    "payment_method_promotion_required",
+                    space.id,
+                )
             if space.has_payment_method and space.payment_method_status == "bound":
                 raise PersonalPaymentMethodBindError("payment_method_already_bound", space.id)
             if _payment_method_cooldown_active(space, now=now):
@@ -518,9 +558,8 @@ class PersonalPaymentMethodBindWorkflow:
         with self._session_factory() as session:
             space = session.get(SpaceModel, context.space_id, with_for_update=True)
             card = session.get(PaymentCardPoolModel, attempt.card_id, with_for_update=True)
-            network_error = _is_network_payment_method_error(error)
             if card is not None:
-                card.card_status = "available" if network_error else "failed"
+                card.card_status = "failed"
                 card.reserved_by_space_id = None
                 card.reserved_at = None
                 card.last_error_code = error.error_code[:200]
@@ -620,6 +659,12 @@ def _mail_provider_name(email: str) -> str:
 def _bind_error(exc: Exception) -> PersonalPaymentMethodBindError:
     if isinstance(exc, PersonalPaymentMethodBindError):
         return exc
+    if isinstance(exc, BrowserPaymentMethodConfirmError):
+        return PersonalPaymentMethodBindError(
+            exc.error_code,
+            exc.error_message[:1000],
+            diagnostics=exc.diagnostics,
+        )
     text = " ".join(str(exc or "").split())
     possible_code = text.partition(":")[0].strip()
     if possible_code and len(possible_code) <= 200 and " " not in possible_code:

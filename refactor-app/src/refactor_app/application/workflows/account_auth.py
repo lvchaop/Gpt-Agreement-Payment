@@ -61,6 +61,7 @@ from refactor_app.plugins.openai_chatgpt.client import (
 
 PROXY_HEALTHCHECK_URL = "https://chatgpt.com/api/auth/csrf"
 ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+PLUS_ONE_MONTH_FREE_PROMOTION_ID = "plus-1-month-free"
 TRACE_DIR = Path("runtime/auth-traces")
 TotpCodeResolver = Callable[[str], str]
 
@@ -396,6 +397,110 @@ class BackfillSessionWorkflow:
             "personal_session_access_token_status": personal_token_status,
             "personal_session_access_token_error": personal_token_error,
         }
+
+    def probe_personal_space_promotion(
+        self,
+        *,
+        user_account_id: str,
+        proxy_url: str,
+        run_id: str = "",
+    ) -> dict:
+        step_id = self._start_step(
+            run_id,
+            "account_auth.personal_promotion_check",
+            {
+                "user_account_id": user_account_id,
+                "proxy_country": "TR",
+            },
+        )
+        try:
+            with self._session_factory() as session:
+                account = session.get(UserAccountModel, user_account_id)
+                if account is None:
+                    raise AccountAuthWorkflowError("user_account row disappeared")
+                space = session.scalars(
+                    select(SpaceModel).where(
+                        SpaceModel.provider == "openai_chatgpt",
+                        SpaceModel.owner_user_account_id == user_account_id,
+                        SpaceModel.space_type == "personal",
+                        SpaceModel.credential_type == "personal_account",
+                    )
+                ).first()
+                if space is None:
+                    raise AccountAuthWorkflowError("missing_personal_chatgpt_account_id")
+                access_token = str(account.access_token or "").strip()
+                cookie_header = _web_session_cookie_header(account)
+                oai_device_id = str(account.device_id or "").strip()
+                personal_account_id = str(space.external_space_id or "").strip()
+
+            payload = _fetch_accounts_check_v4(
+                access_token=access_token,
+                cookie_header=cookie_header,
+                proxy_url=proxy_url,
+                chatgpt_account_id=personal_account_id,
+                oai_device_id=oai_device_id,
+            )
+            promotion_id = _extract_account_promotion_id(
+                payload,
+                account_id=personal_account_id,
+            )
+            has_promotion = promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID
+            now = datetime.now(UTC)
+            with self._session_factory() as session:
+                space = session.scalars(
+                    select(SpaceModel)
+                    .where(
+                        SpaceModel.provider == "openai_chatgpt",
+                        SpaceModel.owner_user_account_id == user_account_id,
+                        SpaceModel.space_type == "personal",
+                        SpaceModel.external_space_id == personal_account_id,
+                    )
+                    .with_for_update()
+                ).first()
+                if space is None:
+                    raise AccountAuthWorkflowError("personal_space_row_disappeared")
+                space.has_promotion = has_promotion
+                space.promotion_id = promotion_id if has_promotion else ""
+                space.updated_at = now
+                session.commit()
+
+            result = {
+                "status": "succeeded",
+                "personal_chatgpt_account_id": personal_account_id,
+                "has_promotion": has_promotion,
+                "promotion_id": promotion_id if has_promotion else "",
+                "proxy_country": "TR",
+            }
+            self._write_event(
+                run_id,
+                "account_auth.personal_promotion_checked",
+                "personal space promotion checked through TR proxy",
+                {"user_account_id": user_account_id, **result},
+                step_id=step_id,
+            )
+            self._finish_step(step_id, "succeeded", output_json=result)
+            return result
+        except Exception as exc:
+            self._write_event(
+                run_id,
+                "account_auth.personal_promotion_check_failed",
+                "personal space promotion check failed",
+                {
+                    "user_account_id": user_account_id,
+                    "proxy_country": "TR",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:1000],
+                },
+                level="WARN",
+                step_id=step_id,
+            )
+            self._finish_step(
+                step_id,
+                "failed",
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+            )
+            raise
 
     def refresh_detected_spaces_from_current_session(
         self,
@@ -2552,6 +2657,47 @@ def _extract_personal_accounts_check_identity(
         if identity is not None and identity.structure == "personal":
             return identity
     return None
+
+
+def _extract_account_promotion_id(payload: dict, *, account_id: str = "") -> str:
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, dict):
+        return ""
+
+    target_account_id = str(account_id or "").strip()
+    candidates: list[dict] = []
+    seen: set[int] = set()
+    for key in (target_account_id, "default"):
+        entry = accounts.get(key)
+        if isinstance(entry, dict) and id(entry) not in seen:
+            candidates.append(entry)
+            seen.add(id(entry))
+    for entry in accounts.values():
+        if not isinstance(entry, dict) or id(entry) in seen:
+            continue
+        identity = _accounts_check_identity_from_entry(entry)
+        if target_account_id:
+            if identity is None or identity.account_id != target_account_id:
+                continue
+        elif identity is None or identity.structure != "personal":
+            continue
+        candidates.append(entry)
+        seen.add(id(entry))
+
+    for entry in candidates:
+        identity = _accounts_check_identity_from_entry(entry)
+        if target_account_id and identity is not None and identity.account_id != target_account_id:
+            continue
+        campaigns = entry.get("eligible_promo_campaigns")
+        if not isinstance(campaigns, dict):
+            continue
+        for campaign in campaigns.values():
+            if not isinstance(campaign, dict):
+                continue
+            promotion_id = str(campaign.get("id") or "").strip()
+            if promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID:
+                return promotion_id
+    return ""
 
 
 def _accounts_check_identity_from_entry(entry: object) -> AccountsCheckIdentity | None:

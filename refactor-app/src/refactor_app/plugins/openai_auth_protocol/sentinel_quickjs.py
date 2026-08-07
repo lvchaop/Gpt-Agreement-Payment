@@ -31,6 +31,7 @@ DEFAULT_SEC_CH_UA = BROWSER_FINGERPRINT.sec_ch_ua
 _SESSION_CONTEXT_ATTR = "_openai_sentinel_runtime_context"
 _FLOW_PAGE_URL = {
     "authorize_continue": "https://auth.openai.com/email-verification",
+    "email_otp_validate": "https://auth.openai.com/email-verification",
     "password_verify": "https://auth.openai.com/log-in/password",
     "username_password_create": "https://auth.openai.com/create-account/password",
     "create_account": "https://auth.openai.com/about-you",

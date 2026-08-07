@@ -171,7 +171,7 @@ def test_real_sdk_flow_passes_page_cookie_and_context_to_runner(
                 "so": "session-observer-token",
                 "c": "challenge-token",
                 "id": "device-id",
-                "flow": "create_account",
+                "flow": "oauth_create_account",
             }
         )
 
@@ -181,7 +181,7 @@ def test_real_sdk_flow_passes_page_cookie_and_context_to_runner(
     token, so_token = sentinel_quickjs.get_sentinel_tokens_via_quickjs(
         session,
         device_id="device-id",
-        flow="create_account",
+        flow="oauth_create_account",
     )
 
     assert json.loads(token)["p"] == "real-sdk-proof"
@@ -305,6 +305,9 @@ def test_auth_flow_snapshot_preserves_sentinel_runtime_context() -> None:
     config = Config()
     config.proxy_meta = {"register": {"country_code": "JP"}}
     original = AuthFlow(config)
+    original._last_auth_session_logging_id = "session-logging-id"
+    original._last_auth_oauth_init_url = "https://auth.openai.com/email-verification"
+    original._auth_web_runtime_page_url = "https://auth.openai.com/email-verification"
     snapshot = original.export_protocol_snapshot()
     restored = AuthFlow(config)
 
@@ -312,6 +315,11 @@ def test_auth_flow_snapshot_preserves_sentinel_runtime_context() -> None:
 
     assert restored._sentinel_runtime_context == original._sentinel_runtime_context
     assert restored._sentinel_runtime_context.browser_profile["timezone_iana"] == "Asia/Tokyo"
+    assert restored._last_auth_session_logging_id == "session-logging-id"
+    assert restored._last_auth_oauth_init_url == "https://auth.openai.com/email-verification"
+    assert restored._auth_web_runtime_page_url == "https://auth.openai.com/email-verification"
+    original.close()
+    restored.close()
 
 
 def test_real_sdk_failure_does_not_enter_synthetic_path(

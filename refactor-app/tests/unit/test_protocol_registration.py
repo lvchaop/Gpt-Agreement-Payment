@@ -1757,6 +1757,61 @@ def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> No
     }
 
 
+def test_icloud_promotion_check_uses_email_hashed_tr_proxy(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Detector:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def probe_personal_space_promotion(self, **kwargs):
+            calls.append(("probe", kwargs["proxy_url"]))
+            assert kwargs["user_account_id"] == "account-1"
+            return {
+                "status": "succeeded",
+                "has_promotion": True,
+                "promotion_id": "plus-1-month-free",
+                "proxy_country": "TR",
+            }
+
+    def resolve_proxy(_session_factory, *, email: str, country_code: str):
+        calls.append((email, country_code))
+        return RegistrationBackboneProxy(
+            proxy_url="http://tr-proxy.example:8080",
+            endpoint_id="backbone-77",
+            endpoint_number=77,
+            endpoint_count=20_000,
+            country_code=country_code,
+        )
+
+    monkeypatch.setattr(protocol_registration, "BackfillSessionWorkflow", Detector)
+    monkeypatch.setattr(protocol_registration, "resolve_registration_backbone_proxy", resolve_proxy)
+    workflow = ProtocolRegistrationWorkflow(session_factory=lambda: None, mail_provider=object())
+
+    result = workflow._run_post_registration_promotion_check(
+        ProtocolRegistrationInput(
+            mode="email_protocol_no_phone",
+            mail_provider="icloud_hide_my_email",
+        ),
+        user_account_id="account-1",
+        email="MixedCase@icloud.com",
+        run_id="",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    assert calls == [
+        ("MixedCase@icloud.com", "TR"),
+        ("probe", "http://tr-proxy.example:8080"),
+    ]
+    assert result == {
+        "status": "succeeded",
+        "has_promotion": True,
+        "promotion_id": "plus-1-month-free",
+        "proxy_country": "TR",
+        "proxy_endpoint_id": "backbone-77",
+    }
+
+
 def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
     calls: list[str] = []
     auth_url_kwargs: list[dict] = []
@@ -2109,8 +2164,8 @@ def test_registration_state_mutations_send_sentinel_so_and_invocation_id() -> No
 
     assert sentinel_flows == [
         "username_password_create",
-        "authorize_continue",
-        "create_account",
+        "email_otp_validate",
+        "oauth_create_account",
     ]
     assert [url.rsplit("/", 1)[-1] for url, _headers in requests] == [
         "register",
@@ -2154,6 +2209,15 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
     assert len(query["auth_session_logging_id"]) == 1
     assert "prompt" not in query
     assert "ext-passkey-client-capabilities" not in query
+
+    flow.get_auth_url("csrf-token")
+
+    neutral_query = parse_qs(urlparse(requested_urls[1]).query)
+    assert neutral_query["ext-oai-did"] == [flow.result.device_id]
+    assert len(neutral_query["auth_session_logging_id"]) == 1
+    assert neutral_query["ext-passkey-client-capabilities"] == ["11111"]
+    assert "prompt" not in neutral_query
+    assert "screen_hint" not in neutral_query
 
 
 def test_registration_headers_match_configured_browser_fingerprint() -> None:

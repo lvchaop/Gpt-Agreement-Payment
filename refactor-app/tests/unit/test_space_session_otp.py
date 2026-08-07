@@ -568,6 +568,9 @@ def test_pending_otp_is_collected_before_ready_barrier() -> None:
         def restore_protocol_snapshot(self, _snapshot: dict) -> None:
             events.append("restore")
 
+        def _ensure_auth_web_runtime(self) -> None:
+            events.append("runtime_ready")
+
         def kickoff_otp_delivery(self, _reason: str) -> bool:
             events.append("send")
             return True
@@ -608,7 +611,7 @@ def test_pending_otp_is_collected_before_ready_barrier() -> None:
     )
 
     assert result["phase"] == "otp_validated"
-    assert events == ["restore", "mail", "ready", "validate"]
+    assert events == ["restore", "mail", "runtime_ready", "ready", "validate"]
     assert wait_kwargs["max_polls"] == 1
     assert wait_kwargs["issued_after"] == 123.0
 

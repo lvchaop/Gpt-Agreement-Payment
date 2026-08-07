@@ -127,6 +127,8 @@ class SpaceModel(Base):
     auto_replenish_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    has_promotion: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    promotion_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     has_payment_method: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     payment_method_status: Mapped[str] = mapped_column(
         Text, nullable=False, default="missing"
@@ -174,6 +176,7 @@ class SpaceModel(Base):
         Index("idx_spaces_credential_type", "credential_type"),
         Index("idx_spaces_owner_user_account_id", "owner_user_account_id"),
         Index("idx_spaces_auto_replenish", "auto_replenish_enabled", "space_status", "space_type"),
+        Index("idx_spaces_promotion", "space_type", "has_promotion"),
         Index("idx_spaces_payment_method", "space_type", "payment_method_status"),
     )
 

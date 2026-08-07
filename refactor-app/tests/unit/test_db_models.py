@@ -85,6 +85,8 @@ def test_personal_payment_method_tables_have_plaintext_card_fields() -> None:
     addresses = Base.metadata.tables["payment_address_pool"]
 
     assert {
+        "has_promotion",
+        "promotion_id",
         "has_payment_method",
         "payment_method_status",
         "payment_method_attempt_count",

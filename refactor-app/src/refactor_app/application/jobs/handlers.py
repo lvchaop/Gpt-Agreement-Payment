@@ -1225,6 +1225,8 @@ def _run_personal_payment_method_bind_tick_job(
                     SpaceModel.provider == "openai_chatgpt",
                     SpaceModel.space_type == "personal",
                     SpaceModel.space_status == "active",
+                    SpaceModel.has_promotion.is_(True),
+                    SpaceModel.promotion_id != "",
                     SpaceModel.has_payment_method.is_(False),
                     SpaceModel.payment_method_status != "bound",
                     or_(

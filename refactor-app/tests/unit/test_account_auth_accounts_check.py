@@ -8,6 +8,8 @@ from refactor_app.application.workflows import account_auth
 from refactor_app.application.workflows.account_auth import (
     AccountAuthWorkflowError,
     BackfillSessionWorkflow,
+    PLUS_ONE_MONTH_FREE_PROMOTION_ID,
+    _extract_account_promotion_id,
     _extract_accounts_check_identities,
     _extract_personal_accounts_check_identity,
     _extract_personal_chatgpt_account_id,
@@ -91,6 +93,87 @@ def test_accounts_check_selects_personal_identity_as_account_identity() -> None:
     assert identity.account_id == "personal-space-1"
     assert identity.account_owner_id == "user-owner-1"
     assert _extract_personal_chatgpt_account_id(payload) == "personal-space-1"
+
+
+def test_accounts_check_extracts_plus_promotion_for_target_personal_space() -> None:
+    payload = _accounts_check_payload()
+    payload["accounts"]["personal-space-1"]["eligible_promo_campaigns"] = {
+        "plus": {"id": PLUS_ONE_MONTH_FREE_PROMOTION_ID}
+    }
+
+    assert (
+        _extract_account_promotion_id(payload, account_id="personal-space-1")
+        == PLUS_ONE_MONTH_FREE_PROMOTION_ID
+    )
+
+    payload["accounts"]["personal-space-1"].pop("eligible_promo_campaigns")
+    payload["accounts"]["business-space-1"]["eligible_promo_campaigns"] = {
+        "plus": {"id": PLUS_ONE_MONTH_FREE_PROMOTION_ID}
+    }
+    assert _extract_account_promotion_id(payload, account_id="personal-space-1") == ""
+
+
+def test_personal_promotion_probe_uses_tr_proxy_and_updates_space(monkeypatch) -> None:
+    captured: dict = {}
+    account = SimpleNamespace(
+        access_token="personal-access-token",
+        session_token="session-token",
+        cookie_header="oai-did=device-1",
+        device_id="device-1",
+    )
+    space = SimpleNamespace(
+        external_space_id="personal-space-1",
+        has_promotion=False,
+        promotion_id="",
+        updated_at=None,
+    )
+
+    class ScalarResult:
+        def first(self):
+            return space
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _model, key):
+            assert key == "account-1"
+            return account
+
+        def scalars(self, _stmt):
+            return ScalarResult()
+
+        def commit(self):
+            return None
+
+    def fetch(**kwargs):
+        captured.update(kwargs)
+        payload = _accounts_check_payload()
+        payload["accounts"]["personal-space-1"]["eligible_promo_campaigns"] = {
+            "plus": {"id": PLUS_ONE_MONTH_FREE_PROMOTION_ID}
+        }
+        return payload
+
+    monkeypatch.setattr(account_auth, "_fetch_accounts_check_v4", fetch)
+    result = BackfillSessionWorkflow(
+        session_factory=FakeSession,
+        mail_provider=object(),
+    ).probe_personal_space_promotion(
+        user_account_id="account-1",
+        proxy_url="http://tr-proxy.example:8080",
+    )
+
+    assert captured["proxy_url"] == "http://tr-proxy.example:8080"
+    assert captured["chatgpt_account_id"] == "personal-space-1"
+    assert captured["access_token"] == "personal-access-token"
+    assert "__Secure-next-auth.session-token=session-token" in captured["cookie_header"]
+    assert result["proxy_country"] == "TR"
+    assert result["has_promotion"] is True
+    assert space.has_promotion is True
+    assert space.promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID
 
 
 def test_account_user_id_extracts_member_user_id_without_workspace_suffix() -> None:

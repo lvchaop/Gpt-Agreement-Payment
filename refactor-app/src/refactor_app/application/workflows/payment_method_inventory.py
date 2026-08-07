@@ -119,6 +119,8 @@ def payment_method_inventory_summary(session: Session) -> dict[str, Any]:
             .where(
                 SpaceModel.space_type == "personal",
                 SpaceModel.space_status == "active",
+                SpaceModel.has_promotion.is_(True),
+                SpaceModel.promotion_id != "",
                 SpaceModel.has_payment_method.is_(False),
                 or_(
                     SpaceModel.payment_method_attempt_count < PAYMENT_METHOD_MAX_ATTEMPTS,

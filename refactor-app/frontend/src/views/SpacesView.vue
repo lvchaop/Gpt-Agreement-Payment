@@ -82,6 +82,7 @@ const selectedPersonalSpaceCount = computed(() => selectedSpaces.value.filter(
 const selectedUnboundPersonalSpaceCount = computed(() => selectedSpaces.value.filter(
   (row) => String(row.space_type || "") === "personal"
     && String(row.space_status || "") === "active"
+    && Boolean(row.has_promotion)
     && !Boolean(row.has_payment_method)
     && String(row.payment_method_status || "") !== "bound"
     && !Boolean(row.payment_method_cooldown_active),
@@ -93,6 +94,8 @@ const columns: Column[] = [
   { key: "external_space_id", label: "外部空间 ID", mono: true, summary: 26 },
   { key: "space_type", label: "空间类型", badge: true },
   { key: "plan_type", label: "订阅类型", badge: true, sortable: true },
+  { key: "has_promotion", label: "是否有优惠", type: "boolean" },
+  { key: "promotion_id", label: "优惠 ID", mono: true },
   { key: "last_session_refresh_at", label: "最近 Session 时间", type: "datetime", relativeTime: true, sortable: true },
   { key: "credential_type", label: "凭证类型", badge: true },
   { key: "auth_mode", label: "授权模式", badge: true },
@@ -154,6 +157,14 @@ const filters: TableFilter[] = [
     options: [
       { label: "codex_oauth", value: "codex_oauth" },
       { label: "backend_access_token", value: "backend_access_token" },
+    ],
+  },
+  {
+    key: "has_promotion",
+    label: "是否有优惠",
+    options: [
+      { label: "有优惠", value: "true" },
+      { label: "无优惠", value: "false" },
     ],
   },
   {
@@ -634,7 +645,7 @@ onMounted(() => {
     <template #rowActions="{ row }">
       <div class="row-actions">
         <button
-          v-if="String(row.space_type || '') === 'personal' && !Boolean(row.has_payment_method)"
+          v-if="String(row.space_type || '') === 'personal' && Boolean(row.has_promotion) && !Boolean(row.has_payment_method)"
           class="btn primary small"
           :disabled="String(row.space_status || '') !== 'active' || Boolean(row.payment_method_cooldown_active) || bindingPaymentSpaceId === String(row.id || '')"
           title="为个人空间创建绑卡 Job"

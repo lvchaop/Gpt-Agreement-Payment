@@ -128,14 +128,17 @@ def acquire_codex_refresh_token(
         config.auth_trace_dump_path = trace_dump_path
     prepare_domain_mailbox(mail_provider, email=email)
     flow = AuthFlow(config)
-    flow.result.email = email.strip().lower()
-    flow.result.password = password
-    adapter = ExternalMailOtpAdapter(mail_provider, mailbox_email=email)
-    ok = flow.oauth_codex_rt_exchange(mail_provider=adapter)
-    flow.result.cookie_header = flow._build_chatgpt_cookie_header()
-    return CodexRtResult(
-        ok=ok,
-        auth_result=flow.result,
-        cookie_header=flow.result.cookie_header,
-        snapshot=flow.export_protocol_snapshot(mail_events=adapter.events),
-    )
+    try:
+        flow.result.email = email.strip().lower()
+        flow.result.password = password
+        adapter = ExternalMailOtpAdapter(mail_provider, mailbox_email=email)
+        ok = flow.oauth_codex_rt_exchange(mail_provider=adapter)
+        flow.result.cookie_header = flow._build_chatgpt_cookie_header()
+        return CodexRtResult(
+            ok=ok,
+            auth_result=flow.result,
+            cookie_header=flow.result.cookie_header,
+            snapshot=flow.export_protocol_snapshot(mail_events=adapter.events),
+        )
+    finally:
+        flow.close()

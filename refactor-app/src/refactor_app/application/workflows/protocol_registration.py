@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re
@@ -40,10 +41,13 @@ from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import BrowserPh
 from refactor_app.plugins.openai_auth_protocol.config import Config, PhoneConfig
 from refactor_app.plugins.twofauth import TwoFAuthClient
 
+logger = logging.getLogger(__name__)
+
 EMAIL_PROTOCOL_NO_PHONE = "email_protocol_no_phone"
 EMAIL_BROWSER_NO_PHONE = "email_browser_no_phone"
 PHONE_PROTOCOL_BIND_EMAIL = "phone_protocol_bind_email"
 ICLOUD_HIDE_MY_EMAIL_PROVIDER = "icloud_hide_my_email"
+ICLOUD_PROMOTION_PROXY_COUNTRY = "TR"
 SUPPORTED_REGISTRATION_MAIL_PROVIDERS = frozenset(
     {
         "outlook",
@@ -93,6 +97,15 @@ class _RegistrationAttempt:
     result: AuthResult
     flow: AuthFlow | None
     proxy_url: str
+
+
+def _close_auth_flow(flow: AuthFlow | None) -> None:
+    if flow is None:
+        return
+    try:
+        flow.close()
+    except Exception as exc:
+        logger.warning("AuthFlow close failed: %s", exc)
 
 
 class ProtocolRegistrationWorkflow:
@@ -164,6 +177,7 @@ class ProtocolRegistrationWorkflow:
         )
         user_account_id = ""
         account_persisted = False
+        attempt: _RegistrationAttempt | None = None
         try:
             claimed = mail.claim_mailbox()
             target_email = claimed.email.strip()
@@ -253,6 +267,13 @@ class ProtocolRegistrationWorkflow:
                     },
                     "WARN",
                 )
+            promotion_check = self._run_post_registration_promotion_check(
+                input_,
+                user_account_id=user_account_id,
+                email=result.email or target_email,
+                run_id=run_id,
+                emit=emit,
+            )
             codex_authorization = self._run_post_registration_codex_authorization(
                 input_,
                 user_account_id=user_account_id,
@@ -272,6 +293,8 @@ class ProtocolRegistrationWorkflow:
                 "proxy_country": proxy.country_code,
                 "proxy_endpoint_id": proxy.endpoint_id,
             }
+            if promotion_check is not None:
+                output["promotion_check"] = promotion_check
             if security_setup is not None:
                 output["security_setup"] = security_setup.to_dict()
             if codex_authorization is not None:
@@ -314,6 +337,8 @@ class ProtocolRegistrationWorkflow:
                 if user_account_id:
                     self._delete_placeholder_account(user_account_id)
             raise
+        finally:
+            _close_auth_flow(attempt.flow if attempt is not None else None)
 
     def _resolve_registration_proxy(
         self,
@@ -348,7 +373,11 @@ class ProtocolRegistrationWorkflow:
             }
         }
         flow = AuthFlow(cfg, trace_callback=self._make_http_trace_callback(emit))
-        result = flow.run_register(mail)
+        try:
+            result = flow.run_register(mail)
+        except Exception:
+            _close_auth_flow(flow)
+            raise
         return _RegistrationAttempt(result=result, flow=flow, proxy_url=proxy_url)
 
     def _execute_email_browser(
@@ -401,7 +430,11 @@ class ProtocolRegistrationWorkflow:
             event_callback=emit,
         )
         flow = AuthFlow(cfg, trace_callback=self._make_http_trace_callback(emit))
-        result = flow.run_phone_register(mail, phone)
+        try:
+            result = flow.run_phone_register(mail, phone)
+        except Exception:
+            _close_auth_flow(flow)
+            raise
         return _RegistrationAttempt(result=result, flow=flow, proxy_url=proxy_url)
 
     def _make_event_emitter(self, *, run_id: str, work_id: str, mode: str) -> TraceEmitter:
@@ -711,6 +744,66 @@ class ProtocolRegistrationWorkflow:
             "proxy_source": "registration_current_proxy",
             "add_phone_provider": "grizzly_sms",
         }
+
+    def _run_post_registration_promotion_check(
+        self,
+        input_: ProtocolRegistrationInput,
+        *,
+        user_account_id: str,
+        email: str,
+        run_id: str,
+        emit: TraceEmitter,
+    ) -> dict[str, Any] | None:
+        if input_.mail_provider != ICLOUD_HIDE_MY_EMAIL_PROVIDER:
+            return None
+        try:
+            proxy = self._resolve_registration_proxy(
+                target_email=email,
+                country_code=ICLOUD_PROMOTION_PROXY_COUNTRY,
+            )
+            emit(
+                "promotion_check.proxy_assigned",
+                {
+                    "user_account_id": user_account_id,
+                    "proxy_country": proxy.country_code,
+                    "proxy_endpoint_id": proxy.endpoint_id,
+                    "proxy_source": "target_email_hash",
+                },
+            )
+            result = BackfillSessionWorkflow(
+                session_factory=self._session_factory,
+                mail_provider=self._mail_provider,
+            ).probe_personal_space_promotion(
+                user_account_id=user_account_id,
+                proxy_url=proxy.proxy_url,
+                run_id=run_id,
+            )
+            emit(
+                "promotion_check.succeeded",
+                {
+                    "user_account_id": user_account_id,
+                    "has_promotion": bool(result.get("has_promotion")),
+                    "promotion_id": str(result.get("promotion_id") or ""),
+                    "proxy_country": proxy.country_code,
+                    "proxy_endpoint_id": proxy.endpoint_id,
+                },
+            )
+            return {**result, "proxy_endpoint_id": proxy.endpoint_id}
+        except Exception as exc:
+            result = {
+                "status": "failed",
+                "has_promotion": False,
+                "promotion_id": "",
+                "proxy_country": ICLOUD_PROMOTION_PROXY_COUNTRY,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:1000],
+            }
+            emit(
+                "promotion_check.failed",
+                {"user_account_id": user_account_id, **result},
+                "WARN",
+            )
+            return result
 
     def _detect_account_spaces_after_registration(
         self,

@@ -147,14 +147,33 @@ def _oauth_init_flow(responses: list[_OAuthInitResponse]) -> AuthFlow:
     flow = AuthFlow.__new__(AuthFlow)
     flow.session = _OAuthInitSession(responses)
     flow.result = AuthResult()
+    flow._auth_web_runtime = None
+    flow._auth_web_runtime_page_url = ""
     flow._last_auth_oauth_init_url = ""
+    flow._last_auth_session_logging_id = ""
     flow._common_headers = lambda *_args, **_kwargs: {"User-Agent": "test-agent"}
     flow._get_oai_did_cookie = lambda: ""
     flow._trace_http = lambda *_args, **_kwargs: None
+    runtime = SimpleNamespace(
+        runtime_info={"deviceId": "device-from-bootstrap"},
+        auth_session_logging_id="runtime-session-id",
+        is_ready=True,
+        close=lambda: None,
+    )
+
+    def start_runtime(*, html_text: str, page_url: str):
+        assert html_text == "<html>ready</html>"
+        flow._auth_web_runtime = runtime
+        flow._auth_web_runtime_page_url = page_url
+        return runtime
+
+    flow._start_auth_web_runtime = start_runtime
     return flow
 
 
-def test_auth_oauth_init_retries_cloudflare_warmup_once_with_current_proxy() -> None:
+def test_auth_oauth_init_retries_cloudflare_with_pure_http_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     flow = _oauth_init_flow(
         [
             _OAuthInitResponse(challenged=True),
@@ -164,15 +183,21 @@ def test_auth_oauth_init_retries_cloudflare_warmup_once_with_current_proxy() -> 
     )
     warmup_calls: list[str] = []
     flow._browser_warm_auth_oauth_init = lambda url: warmup_calls.append(url) or True
+    monkeypatch.setattr(
+        "refactor_app.plugins.openai_auth_protocol.auth_flow.time.sleep",
+        lambda _: None,
+    )
 
     device_id = flow.auth_oauth_init("https://auth.openai.com/authorize")
 
     assert device_id == "device-from-current-proxy"
     assert len(flow.session.get_calls) == 3
-    assert len(warmup_calls) == 2
+    assert warmup_calls == []
 
 
-def test_auth_oauth_init_fails_after_second_cloudflare_warmup() -> None:
+def test_auth_oauth_init_fails_after_three_pure_http_cloudflare_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     flow = _oauth_init_flow(
         [
             _OAuthInitResponse(challenged=True),
@@ -182,6 +207,10 @@ def test_auth_oauth_init_fails_after_second_cloudflare_warmup() -> None:
     )
     warmup_calls: list[str] = []
     flow._browser_warm_auth_oauth_init = lambda url: warmup_calls.append(url) or True
+    monkeypatch.setattr(
+        "refactor_app.plugins.openai_auth_protocol.auth_flow.time.sleep",
+        lambda _: None,
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -190,7 +219,7 @@ def test_auth_oauth_init_fails_after_second_cloudflare_warmup() -> None:
         flow.auth_oauth_init("https://auth.openai.com/authorize")
 
     assert len(flow.session.get_calls) == 3
-    assert len(warmup_calls) == 2
+    assert warmup_calls == []
 
 
 def test_totp_challenge_request_order_matches_har() -> None:

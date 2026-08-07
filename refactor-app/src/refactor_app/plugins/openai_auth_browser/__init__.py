@@ -14,6 +14,7 @@ from refactor_app.plugins.openai_auth_browser.email_registration import (
 from refactor_app.plugins.openai_auth_browser.personal_payment_method import (
     BrowserBillingDetails,
     BrowserPaymentCard,
+    BrowserPaymentMethodConfirmError,
     BrowserPaymentMethodResult,
     BrowserPersonalPaymentMethodError,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "BrowserEmailRegistrationError",
     "BrowserBillingDetails",
     "BrowserPaymentCard",
+    "BrowserPaymentMethodConfirmError",
     "BrowserPaymentMethodResult",
     "BrowserPersonalPaymentMethodError",
     "CamoufoxAccountSecurity",

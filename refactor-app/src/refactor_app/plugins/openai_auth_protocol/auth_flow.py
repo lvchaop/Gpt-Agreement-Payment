@@ -35,8 +35,54 @@ from .config import Config
 from .mail_provider import MailProvider
 from .http_client import create_http_session, USER_AGENT
 from .sentinel_quickjs import bind_sentinel_runtime_context
+from .auth_web_runtime import AuthWebRuntime, start_auth_web_runtime
 
 logger = logging.getLogger(__name__)
+
+_AUTH_WEB_PAGE_CONTEXTS = {
+    "create_account": ("/create-account", "Create Account", "CREATE_ACCOUNT"),
+    "create_account_password": (
+        "/create-account/password",
+        "Create Account Password",
+        "CREATE_ACCOUNT_PASSWORD",
+    ),
+    "email_otp_verification": (
+        "/email-verification",
+        "Email Verification",
+        "EMAIL_VERIFICATION",
+    ),
+    "about_you": ("/about-you", "About You", "ABOUT_YOU"),
+    "login": ("/log-in", "Log In", "LOG_IN"),
+    "log_in": ("/log-in", "Log In", "LOG_IN"),
+    "login_password": ("/log-in/password", "Log In Password", "LOG_IN_PASSWORD"),
+}
+_AUTH_WEB_PAGE_CONTEXTS_BY_PATH = {
+    path: (title, route_id) for path, title, route_id in _AUTH_WEB_PAGE_CONTEXTS.values()
+}
+
+
+def _resolve_auth_web_page_context(
+    *,
+    page_type: str = "",
+    page_url: str = "",
+) -> tuple[str, str, str] | None:
+    normalized_type = str(page_type or "").strip().lower()
+    configured = _AUTH_WEB_PAGE_CONTEXTS.get(normalized_type)
+    candidate_url = str(page_url or "").strip()
+    if candidate_url:
+        candidate_url = urljoin("https://auth.openai.com/", candidate_url)
+        parsed = urlparse(candidate_url)
+        if (parsed.hostname or "").lower() != "auth.openai.com":
+            candidate_url = ""
+        else:
+            normalized_path = parsed.path.rstrip("/") or "/"
+            by_path = _AUTH_WEB_PAGE_CONTEXTS_BY_PATH.get(normalized_path)
+            if by_path is not None:
+                return candidate_url, by_path[0], by_path[1]
+    if configured is None:
+        return None
+    path, title, route_id = configured
+    return candidate_url or urljoin("https://auth.openai.com/", path), title, route_id
 
 
 class PasswordRequiredByUpstreamError(RuntimeError):
@@ -130,6 +176,26 @@ class EmailAlreadyInUseError(RuntimeError):
         super().__init__(detail)
 
 
+class _AuthFlowHttpSession:
+    """Route Auth Web requests through the SDK runtime while exposing one cookie jar."""
+
+    def __init__(self, owner: "AuthFlow", raw_session: Any):
+        self._owner = owner
+        self.raw_session = raw_session
+
+    def request(self, method: str, url: str, **kwargs: Any):
+        return self._owner._request(method, url, **kwargs)
+
+    def get(self, url: str, **kwargs: Any):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any):
+        return self.request("POST", url, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self.raw_session, name)
+
+
 class AuthFlow:
     """注册/登录协议流"""
 
@@ -140,10 +206,11 @@ class AuthFlow:
         self._trace_callback = trace_callback
         self._impersonate_candidates = [BROWSER_IMPERSONATE]
         self._impersonate_idx = 0
-        self.session = create_http_session(
+        raw_session = create_http_session(
             proxy=config.proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],
         )
+        self.session = _AuthFlowHttpSession(self, raw_session)
         proxy_meta = getattr(config, "proxy_meta", {}) or {}
         register_meta = proxy_meta.get("register") if isinstance(proxy_meta, dict) else {}
         if not isinstance(register_meta, dict):
@@ -187,6 +254,8 @@ class AuthFlow:
         self._last_otp_sent_at: float = 0.0
         self._last_auth_oauth_init_url: str = ""
         self._last_auth_session_logging_id: str = ""
+        self._auth_web_runtime: AuthWebRuntime | None = None
+        self._auth_web_runtime_page_url: str = ""
         self._trace_dump_enabled = bool(getattr(config, "auth_trace_dump_enabled", False)) or str(
             os.getenv("AUTH_TRACE_DUMP", "0")
         ).lower() in ("1", "true", "yes", "on")
@@ -207,6 +276,223 @@ class AuthFlow:
             "[otp-send-time] %s email=%s ts=%.6f", label, self.result.email, self._last_otp_sent_at
         )
         return self._last_otp_sent_at
+
+    def _raw_http_session(self):
+        session = self.session
+        if isinstance(session, _AuthFlowHttpSession):
+            return session.raw_session
+        return session
+
+    def _stop_auth_web_runtime(self) -> None:
+        runtime = getattr(self, "_auth_web_runtime", None)
+        self._auth_web_runtime = None
+        if runtime is not None:
+            runtime.close()
+
+    def _session_request(self, method: str, url: str, **kwargs: Any):
+        session = self._raw_http_session()
+        requester = getattr(session, "request", None)
+        if callable(requester):
+            return requester(method.upper(), url, **kwargs)
+        return getattr(session, method.lower())(url, **kwargs)
+
+    @staticmethod
+    def _auth_web_navigation_site(page_url: str, referer: str) -> str:
+        page_host = (urlparse(page_url).hostname or "").lower()
+        referer_host = (urlparse(referer).hostname or "").lower()
+        if page_host and page_host == referer_host:
+            return "same-origin"
+        if page_host and referer_host and (
+            page_host.endswith(f".{referer_host}") or referer_host.endswith(f".{page_host}")
+        ):
+            return "same-site"
+        return "cross-site"
+
+    def _load_auth_web_document(
+        self,
+        page_url: str,
+        *,
+        referer: str,
+        trace_step: str,
+        timeout: int = 30,
+    ):
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": self._common_headers(referer).get(
+                "Accept-Language", "en-US,en;q=0.9"
+            ),
+            "Referer": referer,
+            "User-Agent": self._common_headers(referer)["User-Agent"],
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": self._auth_web_navigation_site(page_url, referer),
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        response = self._session_request(
+            "GET",
+            page_url,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        self._trace_http(trace_step, response)
+        if self._is_cloudflare_challenge_response(response):
+            raise RuntimeError(f"Auth Web document navigation was blocked: {page_url}")
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            raise RuntimeError(f"Auth Web document navigation failed: HTTP {status} {page_url}")
+        resolved_url = str(getattr(response, "url", "") or page_url)
+        html_text = str(getattr(response, "text", "") or "")
+        self._last_auth_oauth_init_url = resolved_url
+        self._start_auth_web_runtime(html_text=html_text, page_url=resolved_url)
+        return response
+
+    def _record_auth_web_sentinel_timing(self, stage: str) -> None:
+        runtime = getattr(self, "_auth_web_runtime", None)
+        if runtime is None or not runtime.is_ready:
+            return
+        try:
+            runtime.record_sentinel_timing(stage)
+        except Exception as exc:
+            logger.warning("Auth Web Sentinel timing event failed stage=%s: %s", stage, exc)
+
+    def _start_auth_web_runtime(self, *, html_text: str, page_url: str) -> AuthWebRuntime:
+        if not html_text.strip():
+            raise RuntimeError("Auth Web runtime initialization HTML was empty")
+        self._stop_auth_web_runtime()
+        runtime = start_auth_web_runtime(
+            self._raw_http_session(),
+            html_text=html_text,
+            page_url=page_url,
+            sentinel_context=self._sentinel_runtime_context,
+        )
+        self._auth_web_runtime = runtime
+        self._auth_web_runtime_page_url = page_url
+        runtime_logging_id = runtime.auth_session_logging_id
+        previous_logging_id = self._last_auth_session_logging_id
+        if previous_logging_id and runtime_logging_id and previous_logging_id != runtime_logging_id:
+            logger.warning(
+                "Auth Session Logging ID changed between authorize URL and bootstrap: %s -> %s",
+                previous_logging_id,
+                runtime_logging_id,
+            )
+        if runtime_logging_id:
+            self._last_auth_session_logging_id = runtime_logging_id
+        logger.info(
+            "Auth Web SDK runtime ready page=%s session_logging_id=%s",
+            page_url,
+            self._last_auth_session_logging_id or "<empty>",
+        )
+        return runtime
+
+    def _ensure_auth_web_runtime(self) -> AuthWebRuntime:
+        runtime = getattr(self, "_auth_web_runtime", None)
+        if runtime is not None and runtime.is_ready:
+            return runtime
+        page_url = str(
+            getattr(self, "_auth_web_runtime_page_url", "")
+            or getattr(self, "_last_auth_oauth_init_url", "")
+            or ""
+        ).strip()
+        if not page_url:
+            raise RuntimeError("Auth Web runtime page URL is missing")
+        self._load_auth_web_document(
+            page_url,
+            referer="https://chatgpt.com/",
+            trace_step="auth_web_runtime_restore",
+        )
+        runtime = getattr(self, "_auth_web_runtime", None)
+        if runtime is None or not runtime.is_ready:
+            raise RuntimeError("Auth Web runtime restore did not produce a live runtime")
+        return runtime
+
+    def _sync_auth_web_page(self, *, page_type: str = "", page_url: str = "") -> bool:
+        runtime = getattr(self, "_auth_web_runtime", None)
+        if runtime is None or not runtime.is_ready:
+            return False
+        context = _resolve_auth_web_page_context(page_type=page_type, page_url=page_url)
+        if context is None:
+            return False
+        next_url, page_title, route_id = context
+        changed = runtime.navigate(
+            page_url=next_url,
+            page_title=page_title,
+            route_id=route_id,
+        )
+        self._auth_web_runtime_page_url = next_url
+        if changed:
+            logger.info(
+                "Auth Web view changed route=%s page=%s",
+                route_id,
+                next_url,
+            )
+        return changed
+
+    def _sync_auth_web_page_from_response(
+        self,
+        response: Any,
+        *,
+        method: str,
+        request_url: str,
+    ) -> None:
+        if method.upper() == "GET":
+            response_url = str(getattr(response, "url", "") or request_url)
+            self._sync_auth_web_page(page_url=response_url)
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        page = payload.get("page")
+        page_type = str(page.get("type") or "") if isinstance(page, dict) else ""
+        continue_url = str(payload.get("continue_url") or "")
+        self._sync_auth_web_page(page_type=page_type, page_url=continue_url)
+
+    def _request(self, method: str, url: str, **kwargs: Any):
+        if AuthWebRuntime.supports_url(url):
+            runtime = getattr(self, "_auth_web_runtime", None)
+            has_runtime_context = bool(
+                runtime is not None
+                or getattr(self, "_auth_web_runtime_page_url", "")
+                or getattr(self, "_last_auth_oauth_init_url", "")
+            )
+            if has_runtime_context:
+                runtime = self._ensure_auth_web_runtime()
+                headers = kwargs.get("headers") or {}
+                referer = next(
+                    (
+                        str(value)
+                        for name, value in headers.items()
+                        if str(name).lower() == "referer" and value
+                    ),
+                    "",
+                )
+                page_url = (
+                    referer
+                    if AuthWebRuntime.supports_url(referer)
+                    else self._auth_web_runtime_page_url
+                )
+                if page_url:
+                    self._sync_auth_web_page(page_url=page_url)
+                path = urlparse(url).path or "/"
+                runtime.record_stage(
+                    f"{method.upper()} {path}",
+                    phase=f"{method.lower()}:{path}",
+                    page_url=page_url,
+                )
+                response = runtime.request(method, url, **kwargs)
+                self._sync_auth_web_page_from_response(
+                    response,
+                    method=method,
+                    request_url=url,
+                )
+                return response
+        return self._session_request(method, url, **kwargs)
+
+    def close(self) -> None:
+        self._stop_auth_web_runtime()
 
     def _export_cookie_jar(self) -> list[dict[str, Any]]:
         """Serialize current HTTP cookie jar with enough metadata to restore it later."""
@@ -289,6 +575,9 @@ class AuthFlow:
             "result": self.result.to_dict(),
             "cookies": self._export_cookie_jar(),
             "impersonate_idx": self._impersonate_idx,
+            "auth_session_logging_id": getattr(self, "_last_auth_session_logging_id", ""),
+            "auth_oauth_init_url": getattr(self, "_last_auth_oauth_init_url", ""),
+            "auth_web_runtime_page_url": getattr(self, "_auth_web_runtime_page_url", ""),
             "oauth": {
                 "client_secret": self._oauth_client_secret,
                 "client_id": self._oauth_client_id,
@@ -313,6 +602,7 @@ class AuthFlow:
         """Restore auth-flow state exported by export_protocol_snapshot."""
         if not isinstance(snapshot, dict):
             raise RuntimeError("协议快照格式错误")
+        self._stop_auth_web_runtime()
         try:
             idx = int(snapshot.get("impersonate_idx") or 0)
         except Exception:
@@ -330,10 +620,11 @@ class AuthFlow:
         runtime_context = sentinel_snapshot.get("runtime_context")
         if not isinstance(runtime_context, dict):
             runtime_context = self._sentinel_runtime_context
-        self.session = create_http_session(
+        raw_session = create_http_session(
             proxy=self.config.proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],
         )
+        self.session = _AuthFlowHttpSession(self, raw_session)
         self._sentinel_runtime_context = bind_sentinel_runtime_context(
             self.session,
             context=runtime_context,
@@ -386,6 +677,19 @@ class AuthFlow:
         )
         self._last_sentinel_so_token = str(
             sentinel.get("last_so_token") or self._last_sentinel_so_token or ""
+        )
+        self._last_auth_session_logging_id = str(
+            snapshot.get("auth_session_logging_id")
+            or getattr(self, "_last_auth_session_logging_id", "")
+            or ""
+        )
+        self._last_auth_oauth_init_url = str(
+            snapshot.get("auth_oauth_init_url")
+            or getattr(self, "_last_auth_oauth_init_url", "")
+            or ""
+        )
+        self._auth_web_runtime_page_url = str(
+            snapshot.get("auth_web_runtime_page_url") or self._last_auth_oauth_init_url or ""
         )
 
     def _init_trace_dump(self) -> None:
@@ -1560,10 +1864,18 @@ class AuthFlow:
         return AuthFlow._phone_protocol_register_retry_reason(message) == "invalid_phone_number"
 
     def _reset_phone_protocol_attempt_state(self) -> None:
-        self.session = create_http_session(
+        self._stop_auth_web_runtime()
+        raw_session = create_http_session(
             proxy=self.config.proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],
         )
+        self.session = _AuthFlowHttpSession(self, raw_session)
+        self._sentinel_runtime_context = bind_sentinel_runtime_context(
+            self.session,
+            context=self._sentinel_runtime_context,
+        )
+        self._auth_web_runtime_page_url = ""
+        self._last_auth_oauth_init_url = ""
         self.result.device_id = ""
         self.result.csrf_token = ""
         self._last_sentinel_token = ""
@@ -2175,11 +2487,15 @@ class AuthFlow:
         self._impersonate_idx += 1
         imp = self._impersonate_candidates[self._impersonate_idx]
         logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}")
-        self.session = create_http_session(proxy=self.config.proxy, impersonate=imp)
+        self._stop_auth_web_runtime()
+        raw_session = create_http_session(proxy=self.config.proxy, impersonate=imp)
+        self.session = _AuthFlowHttpSession(self, raw_session)
         self._sentinel_runtime_context = bind_sentinel_runtime_context(
             self.session,
             context=self._sentinel_runtime_context,
         )
+        self._auth_web_runtime_page_url = ""
+        self._last_auth_oauth_init_url = ""
         return True
 
     @staticmethod
@@ -2296,30 +2612,6 @@ class AuthFlow:
             except Exception:
                 pass
 
-    @staticmethod
-    def _datadog_trace_headers() -> dict:
-        """生成 Datadog APM 追踪头。
-
-        OpenAI 前端集成 Datadog RUM，所有真实浏览器请求都带这 6 个头；
-        缺失会被风控判定为非浏览器会话，OTP 邮件等敏感操作会被 silent-drop
-        （接口返 200 但邮件不下发）。
-
-        参考 https://github.com/zc-zhangchen/any-auto-register
-        platforms/chatgpt/utils.py:generate_datadog_trace（MIT）。
-        """
-        trace_id = str(random.getrandbits(64))
-        parent_id = str(random.getrandbits(64))
-        trace_hex = format(int(trace_id), "016x")
-        parent_hex = format(int(parent_id), "016x")
-        return {
-            "traceparent": f"00-0000000000000000{trace_hex}-{parent_hex}-01",
-            "tracestate": "dd=s:1;o:rum",
-            "x-datadog-origin": "rum",
-            "x-datadog-parent-id": parent_id,
-            "x-datadog-sampling-priority": "1",
-            "x-datadog-trace-id": trace_id,
-        }
-
     def _common_headers(self, referer: str = "https://chatgpt.com/") -> dict:
         """
         构造通用请求头。
@@ -2328,7 +2620,7 @@ class AuthFlow:
         - Origin 必须与 Referer 同源（尤其 auth.openai.com 的状态机接口），
           否则容易触发 invalid_state / 风控分支。
         - 在 auth.openai.com 域下，尽量补充 oai-device-id，提升状态机连续性。
-        - 全请求注入 Datadog trace 头，避免 OTP silent-drop。
+        - Auth Web 请求的 Datadog trace 头由真实 RUM SDK 注入。
         """
         origin = "https://chatgpt.com"
         try:
@@ -2363,7 +2655,6 @@ class AuthFlow:
             if device_id:
                 headers["oai-device-id"] = device_id
 
-        headers.update(self._datadog_trace_headers())
         return headers
 
     # ── Step 1: 检查代理连通性 ──
@@ -2467,23 +2758,25 @@ class AuthFlow:
         headers = self._common_headers("https://chatgpt.com/")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         signin_url = "https://chatgpt.com/api/auth/signin/openai"
-        query = {}
+        if not self.result.device_id:
+            self.result.device_id = str(uuid.uuid4())
+        generated_session_logging_id = str(uuid.uuid4())
+        query = {
+            "ext-oai-did": self.result.device_id,
+            "auth_session_logging_id": generated_session_logging_id,
+        }
+        if screen_hint != "signup":
+            query["ext-passkey-client-capabilities"] = "11111"
         if login_hint or screen_hint or prompt:
-            if not self.result.device_id:
-                self.result.device_id = str(uuid.uuid4())
             if prompt:
                 query["prompt"] = prompt
             elif default_prompt:
                 query["prompt"] = default_prompt
-            if screen_hint != "signup" or login_hint or prompt:
-                query["ext-passkey-client-capabilities"] = "11111"
-            query["ext-oai-did"] = self.result.device_id
-            query["auth_session_logging_id"] = str(uuid.uuid4())
             if screen_hint:
                 query["screen_hint"] = screen_hint
             if login_hint:
                 query["login_hint"] = login_hint
-            signin_url = f"{signin_url}?{urlencode(query)}"
+        signin_url = f"{signin_url}?{urlencode(query)}"
         resp = self.session.post(
             signin_url,
             headers=headers,
@@ -2503,46 +2796,47 @@ class AuthFlow:
         self._remember_oauth_params(auth_url)
         auth_url = self._inject_pkce_into_auth_url(auth_url)
         self._remember_oauth_params(auth_url)
+        auth_query = parse_qs(urlparse(auth_url).query)
+        self._last_auth_session_logging_id = str(
+            generated_session_logging_id
+            or (auth_query.get("auth_session_logging_id") or [""])[0]
+            or ""
+        )
         logger.info(f"Auth URL: {auth_url[:80]}...")
         return auth_url
 
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
     def auth_oauth_init(self, auth_url: str) -> str:
         logger.info("[3/10] OAuth 初始化...")
+        self._stop_auth_web_runtime()
+        self._auth_web_runtime_page_url = ""
+        self._last_auth_oauth_init_url = ""
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": "https://chatgpt.com/",
             "User-Agent": self._common_headers()["User-Agent"],
         }
-        resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
-        self._trace_http("auth_oauth_init", resp)
-        if self._is_cloudflare_challenge_response(resp):
-            for warmup_attempt in range(1, 3):
+        resp = None
+        for attempt in range(1, 4):
+            resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
+            self._trace_http(f"auth_oauth_init_attempt_{attempt}", resp)
+            if not self._is_cloudflare_challenge_response(resp):
+                break
+            if attempt < 3:
                 logger.warning(
-                    "auth_oauth_init Cloudflare challenge warmup attempt=%s/2",
-                    warmup_attempt,
+                    "auth_oauth_init Cloudflare challenge; pure HTTP retry attempt=%s/3",
+                    attempt,
                 )
-                warmed = self._browser_warm_auth_oauth_init(auth_url)
-                if warmed:
-                    resp = self.session.get(
-                        auth_url,
-                        headers=headers,
-                        timeout=30,
-                        allow_redirects=True,
-                    )
-                    trace_step = (
-                        "auth_oauth_init_after_browser_warmup"
-                        if warmup_attempt == 1
-                        else "auth_oauth_init_after_browser_warmup_retry"
-                    )
-                    self._trace_http(trace_step, resp)
-                if not self._is_cloudflare_challenge_response(resp):
-                    break
-            if self._is_cloudflare_challenge_response(resp):
-                raise RuntimeError(
-                    "auth_oauth_init 被 Cloudflare challenge 拦截，浏览器 warmup 后仍未建立 auth session"
-                )
+                time.sleep(1)
+        if resp is None or self._is_cloudflare_challenge_response(resp):
+            raise RuntimeError(
+                "auth_oauth_init 被 Cloudflare challenge 拦截，纯 HTTP 重试后仍未建立 auth session"
+            )
         self._last_auth_oauth_init_url = str(getattr(resp, "url", "") or "")
+        runtime = self._start_auth_web_runtime(
+            html_text=str(getattr(resp, "text", "") or ""),
+            page_url=self._last_auth_oauth_init_url or auth_url,
+        )
 
         # 从 cookie 获取 oai-did
         device_id = ""
@@ -2561,6 +2855,9 @@ class AuthFlow:
                 device_id = self._get_oai_did_cookie()
             except Exception:
                 pass
+
+        if not device_id:
+            device_id = str(runtime.runtime_info.get("deviceId") or "").strip()
 
         # fallback: 从 HTML 提取
         if not device_id:
@@ -2595,11 +2892,13 @@ class AuthFlow:
         resolved_device_id = (device_id or self.result.device_id or "").strip()
         if not resolved_device_id:
             raise RuntimeError(f"Sentinel flow={flow} 缺少 device_id")
+        self._record_auth_web_sentinel_timing("request_start")
         token, so_token = get_sentinel_tokens(
             self.session,
             device_id=resolved_device_id,
             flow=flow,
         )
+        self._record_auth_web_sentinel_timing("ready")
         self._last_sentinel_token = token or ""
         self._last_sentinel_so_token = so_token or ""
         logger.info(
@@ -2884,12 +3183,12 @@ class AuthFlow:
 
         # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
         try:
-            pw_page = self.session.get(
+            pw_page = self._load_auth_web_document(
                 "https://auth.openai.com/create-account/password",
-                headers=self._common_headers("https://auth.openai.com/create-account"),
+                referer="https://auth.openai.com/create-account",
+                trace_step="create_account_password_page",
                 timeout=15,
             )
-            self._trace_http("create_account_password_page", pw_page)
             logger.info(f"create-account/password 页面: {pw_page.status_code}")
         except Exception as e:
             logger.warning(f"访问 create-account/password 页面失败: {e}")
@@ -3155,7 +3454,7 @@ class AuthFlow:
         if self.result.device_id:
             try:
                 fresh_sentinel_token, fresh_so_token = self._refresh_sentinel_tokens(
-                    "authorize_continue"
+                    "email_otp_validate"
                 )
             except Exception as e:
                 raise RuntimeError("验证 OTP 前 Sentinel real SDK 刷新失败") from e
@@ -3192,13 +3491,13 @@ class AuthFlow:
     # ── Step 9: 创建账户 ──
     def create_account(self) -> str:
         logger.info("[8/10] 创建账户...")
-        # 创建账户前刷新 sentinel token，flow 为 create_account
+        # Auth Web's about-you route requests the oauth_create_account flow.
         fresh_sentinel_token = ""
         fresh_so_token = ""
         if self.result.device_id:
             try:
                 fresh_sentinel_token, fresh_so_token = self._refresh_sentinel_tokens(
-                    "create_account"
+                    "oauth_create_account"
                 )
             except Exception as e:
                 raise RuntimeError("创建账户前 Sentinel real SDK 刷新失败") from e
@@ -4402,6 +4701,9 @@ class AuthFlow:
             snapshot["otp_code"] = otp_code
             snapshot["otp_sent_at"] = otp_sent_at
             snapshot["otp_received_at"] = time.time()
+        # Rebuild the real Auth Web SDK and warm the shared HTTP session before
+        # before_validate releases the cross-work submit barrier.
+        self._ensure_auth_web_runtime()
         email_for_sync = str(snapshot.get("email") or self.result.email or "")
         otp_resp = self.verify_otp(
             otp_code,
