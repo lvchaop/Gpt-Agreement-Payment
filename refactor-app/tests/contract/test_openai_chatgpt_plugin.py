@@ -7,6 +7,7 @@ import httpx
 import pytest
 from curl_cffi.const import CurlOpt
 
+from refactor_app.config.browser_fingerprint import BROWSER_IMPERSONATE
 from refactor_app.plugins.contracts import OpenAIChatGPTProvider
 from refactor_app.plugins.openai_chatgpt import (
     OpenAIChatGPTClient,
@@ -170,6 +171,40 @@ def test_invite_and_accept_use_team_backend_endpoints_and_headers() -> None:
     ]
 
 
+def test_revoke_invite_deletes_collection_with_email_body() -> None:
+    requests: list[httpx.Request] = []
+
+    def chatgpt_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "DELETE"
+        assert request.url.path == "/backend-api/accounts/workspace-1/invites"
+        assert request.headers["authorization"] == "Bearer access-1"
+        assert request.headers["chatgpt-account-id"] == "workspace-1"
+        assert json.loads(request.content) == {"email_address": "member@example.test"}
+        return httpx.Response(200, json={"ok": True})
+
+    client = OpenAIChatGPTClient(
+        OpenAIChatGPTClientConfig(),
+        auth_http_client=httpx.Client(
+            base_url="https://auth.openai.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        ),
+        chatgpt_http_client=httpx.Client(
+            base_url="https://chatgpt.com",
+            transport=httpx.MockTransport(chatgpt_handler),
+        ),
+    )
+
+    payload = client.revoke_account_invite(
+        access_token="access-1",
+        account_id="workspace-1",
+        email="member@example.test",
+    )
+
+    assert payload["ok"] is True
+    assert len(requests) == 1
+
+
 def test_batch_invite_sends_all_emails_and_preserves_per_email_results() -> None:
     def chatgpt_handler(request: httpx.Request) -> httpx.Response:
         assert json.loads(request.content)["email_addresses"] == [
@@ -302,6 +337,48 @@ def test_change_email_uses_web_session_cookie_and_bearer_token() -> None:
     ]
 
 
+def test_change_email_accepts_bearer_token_without_cookie() -> None:
+    requests: list[httpx.Request] = []
+    access_token = jwt_with_claims(chatgpt_account_id="personal-1", user_id="user-1")
+
+    def chatgpt_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["authorization"] == f"Bearer {access_token}"
+        assert "cookie" not in request.headers
+        if request.url.path == "/backend-api/accounts/change_email/eligibility":
+            return httpx.Response(200, json={"eligible": True})
+        if request.url.path == "/backend-api/accounts/change_email/begin":
+            return httpx.Response(200, json={"success": True})
+        if request.url.path == "/backend-api/accounts/change_email/verify":
+            return httpx.Response(200, json={"success": True})
+        return httpx.Response(404, json={"error": "not found"})
+
+    client = OpenAIChatGPTClient(
+        OpenAIChatGPTClientConfig(),
+        chatgpt_http_client=httpx.Client(
+            base_url="https://chatgpt.com",
+            transport=httpx.MockTransport(chatgpt_handler),
+        ),
+    )
+
+    assert client.check_change_email_eligibility(
+        access_token=access_token,
+        cookie_header="",
+    )["eligible"] is True
+    assert client.begin_change_email(
+        access_token=access_token,
+        cookie_header="",
+        email="new@example.test",
+    )["success"] is True
+    assert client.verify_change_email(
+        access_token=access_token,
+        cookie_header="",
+        email="new@example.test",
+        code="123456",
+    )["success"] is True
+    assert len(requests) == 3
+
+
 def test_remove_account_user_uses_workspace_delete_endpoint_and_headers() -> None:
     requests: list[httpx.Request] = []
 
@@ -333,6 +410,49 @@ def test_remove_account_user_uses_workspace_delete_endpoint_and_headers() -> Non
 
     assert result["ok"] is True
     assert len(requests) == 1
+
+
+def test_account_list_page_size_is_capped_at_upstream_limit() -> None:
+    requests: list[httpx.Request] = []
+
+    def chatgpt_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.params["limit"] == "100"
+        offset = int(request.url.params["offset"])
+        if offset == 0:
+            return httpx.Response(
+                200,
+                json={
+                    "items": [{"id": f"user-{index}"} for index in range(100)],
+                    "total": 101,
+                },
+            )
+        assert offset == 100
+        return httpx.Response(
+            200,
+            json={"items": [{"id": "user-100"}], "total": 101},
+        )
+
+    client = OpenAIChatGPTClient(
+        OpenAIChatGPTClientConfig(),
+        auth_http_client=httpx.Client(
+            base_url="https://auth.openai.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        ),
+        chatgpt_http_client=httpx.Client(
+            base_url="https://chatgpt.com",
+            transport=httpx.MockTransport(chatgpt_handler),
+        ),
+    )
+
+    users = client.list_account_users(
+        access_token="access-1",
+        account_id="workspace-1",
+        page_size=200,
+    )
+
+    assert len(users) == 101
+    assert [request.url.params["offset"] for request in requests] == ["0", "100"]
 
 
 def test_single_invite_rejects_http_200_business_error() -> None:
@@ -417,6 +537,7 @@ def test_proxy_session_uses_pre_resolved_proxy_dns_entries(
 
     assert first is second
     assert len(created) == 1
+    assert created[0]["impersonate"] == BROWSER_IMPERSONATE
     assert created[0]["curl_options"] == {CurlOpt.RESOLVE: list(resolve)}
 
 

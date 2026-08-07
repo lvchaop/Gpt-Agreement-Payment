@@ -55,6 +55,7 @@ const filters: TableFilter[] = [
     key: "personal_plan_type",
     label: "个人订阅",
     options: [
+      { label: "未知", value: "unknown" },
       { label: "Free", value: "free" },
       { label: "Plus", value: "plus" },
       { label: "Pro", value: "pro" },

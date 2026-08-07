@@ -62,6 +62,7 @@ Thumbs.db
 
 # 测试期临时数据
 test_*.py
+!scripts/test_claude_sepa_upgrade.py
 !test_rt.py.example
 !webui/tests/test_*.py
 !refactor-app/tests/

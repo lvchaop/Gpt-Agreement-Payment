@@ -1,6 +1,6 @@
 # Space 最新设计改动点与实施计划
 
-更新时间：2026-07-06
+更新时间：2026-07-23
 
 本文是当前口径的执行计划，避免后续实现时继续按旧 Workspace / Codex OAuth 逻辑散改。
 
@@ -124,9 +124,11 @@ team_admin_proxy_bindings.team_admin_session_id = team_admin_sessions.id
   清空 failure_code / failure_message
 
 远端 invites 命中：
-  upsert space_memberships
-  membership_status = invited
-  清空 failure_code / failure_message
+  仅当邮箱命中 account_status = active 的本地账号，且当前 space 下完全没有该账号的 membership 行时：
+    insert space_memberships
+    membership_status = active
+  已有任意状态 membership 时不新增、不改状态
+  账号不存在或 account_status != active 时不新增
 
 本地 active / invited / accepted 但本轮远端 users 和 invites 都不存在：
   物理删除当前 space 下的 space_memberships 行
@@ -184,8 +186,9 @@ user_accounts.email 非空
 
 ```text
 failed membership 不算当前占位。
-如果本地曾经写 failed，但下一轮远端 users / invites 已经能看到该账号，
-远端同步结果优先，本地状态统一改成 active / invited。
+如果本地曾经写 failed，下一轮远端 users 已经能看到该账号，则更新为 active。
+如果只有远端 invites 能看到该账号，已有 failed membership 保持不变；只有完全没有
+membership 行且账号 account_status = active 时才新增 active membership。
 ```
 
 明确不做：
@@ -202,7 +205,9 @@ failed membership 不算当前占位。
 ### 3.1 职责
 
 ```text
-把已经确认 active 的 membership 转成 space_credentials。
+对指定 Business Space 下已经确认 active 的成员创建空间凭证。
+优先创建 Codex OAuth credential。
+只有 OAuth 命中 add_phone / select-channel 时，降级为 Web Access Token 创建 Business AT。
 ```
 
 ### 3.2 business/team 处理对象
@@ -210,38 +215,83 @@ failed membership 不算当前占位。
 必须满足：
 
 ```text
+Job 参数 space_id 必填；一次 Job 只处理一个 Business Space
 spaces.space_type = business
 spaces.credential_type IN (team_5h_weekly, team_monthly)
+spaces.space_status = active
 space_memberships.membership_status = active
+space_memberships.session_account_detected = true
 当前 user_account_id + space_id 没有 active space_credentials
 user_accounts.account_status = active
 user_accounts.session_status = active
-user_accounts.cookie_header 非空 或 user_accounts.session_token 非空
+user_accounts.openai_user_id 非空
+user_accounts.cookie_header / auth_cookie_header / session_token 至少一个非空
 ```
 
-`membership_status = active` 只能由 `space_membership_invite_sync` 根据远端 users 写入。
+候选查询只读取本次 `space_id` 下的成员，不跨 Space 扫描。
+运行中 Job 的去重也只按本次 `space_id` 判断：同一 Space 不重复启动；其它 Space
+可以独立启动，不会错误返回另一个 Space 的授权 Job。
 
-授权 job 使用每个成员账号自己的 Web 登录态调 wham 创建接口。当前 HAR 证据显示该接口走 cookie/session web 态，不依赖 `Authorization: Bearer`。
+### 3.3 主路径：指定 Business Space 的 Codex OAuth
 
-### 3.3 business/team 创建 AT
-
-只调用：
+每个 OAuth Work：
 
 ```text
-POST /backend-api/wham/auth-credentials
+1. 使用当前成员账号绑定的账号代理。
+2. 使用该账号已有 cookie/session 尝试 Codex OAuth。
+3. OAuth 的 target_workspace_id 固定为 spaces.external_space_id。
+4. 校验返回 token 的 chatgpt_account_id 等于 spaces.external_space_id。
+5. 校验返回 token 的 user_id 等于 user_accounts.openai_user_id。
+6. 成功后只 upsert 当前 user_account_id + space_id 的 space_credentials。
 ```
 
-该接口是成员账号动作，必须使用 `user_account_proxy_bindings` 给当前 `user_account_id` 分配/探活后的账号代理；不能使用空间管理员静态代理，也不能裸连。
+OAuth Work 不设置同空间互斥键，实际同时执行数只由 Job 的 `work_count` 控制。
 
-Header：
+OAuth 成功写入：
 
 ```text
-chatgpt-account-id: spaces.external_space_id
-cookie: user_accounts.cookie_header
-oai-device-id: cookie_header 中的 oai-did，如果存在
+space_credentials.auth_mode = codex_oauth
+space_credentials.space_id = spaces.id
+space_credentials.user_account_id = space_memberships.user_account_id
+space_credentials.space_membership_id = space_memberships.id
+space_credentials.access_token = OAuth access_token
+space_credentials.id_token = OAuth id_token
+space_credentials.refresh_token = OAuth refresh_token
+space_credentials.codex_client_id = Codex client_id
+space_credentials.account_id = user_accounts.openai_user_id
+space_credentials.token_chatgpt_account_id = spaces.external_space_id
+space_credentials.credential_status = active
 ```
 
-Body：
+### 3.4 降级路径：Web Access Token 创建 Business AT
+
+只允许以下两种 OAuth 结果进入降级：
+
+```text
+add_phone_blocked
+phone_otp_select_channel
+```
+
+账号已有 `user_accounts.codex_select_channel_required = true` 时，不再尝试 OAuth，直接进入降级。
+
+除以上两种结果外，OAuth 的任何失败都直接使当前 OAuth Work 失败，不创建 AT Work。
+
+降级不是在 OAuth Work 内直接请求，而是在同一个 Job 追加一个：
+
+```text
+space.business_access_token.create.account
+```
+
+同一个账号、同一个 Space、同一个 Job 最多追加一个降级 Work。该 Work 使用账号代理及成员账号的 Web 登录态：
+
+```text
+1. 通过 GET /api/auth/session?exchange_workspace_token=true&workspace_id={external_space_id}
+   获取目标 Business Space 的 Web accessToken。
+2. POST /backend-api/wham/auth-credentials。
+3. 请求携带目标 workspace 的 Authorization 和 chatgpt-account-id。
+```
+
+创建接口 Body：
 
 ```json
 {
@@ -251,16 +301,13 @@ Body：
 }
 ```
 
-校验：
+同一 Space 的降级 AT Work 使用同一个执行键串行领取；进程内再按
+`spaces.external_space_id` 加锁，保证相邻 AT 请求开始时间至少间隔 10 秒。不同 Space 互不阻塞。
+
+降级成功写入：
 
 ```text
-response.workspace_id == spaces.external_space_id
-response.access_token 非空
-```
-
-写入：
-
-```text
+space_credentials.auth_mode = backend_access_token
 space_credentials.space_id = spaces.id
 space_credentials.user_account_id = space_memberships.user_account_id
 space_credentials.space_membership_id = space_memberships.id
@@ -275,7 +322,32 @@ space_credentials.credential_status = active
 space_credentials.last_authorized_at = now
 ```
 
-### 3.4 授权 Job 禁止事项
+### 3.5 凭证级授权方式与下游 payload
+
+授权方式记录在现有 `space_credentials.auth_mode`，不新增表：
+
+```text
+codex_oauth
+backend_access_token
+```
+
+`spaces.credential_type` 仍然只负责余额、推送量和回收规则；不会因授权结果改变。
+
+下游 payload 按凭证授权方式选择：
+
+```text
+space_credentials.auth_mode = codex_oauth
+  -> 使用现有 DownstreamCodexPayload
+  -> 调下游 push_codex_credential
+
+space_credentials.auth_mode = backend_access_token
+  -> 使用现有 Business AT payload
+  -> 调下游 push_business_access_token
+```
+
+两种 payload 的余额和坑位仍按 `spaces.credential_type` 记账。
+
+### 3.6 授权 Job 禁止事项
 
 ```text
 不调用 GET /backend-api/wham/usage
@@ -290,14 +362,33 @@ space_credentials.last_authorized_at = now
 不回收
 ```
 
-### 3.5 授权 workflow 实现要求
+### 3.7 完整流程
+
+```mermaid
+flowchart TD
+    A["选择一个 active Business Space"] --> B["查询该 Space 的合格 active membership"]
+    B --> C["按 work_count 同时执行 OAuth Work"]
+    C --> D{"账号已标记 select-channel?"}
+    D -- "是" --> G["追加同 Job 的 AT 降级 Work"]
+    D -- "否" --> E["Codex OAuth 切换到目标 Business Space"]
+    E --> F{"OAuth 结果"}
+    F -- "成功" --> H["写 codex_oauth credential"]
+    F -- "add_phone / select-channel" --> G
+    F -- "其他失败" --> I["当前 Work 失败"]
+    G --> J["同 Space 至少间隔 10 秒创建 AT"]
+    J --> K["写 backend_access_token credential"]
+    H --> L["Job 等待全部原始及追加 Work 结束"]
+    I --> L
+    K --> L
+```
 
 代码必须保持：
 
 ```text
 读取已有 spaces
 读取已有 active space_memberships
-POST /wham/auth-credentials
+OAuth 优先，且 target_workspace_id 来自 spaces.external_space_id
+仅两类 phone gate 追加 AT Work
 只写 space_credentials
 不调用 fetch_wham_usage()
 不调用 infer_credential_type()
@@ -342,9 +433,9 @@ cpa:
 custom_http:
   POST downstream_channels.base_url
   Header 使用 custom_auth_header_name/custom_auth_header_value
-  personal_account payload 按 custom_payload_type 构造:
+  Codex OAuth payload 按 custom_payload_type 构造:
     sub2api / sub2api_admin_accounts / cpa
-  business/team 直接发送 Business AT payload
+  backend_access_token 直接发送 Business AT payload
 
 local_sub2api:
   不发 HTTP
@@ -609,9 +700,12 @@ downstream_channel_credential_type_balances.claimed_push_count -= 1
 2. 删除 business 授权流程中的 infer_credential_type。
 3. 删除 business 授权流程中的 business space upsert。
 4. 删除 _upsert_business_membership。
-5. business 授权改为读取已有 space + active membership。
-6. membership 不存在或不是 active 时失败/跳过。
-7. 授权成功只写 space_credentials。
+5. Job 参数必须指定一个 active Business Space，候选只从该 Space 读取。
+6. business 授权优先执行目标 Space 的 Codex OAuth。
+7. 只有 add_phone / select-channel 才追加 Web Access Token 降级 Work。
+8. 同 Space 的降级 AT 请求至少间隔 10 秒，不同 Space 互不阻塞。
+9. membership 不存在、不是 active 或未识别目标 Space 时失败/跳过。
+10. 授权成功只写 space_credentials，并按结果写 auth_mode。
 ```
 
 验证：
@@ -620,6 +714,9 @@ downstream_channel_credential_type_balances.claimed_push_count -= 1
 授权 job 不再改 space_memberships。
 授权 job 不再改 spaces.credential_type。
 授权 job 不再调用 /wham/usage。
+OAuth 成功写 auth_mode=codex_oauth。
+phone gate 降级成功写 auth_mode=backend_access_token。
+非 phone gate 的 OAuth 失败不会创建 Business AT。
 ```
 
 ### Phase 2：实现/修正空间成员同步与邀请
@@ -635,7 +732,7 @@ downstream_channel_credential_type_balances.claimed_push_count -= 1
 ```text
 1. 同步 subscriptions/users/invites。
 2. users 命中写 active。
-3. invites 命中写 invited。
+3. invites 命中 active 账号且本地完全没有 membership 时新增 active；已有 membership 不修改。
 4. 本地 active/invited/accepted 但远端 users/invites 都不存在时，按当前 space_id 物理删除 membership。
 5. 空间邀请固定实现 1000 条直连 Work，并使用一个内存屏障。
 6. 去掉 cooldown / other-space 排除。
@@ -751,7 +848,10 @@ team_monthly monthly >= 95% 结算为 used 并释放坑位。
 
 当前实现必须通过以下证据核验：
   - space_authorization.py 不出现 fetch_wham_usage / infer_credential_type / _upsert_business_membership。
-  - automation.space_authorize 从 active membership + user_accounts Web 登录态选待授权成员。
+  - automation.space_authorize 只从指定 Business Space 的 active membership 选成员。
+  - OAuth target_workspace_id 等于 spaces.external_space_id。
+  - 只有 add_phone / select-channel 会追加 Web Access Token 降级 Work。
+  - space_credentials.auth_mode 决定下游使用 Codex OAuth 或 Business AT payload。
   - automation.space_recycle_sweep 不调用 /backend-api/wham/usage。
   - 迁移约束 automation_schedules.schedule_type 包含 4 个 Space job。
 ```

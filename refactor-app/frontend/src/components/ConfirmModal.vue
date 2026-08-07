@@ -28,6 +28,7 @@ const emit = defineEmits<{ close: []; confirm: [] }>();
             <dt>{{ key }}</dt><dd>{{ value }}</dd>
           </template>
         </dl>
+        <div v-if="$slots.default" class="modal-body"><slot /></div>
         <footer>
           <button class="btn" :disabled="busy" @click="emit('close')">取消</button>
           <button class="btn" :class="{ danger, primary: !danger }" :disabled="busy" @click="emit('confirm')">
@@ -53,5 +54,6 @@ dt, dd { border-bottom: 1px solid var(--border); margin: 0; padding: 9px 12px; }
 dt { color: var(--text-muted); font-size: 11px; font-weight: 700; }
 dd { font-size: 12px; overflow-wrap: anywhere; }
 dl > :nth-last-child(-n+2) { border-bottom: 0; }
+.modal-body { border-bottom: 1px solid var(--border); padding: 14px 16px; }
 footer { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 16px; }
 </style>

@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class HealthcheckResult:
+    status: str
+    message: str = ""
+    details: dict = field(default_factory=dict)
+
+
+class PluginContract(Protocol):
+    name: str
+
+    def validate_config(self) -> None: ...
+
+    def healthcheck(self) -> HealthcheckResult: ...
+
+    def capabilities(self) -> list[str]: ...
+
+
+@dataclass(frozen=True)
+class ProxyNode:
+    provider: str
+    external_proxy_id: str
+    connection_mode: str
+    proxy_host: str
+    proxy_port: int
+    proxy_scheme: str
+    proxy_type: str = "proxyserver"
+    proxy_username: str = ""
+    proxy_password: str = ""
+    country_code: str = ""
+    city_name: str = ""
+    asn_name: str = ""
+    provider_valid: bool = False
+    last_provider_verification_at: datetime | None = None
+
+
+class ProxyProvider(PluginContract, Protocol):
+    def list_proxies(self) -> list[ProxyNode]: ...
+
+
+@dataclass(frozen=True)
+class MailLease:
+    provider: str
+    external_lease_id: str
+    email: str
+
+
+@dataclass(frozen=True)
+class OtpMessage:
+    code: str
+    raw: dict = field(default_factory=dict)
+
+
+class MailProvider(PluginContract, Protocol):
+    def allocate_mailbox(self, *, purpose: str = "") -> MailLease: ...
+
+    def poll_otp(self, *, external_lease_id: str, timeout_s: int) -> OtpMessage | None: ...
+
+    def mark_used(self, *, external_lease_id: str) -> None: ...
+
+    def mark_failed(
+        self,
+        *,
+        external_lease_id: str,
+        failure_code: str = "",
+        failure_message: str = "",
+    ) -> None: ...
+
+    def release(self, *, external_lease_id: str, reason: str = "") -> None: ...
+
+
+@dataclass(frozen=True)
+class TokenClaims:
+    token_chatgpt_account_id: str
+    account_id: str = ""
+    chatgpt_account_user_id: str = ""
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OAuthTokenSet:
+    access_token: str
+    id_token: str
+    refresh_token: str
+    expires_at: datetime | None
+    claims: TokenClaims
+
+
+class OpenAIChatGPTProvider(PluginContract, Protocol):
+    def refresh_workspace_token(
+        self,
+        *,
+        refresh_token: str,
+        external_workspace_id: str,
+        client_id: str,
+    ) -> OAuthTokenSet: ...
+
+    def decode_access_token(self, access_token: str) -> TokenClaims: ...
+
+    def invite_member(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        email: str,
+        cookie_header: str = "",
+        seat_type: str = "default",
+        proxy_url: str = "",
+        proxy_resolve: tuple[str, ...] = (),
+    ) -> dict: ...
+
+    def invite_members(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        emails: list[str],
+        cookie_header: str = "",
+        seat_type: str = "default",
+        proxy_url: str = "",
+        proxy_resolve: tuple[str, ...] = (),
+    ) -> dict: ...
+
+    def accept_invite(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str = "",
+        device_id: str = "",
+    ) -> dict: ...
+
+    def probe_membership(self, *, access_token: str, team_id: str) -> dict: ...
+
+    def fetch_subscription(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def update_subscription_seats(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        updated_seats: int,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def list_account_users(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]: ...
+
+    def list_account_invites(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        cookie_header: str = "",
+        page_size: int = 100,
+        proxy_url: str = "",
+    ) -> list[dict]: ...
+
+    def remove_account_user(
+        self,
+        *,
+        access_token: str,
+        account_id: str,
+        user_id: str,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def heartbeat_codex_credential(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str = "",
+        model: str = "",
+    ) -> dict: ...
+
+    def probe_codex_responses_usage(
+        self,
+        *,
+        access_token: str,
+        team_id: str,
+        proxy_url: str = "",
+        model: str = "",
+    ) -> dict: ...
+
+    def fetch_wham_usage(
+        self,
+        *,
+        access_token: str,
+        chatgpt_account_id: str = "",
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def create_wham_auth_credential(
+        self,
+        *,
+        access_token: str = "",
+        chatgpt_account_id: str,
+        name: str,
+        ttl_seconds: int = 7_776_000,
+        cookie_header: str = "",
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def fetch_web_session_payload(
+        self,
+        *,
+        cookie_header: str,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def check_change_email_eligibility(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def begin_change_email(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        email: str,
+        remove_social_subscriptions: bool = False,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+    def verify_change_email(
+        self,
+        *,
+        access_token: str,
+        cookie_header: str,
+        email: str,
+        code: str,
+        remove_social_subscriptions: bool = False,
+        proxy_url: str = "",
+    ) -> dict: ...
+
+
+@dataclass(frozen=True)
+class DownstreamCodexPayload:
+    access_token: str
+    id_token: str
+    refresh_token: str
+    email: str
+    account_id: str
+    downstream_chatgpt_account_id: str
+    token_chatgpt_account_id: str
+    client_id: str
+    expires_at: datetime | None
+    plan_tag: str = ""
+    plan_type: str = ""
+
+    @property
+    def chatgpt_user_id(self) -> str:
+        return self.account_id
+
+
+@dataclass(frozen=True)
+class DownstreamPushResult:
+    pushed: bool
+    downstream_external_id: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    raw: dict = field(default_factory=dict)
+
+
+class DownstreamProvider(PluginContract, Protocol):
+    def push_codex_credential(self, payload: DownstreamCodexPayload) -> DownstreamPushResult: ...
+
+    def push_business_access_token(self, payload: dict) -> DownstreamPushResult: ...

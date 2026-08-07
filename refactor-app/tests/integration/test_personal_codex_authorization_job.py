@@ -155,6 +155,10 @@ def test_selected_personal_memberships_create_manual_authorize_job(
                     ],
                     created_by="test",
                     work_count=2,
+                    use_hero_sms_for_add_phone=True,
+                    hero_sms_country="73",
+                    hero_sms_max_price="0.25",
+                    force_clean_browser_login=True,
                 ),
                 session=session,
             )
@@ -163,20 +167,24 @@ def test_selected_personal_memberships_create_manual_authorize_job(
         assert captured["job"]["input_json"]["authorization_mode"] == (
             "manual_personal_memberships"
         )
-        assert captured["job"]["input_json"]["space_membership_ids"] == [
-            eligible_membership_id
-        ]
+        assert captured["job"]["input_json"]["space_membership_ids"] == [eligible_membership_id]
+        assert captured["job"]["input_json"]["use_hero_sms_for_add_phone"] is True
+        assert captured["job"]["input_json"]["hero_sms_country"] == "73"
+        assert captured["job"]["input_json"]["hero_sms_max_price"] == "0.25"
+        assert captured["job"]["input_json"]["force_clean_browser_login"] is True
         assert "cookie" not in str(captured["job"]["input_json"]).lower()
         assert "token" not in str(captured["job"]["input_json"]).lower()
         assert len(captured["works"]) == 1
-        assert captured["works"][0]["work_type"] == (
-            "space.personal_codex.authorize.account"
-        )
+        assert captured["works"][0]["work_type"] == ("space.personal_codex.authorize.account")
         assert captured["works"][0]["input_json"] == {
             "space_membership_id": eligible_membership_id,
             "space_id": eligible_space_id,
             "user_account_id": eligible_account_id,
             "external_space_id": f"{prefix}-eligible-external",
+            "force_clean_browser_login": True,
+            "use_hero_sms_for_add_phone": True,
+            "hero_sms_country": "73",
+            "hero_sms_max_price": "0.25",
             "_run_id": "manual-personal-run",
         }
         assert result["requested_count"] == 2
@@ -191,9 +199,7 @@ def test_selected_personal_memberships_create_manual_authorize_job(
     finally:
         with session_factory() as session:
             session.execute(
-                delete(SpaceModel).where(
-                    SpaceModel.id.in_([eligible_space_id, blocked_space_id])
-                )
+                delete(SpaceModel).where(SpaceModel.id.in_([eligible_space_id, blocked_space_id]))
             )
             session.execute(
                 delete(UserAccountModel).where(
@@ -201,3 +207,50 @@ def test_selected_personal_memberships_create_manual_authorize_job(
                 )
             )
             session.commit()
+
+
+def test_personal_codex_hero_options_accept_price_above_default() -> None:
+    options = resources._validated_personal_codex_hero_options(
+        resources.PersonalCodexAuthorizationJobRequest(
+            space_membership_ids=["membership-1"],
+            use_hero_sms_for_add_phone=True,
+            hero_sms_country="151",
+            hero_sms_max_price="1.25",
+        )
+    )
+
+    assert options == {
+        "use_hero_sms_for_add_phone": True,
+        "hero_sms_country": "151",
+        "hero_sms_max_price": "1.25",
+    }
+
+
+def test_personal_codex_hero_options_accept_numeric_price_from_browser() -> None:
+    options = resources._validated_personal_codex_hero_options(
+        resources.PersonalCodexAuthorizationJobRequest(
+            space_membership_ids=["membership-1"],
+            use_hero_sms_for_add_phone=True,
+            hero_sms_country="16",
+            hero_sms_max_price=0.05,
+        )
+    )
+
+    assert options == {
+        "use_hero_sms_for_add_phone": True,
+        "hero_sms_country": "16",
+        "hero_sms_max_price": "0.05",
+    }
+
+
+def test_personal_codex_without_hero_does_not_store_phone_options() -> None:
+    options = resources._validated_personal_codex_hero_options(
+        resources.PersonalCodexAuthorizationJobRequest(
+            space_membership_ids=["membership-1"],
+            use_hero_sms_for_add_phone=False,
+            hero_sms_country="not-used",
+            hero_sms_max_price="not-used",
+        )
+    )
+
+    assert options == {"use_hero_sms_for_add_phone": False}

@@ -16,10 +16,16 @@ const pushWorkCount = ref(5);
 const downstreamChannelId = ref("");
 const downstreamChannels = ref<Row[]>([]);
 
-const filters: TableFilter[] = [{ key: "credential_status", label: "凭证状态", options: [
-  { label: "有效", value: "active" }, { label: "无效", value: "invalid" },
-  { label: "过期", value: "expired" }, { label: "错误", value: "error" },
-] }];
+const filters: TableFilter[] = [
+  { key: "credential_status", label: "凭证状态", options: [
+    { label: "有效", value: "active" }, { label: "无效", value: "invalid" },
+    { label: "过期", value: "expired" }, { label: "错误", value: "error" },
+  ] },
+  { key: "auth_mode", label: "授权方式", options: [
+    { label: "Codex OAuth", value: "codex_oauth" },
+    { label: "Business AT", value: "backend_access_token" },
+  ] },
+];
 
 const columns: Column[] = [
   { key: "id", label: "空间凭证 ID", mono: true, summary: 24, copyable: true },
@@ -29,6 +35,7 @@ const columns: Column[] = [
   { key: "external_space_id", label: "外部空间 ID", mono: true, summary: 28 },
   { key: "space_type", label: "空间类型", badge: true },
   { key: "credential_type", label: "凭证类型", badge: true },
+  { key: "auth_mode", label: "授权方式", badge: true },
   { key: "credential_status", label: "凭证状态", badge: true },
   { key: "external_credential_id", label: "外部凭证 ID", mono: true, summary: 28 },
   { key: "account_id", label: "Account ID", mono: true, summary: 28 },

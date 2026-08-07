@@ -10,43 +10,72 @@ import { useOpsStore } from "../stores/ops";
 const router = useRouter();
 const store = useOpsStore();
 const fileInput = ref<HTMLInputElement | null>(null);
-const fileName = ref("");
+const mode = ref<"mapped_csv" | "source_jsonl_auto_claim">("mapped_csv");
+const fileNames = ref<string[]>([]);
 const csvText = ref("");
+const sourceJsonlText = ref("");
 const workCount = ref(5);
 const otpTimeoutS = ref(180);
 const submitting = ref(false);
-const selected = computed(() => Boolean(csvText.value.trim()));
+const selected = computed(() =>
+  mode.value === "mapped_csv"
+    ? Boolean(csvText.value.trim())
+    : Boolean(sourceJsonlText.value.trim()),
+);
+const sourceRecordCount = computed(() =>
+  sourceJsonlText.value.split(/\r?\n/).filter((line) => line.trim()).length,
+);
 
 async function selectFile(event: Event) {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (!file) return;
+  const files = Array.from(input.files ?? []);
+  if (!files.length) return;
   try {
-    csvText.value = await file.text();
-    fileName.value = file.name;
+    if (mode.value === "mapped_csv") {
+      csvText.value = await files[0].text();
+      sourceJsonlText.value = "";
+      fileNames.value = [files[0].name];
+      return;
+    }
+    const contents = await Promise.all(files.map((file) => file.text()));
+    sourceJsonlText.value = contents.map((item) => item.trim()).filter(Boolean).join("\n");
+    csvText.value = "";
+    fileNames.value = files.map((file) => file.name);
   } catch (err) {
     clearFile();
-    store.toast("读取 CSV 失败", String((err as Error).message ?? err), "error");
+    store.toast("读取账号文件失败", String((err as Error).message ?? err), "error");
   }
 }
 
 function clearFile() {
   csvText.value = "";
-  fileName.value = "";
+  sourceJsonlText.value = "";
+  fileNames.value = [];
   if (fileInput.value) fileInput.value.value = "";
+}
+
+function setMode(nextMode: "mapped_csv" | "source_jsonl_auto_claim") {
+  if (mode.value === nextMode) return;
+  mode.value = nextMode;
+  clearFile();
 }
 
 async function submitJob() {
   if (!selected.value) {
-    store.toast("未选择 CSV", "请选择换绑邮箱 CSV。", "warning");
+    store.toast("未选择文件", "请选择换绑所需文件。", "warning");
     return;
   }
   submitting.value = true;
   try {
     const result = await resourcesApi.createAccountEmailChangeJob({
+      mode: mode.value,
       csv_text: csvText.value,
+      source_jsonl_text: sourceJsonlText.value,
       work_count: Math.max(1, Number(workCount.value || 1)),
       otp_timeout_s: Math.max(1, Number(otpTimeoutS.value || 180)),
+      mail_provider: "outlook",
+      project_key: "",
+      caller_id: "refactor-app-protocol-registration",
       created_by: "ops-ui",
     });
     store.toast(
@@ -67,22 +96,39 @@ async function submitJob() {
   <div>
     <PageHeader
       title="换绑邮箱"
-      description="按 CSV 行将已注册账号换绑到对应的新邮箱。"
+      description="将已注册账号换绑到指定邮箱，或从邮箱池自动领取未使用邮箱。"
     />
 
     <section class="panel email-change-panel">
+      <div class="mode-control" role="group" aria-label="换绑模式">
+        <button
+          type="button"
+          :class="{ active: mode === 'mapped_csv' }"
+          @click="setMode('mapped_csv')"
+        >
+          CSV 指定邮箱
+        </button>
+        <button
+          type="button"
+          :class="{ active: mode === 'source_jsonl_auto_claim' }"
+          @click="setMode('source_jsonl_auto_claim')"
+        >
+          账号文件自动领取
+        </button>
+      </div>
       <div class="form-grid">
         <div class="file-field">
-          <span>CSV 文件</span>
+          <span>{{ mode === "mapped_csv" ? "CSV 文件" : "账号文件" }}</span>
           <input
             ref="fileInput"
             class="file-input"
             type="file"
-            accept=".csv,text/csv"
+            :accept="mode === 'mapped_csv' ? '.csv,text/csv' : '.txt,.json,.jsonl,text/plain,application/json'"
+            :multiple="mode === 'source_jsonl_auto_claim'"
             @change="selectFile"
           />
           <button class="btn" type="button" @click="fileInput?.click()">
-            <FileUp :size="16" />选择 CSV
+            <FileUp :size="16" />{{ mode === "mapped_csv" ? "选择 CSV" : "选择账号文件" }}
           </button>
         </div>
         <label>
@@ -95,12 +141,13 @@ async function submitJob() {
         </label>
       </div>
 
-      <div v-if="fileName" class="selected-file">
+      <div v-if="fileNames.length" class="selected-file">
         <div>
-          <strong>{{ fileName }}</strong>
-          <span>字段：old_mail, new_mail</span>
+          <strong>{{ fileNames.length === 1 ? fileNames[0] : `${fileNames.length} 个文件` }}</strong>
+          <span v-if="mode === 'mapped_csv'">字段：old_mail, new_mail</span>
+          <span v-else>{{ sourceRecordCount }} 条账号记录 · 新邮箱来源：Outlook 邮箱池</span>
         </div>
-        <button class="icon-btn" type="button" title="移除 CSV" @click="clearFile">
+        <button class="icon-btn" type="button" title="移除文件" @click="clearFile">
           <X :size="16" />
         </button>
       </div>
@@ -117,6 +164,32 @@ async function submitJob() {
 <style scoped>
 .email-change-panel {
   padding: 16px;
+}
+
+.mode-control {
+  background: var(--panel-bg-2);
+  border: 1px solid var(--border);
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(150px, 1fr));
+  margin-bottom: 14px;
+  padding: 3px;
+}
+
+.mode-control button {
+  background: transparent;
+  border: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  min-height: 34px;
+  padding: 0 12px;
+}
+
+.mode-control button.active {
+  background: var(--accent);
+  color: white;
 }
 
 .form-grid {

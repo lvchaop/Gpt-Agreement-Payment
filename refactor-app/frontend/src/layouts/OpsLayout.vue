@@ -6,6 +6,7 @@ import {
   Cable,
   ChevronLeft,
   CircleGauge,
+  CreditCard,
   DatabaseZap,
   FileClock,
   KeyRound,
@@ -62,6 +63,10 @@ const navGroups = [
       { to: "/proxy", label: "代理池", icon: ServerCog },
       { to: "/mail", label: "邮箱", icon: AtSign },
     ],
+  },
+  {
+    label: "支付资料",
+    items: [{ to: "/payment-method-pools", label: "支付资料池", icon: CreditCard }],
   },
 ];
 

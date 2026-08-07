@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from refactor_app.application.workflows.space_recycle import _parse_codex_usage_headers
 from refactor_app.application.workflows.space_usage import (
     infer_credential_type,
     parse_wham_usage_windows,
@@ -33,6 +34,31 @@ def test_parse_team_five_hour_weekly_usage_windows() -> None:
     assert [item.quota_window_kind for item in windows] == ["five_hour", "weekly"]
     assert infer_credential_type(space_type="business", usage_payload=payload) == "team_5h_weekly"
     assert usage_status_from_percent(windows[1].used_percent) == "used"
+
+
+def test_infer_business_five_hour_weekly_from_weekly_window_only() -> None:
+    payload = {
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": True,
+            "limit_reached": False,
+            "primary_window": {
+                "used_percent": 0,
+                "limit_window_seconds": 604_800,
+                "reset_after_seconds": 604_800,
+                "reset_at": 1_783_389_439,
+            },
+            "secondary_window": None,
+        },
+    }
+
+    windows = parse_wham_usage_windows(payload)
+
+    assert [item.quota_window_kind for item in windows] == ["weekly"]
+    assert infer_credential_type(
+        space_type="business",
+        usage_payload=payload,
+    ) == "team_5h_weekly"
 
 
 def test_parse_personal_monthly_usage_window() -> None:
@@ -99,3 +125,22 @@ def test_infer_business_monthly_from_variable_calendar_month_window() -> None:
     assert [item.quota_window_kind for item in windows] == ["monthly"]
     assert windows[0].limit_window_seconds == 2_628_000
     assert infer_credential_type(space_type="business", usage_payload=payload) == "team_monthly"
+
+
+def test_parse_codex_monthly_usage_headers_accepts_variable_calendar_window() -> None:
+    windows = _parse_codex_usage_headers(
+        {
+            "x-codex-primary-used-percent": "70",
+            "x-codex-primary-window-minutes": "43800",
+            "x-codex-primary-reset-after-seconds": "12345",
+        }
+    )
+
+    assert windows == [
+        {
+            "quota_window_kind": "monthly",
+            "usage_percent": 70,
+            "limit_window_seconds": 2_628_000,
+            "reset_after_seconds": 12_345,
+        }
+    ]

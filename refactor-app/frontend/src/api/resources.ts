@@ -18,6 +18,11 @@ export type PersonalCodexAuthorizationJobResult = AccountWorkJobResult & {
   selection_skipped_count: number;
   selection_skipped: Array<{ space_membership_id: string; reason: string }>;
 };
+export type PersonalPaymentMethodBindSelectedJobResult = AccountWorkJobResult & {
+  requested_count: number;
+  selection_skipped_count: number;
+  selection_skipped: Array<{ space_id: string; reason: string }>;
+};
 
 export const resourcesApi = {
   overview: () => getJson<{ generated_at: string; metrics: Record<string, number>; recent_failed_jobs: Row[] }>("/ops/overview"),
@@ -38,6 +43,8 @@ export const resourcesApi = {
     postJson<AccountWorkJobResult>("/user-accounts/backfill-session-rt-job", body),
   backfillSession: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/user-accounts/backfill-session-job", body),
+  refreshSessionSpaceDetection: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/memberships/refresh-session-space-detection-job", body),
   backfillRt: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/user-accounts/backfill-rt-job", body),
   createProtocolRegistrationJob: (body: Record<string, unknown>) =>
@@ -68,6 +75,56 @@ export const resourcesApi = {
   spaces: (params: PageQuery = {}) => getJson<PagedResult<Row>>(withQuery("/spaces", params)),
   patchSpace: (id: string, body: Record<string, unknown>) =>
     patchJson<Row>(`/spaces/${encodeURIComponent(id)}`, body),
+  paymentMethodPoolSummary: () => getJson<Row>("/payment-method-pools/summary"),
+  importPaymentMethodPools: (body: Record<string, unknown>) =>
+    postJson<Row>("/payment-method-pools/import", body),
+  paymentNamePool: (params: PageQuery = {}) =>
+    getJson<PagedResult<Row>>(withQuery("/payment-method-pools/names", params)),
+  createPaymentName: (body: Record<string, unknown>) =>
+    postJson<Row>("/payment-method-pools/names", body),
+  patchPaymentName: (id: string, body: Record<string, unknown>) =>
+    patchJson<Row>(`/payment-method-pools/names/${encodeURIComponent(id)}`, body),
+  deletePaymentName: (id: string) =>
+    deleteJson<Row>(`/payment-method-pools/names/${encodeURIComponent(id)}`),
+  paymentAddressPool: (params: PageQuery = {}) =>
+    getJson<PagedResult<Row>>(withQuery("/payment-method-pools/addresses", params)),
+  createPaymentAddress: (body: Record<string, unknown>) =>
+    postJson<Row>("/payment-method-pools/addresses", body),
+  patchPaymentAddress: (id: string, body: Record<string, unknown>) =>
+    patchJson<Row>(`/payment-method-pools/addresses/${encodeURIComponent(id)}`, body),
+  deletePaymentAddress: (id: string) =>
+    deleteJson<Row>(`/payment-method-pools/addresses/${encodeURIComponent(id)}`),
+  paymentCardPool: (params: PageQuery = {}) =>
+    getJson<PagedResult<Row>>(withQuery("/payment-method-pools/cards", params)),
+  createPaymentCard: (body: Record<string, unknown>) =>
+    postJson<Row>("/payment-method-pools/cards", body),
+  patchPaymentCard: (id: string, body: Record<string, unknown>) =>
+    patchJson<Row>(`/payment-method-pools/cards/${encodeURIComponent(id)}`, body),
+  deletePaymentCard: (id: string) =>
+    deleteJson<Row>(`/payment-method-pools/cards/${encodeURIComponent(id)}`),
+  bindPersonalPaymentMethod: (id: string, body: Record<string, unknown> = {}) =>
+    postJson<AccountWorkJobResult>(
+      `/spaces/${encodeURIComponent(id)}/payment-method-bind-job`,
+      body,
+    ),
+  bindSelectedPersonalPaymentMethods: (body: Record<string, unknown>) =>
+    postJson<PersonalPaymentMethodBindSelectedJobResult>(
+      "/spaces/payment-method-bind-selected-job",
+      body,
+    ),
+  spaceReplenishEmailSummary: () =>
+    getJson<Row>("/space-replenish-emails/summary"),
+  importSpaceReplenishEmails: (body: Record<string, unknown>) =>
+    postJson<Row>("/space-replenish-emails/import", body),
+  prepareSpaceAutoReplenishInvites: (id: string, body: Record<string, unknown> = {}) =>
+    postJson<AccountWorkJobResult>(
+      `/spaces/${encodeURIComponent(id)}/auto-replenish/invite-job`,
+      body,
+    ),
+  hostSpaceAutoReplenishment: (id: string) =>
+    postJson<Row>(`/spaces/${encodeURIComponent(id)}/auto-replenish/hosting`, {}),
+  cancelSpaceAutoReplenishmentHosting: (id: string) =>
+    deleteJson<Row>(`/spaces/${encodeURIComponent(id)}/auto-replenish/hosting`),
   syncRemoteSpaceMemberships: (id: string, body: Record<string, unknown> = {}) =>
     postJson<Row>(`/spaces/${encodeURIComponent(id)}/memberships/sync-remote`, body),
   expandSpaceSeats: (id: string, body: Record<string, unknown> = {}) =>
@@ -82,6 +139,20 @@ export const resourcesApi = {
   submitSpaceSessionOtp: (id: string, body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>(
       `/spaces/${encodeURIComponent(id)}/session-otp/submit-job`,
+      body,
+    ),
+  submitSpaceSessionOtpRemote: (id: string, body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>(
+      `/spaces/${encodeURIComponent(id)}/session-otp/remote-submit-job`,
+      body,
+    ),
+  multiSpaceSessionOtpSummary: (body: Record<string, unknown>) =>
+    postJson<Row>("/memberships/session-otp/summary", body),
+  prepareMultiSpaceSessionOtp: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>("/memberships/session-otp/prepare-job", body),
+  submitMultiSpaceSessionOtpRemote: (body: Record<string, unknown>) =>
+    postJson<AccountWorkJobResult>(
+      "/memberships/session-otp/remote-submit-job",
       body,
     ),
   createBusinessAccessTokenCredentials: (body: Record<string, unknown>) =>

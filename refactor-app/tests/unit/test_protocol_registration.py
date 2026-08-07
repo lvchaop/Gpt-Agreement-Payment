@@ -16,11 +16,51 @@ from refactor_app.application.workflows.protocol_registration import (
     _extract_otp,
     _hero_phone_parts,
 )
+from refactor_app.application.workflows.registration_proxy import RegistrationBackboneProxy
+from refactor_app.config.browser_fingerprint import (
+    BROWSER_SEC_CH_UA,
+    BROWSER_SEC_CH_UA_PLATFORM,
+    BROWSER_USER_AGENT,
+)
 from refactor_app.config.settings import Settings
 from refactor_app.plugins.contracts import OtpMessage
 from refactor_app.plugins.mail_external_api.client import ClaimedMailAccount
+from refactor_app.plugins.openai_auth_browser import AccountSecuritySetupResult
 from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthFlow, AuthResult
 from refactor_app.plugins.openai_auth_protocol.config import Config, PhoneConfig
+
+
+def test_email_protocol_passes_proxy_country_to_sentinel_context(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Flow:
+        def __init__(self, config: Config, trace_callback=None) -> None:
+            captured["config"] = config
+            captured["trace_callback"] = trace_callback
+
+        def run_register(self, mail) -> AuthResult:
+            captured["mail"] = mail
+            return AuthResult()
+
+    monkeypatch.setattr(protocol_registration, "AuthFlow", Flow)
+    workflow = ProtocolRegistrationWorkflow.__new__(ProtocolRegistrationWorkflow)
+    mail = object()
+
+    workflow._execute_email_protocol(
+        ProtocolRegistrationInput(mode="email_protocol_no_phone", proxy_country="JP"),
+        mail=mail,
+        user_account_id="account-1",
+        work_id="work-1",
+        proxy_url="http://proxy.example",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    config = captured["config"]
+    assert isinstance(config, Config)
+    assert config.proxy == "http://proxy.example"
+    assert config.proxy_meta["register"]["country_code"] == "JP"
+    assert config.proxy_meta["register"]["region"] == "JP"
+    assert captured["mail"] is mail
 
 
 def test_auth_flow_csrf_retries_cloudflare_403_three_times(monkeypatch) -> None:
@@ -53,10 +93,9 @@ def test_auth_flow_csrf_retries_cloudflare_403_three_times(monkeypatch) -> None:
     assert session.calls == 3
 
 
-def test_email_registration_reassigns_proxy_after_cloudflare_403(monkeypatch) -> None:
-    proxy_urls = ["http://proxy-1.example", "http://proxy-2.example"]
-    assigned: list[str] = []
-    released: list[dict] = []
+def test_email_registration_keeps_hashed_proxy_after_cloudflare_403(monkeypatch) -> None:
+    proxy_url = "http://proxy-1.example"
+    assigned: list[tuple[str, str]] = []
     flow_proxies: list[str] = []
     stored_emails: list[str] = []
 
@@ -110,52 +149,39 @@ def test_email_registration_reassigns_proxy_after_cloudflare_403(monkeypatch) ->
 
         def run_register(self, mail) -> AuthResult:
             email = mail.create_mailbox()
-            if len(flow_proxies) == 1:
-                raise RuntimeError("cloudflare_csrf_403_after_3_retries")
-            result = AuthResult()
-            result.email = email
-            result.session_token = "session-token"
-            result.access_token = "access-token"
-            return result
+            raise RuntimeError(f"cloudflare_csrf_403_after_3_retries:{email}")
 
-    def assign_proxy(*_args, **_kwargs) -> str:
-        proxy = proxy_urls[len(assigned)]
-        assigned.append(proxy)
-        return proxy
-
-    def release_proxy(*_args, **kwargs) -> str:
-        released.append(kwargs)
-        return "proxy-1"
+    def resolve_proxy(_session_factory, *, email: str, country_code: str):
+        assigned.append((email, country_code))
+        return RegistrationBackboneProxy(
+            proxy_url=proxy_url,
+            endpoint_id="backbone-17",
+            endpoint_number=17,
+            endpoint_count=20_000,
+            country_code="US",
+        )
 
     monkeypatch.setattr(protocol_registration, "AuthFlow", Flow)
-    monkeypatch.setattr(protocol_registration, "ensure_account_proxy_url", assign_proxy)
     monkeypatch.setattr(
         protocol_registration,
-        "release_account_proxy_for_reassign",
-        release_proxy,
+        "resolve_registration_backbone_proxy",
+        resolve_proxy,
     )
 
-    result = Workflow(session_factory=lambda: None, mail_provider=MailProvider()).run(
-        ProtocolRegistrationInput(
-            mode="email_protocol_no_phone",
-            use_proxy=True,
-            caller_id="caller",
-            project_key="openai-register",
-        ),
-        work_id="work-1",
-        run_id="run-1",
-    )
+    with pytest.raises(RuntimeError, match="cloudflare_csrf_403_after_3_retries"):
+        Workflow(session_factory=lambda: None, mail_provider=MailProvider()).run(
+            ProtocolRegistrationInput(
+                mode="email_protocol_no_phone",
+                caller_id="caller",
+                project_key="openai-register",
+            ),
+            work_id="work-1",
+            run_id="run-1",
+        )
 
-    assert result["email"] == "retryaccount@example.test"
-    assert stored_emails == ["RetryAccount@example.test"]
-    assert assigned == proxy_urls
-    assert flow_proxies == proxy_urls
-    assert released == [
-        {
-            "error_code": "cloudflare_csrf_403_after_3_retries",
-            "error_message": "cloudflare_csrf_403_after_3_retries",
-        }
-    ]
+    assert stored_emails == []
+    assert assigned == [("RetryAccount@example.test", "US")]
+    assert flow_proxies == [proxy_url]
 
 
 def test_hero_sms_phone_provider_adapter_lifecycle(monkeypatch) -> None:
@@ -441,6 +467,18 @@ def test_settings_reads_hero_sms_api_key_without_job_payload(monkeypatch) -> Non
     assert Settings(_env_file=None).hero_sms_api_key == "hero-key-from-env"
 
 
+def test_settings_reads_grizzly_sms_api_key_without_job_payload(monkeypatch) -> None:
+    monkeypatch.setenv("GRIZZLY_SMS_API_KEY", "grizzly-key-from-env")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.grizzly_sms_api_key == "grizzly-key-from-env"
+    assert settings.grizzly_sms_base_url == ("https://api.grizzlysms.com/stubs/handler_api.php")
+    assert settings.grizzly_sms_service == "dr"
+    assert settings.grizzly_sms_country == "187"
+    assert settings.grizzly_sms_max_price == "0.18"
+
+
 def test_registration_mail_adapter_lowercases_openai_email_but_keeps_mailbox_email() -> None:
     class FakeMailProvider:
         def __init__(self) -> None:
@@ -539,6 +577,68 @@ def test_registration_mail_adapter_claims_new_mailbox_after_release() -> None:
     ]
 
 
+def test_registration_mail_adapter_fixed_email_uses_verification_api_without_claiming() -> None:
+    calls: list[str] = []
+
+    class FakeMailProvider:
+        def claim_random(self, **_kwargs):
+            calls.append("claim_random")
+            raise AssertionError("fixed email must not claim a remote mailbox")
+
+        def wait_for_otp_by_email(self, *, email: str, **_kwargs) -> OtpMessage:
+            calls.append(f"wait:{email}")
+            return OtpMessage(code="654321", raw={})
+
+        def claim_complete(self, *_args, **_kwargs):
+            calls.append("claim_complete")
+
+        def claim_release(self, *_args, **_kwargs):
+            calls.append("claim_release")
+
+    adapter = RegistrationMailProviderAdapter(
+        mail_provider=FakeMailProvider(),  # type: ignore[arg-type]
+        caller_id="space-auto-replenish",
+        task_id="work-1",
+        provider="outlook",
+        project_key="space-auto-replenish",
+        email_domain="",
+        fixed_email="MixedCaseMailbox@outlook.com",
+    )
+
+    email = adapter.create_mailbox()
+    code = adapter.wait_for_otp(email)
+    adapter.mark_used(email)
+    adapter.mark_unused(email)
+
+    assert email == "MixedCaseMailbox@outlook.com"
+    assert code == "654321"
+    assert calls == ["wait:MixedCaseMailbox@outlook.com"]
+
+
+def test_registration_mail_adapter_ensures_fixed_domain_mail_before_returning_it() -> None:
+    calls: list[str] = []
+
+    class FakeMailProvider:
+        def ensure_domain_email(self, *, email: str) -> dict:
+            calls.append(f"ensure:{email}")
+            return {"email": email}
+
+    adapter = RegistrationMailProviderAdapter(
+        mail_provider=FakeMailProvider(),  # type: ignore[arg-type]
+        caller_id="space-auto-replenish",
+        task_id="work-1",
+        provider="cloudflare_temp_mail",
+        project_key="space-auto-replenish",
+        email_domain="boluodadaxyz.xyz",
+        fixed_email="Worker@boluodadaxyz.xyz",
+    )
+
+    email = adapter.create_mailbox()
+
+    assert email == "Worker@boluodadaxyz.xyz"
+    assert calls == ["ensure:Worker@boluodadaxyz.xyz"]
+
+
 def test_phone_email_binding_timeout_rotates_up_to_ten_mailboxes(monkeypatch) -> None:
     monkeypatch.delenv("PHONE_PROTOCOL_MAX_EMAIL_BIND_ATTEMPTS", raising=False)
     flow = AuthFlow.__new__(AuthFlow)
@@ -602,6 +702,224 @@ def test_registration_success_persists_claimed_email_case() -> None:
     assert account.email == "DawnMontgomery148200@outlook.com"
 
 
+def test_registration_does_not_persist_password_when_security_setup_failed() -> None:
+    account = SimpleNamespace()
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _model, _account_id):
+            return account
+
+        def commit(self) -> None:
+            pass
+
+    result = AuthResult()
+    result.email = "icloud-user@example.test"
+    result.password = "candidate-password"
+    result.session_token = "session-token"
+    workflow = ProtocolRegistrationWorkflow(
+        session_factory=FakeSession,
+        mail_provider=object(),
+    )
+
+    workflow._write_success_account(
+        user_account_id="account-1",
+        result=result,
+        flow=SimpleNamespace(session=SimpleNamespace(cookies={})),
+        account_email=result.email,
+        security_setup=AccountSecuritySetupResult(
+            password_status="failed",
+            password_error_code="password_setup_failed",
+            password_error_message="password setup failed",
+            mfa_status="failed",
+            mfa_error_code="mfa_setup_failed",
+            mfa_error_message="MFA setup failed",
+        ),
+    )
+
+    assert account.account_status == "active"
+    assert account.session_status == "active"
+    assert account.password == ""
+    assert account.password_status == "failed"
+    assert account.password_last_error_code == "password_setup_failed"
+    assert account.mfa_status == "failed"
+    assert account.mfa_last_error_code == "mfa_setup_failed"
+    assert account.security_setup_last_attempt_at is not None
+
+
+def test_registration_persists_only_a_confirmed_configured_password() -> None:
+    account = SimpleNamespace()
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _model, _account_id):
+            return account
+
+        def commit(self) -> None:
+            pass
+
+    result = AuthResult()
+    result.email = "icloud-user@example.test"
+    result.password = "configured-password"
+    workflow = ProtocolRegistrationWorkflow(
+        session_factory=FakeSession,
+        mail_provider=object(),
+    )
+
+    workflow._write_success_account(
+        user_account_id="account-1",
+        result=result,
+        flow=SimpleNamespace(session=SimpleNamespace(cookies={})),
+        account_email=result.email,
+        security_setup=AccountSecuritySetupResult(
+            password_status="configured",
+            password_value_confirmed=True,
+            mfa_status="configured",
+            twofauth_account_id="twofauth-42",
+        ),
+    )
+
+    assert account.password == "configured-password"
+    assert account.password_status == "configured"
+    assert account.mfa_status == "configured"
+    assert account.twofauth_account_id == "twofauth-42"
+
+
+def test_icloud_security_exception_keeps_registration_successful(monkeypatch) -> None:
+    events: list[tuple[str, str]] = []
+    persisted: dict = {}
+    calls: dict = {}
+
+    class FakeMailProvider:
+        def claim_random(self, **_kwargs) -> ClaimedMailAccount:
+            return ClaimedMailAccount(
+                account_id="icloud-mail-1",
+                email="icloud-user@example.test",
+                claim_token="claim-token",
+                caller_id="caller",
+                task_id="work-icloud",
+                email_domain="example.test",
+            )
+
+        def claim_complete(self, _claim, *, result: str, detail: str):
+            calls["claim_complete"] = (result, detail)
+            return {"success": True}
+
+        def claim_release(self, *_args, **_kwargs):
+            calls["claim_release"] = True
+            return {"success": True}
+
+    class FakeAuthFlow:
+        def __init__(self, _cfg, trace_callback=None) -> None:
+            self.session = SimpleNamespace(
+                cookies=[
+                    SimpleNamespace(
+                        name="auth-session",
+                        value="auth-cookie-value",
+                        domain="auth.openai.com",
+                    )
+                ]
+            )
+
+        def run_register(self, mail) -> AuthResult:
+            result = AuthResult()
+            result.email = mail.create_mailbox()
+            result.password = "candidate-password"
+            result.password_configured = True
+            result.session_token = "session-token"
+            result.access_token = "access-token"
+            result.cookie_header = "__Secure-next-auth.session-token=session-token"
+            return result
+
+    class FailingSecurity:
+        def __init__(self, config, *, event_callback=None) -> None:
+            calls["security_config"] = config
+
+        def run(self, **kwargs):
+            calls["security_run"] = kwargs
+            raise RuntimeError("security setup failed")
+
+    class Workflow(ProtocolRegistrationWorkflow):
+        def _make_event_emitter(self, **_kwargs):
+            return lambda stage, _data, level="INFO": events.append((stage, level))
+
+        def _make_claim_persist_callback(self, _work_id: str):
+            return None
+
+        def _create_placeholder_account(self, *, email: str) -> str:
+            return "account-icloud"
+
+        def _set_placeholder_account_email(self, _user_account_id: str, _email: str) -> None:
+            return None
+
+        def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
+            return None
+
+        def _write_success_account(self, **kwargs) -> None:
+            persisted.update(kwargs)
+
+        def _detect_account_spaces_after_registration(self, **_kwargs) -> dict:
+            return {"accounts_check_succeeded": True}
+
+        def _delete_placeholder_account(self, _user_account_id: str) -> None:
+            calls["delete_placeholder"] = True
+
+    twofauth_client = object()
+    monkeypatch.setattr(protocol_registration, "AuthFlow", FakeAuthFlow)
+    monkeypatch.setattr(protocol_registration, "CamoufoxAccountSecurity", FailingSecurity)
+    monkeypatch.setattr(
+        protocol_registration,
+        "resolve_registration_backbone_proxy",
+        lambda *_args, **_kwargs: RegistrationBackboneProxy(
+            proxy_url="http://icloud-proxy.example",
+            endpoint_id="backbone-19",
+            endpoint_number=19,
+            endpoint_count=20_000,
+            country_code="US",
+        ),
+    )
+
+    output = Workflow(
+        session_factory=lambda: None,
+        mail_provider=FakeMailProvider(),
+        twofauth_client=twofauth_client,
+    ).run(
+        ProtocolRegistrationInput(
+            mode="email_protocol_no_phone",
+            mail_provider="icloud_hide_my_email",
+            use_proxy=False,
+        ),
+        work_id="work-icloud",
+        run_id="run-icloud",
+    )
+
+    setup = output["security_setup"]
+    assert output["user_account_id"] == "account-icloud"
+    assert setup["password_status"] == "configured"
+    assert setup["mfa_status"] == "failed"
+    assert persisted["security_setup"].password_status == "configured"
+    assert persisted["result"].password_configured is True
+    assert calls["security_run"]["twofauth_client"] is twofauth_client
+    assert calls["security_run"]["auth_result"].auth_cookie_header == (
+        "auth-session=auth-cookie-value"
+    )
+    assert calls["claim_complete"] == ("success", "icloud-user@example.test")
+    assert "delete_placeholder" not in calls
+    assert "claim_release" not in calls
+    assert ("account_security.unhandled_failure", "ERROR") in events
+    assert ("succeeded", "INFO") in events
+
+
 def test_icloud_registration_adapter_ignores_email_domain() -> None:
     class FakeMailProvider:
         def __init__(self) -> None:
@@ -648,7 +966,159 @@ def test_icloud_registration_adapter_ignores_email_domain() -> None:
     assert provider.wait_email == "ocelots_plover_3p@icloud.com"
 
 
-def test_email_protocol_assigns_account_proxy_before_claiming_mailbox(monkeypatch) -> None:
+def test_icloud_registration_runs_codex_after_mfa_with_same_proxy(monkeypatch) -> None:
+    order: list[str] = []
+    captured: dict = {}
+    current_proxy = "http://current-registration-proxy.example:8080"
+    phone_provider = object()
+
+    def totp_resolver(_account_id: str) -> str:
+        return "654321"
+
+    class MailProvider:
+        def claim_random(self, **_kwargs) -> ClaimedMailAccount:
+            return ClaimedMailAccount(
+                account_id="icloud-mail-codex",
+                email="codex-after-mfa@icloud.com",
+                claim_token="claim-token",
+                caller_id="caller",
+                task_id="work-icloud-codex",
+            )
+
+        def claim_complete(self, _claim, *, result: str, detail: str):
+            order.append(f"claim_complete:{result}:{detail}")
+            return {"success": True}
+
+        def claim_release(self, *_args, **_kwargs):
+            order.append("claim_release")
+            return {"success": True}
+
+    class Workflow(ProtocolRegistrationWorkflow):
+        def _make_event_emitter(self, **_kwargs):
+            return lambda stage, _data, level="INFO": order.append(f"event:{stage}:{level}")
+
+        def _make_claim_persist_callback(self, _work_id: str):
+            return None
+
+        def _create_placeholder_account(self, *, email: str) -> str:
+            return "account-icloud-codex"
+
+        def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
+            return None
+
+        def _resolve_registration_proxy(self, **_kwargs) -> RegistrationBackboneProxy:
+            return RegistrationBackboneProxy(
+                proxy_url=current_proxy,
+                endpoint_id="backbone-187",
+                endpoint_number=187,
+                endpoint_count=1000,
+                country_code="US",
+            )
+
+        def _run_post_registration_security(self, *_args, **_kwargs):
+            order.append("security_configured")
+            return AccountSecuritySetupResult(
+                password_status="configured",
+                password_value_confirmed=True,
+                mfa_status="configured",
+                twofauth_account_id="twofauth-icloud-codex",
+            )
+
+        def _write_success_account(self, **_kwargs) -> None:
+            order.append("account_persisted")
+
+        def _detect_account_spaces_after_registration(self, **_kwargs) -> dict:
+            order.append("personal_space_detected")
+            return {
+                "accounts_check_succeeded": True,
+                "personal_chatgpt_account_id": "personal-space-1",
+            }
+
+        def _delete_placeholder_account(self, _user_account_id: str) -> None:
+            order.append("delete_placeholder")
+
+    class FakeBackfillRtWorkflow:
+        def __init__(self, **kwargs) -> None:
+            captured["codex_init"] = kwargs
+
+        def run(self, **kwargs) -> str:
+            order.append("codex_authorized")
+            captured["codex_run"] = kwargs
+            return kwargs["user_account_id"]
+
+    def runner(*_args, proxy_url: str, **_kwargs):
+        assert proxy_url == current_proxy
+        result = AuthResult()
+        result.email = "codex-after-mfa@icloud.com"
+        result.password = "configured-password"
+        result.password_configured = True
+        result.session_token = "session-token"
+        result.access_token = "access-token"
+        result.cookie_header = "__Secure-next-auth.session-token=session-token"
+        return protocol_registration._RegistrationAttempt(
+            result=result,
+            flow=None,
+            proxy_url=proxy_url,
+        )
+
+    monkeypatch.setattr(protocol_registration, "BackfillRtWorkflow", FakeBackfillRtWorkflow)
+    output = Workflow(
+        session_factory=lambda: None,
+        mail_provider=MailProvider(),
+        authorize_codex_after_security=True,
+        codex_phone_provider=phone_provider,
+        totp_code_resolver=totp_resolver,
+    )._run_registration_lifecycle(
+        ProtocolRegistrationInput(
+            mode="email_protocol_no_phone",
+            mail_provider="icloud_hide_my_email",
+        ),
+        mode="email_protocol_no_phone",
+        work_id="work-icloud-codex",
+        run_id="run-icloud-codex",
+        runner=runner,
+    )
+
+    assert captured["codex_init"]["phone_provider"] is phone_provider
+    assert captured["codex_init"]["totp_code_resolver"] is totp_resolver
+    assert captured["codex_run"] == {
+        "user_account_id": "account-icloud-codex",
+        "run_id": "run-icloud-codex",
+        "proxy_url_override": current_proxy,
+    }
+    assert order.index("security_configured") < order.index("account_persisted")
+    assert order.index("account_persisted") < order.index("personal_space_detected")
+    assert order.index("personal_space_detected") < order.index("codex_authorized")
+    assert output["codex_authorization"] == {
+        "status": "succeeded",
+        "authorization_scope": "personal",
+        "proxy_source": "registration_current_proxy",
+        "add_phone_provider": "grizzly_sms",
+    }
+    assert "claim_release" not in order
+
+
+def test_registration_codex_grizzly_provider_matches_invite_executor_defaults() -> None:
+    provider = handlers._registration_codex_grizzly_phone_provider(
+        session_factory=lambda: None,
+        settings=SimpleNamespace(grizzly_sms_api_key="test-grizzly-key"),
+        run_id="",
+    )
+    try:
+        assert provider.base_url == "https://api.grizzlysms.com/stubs/handler_api.php"
+        assert provider.cfg.service == "dr"
+        assert provider.cfg.country == "187"
+        assert provider.cfg.countries == ["187"]
+        assert provider.cfg.maxPrice == "0.18"
+        assert provider.cfg.max_number_attempts == 3
+        assert provider.cfg.request_timeout_s == 20
+        assert provider.cfg.otp_timeout_s == 120
+        assert provider.cfg.otp_poll_interval_s == 3.0
+    finally:
+        provider.close()
+
+
+def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypatch) -> None:
     order: list[str] = []
 
     class FakeMailProvider:
@@ -695,6 +1165,7 @@ def test_email_protocol_assigns_account_proxy_before_claiming_mailbox(monkeypatc
             result: AuthResult,
             flow,
             account_email: str,
+            security_setup=None,
         ) -> None:
             order.append(f"write_success:{account_email}")
 
@@ -712,9 +1183,15 @@ def test_email_protocol_assigns_account_proxy_before_claiming_mailbox(monkeypatc
         def _merge_work_output(self, work_id: str, patch: dict) -> None:
             order.append(f"persist_account:{patch.get('user_account_id', '')}")
 
-    def fake_ensure_account_proxy_url(_session_factory, user_account_id: str, **_kwargs) -> str:
-        order.append(f"assign_proxy:{user_account_id}")
-        return "http://127.0.0.1:18088"
+    def fake_registration_proxy(_session_factory, *, email: str, country_code: str):
+        order.append(f"hash_proxy:{email}:{country_code}")
+        return RegistrationBackboneProxy(
+            proxy_url="http://127.0.0.1:18088",
+            endpoint_id="backbone-21",
+            endpoint_number=21,
+            endpoint_count=20_000,
+            country_code=country_code,
+        )
 
     class FakeAuthFlow:
         def __init__(self, cfg, trace_callback=None) -> None:
@@ -725,12 +1202,15 @@ def test_email_protocol_assigns_account_proxy_before_claiming_mailbox(monkeypatc
             email = mail.create_mailbox()
             result = AuthResult()
             result.email = email
+            result.password_configured = True
             result.session_token = "session-token"
             result.access_token = "access-token"
             return result
 
     monkeypatch.setattr(
-        protocol_registration, "ensure_account_proxy_url", fake_ensure_account_proxy_url
+        protocol_registration,
+        "resolve_registration_backbone_proxy",
+        fake_registration_proxy,
     )
     monkeypatch.setattr(protocol_registration, "AuthFlow", FakeAuthFlow)
 
@@ -744,9 +1224,15 @@ def test_email_protocol_assigns_account_proxy_before_claiming_mailbox(monkeypatc
     )
 
     assert result["user_account_id"] == "protocol-account-1"
-    assert order.index("create_account:") < order.index("assign_proxy:protocol-account-1")
-    assert order.index("assign_proxy:protocol-account-1") < order.index("claim_mailbox")
-    assert order.index("auth_flow_proxy:http://127.0.0.1:18088") < order.index("claim_mailbox")
+    assert order.index("claim_mailbox") < order.index(
+        "create_account:JosephStevenson892165@outlook.com"
+    )
+    assert order.index("create_account:JosephStevenson892165@outlook.com") < order.index(
+        "hash_proxy:JosephStevenson892165@outlook.com:US"
+    )
+    assert order.index("hash_proxy:JosephStevenson892165@outlook.com:US") < order.index(
+        "auth_flow_proxy:http://127.0.0.1:18088"
+    )
     assert "write_success:JosephStevenson892165@outlook.com" in order
     assert "claim_complete" in order
     assert "detect_account_spaces" in order
@@ -757,7 +1243,96 @@ def test_email_protocol_assigns_account_proxy_before_claiming_mailbox(monkeypatc
     assert "delete_account" not in order
 
 
-def test_email_browser_reuses_account_proxy_persistence_and_v4(monkeypatch) -> None:
+@pytest.mark.parametrize("mail_provider", ["custom", "icloud_hide_my_email"])
+def test_email_protocol_rejects_valid_tokens_without_confirmed_password(
+    mail_provider: str,
+) -> None:
+    calls: list[str] = []
+
+    class MailProvider:
+        def claim_random(self, **_kwargs) -> ClaimedMailAccount:
+            return ClaimedMailAccount(
+                account_id="mail-without-password",
+                email="NoPassword@example.test",
+                claim_token="claim-token",
+                caller_id="caller",
+                task_id="work-without-password",
+            )
+
+        def claim_release(self, _claim: ClaimedMailAccount, *, reason: str):
+            calls.append(f"claim_release:{reason}")
+            return {"success": True}
+
+    class Workflow(ProtocolRegistrationWorkflow):
+        def _make_event_emitter(self, **_kwargs):
+            return lambda *_args, **_event_kwargs: None
+
+        def _make_claim_persist_callback(self, _work_id: str):
+            return None
+
+        def _create_placeholder_account(self, *, email: str) -> str:
+            return "account-without-password"
+
+        def _set_placeholder_account_email(self, _user_account_id: str, _email: str) -> None:
+            return None
+
+        def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
+            return None
+
+        def _resolve_registration_proxy(self, **_kwargs) -> RegistrationBackboneProxy:
+            return RegistrationBackboneProxy(
+                proxy_url="http://proxy.example",
+                endpoint_id="backbone-1",
+                endpoint_number=1,
+                endpoint_count=10,
+                country_code="US",
+            )
+
+        def _write_success_account(self, **_kwargs) -> None:
+            calls.append("write_success")
+
+        def _delete_placeholder_account(self, user_account_id: str) -> None:
+            calls.append(f"delete_account:{user_account_id}")
+
+    def runner(*_args, **_kwargs):
+        result = AuthResult()
+        result.email = "NoPassword@example.test"
+        result.session_token = "session-token"
+        result.access_token = "access-token"
+        return protocol_registration._RegistrationAttempt(
+            result=result,
+            flow=None,
+            proxy_url="http://proxy.example",
+        )
+
+    workflow = Workflow(session_factory=lambda: None, mail_provider=MailProvider())
+    with pytest.raises(
+        protocol_registration.ProtocolRegistrationWorkflowError,
+        match="without configured password",
+    ):
+        workflow._run_registration_lifecycle(
+            ProtocolRegistrationInput(
+                mode="email_protocol_no_phone",
+                mail_provider=mail_provider,
+            ),
+            mode="email_protocol_no_phone",
+            work_id="work-without-password",
+            run_id="run-without-password",
+            runner=runner,
+        )
+
+    assert "write_success" not in calls
+    assert "delete_account:account-without-password" in calls
+    assert any(call.startswith("claim_release:registration_failed:") for call in calls)
+
+
+def test_default_protocol_password_meets_current_minimum_length() -> None:
+    password = protocol_registration.AuthFlow._default_password_from_email("a@b")
+
+    assert len(password) >= 12
+
+
+def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
     order: list[str] = []
 
     class FakeMailProvider:
@@ -827,12 +1402,18 @@ def test_email_browser_reuses_account_proxy_persistence_and_v4(monkeypatch) -> N
         def _merge_work_output(self, work_id: str, patch: dict) -> None:
             order.append("persist_account")
 
-    def fake_proxy(_session_factory, user_account_id: str, **_kwargs) -> str:
-        order.append(f"assign_proxy:{user_account_id}")
-        return "http://browser-proxy.example:8080"
+    def fake_proxy(_session_factory, *, email: str, country_code: str):
+        order.append(f"hash_proxy:{email}:{country_code}")
+        return RegistrationBackboneProxy(
+            proxy_url="http://browser-proxy.example:8080",
+            endpoint_id="backbone-22",
+            endpoint_number=22,
+            endpoint_count=20_000,
+            country_code=country_code,
+        )
 
     monkeypatch.setattr(protocol_registration, "CamoufoxEmailRegistration", FakeBrowser)
-    monkeypatch.setattr(protocol_registration, "ensure_account_proxy_url", fake_proxy)
+    monkeypatch.setattr(protocol_registration, "resolve_registration_backbone_proxy", fake_proxy)
 
     result = TestWorkflow(
         session_factory=lambda: None,
@@ -842,14 +1423,15 @@ def test_email_browser_reuses_account_proxy_persistence_and_v4(monkeypatch) -> N
             mode="email_browser_no_phone",
             caller_id="caller",
             project_key="openai-register",
+            use_proxy=False,
         ),
         work_id="work-1",
         run_id="run-1",
     )
 
     assert result["mode"] == "email_browser_no_phone"
-    assert order.index("create_account") < order.index("assign_proxy:browser-account-1")
-    assert order.index("assign_proxy:browser-account-1") < order.index("claim_mailbox")
+    assert order.index("claim_mailbox") < order.index("create_account")
+    assert order.index("create_account") < order.index("hash_proxy:BrowserAccount@outlook.com:US")
     assert "write_success:BrowserAccount@outlook.com" in order
     assert "detect_v4:http://browser-proxy.example:8080" in order
     assert "claim_complete" in order
@@ -904,8 +1486,14 @@ def test_email_browser_failure_releases_mail_and_deletes_placeholder(monkeypatch
     monkeypatch.setattr(protocol_registration, "CamoufoxEmailRegistration", FakeBrowser)
     monkeypatch.setattr(
         protocol_registration,
-        "ensure_account_proxy_url",
-        lambda *_args, **_kwargs: "http://browser-proxy.example:8080",
+        "resolve_registration_backbone_proxy",
+        lambda *_args, **_kwargs: RegistrationBackboneProxy(
+            proxy_url="http://browser-proxy.example:8080",
+            endpoint_id="backbone-23",
+            endpoint_number=23,
+            endpoint_count=20_000,
+            country_code="US",
+        ),
     )
 
     with pytest.raises(RuntimeError, match="browser failed"):
@@ -918,6 +1506,93 @@ def test_email_browser_failure_releases_mail_and_deletes_placeholder(monkeypatch
     assert "set_email:FailedBrowser@outlook.com" in order
     assert "claim_release:registration_failed:FailedBrowser@outlook.com" in order
     assert "delete_account:browser-account-2" in order
+
+
+def test_post_registration_detection_failure_keeps_persisted_account() -> None:
+    calls: list[str] = []
+
+    class MailProvider:
+        def claim_random(self, **_kwargs) -> ClaimedMailAccount:
+            return ClaimedMailAccount(
+                account_id="mail-3",
+                email="SavedBrowser@icloud.com",
+                claim_token="claim-token",
+                caller_id="caller",
+                task_id="work-3",
+            )
+
+        def claim_complete(self, _claim, *, result: str, detail: str):
+            calls.append(f"claim_complete:{result}:{detail}")
+            return {"success": True}
+
+        def claim_release(self, *_args, **_kwargs):
+            calls.append("claim_release")
+            return {"success": True}
+
+    class Workflow(ProtocolRegistrationWorkflow):
+        def _make_event_emitter(self, **_kwargs):
+            return lambda stage, _data, level="INFO": calls.append(f"event:{stage}:{level}")
+
+        def _make_claim_persist_callback(self, _work_id: str):
+            return None
+
+        def _create_placeholder_account(self, *, email: str) -> str:
+            calls.append(f"create:{email}")
+            return "account-3"
+
+        def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
+            return None
+
+        def _resolve_registration_proxy(self, **_kwargs) -> RegistrationBackboneProxy:
+            return RegistrationBackboneProxy(
+                proxy_url="http://proxy.example",
+                endpoint_id="backbone-3",
+                endpoint_number=3,
+                endpoint_count=10,
+                country_code="US",
+            )
+
+        def _write_success_account(self, **_kwargs) -> None:
+            calls.append("write_success")
+
+        def _detect_account_spaces_after_registration(self, **_kwargs) -> dict:
+            raise RuntimeError("event step foreign key failed")
+
+        def _delete_placeholder_account(self, _user_account_id: str) -> None:
+            calls.append("delete_account")
+
+    def runner(*_args, **_kwargs):
+        result = AuthResult()
+        result.email = "SavedBrowser@icloud.com"
+        result.session_token = "session-token"
+        result.access_token = "access-token"
+        return protocol_registration._RegistrationAttempt(
+            result=result,
+            flow=None,
+            proxy_url="http://proxy.example",
+        )
+
+    workflow = Workflow(session_factory=lambda: None, mail_provider=MailProvider())
+    output = workflow._run_registration_lifecycle(
+        ProtocolRegistrationInput(mode="email_browser_no_phone", mail_provider="custom"),
+        mode="email_browser_no_phone",
+        work_id="work-3",
+        run_id="run-3",
+        runner=runner,
+    )
+
+    assert output["user_account_id"] == "account-3"
+    assert output["has_session_token"] is True
+    assert output["account_detection"] == {
+        "accounts_check_succeeded": False,
+        "error_type": "RuntimeError",
+        "error_message": "event step foreign key failed",
+    }
+    assert "write_success" in calls
+    assert "event:account_detection.failed:WARN" in calls
+    assert "event:succeeded:INFO" in calls
+    assert "claim_release" not in calls
+    assert "delete_account" not in calls
 
 
 def test_registration_job_does_not_inject_global_proxy_override(monkeypatch) -> None:
@@ -975,6 +1650,60 @@ def test_registration_job_does_not_inject_global_proxy_override(monkeypatch) -> 
     assert queued_inputs[0]["mode"] == "email_browser_no_phone"
     assert queued_inputs[0]["use_proxy"] is True
     assert queued_inputs[0]["proxy_url"] == ""
+
+
+def test_protocol_registration_work_closes_security_clients_after_failure(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            calls.append("twofauth_close")
+
+    class PhoneProvider:
+        def close(self) -> None:
+            calls.append("grizzly_close")
+
+    class Workflow:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["twofauth_client"] is client
+            assert kwargs["authorize_codex_after_security"] is True
+            assert kwargs["codex_phone_provider"] is phone_provider
+            assert kwargs["totp_code_resolver"] is totp_resolver
+
+        def run(self, *_args, **_kwargs):
+            raise RuntimeError("registration failed")
+
+    client = Client()
+    phone_provider = PhoneProvider()
+
+    def totp_resolver(_account_id: str) -> str:
+        return "123456"
+
+    monkeypatch.setattr(handlers, "_twofauth_client", lambda _settings: client)
+    monkeypatch.setattr(
+        handlers,
+        "_twofauth_otp_resolver",
+        lambda _settings: totp_resolver,
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_registration_codex_grizzly_phone_provider",
+        lambda **_kwargs: phone_provider,
+    )
+    monkeypatch.setattr(handlers, "_mail_plugin", lambda _settings: object())
+    monkeypatch.setattr(handlers, "ProtocolRegistrationWorkflow", Workflow)
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        handlers._run_protocol_registration_work(
+            session_factory=lambda: None,
+            settings=SimpleNamespace(hero_sms_api_key=""),
+            input_json={
+                "mode": "email_protocol_no_phone",
+                "mail_provider": "icloud_hide_my_email",
+            },
+        )
+
+    assert calls == ["grizzly_close", "twofauth_close"]
 
 
 def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> None:
@@ -1062,6 +1791,8 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
             return True
 
         def register_password(self, _email: str) -> bool:
+            self.result.password = "confirmed-registration-password"
+            self.result.password_configured = True
             return True
 
         def send_otp(self) -> None:
@@ -1103,12 +1834,293 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
     result = flow.run_register(FakeMailProvider())
 
     assert result.is_valid()
-    assert auth_url_kwargs == [{"screen_hint": "signup", "default_prompt": ""}]
+    assert auth_url_kwargs == [{}]
     assert calls == [
         "dump:post_verify_otp_new",
         "chatgpt_callback",
         "chatgpt_session",
     ]
+
+
+def test_signup_treats_passwordless_signup_as_new_password_registration() -> None:
+    flow = AuthFlow.__new__(AuthFlow)
+    flow._existing_email_verification_mode = ""
+    flow._existing_page_type = ""
+    flow._is_existing_account = True
+    flow.authorize_continue = lambda **_kwargs: {
+        "continue_url": "https://auth.openai.com/email-verification",
+        "page": {
+            "type": "email_otp_verification",
+            "payload": {"email_verification_mode": "passwordless_signup"},
+        },
+    }
+
+    assert flow.signup("new-account@example.test", "sentinel") is True
+    assert flow._is_existing_account is False
+    assert flow._existing_email_verification_mode == "passwordless_signup"
+
+
+def test_signup_keeps_passwordless_login_on_existing_account_path() -> None:
+    flow = AuthFlow.__new__(AuthFlow)
+    flow._existing_email_verification_mode = ""
+    flow._existing_page_type = ""
+    flow._is_existing_account = False
+    flow.authorize_continue = lambda **_kwargs: {
+        "continue_url": "https://auth.openai.com/email-verification",
+        "page": {
+            "type": "email_otp_verification",
+            "payload": {"email_verification_mode": "passwordless_login"},
+        },
+    }
+
+    assert flow.signup("existing-account@example.test", "sentinel") is False
+    assert flow._is_existing_account is True
+    assert flow._existing_email_verification_mode == "passwordless_login"
+
+
+def test_auth_flow_legacy_password_registration_does_not_fallback_when_password_fails() -> None:
+    calls: list[str] = []
+
+    class FakeMailProvider:
+        last_persona = None
+
+        def create_mailbox(self) -> str:
+            return "password-required@example.test"
+
+    class PasswordFailureAuthFlow(AuthFlow):
+        def check_proxy(self) -> bool:
+            return True
+
+        def get_csrf_token(self) -> str:
+            return "csrf"
+
+        def get_auth_url(self, _csrf_token: str, **_kwargs) -> str:
+            return "https://auth.example.test/authorize"
+
+        def auth_oauth_init(self, _auth_url: str) -> str:
+            return "device-id"
+
+        def get_sentinel_token(self, _device_id: str) -> str:
+            return "sentinel"
+
+        def signup(self, _email: str, _sentinel: str) -> bool:
+            self._existing_email_verification_mode = ""
+            return True
+
+        def register_password(self, _email: str) -> bool:
+            self._last_register_password_error = "invalid_auth_step"
+            self.result.password_configured = False
+            return False
+
+        def send_otp(self) -> None:
+            calls.append("send_otp")
+
+        def kickoff_otp_delivery(self, _mode: str) -> bool:
+            calls.append("kickoff_otp_delivery")
+            return True
+
+    flow = PasswordFailureAuthFlow(Config())
+
+    with pytest.raises(RuntimeError, match="禁止降级到 OTP-only"):
+        flow.run_register(FakeMailProvider())
+
+    assert calls == []
+
+
+def test_auth_flow_passwordless_signup_still_requires_password_before_otp() -> None:
+    calls: list[str] = []
+
+    class FakeMailProvider:
+        last_persona = None
+
+        def create_mailbox(self) -> str:
+            return "passwordless-new@example.test"
+
+        def wait_for_otp(self, *_args, **_kwargs) -> str:
+            calls.append("wait_for_otp")
+            return "123456"
+
+    class PasswordlessSignupAuthFlow(AuthFlow):
+        def check_proxy(self) -> bool:
+            return True
+
+        def get_csrf_token(self) -> str:
+            return "csrf"
+
+        def get_auth_url(self, _csrf_token: str, **_kwargs) -> str:
+            return "https://auth.example.test/authorize"
+
+        def auth_oauth_init(self, _auth_url: str) -> str:
+            return "device-id"
+
+        def get_sentinel_token(self, _device_id: str) -> str:
+            return "sentinel"
+
+        def signup(self, _email: str, _sentinel: str) -> bool:
+            self._existing_email_verification_mode = "passwordless_signup"
+            self._existing_page_type = "email_otp_verification"
+            return True
+
+        def register_email_password_with_retry(self, _email: str) -> bool:
+            calls.append("register_password")
+            self.result.password = "configured-password"
+            self.result.password_configured = True
+            return True
+
+        def send_otp(self) -> None:
+            calls.append("send_otp")
+
+        def verify_otp(self, _code: str) -> dict:
+            calls.append("verify_otp")
+            return {}
+
+        def fetch_client_auth_session_dump(self, stage: str = "") -> dict:
+            calls.append(f"dump:{stage}")
+            return {}
+
+        def create_account(self) -> str:
+            calls.append("create_account")
+            return "https://chatgpt.com/api/auth/callback/openai?code=chatgpt-code"
+
+        def follow_redirect_chain(self, _continue_url: str):
+            calls.append("chatgpt_callback")
+            return (
+                "https://chatgpt.com/api/auth/callback/openai?code=chatgpt-code",
+                "https://chatgpt.com/",
+            )
+
+        def get_auth_session(self):
+            calls.append("chatgpt_session")
+            self.result.session_token = "session-token"
+            self.result.access_token = "access-token"
+            return self.result.session_token, self.result.access_token
+
+    flow = PasswordlessSignupAuthFlow(Config())
+    result = flow.run_register(FakeMailProvider())
+
+    assert result.is_valid()
+    assert result.password == "configured-password"
+    assert result.password_configured is True
+    assert calls == [
+        "register_password",
+        "send_otp",
+        "wait_for_otp",
+        "verify_otp",
+        "dump:post_verify_otp_new",
+        "create_account",
+        "chatgpt_callback",
+        "chatgpt_session",
+    ]
+
+
+def test_email_password_registration_retries_transient_account_creation_failure(
+    monkeypatch,
+) -> None:
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    class RetryAuthFlow(AuthFlow):
+        def register_password(self, _email: str) -> bool:
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                self._last_register_password_error = (
+                    '{"error":{"code":"account_creation_failed",'
+                    '"message":"Failed to create account. Please try again."}}'
+                )
+                return False
+            self._last_register_password_error = ""
+            self.result.password_configured = True
+            return True
+
+    monkeypatch.setenv("EMAIL_PROTOCOL_REGISTER_PASSWORD_ATTEMPTS", "3")
+    monkeypatch.setattr(
+        "refactor_app.plugins.openai_auth_protocol.auth_flow.time.sleep", sleeps.append
+    )
+    flow = RetryAuthFlow(Config())
+
+    assert flow.register_email_password_with_retry("retry@example.test") is True
+    assert attempts == [1, 2, 3]
+    assert sleeps == [2.0, 4.0]
+
+
+def test_email_password_registration_does_not_retry_non_transient_failure(monkeypatch) -> None:
+    attempts: list[int] = []
+
+    class NonRetryAuthFlow(AuthFlow):
+        def register_password(self, _email: str) -> bool:
+            attempts.append(len(attempts) + 1)
+            self._last_register_password_error = "invalid_auth_step"
+            return False
+
+    monkeypatch.setenv("EMAIL_PROTOCOL_REGISTER_PASSWORD_ATTEMPTS", "3")
+    flow = NonRetryAuthFlow(Config())
+
+    assert flow.register_email_password_with_retry("no-retry@example.test") is False
+    assert attempts == [1]
+
+
+def test_registration_state_mutations_send_sentinel_so_and_invocation_id() -> None:
+    requests: list[tuple[str, dict[str, str]]] = []
+    sentinel_flows: list[str] = []
+
+    class Response:
+        status_code = 200
+        text = "{}"
+        headers = {}
+        url = "https://auth.openai.com/"
+
+        def __init__(self, payload: dict | None = None) -> None:
+            self._payload = payload or {}
+
+        def json(self) -> dict:
+            return self._payload
+
+    class Session:
+        def get(self, *_args, **_kwargs) -> Response:
+            return Response()
+
+        def post(self, url: str, *, headers: dict[str, str], **_kwargs) -> Response:
+            requests.append((url, dict(headers)))
+            if url.endswith("/api/accounts/create_account"):
+                return Response({"continue_url": "https://chatgpt.com/callback"})
+            return Response()
+
+    flow = AuthFlow.__new__(AuthFlow)
+    flow.session = Session()
+    flow.result = AuthResult()
+    flow.result.email = "new@example.test"
+    flow.result.password = "candidate-password"
+    flow.result.device_id = "device-id"
+    flow._last_sentinel_token = ""
+    flow._last_sentinel_so_token = ""
+    flow._last_register_password_error = ""
+    flow._common_headers = lambda *_args, **_kwargs: {}
+    flow._trace_http = lambda *_args, **_kwargs: None
+
+    def refresh(flow_name: str, **_kwargs) -> tuple[str, str]:
+        sentinel_flows.append(flow_name)
+        return f"sentinel-{flow_name}", f"so-{flow_name}"
+
+    flow._refresh_sentinel_tokens = refresh
+
+    assert flow.register_password("new@example.test") is True
+    assert flow.verify_otp("123456") == {}
+    assert flow.create_account() == "https://chatgpt.com/callback"
+
+    assert sentinel_flows == [
+        "username_password_create",
+        "authorize_continue",
+        "create_account",
+    ]
+    assert [url.rsplit("/", 1)[-1] for url, _headers in requests] == [
+        "register",
+        "validate",
+        "create_account",
+    ]
+    for _url, headers in requests:
+        assert headers["openai-sentinel-token"].startswith("sentinel-")
+        assert headers["openai-sentinel-so-token"].startswith("so-")
+        assert len(headers["x-access-flow-invocation-id"]) == 36
 
 
 def test_registration_signin_query_matches_legacy_password_flow() -> None:
@@ -1144,15 +2156,14 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
     assert "ext-passkey-client-capabilities" not in query
 
 
-def test_registration_headers_match_legacy_chrome_148_profile() -> None:
+def test_registration_headers_match_configured_browser_fingerprint() -> None:
     flow = AuthFlow(Config())
 
     headers = flow._common_headers("https://auth.openai.com/create-account")
 
-    assert "Chrome/148.0.0.0" in headers["User-Agent"]
-    assert headers["sec-ch-ua"] == (
-        '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
-    )
+    assert headers["User-Agent"] == BROWSER_USER_AGENT
+    assert headers["sec-ch-ua"] == BROWSER_SEC_CH_UA
+    assert headers["sec-ch-ua-platform"] == BROWSER_SEC_CH_UA_PLATFORM
     assert "Accept-Encoding" not in headers
     assert "Cache-Control" not in headers
     assert "Pragma" not in headers

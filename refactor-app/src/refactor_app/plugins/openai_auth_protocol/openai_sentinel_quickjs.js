@@ -229,7 +229,7 @@ function installRuntime(payload) {
     language: String(payload.language || "zh-CN"),
     languages: Array.isArray(payload.languages) ? payload.languages : ["zh-CN", "zh"],
     hardwareConcurrency: Number(payload.hardware_concurrency || 12),
-    platform: "Win32",
+    platform: String(payload.navigator_platform || "MacIntel"),
     vendor: "Google Inc.",
     webdriver: false,
   };

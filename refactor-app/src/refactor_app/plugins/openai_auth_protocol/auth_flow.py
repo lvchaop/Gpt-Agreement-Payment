@@ -25,14 +25,25 @@ from datetime import datetime
 from typing import Optional, Any, Callable
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
+from refactor_app.config.browser_fingerprint import (
+    BROWSER_IMPERSONATE,
+    BROWSER_SEC_CH_UA,
+    BROWSER_SEC_CH_UA_PLATFORM,
+)
+
 from .config import Config
 from .mail_provider import MailProvider
 from .http_client import create_http_session, USER_AGENT
+from .sentinel_quickjs import bind_sentinel_runtime_context
 
 logger = logging.getLogger(__name__)
 
 
 class PasswordRequiredByUpstreamError(RuntimeError):
+    pass
+
+
+class TotpRequiredByUpstreamError(RuntimeError):
     pass
 
 
@@ -42,6 +53,7 @@ class AuthResult:
     def __init__(self):
         self.email: str = ""
         self.password: str = ""
+        self.password_configured: bool = False
         self.session_token: str = ""
         self.access_token: str = ""
         self.device_id: str = ""
@@ -65,6 +77,7 @@ class AuthResult:
         return {
             "email": self.email,
             "password": self.password,
+            "password_configured": self.password_configured,
             "session_token": self.session_token,
             "access_token": self.access_token,
             "device_id": self.device_id,
@@ -98,9 +111,15 @@ def session_account_fields(payload: object) -> tuple[str, str, str]:
 
 def default_password_from_email(email: str) -> str:
     password = (email or "").replace("@", "")
-    if len(password) < 8:
+    if len(password) < 12:
         password = f"{password}2026OpenAI"
     return password
+
+
+def _bool_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class EmailAlreadyInUseError(RuntimeError):
@@ -119,11 +138,26 @@ class AuthFlow:
     ):
         self.config = config
         self._trace_callback = trace_callback
-        self._impersonate_candidates = ["chrome136", "chrome124", "chrome120"]
+        self._impersonate_candidates = [BROWSER_IMPERSONATE]
         self._impersonate_idx = 0
         self.session = create_http_session(
             proxy=config.proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],
+        )
+        proxy_meta = getattr(config, "proxy_meta", {}) or {}
+        register_meta = proxy_meta.get("register") if isinstance(proxy_meta, dict) else {}
+        if not isinstance(register_meta, dict):
+            register_meta = {}
+        sentinel_country = str(
+            register_meta.get("country_code")
+            or register_meta.get("country")
+            or register_meta.get("region")
+            or proxy_meta.get("country_code")
+            or ""
+        ).upper()
+        self._sentinel_runtime_context = bind_sentinel_runtime_context(
+            self.session,
+            country_code=sentinel_country,
         )
         self.result = AuthResult()
         self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in (
@@ -167,8 +201,8 @@ class AuthFlow:
         if self.config.proxy or getattr(self.config, "proxy_meta", None):
             logger.info("[proxy-trace] register %s", self._register_proxy_trace())
 
-    def _mark_otp_sent(self, label: str) -> float:
-        self._last_otp_sent_at = time.time()
+    def _mark_otp_sent(self, label: str, *, sent_at: float | None = None) -> float:
+        self._last_otp_sent_at = float(sent_at if sent_at is not None else time.time())
         logger.info(
             "[otp-send-time] %s email=%s ts=%.6f", label, self.result.email, self._last_otp_sent_at
         )
@@ -249,6 +283,7 @@ class AuthFlow:
             "saved_at": datetime.utcnow().isoformat() + "Z",
             "email": self.result.email,
             "password": self.result.password,
+            "password_configured": self.result.password_configured,
             "device_id": self.result.device_id,
             "csrf_token": self.result.csrf_token,
             "result": self.result.to_dict(),
@@ -269,6 +304,7 @@ class AuthFlow:
             "sentinel": {
                 "last_token": self._last_sentinel_token,
                 "last_so_token": self._last_sentinel_so_token,
+                "runtime_context": self._sentinel_runtime_context.to_dict(),
             },
             **extra,
         }
@@ -288,18 +324,37 @@ class AuthFlow:
             and expected_proxy != str(getattr(self.config, "proxy", "") or "").strip()
         ):
             self.config.proxy = expected_proxy
+        sentinel_snapshot = (
+            snapshot.get("sentinel") if isinstance(snapshot.get("sentinel"), dict) else {}
+        )
+        runtime_context = sentinel_snapshot.get("runtime_context")
+        if not isinstance(runtime_context, dict):
+            runtime_context = self._sentinel_runtime_context
         self.session = create_http_session(
             proxy=self.config.proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],
+        )
+        self._sentinel_runtime_context = bind_sentinel_runtime_context(
+            self.session,
+            context=runtime_context,
         )
         self._restore_cookie_jar(snapshot.get("cookies") or [])
 
         result_obj = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
         for key, value in result_obj.items():
             if hasattr(self.result, key):
-                setattr(self.result, key, str(value or ""))
+                if key == "password_configured":
+                    setattr(self.result, key, _bool_value(value))
+                else:
+                    setattr(self.result, key, str(value or ""))
         self.result.email = str(snapshot.get("email") or self.result.email or "")
         self.result.password = str(snapshot.get("password") or self.result.password or "")
+        self.result.password_configured = _bool_value(
+            snapshot.get(
+                "password_configured",
+                result_obj.get("password_configured", self.result.password_configured),
+            )
+        )
         self.result.device_id = str(snapshot.get("device_id") or self.result.device_id or "")
         self.result.csrf_token = str(snapshot.get("csrf_token") or self.result.csrf_token or "")
 
@@ -325,7 +380,7 @@ class AuthFlow:
             oauth.get("client_auth_session_id") or self._client_auth_session_id or ""
         )
 
-        sentinel = snapshot.get("sentinel") if isinstance(snapshot.get("sentinel"), dict) else {}
+        sentinel = sentinel_snapshot
         self._last_sentinel_token = str(
             sentinel.get("last_token") or self._last_sentinel_token or ""
         )
@@ -1448,6 +1503,14 @@ class AuthFlow:
             return 5
 
     @staticmethod
+    def _email_protocol_password_submit_attempts() -> int:
+        raw = os.getenv("EMAIL_PROTOCOL_REGISTER_PASSWORD_ATTEMPTS", "3")
+        try:
+            return max(1, min(int(raw), 5))
+        except Exception:
+            return 3
+
+    @staticmethod
     def _phone_protocol_identity_kind() -> str:
         return (os.getenv("PHONE_PROTOCOL_IDENTITY_KIND", "phone_number") or "phone_number").strip()
 
@@ -2106,13 +2169,17 @@ class AuthFlow:
         return out
 
     def _rotate_impersonate_session(self) -> bool:
-        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试。"""
+        """保留 TLS 重试接口，但不跨浏览器版本切换指纹。"""
         if self._impersonate_idx >= len(self._impersonate_candidates) - 1:
             return False
         self._impersonate_idx += 1
         imp = self._impersonate_candidates[self._impersonate_idx]
         logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}")
         self.session = create_http_session(proxy=self.config.proxy, impersonate=imp)
+        self._sentinel_runtime_context = bind_sentinel_runtime_context(
+            self.session,
+            context=self._sentinel_runtime_context,
+        )
         return True
 
     @staticmethod
@@ -2277,9 +2344,9 @@ class AuthFlow:
             "Referer": referer,
             "Origin": origin,
             "User-Agent": USER_AGENT,
-            "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+            "sec-ch-ua": BROWSER_SEC_CH_UA,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
+            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -2512,15 +2579,36 @@ class AuthFlow:
     # ── Step 5: 获取 Sentinel Token ──
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
+        token, _so_token = self._refresh_sentinel_tokens(
+            "authorize_continue", device_id=device_id
+        )
+        return token
+
+    def _refresh_sentinel_tokens(
+        self,
+        flow: str,
+        *,
+        device_id: str = "",
+    ) -> tuple[str, str]:
         from .sentinel import get_sentinel_tokens
 
+        resolved_device_id = (device_id or self.result.device_id or "").strip()
+        if not resolved_device_id:
+            raise RuntimeError(f"Sentinel flow={flow} 缺少 device_id")
         token, so_token = get_sentinel_tokens(
-            self.session, device_id=device_id, flow="authorize_continue"
+            self.session,
+            device_id=resolved_device_id,
+            flow=flow,
         )
         self._last_sentinel_token = token or ""
         self._last_sentinel_so_token = so_token or ""
-        logger.info("Sentinel Token 获取成功 so_len=%s", len(self._last_sentinel_so_token))
-        return token
+        logger.info(
+            "Sentinel Token 获取成功 flow=%s token_len=%s so_len=%s",
+            flow,
+            len(self._last_sentinel_token),
+            len(self._last_sentinel_so_token),
+        )
+        return self._last_sentinel_token, self._last_sentinel_so_token
 
     # ── Step 6: 提交注册邮箱 ──
     def _phone_protocol_password_verify_warmup(self, phone_e164: str) -> None:
@@ -2632,9 +2720,7 @@ class AuthFlow:
                     len(self._last_sentinel_so_token),
                 )
             except Exception as e:
-                logger.warning(
-                    "authorize/continue 前重新获取 sentinel 失败，回退使用已有 token: %s", e
-                )
+                raise RuntimeError("authorize/continue 前 Sentinel real SDK 刷新失败") from e
 
         headers = self._common_headers(referer)
         headers["Content-Type"] = "application/json"
@@ -2699,12 +2785,16 @@ class AuthFlow:
                 logger.info("注册邮箱已提交")
                 return True
 
-            # 已有账号 OTP 分支
+            # passwordless_signup 仍是新账号。必须切回密码注册页并成功创建密码，
+            # 不能把它误判成已有账号后走 OTP-only。
             if page_type == "email_otp_verification":
-                self._existing_email_verification_mode = (
-                    payload.get("email_verification_mode", "") or ""
-                ).strip()
+                verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+                self._existing_email_verification_mode = verification_mode
                 self._existing_page_type = page_type
+                if verification_mode.lower() == "passwordless_signup":
+                    self._is_existing_account = False
+                    logger.info("检测到 passwordless_signup，新账号切回密码注册流程")
+                    return True
                 logger.info("检测到已有账号，切换到 OTP 登录流程")
                 self._is_existing_account = True
                 return False
@@ -2786,6 +2876,7 @@ class AuthFlow:
     def register_password(self, username: str) -> bool:
         logger.info("[5.5/10] 注册密码...")
         self._last_register_password_error = ""
+        self.result.password_configured = False
         password = (self.result.password or "").strip() or self._default_password_from_email(
             username
         )
@@ -2798,27 +2889,29 @@ class AuthFlow:
                 headers=self._common_headers("https://auth.openai.com/create-account"),
                 timeout=15,
             )
+            self._trace_http("create_account_password_page", pw_page)
             logger.info(f"create-account/password 页面: {pw_page.status_code}")
         except Exception as e:
             logger.warning(f"访问 create-account/password 页面失败: {e}")
 
         # 注册前需要刷新 sentinel token，且 flow 必须为 username_password_create
+        fresh_sentinel_token = ""
+        fresh_so_token = ""
         if self.result.device_id:
             try:
-                from .sentinel import get_sentinel_token as _get_st
-
-                token = _get_st(
-                    self.session, device_id=self.result.device_id, flow="username_password_create"
+                fresh_sentinel_token, fresh_so_token = self._refresh_sentinel_tokens(
+                    "username_password_create"
                 )
-                self._last_sentinel_token = token or ""
-                logger.info("Sentinel Token 获取成功")
             except Exception as e:
-                logger.warning(f"注册前刷新 sentinel 失败: {e}")
+                raise RuntimeError("注册密码前 Sentinel real SDK 刷新失败") from e
 
         headers = self._common_headers("https://auth.openai.com/create-account/password")
         headers["Content-Type"] = "application/json"
-        if self._last_sentinel_token:
-            headers["openai-sentinel-token"] = self._last_sentinel_token
+        headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+        if fresh_sentinel_token:
+            headers["openai-sentinel-token"] = fresh_sentinel_token
+        if fresh_so_token:
+            headers["openai-sentinel-so-token"] = fresh_so_token
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/user/register",
             headers=headers,
@@ -2830,8 +2923,28 @@ class AuthFlow:
             self._last_register_password_error = resp.text or ""
             logger.warning(f"密码注册返回 {resp.status_code}: {resp.text[:200]}")
             return False
+        self.result.password_configured = True
         logger.info("密码注册成功")
         return True
+
+    def register_email_password_with_retry(self, username: str) -> bool:
+        attempts = self._email_protocol_password_submit_attempts()
+        for attempt in range(1, attempts + 1):
+            if self.register_password(username):
+                return True
+            retry_reason = self._phone_protocol_register_retry_reason(
+                self._last_register_password_error
+            )
+            if retry_reason != "account_creation_failed" or attempt >= attempts:
+                return False
+            logger.warning(
+                "邮箱密码注册返回可重试错误 reason=%s attempt=%s/%s，刷新页面和 Sentinel 后重提",
+                retry_reason,
+                attempt,
+                attempts,
+            )
+            time.sleep(min(2.0 * attempt, 4.0))
+        return False
 
     # ── Step 7: 发送 OTP ──
     def send_otp(self):
@@ -2859,6 +2972,7 @@ class AuthFlow:
         """
         headers = self._common_headers(referer)
         headers["Content-Type"] = "application/json"
+        headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
         resp = self.session.post(
@@ -2935,16 +3049,123 @@ class AuthFlow:
         if resp.status_code != 200:
             body = (resp.text or "")[:260]
             raise RuntimeError(f"密码登录失败: {resp.status_code} - {body}")
+        self.result.password_configured = True
         try:
             return resp.json()
         except Exception:
             return {}
 
+    @staticmethod
+    def _extract_totp_factor_id(step: dict | None) -> str:
+        if not isinstance(step, dict):
+            return ""
+        page = step.get("page")
+        payload = page.get("payload") if isinstance(page, dict) else None
+        if not isinstance(payload, dict):
+            return ""
+        factors = payload.get("factors")
+        if isinstance(factors, list):
+            for factor in factors:
+                if not isinstance(factor, dict):
+                    continue
+                if str(factor.get("factor_type") or "").strip().lower() != "totp":
+                    continue
+                factor_id = str(factor.get("id") or "").strip()
+                if factor_id:
+                    return factor_id
+        return ""
+
+    def issue_totp_challenge(self, factor_id: str) -> dict:
+        normalized_factor_id = str(factor_id or "").strip()
+        if not normalized_factor_id:
+            raise RuntimeError("TOTP challenge missing factor id")
+        headers = self._common_headers("https://auth.openai.com/log-in/password")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/mfa/issue_challenge",
+            headers=headers,
+            json={
+                "id": normalized_factor_id,
+                "type": "totp",
+                "force_fresh_challenge": False,
+            },
+            timeout=30,
+        )
+        self._trace_http("issue_totp_challenge", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"TOTP challenge issue failed: {resp.status_code} - {(resp.text or '')[:260]}"
+            )
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    def verify_totp_challenge(self, factor_id: str, code: str) -> dict:
+        normalized_factor_id = str(factor_id or "").strip()
+        normalized_code = str(code or "").strip()
+        if not normalized_factor_id:
+            raise RuntimeError("TOTP challenge missing factor id")
+        if not normalized_code.isdigit():
+            raise RuntimeError("TOTP provider returned an invalid code")
+        headers = self._common_headers(
+            f"https://auth.openai.com/mfa-challenge/{normalized_factor_id}"
+        )
+        headers["Content-Type"] = "application/json"
+        headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/mfa/verify",
+            headers=headers,
+            json={
+                "id": normalized_factor_id,
+                "type": "totp",
+                "code": normalized_code,
+            },
+            timeout=30,
+        )
+        self._trace_http("verify_totp_challenge", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"TOTP verification failed: {resp.status_code} - {(resp.text or '')[:260]}"
+            )
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    def complete_totp_challenge(
+        self,
+        step: dict | None,
+        totp_code_provider: Callable[[], str] | None,
+    ) -> dict:
+        factor_id = self._extract_totp_factor_id(step)
+        if not factor_id:
+            raise RuntimeError("TOTP challenge response missing a TOTP factor")
+        if totp_code_provider is None:
+            raise TotpRequiredByUpstreamError("totp_code_provider_required_by_upstream")
+        self.issue_totp_challenge(factor_id)
+        code = str(totp_code_provider() or "").strip()
+        return self.verify_totp_challenge(factor_id, code)
+
     # ── Step 8: 验证 OTP ──
     def verify_otp(self, otp_code: str, before_post=None, sync_email: str = "") -> dict:
         logger.info("[7/10] 验证 OTP...")
+        fresh_sentinel_token = ""
+        fresh_so_token = ""
+        if self.result.device_id:
+            try:
+                fresh_sentinel_token, fresh_so_token = self._refresh_sentinel_tokens(
+                    "authorize_continue"
+                )
+            except Exception as e:
+                raise RuntimeError("验证 OTP 前 Sentinel real SDK 刷新失败") from e
         headers = self._common_headers("https://auth.openai.com/email-verification")
         headers["Content-Type"] = "application/json"
+        headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+        if fresh_sentinel_token:
+            headers["openai-sentinel-token"] = fresh_sentinel_token
+        if fresh_so_token:
+            headers["openai-sentinel-so-token"] = fresh_so_token
         if before_post is not None:
             before_post(str(sync_email or self.result.email or ""))
         logger.info(
@@ -2972,21 +3193,22 @@ class AuthFlow:
     def create_account(self) -> str:
         logger.info("[8/10] 创建账户...")
         # 创建账户前刷新 sentinel token，flow 为 create_account
+        fresh_sentinel_token = ""
+        fresh_so_token = ""
         if self.result.device_id:
             try:
-                from .sentinel import get_sentinel_token as _get_st
-
-                token = _get_st(
-                    self.session, device_id=self.result.device_id, flow="create_account"
+                fresh_sentinel_token, fresh_so_token = self._refresh_sentinel_tokens(
+                    "create_account"
                 )
-                self._last_sentinel_token = token or ""
-                logger.info("Sentinel Token 获取成功")
             except Exception as e:
-                logger.warning(f"创建账户前刷新 sentinel 失败: {e}")
+                raise RuntimeError("创建账户前 Sentinel real SDK 刷新失败") from e
         headers = self._common_headers("https://auth.openai.com/about-you")
         headers["Content-Type"] = "application/json"
-        if self._last_sentinel_token:
-            headers["openai-sentinel-token"] = self._last_sentinel_token
+        headers["x-access-flow-invocation-id"] = str(uuid.uuid4())
+        if fresh_sentinel_token:
+            headers["openai-sentinel-token"] = fresh_sentinel_token
+        if fresh_so_token:
+            headers["openai-sentinel-so-token"] = fresh_so_token
         _FIRST = [
             "James",
             "John",
@@ -3705,36 +3927,31 @@ class AuthFlow:
 
         # 登录/注册链路
         csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(
-            csrf_token,
-            screen_hint="signup",
-            default_prompt="",
-        )
+        # Keep the OAuth bootstrap neutral. The password-registration flow is selected by
+        # authorize/continue below; adding screen_hint=signup here routes current auth
+        # sessions directly into passwordless_signup before a password can be created.
+        auth_url = self.get_auth_url(csrf_token)
         device_id = self.auth_oauth_init(auth_url)
         sentinel = self.get_sentinel_token(device_id)
         is_new = self.signup(email, sentinel)
 
         if is_new:
-            # 新账号：注册密码 → 发 OTP → 验证 → 创建账户
-            password_registered = self.register_password(email)
+            # 新账号必须先确认密码，再进入邮箱 OTP；禁止降级到 passwordless_signup。
+            password_registered = self.register_email_password_with_retry(email)
             otp_sent_at = time.time()
-            if password_registered:
-                try:
-                    self.send_otp()
-                except RuntimeError as e:
-                    # 部分账号会在 register 后直接转入 email-verification，send 接口会报 invalid_auth_step
-                    if "invalid_auth_step" in str(e).lower():
-                        logger.warning("send_otp 返回 invalid_auth_step，回退到统一发码策略")
-                        if not self.kickoff_otp_delivery("register_password_invalid_auth_step"):
-                            raise
-                    else:
+            if not password_registered or not self.result.password_configured:
+                detail = (self._last_register_password_error or "password was not confirmed")[:260]
+                raise RuntimeError(f"注册密码失败，禁止降级到 OTP-only: {detail}")
+            try:
+                self.send_otp()
+            except RuntimeError as e:
+                # 部分账号会在 register 后直接转入 email-verification，send 接口会报 invalid_auth_step
+                if "invalid_auth_step" in str(e).lower():
+                    logger.warning("send_otp 返回 invalid_auth_step，回退到统一发码策略")
+                    if not self.kickoff_otp_delivery("register_password_invalid_auth_step"):
                         raise
-            else:
-                # 注册密码失败时优先按“已有账号 OTP”回退，避免卡死在 invalid_auth_step
-                logger.warning("注册密码失败，回退到已有账号 OTP 路径")
-                self.fetch_client_auth_session_dump("post_register_password_failed_new")
-                if not self.kickoff_otp_delivery("register_password_failed_fallback"):
-                    self.send_otp()
+                else:
+                    raise
             if self._last_otp_sent_at:
                 otp_sent_at = self._last_otp_sent_at
 
@@ -3967,36 +4184,66 @@ class AuthFlow:
         login_password = (password or "").strip()
         self.result.password = login_password
 
+        prefer_login_hint = str(
+            os.getenv("LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1")
+        ).lower() in ("1", "true", "yes", "on")
         csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token)
+        if prefer_login_hint:
+            auth_url = self.get_auth_url(
+                csrf_token,
+                login_hint=email,
+                screen_hint="login_or_signup",
+                prompt="login",
+            )
+        else:
+            auth_url = self.get_auth_url(csrf_token)
+        authorize_started_at = time.time()
         device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
+        initial_continue_url = self._normalize_continue_url(
+            str(getattr(self, "_last_auth_oauth_init_url", "") or "")
+        )
+        auto_otp_started = bool(
+            prefer_login_hint and "/email-verification" in initial_continue_url
+        )
+        if auto_otp_started:
+            self._mark_otp_sent("authorize/login_hint", sent_at=authorize_started_at)
+            sentinel = ""
+        else:
+            sentinel = self.get_sentinel_token(device_id)
 
         try:
             otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
         except Exception:
             otp_timeout = 180
 
-        page_type = ""
-        mode = ""
-        continue_url = ""
-        logger.info("已有账号协议登录预组装：探测 password/otp 分支")
-        login_step = self.authorize_continue(
-            email=email,
-            sentinel_token=sentinel,
-            screen_hint="login",
-            referer="https://auth.openai.com/log-in",
-            trace_step="authorize_continue_login_prepare_otp",
-        )
-        page_type = (self._extract_page_type(login_step) or "").lower()
-        continue_url = self._normalize_continue_url(
-            self._extract_continue_url_from_step(login_step)
-        )
-        page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
-        payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
-        mode = (payload.get("email_verification_mode", "") or "").lower()
-        self._existing_page_type = page_type
-        self._existing_email_verification_mode = mode
+        if auto_otp_started:
+            page_type = "email_otp_verification"
+            mode = "passwordless_login"
+            continue_url = initial_continue_url
+            self._existing_page_type = page_type
+            self._existing_email_verification_mode = mode
+            logger.info("已有账号协议登录预组装：login_hint 已自动触发邮箱验证码")
+        else:
+            page_type = ""
+            mode = ""
+            continue_url = ""
+            logger.info("已有账号协议登录预组装：探测 password/otp 分支")
+            login_step = self.authorize_continue(
+                email=email,
+                sentinel_token=sentinel,
+                screen_hint="login",
+                referer="https://auth.openai.com/log-in",
+                trace_step="authorize_continue_login_prepare_otp",
+            )
+            page_type = (self._extract_page_type(login_step) or "").lower()
+            continue_url = self._normalize_continue_url(
+                self._extract_continue_url_from_step(login_step)
+            )
+            page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
+            payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+            mode = (payload.get("email_verification_mode", "") or "").lower()
+            self._existing_page_type = page_type
+            self._existing_email_verification_mode = mode
 
         if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
             if not login_password:
@@ -4012,6 +4259,10 @@ class AuthFlow:
             mode = (payload.get("email_verification_mode", "") or mode or "").lower()
             self._existing_page_type = page_type
             self._existing_email_verification_mode = mode
+            if page_type == "mfa_challenge":
+                raise TotpRequiredByUpstreamError(
+                    "staged_email_otp_not_supported_for_totp_account"
+                )
         elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
             logger.info("预组装分支: email_otp_verification")
         elif existing_only:
@@ -4029,14 +4280,15 @@ class AuthFlow:
         otp_code = ""
         otp_received_at = 0.0
         otp_error = ""
-        otp_sent_at = time.time()
+        otp_sent_at = self._last_otp_sent_at or time.time()
         try:
-            resend_ok = self.kickoff_otp_delivery("protocol_prepare_otp")
-            if self._last_otp_sent_at:
-                otp_sent_at = self._last_otp_sent_at
-            if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
-                self.send_otp()
-                otp_sent_at = self._last_otp_sent_at or time.time()
+            if not auto_otp_started:
+                resend_ok = self.kickoff_otp_delivery("protocol_prepare_otp")
+                if self._last_otp_sent_at:
+                    otp_sent_at = self._last_otp_sent_at
+                if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
+                    self.send_otp()
+                    otp_sent_at = self._last_otp_sent_at or time.time()
         except Exception as e:
             otp_error = f"send_otp {type(e).__name__}: {str(e)[:200]}"
             logger.warning(
@@ -4176,6 +4428,7 @@ class AuthFlow:
         password: str = "",
         *,
         existing_only: bool = False,
+        totp_code_provider: Callable[[], str] | None = None,
     ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
@@ -4194,10 +4447,32 @@ class AuthFlow:
         login_password = (password or "").strip()
         self.result.password = login_password
 
+        prefer_login_screen_first = str(
+            os.getenv("LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1")
+        ).lower() in ("1", "true", "yes", "on")
         csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token)
+        if prefer_login_screen_first:
+            auth_url = self.get_auth_url(
+                csrf_token,
+                login_hint=email,
+                screen_hint="login_or_signup",
+                prompt="login",
+            )
+        else:
+            auth_url = self.get_auth_url(csrf_token)
+        authorize_started_at = time.time()
         device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
+        initial_continue_url = self._normalize_continue_url(
+            str(getattr(self, "_last_auth_oauth_init_url", "") or "")
+        )
+        auto_otp_started = bool(
+            prefer_login_screen_first and "/email-verification" in initial_continue_url
+        )
+        if auto_otp_started:
+            self._mark_otp_sent("authorize/login_hint", sent_at=authorize_started_at)
+            sentinel = ""
+        else:
+            sentinel = self.get_sentinel_token(device_id)
 
         continue_url = ""
         try:
@@ -4207,18 +4482,29 @@ class AuthFlow:
 
         page_type = ""
         mode = ""
-        prefer_login_screen_first = str(
-            os.getenv("LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1")
-        ).lower() in ("1", "true", "yes", "on")
-
-        if prefer_login_screen_first:
+        passwordless_otp_sent_at = 0.0
+        if auto_otp_started:
+            page_type = "email_otp_verification"
+            mode = "passwordless_login"
+            continue_url = initial_continue_url
+            passwordless_otp_sent_at = self._last_otp_sent_at
+            self._existing_page_type = page_type
+            self._existing_email_verification_mode = mode
+            logger.info("已有账号协议登录：login_hint 已自动触发邮箱验证码")
+        elif prefer_login_screen_first:
             try:
                 logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
+                login_screen_hint = "login_or_signup" if not login_password else "login"
+                login_referer = (
+                    "https://auth.openai.com/log-in-or-create-account"
+                    if not login_password
+                    else "https://auth.openai.com/log-in"
+                )
                 login_step = self.authorize_continue(
                     email=email,
                     sentinel_token=sentinel,
-                    screen_hint="login",
-                    referer="https://auth.openai.com/log-in",
+                    screen_hint=login_screen_hint,
+                    referer=login_referer,
                     trace_step="authorize_continue_login_protocol",
                 )
                 page_type = (self._extract_page_type(login_step) or "").lower()
@@ -4233,13 +4519,34 @@ class AuthFlow:
 
                 if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
                     if not login_password:
-                        raise PasswordRequiredByUpstreamError("login_password_required_by_upstream")
-                    logger.info("登录分支: login_password -> password/verify")
-                    login_resp = self.login_password_verify(login_password)
-                    page_type = (self._extract_page_type(login_resp) or "").lower()
-                    continue_url = self._normalize_continue_url(
-                        self._extract_continue_url_from_step(login_resp)
-                    )
+                        logger.info("登录分支: login_password + 空密码 -> passwordless OTP")
+                        if not self.send_passwordless_otp(
+                            continue_url or "https://auth.openai.com/log-in/password"
+                        ):
+                            raise PasswordRequiredByUpstreamError(
+                                "login_password_required_by_upstream"
+                            )
+                        passwordless_otp_sent_at = self._last_otp_sent_at or time.time()
+                        page_type = "email_otp_verification"
+                        mode = "passwordless_login"
+                        continue_url = "https://auth.openai.com/email-verification"
+                    else:
+                        logger.info("登录分支: login_password -> password/verify")
+                        login_resp = self.login_password_verify(login_password)
+                        page_type = (self._extract_page_type(login_resp) or "").lower()
+                        continue_url = self._normalize_continue_url(
+                            self._extract_continue_url_from_step(login_resp)
+                        )
+                        if page_type == "mfa_challenge":
+                            logger.info("登录分支: mfa_challenge -> TOTP verify")
+                            login_resp = self.complete_totp_challenge(
+                                login_resp,
+                                totp_code_provider,
+                            )
+                            page_type = (self._extract_page_type(login_resp) or "").lower()
+                            continue_url = self._normalize_continue_url(
+                                self._extract_continue_url_from_step(login_resp)
+                            )
                 elif page_type == "email_otp_verification" or "/email-verification" in (
                     continue_url or ""
                 ):
@@ -4289,10 +4596,12 @@ class AuthFlow:
 
         if not continue_url or "/email-verification" in continue_url:
             # 仍需 OTP：优先 resend 获取新码
-            otp_sent_at = time.time()
-            resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
-            if self._last_otp_sent_at:
-                otp_sent_at = self._last_otp_sent_at
+            otp_sent_at = passwordless_otp_sent_at or time.time()
+            resend_ok = bool(passwordless_otp_sent_at)
+            if not resend_ok:
+                resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
+                if self._last_otp_sent_at:
+                    otp_sent_at = self._last_otp_sent_at
             if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
                 self.send_otp()
                 otp_sent_at = self._last_otp_sent_at or time.time()
@@ -4330,6 +4639,23 @@ class AuthFlow:
                 continue_url = self._normalize_continue_url(
                     self._handle_add_phone_verification(continue_url=continue_url)
                 )
+            otp_page_type = (self._extract_page_type(otp_resp) or "").lower()
+            if otp_page_type == "about_you" or "/about-you" in continue_url:
+                if existing_only:
+                    raise RuntimeError(
+                        "existing_only 登录在 OTP 后进入 about_you 注册分支"
+                    )
+                try:
+                    continue_url = self.create_account()
+                except Exception as exc:
+                    if not self._is_registration_disallowed_error(exc):
+                        raise
+                    logger.warning(
+                        "about_you create_account 被拒绝，尝试 reauthorize 获取 session ..."
+                    )
+                    continue_url = self._reauthorize_for_session(auth_url) or ""
+                    if not continue_url:
+                        raise
 
         continue_url = self._normalize_continue_url(continue_url)
         # 某些边缘态 OTP 后未返回 callback，回退 reauthorize

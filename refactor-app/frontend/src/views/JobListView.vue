@@ -17,6 +17,8 @@ type ConfigField = {
   type: "number" | "text" | "channel" | "space";
   min?: number;
   max?: number;
+  required?: boolean;
+  spaceType?: "business" | "personal";
 };
 
 const router = useRouter();
@@ -68,8 +70,9 @@ const definitions: Record<string, { label: string; defaults: Record<string, Conf
   },
   "automation.space_authorize": {
     label: "空间授权",
-    defaults: { work_count: 1, credential_name_prefix: "codex" },
+    defaults: { space_id: "", work_count: 1, credential_name_prefix: "codex" },
     fields: [
+      { key: "space_id", label: "Business 空间（必选）", type: "space", required: true },
       { key: "work_count", label: "同时执行 Work 数", type: "number", min: 1, max: 350 },
       { key: "credential_name_prefix", label: "凭证名称前缀", type: "text" },
     ],
@@ -96,6 +99,23 @@ const definitions: Record<string, { label: string; defaults: Record<string, Conf
     fields: [
       { key: "space_id", label: "Business 空间", type: "space" },
       { key: "work_count", label: "同时执行 Work 数", type: "number", min: 1, max: 350 },
+    ],
+  },
+  "automation.space_auto_replenish": {
+    label: "自动补号",
+    defaults: { space_id: "", work_count: 20 },
+    fields: [
+      { key: "space_id", label: "Business 空间（留空处理全部已开启空间）", type: "space" },
+      { key: "work_count", label: "同时执行 Space Work 数", type: "number", min: 1, max: 350 },
+    ],
+  },
+  "automation.personal_payment_method_bind": {
+    label: "个人空间绑卡",
+    defaults: { space_id: "", limit: 10, work_count: 1 },
+    fields: [
+      { key: "space_id", label: "个人空间（留空处理全部待绑定空间）", type: "space", spaceType: "personal" },
+      { key: "limit", label: "每轮处理上限", type: "number", min: 1, max: 100 },
+      { key: "work_count", label: "同时执行 Work 数", type: "number", min: 1, max: 10 },
     ],
   },
 };
@@ -185,6 +205,7 @@ function openSchedule(row: Row) {
 async function saveSchedule() {
   const id = String(scheduleTarget.value?.id || "");
   if (!id) return;
+  if (!validateRequiredConfig(scheduleTarget.value, scheduleConfig.value)) return;
   savingSchedule.value = true;
   try {
     await resourcesApi.patchResidentJobSchedule(id, {
@@ -224,6 +245,7 @@ async function runOnce() {
   const target = runTarget.value;
   const id = String(target?.id || "");
   if (!id) return;
+  if (!validateRequiredConfig(target, runConfig.value)) return;
   runningNow.value = true;
   try {
     const result = await resourcesApi.runResidentJobNow(id, {
@@ -246,20 +268,33 @@ async function loadChannels(query: string) {
   return (await resourcesApi.channelOptions(query)).items;
 }
 
-async function loadBusinessSpaces(query: string) {
-  return (await resourcesApi.spaceOptions(query, "business")).items.filter(
+async function loadSpaces(query: string, spaceType: "business" | "personal") {
+  return (await resourcesApi.spaceOptions(query, spaceType)).items.filter(
     (item) => String(item.status || "") === "active",
   );
 }
 
 function entityLoader(field: ConfigField) {
-  return field.type === "space" ? loadBusinessSpaces : loadChannels;
+  if (field.type === "space") {
+    return (query: string) => loadSpaces(query, field.spaceType || "business");
+  }
+  return loadChannels;
 }
 
 function entityPlaceholder(field: ConfigField) {
+  if (field.required) return "请选择 active Business 空间";
   return field.type === "space"
     ? "留空表示全部 active Business 空间"
     : "留空表示全部启用渠道";
+}
+
+function validateRequiredConfig(row: Row | null, config: Record<string, ConfigValue>) {
+  const missing = fieldsFor(row).find(
+    (field) => field.required && !String(config[field.key] || "").trim(),
+  );
+  if (!missing) return true;
+  store.toast("参数不完整", `请选择${missing.label.replace("（必选）", "")}`, "warning");
+  return false;
 }
 
 onMounted(() => {
@@ -275,7 +310,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageHeader title="Job 列表" description="空间邀请、按席位批量邀请、倍增邀请并剔除、空间授权、下游推送、回收结算、Business 空间扩席位。">
+  <PageHeader title="Job 列表" description="空间邀请、授权、推送、回收、扩席位、自动补号与个人空间绑卡。">
     <button class="icon-btn labeled" @click="load">
       <RefreshCw :size="16" :class="{ spin: loading }" />刷新
     </button>

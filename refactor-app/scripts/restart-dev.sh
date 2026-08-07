@@ -73,6 +73,19 @@ launchd_pid() {
     | awk '/^[[:space:]]*pid = [0-9]+/ { print $3; exit }'
 }
 
+wait_for_launchd_gone() {
+  local service="$1"
+  local label="$2"
+  for _ in $(seq 1 60); do
+    if ! launchctl print "$service" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  echo "$label did not stop completely: $service" >&2
+  return 1
+}
+
 wait_for_url() {
   local label="$1"
   local url="$2"
@@ -96,6 +109,7 @@ fi
 if launchctl print "$DEV_LAUNCHD_SERVICE" >/dev/null 2>&1; then
   echo "stop launchd dev service: $DEV_LAUNCHD_LABEL"
   launchctl bootout "$DEV_LAUNCHD_SERVICE"
+  wait_for_launchd_gone "$DEV_LAUNCHD_SERVICE" "$DEV_LAUNCHD_LABEL"
 fi
 
 old_start_pids="$(project_pids_for_pattern "scripts/start-dev.sh")"
@@ -105,6 +119,7 @@ terminate_pids "backend port $BACKEND_PORT" "$(port_pids "$BACKEND_PORT")"
 if launchctl print "$WORKER_LAUNCHD_SERVICE" >/dev/null 2>&1; then
   echo "stop launchd worker: $WORKER_LAUNCHD_LABEL"
   launchctl bootout "$WORKER_LAUNCHD_SERVICE"
+  wait_for_launchd_gone "$WORKER_LAUNCHD_SERVICE" "$WORKER_LAUNCHD_LABEL"
 fi
 terminate_pids \
   "workers" \

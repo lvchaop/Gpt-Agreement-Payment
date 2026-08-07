@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 import pytest
 from fastapi import HTTPException
 
-from refactor_app.api.routes.resources import PatchSpaceRequest, patch_space
+from refactor_app.api.routes.resources import (
+    PatchSpaceRequest,
+    SpaceAutoReplenishInviteJobRequest,
+    create_space_auto_replenish_invite_job,
+    patch_space,
+)
 from refactor_app.domain.space_status import space_status_after_discovery
 from refactor_app.infrastructure.db.models import SpaceModel
 
@@ -14,6 +19,7 @@ class _Session:
     def __init__(self, space: SpaceModel | None) -> None:
         self.space = space
         self.commit_count = 0
+        self.added: list[object] = []
 
     def get(self, model: type[SpaceModel], key: str) -> SpaceModel | None:
         if model is SpaceModel and self.space is not None and self.space.id == key:
@@ -22,6 +28,9 @@ class _Session:
 
     def commit(self) -> None:
         self.commit_count += 1
+
+    def add(self, value: object) -> None:
+        self.added.append(value)
 
 
 def test_patch_space_disables_and_enables_without_deleting_data() -> None:
@@ -56,6 +65,30 @@ def test_patch_space_rejects_non_operator_status() -> None:
         )
 
     assert exc_info.value.status_code == 400
+
+
+def test_server_invite_enables_auto_replenish_and_enqueues_existing_job() -> None:
+    space = _space("active")
+    space.auto_replenish_enabled = False
+    session = _Session(space)
+
+    result = create_space_auto_replenish_invite_job(
+        space.id,
+        SpaceAutoReplenishInviteJobRequest(created_by="ops:test-server-invite"),
+        session,  # type: ignore[arg-type]
+    )
+
+    assert space.auto_replenish_enabled is True
+    assert session.commit_count == 1
+    assert len(session.added) == 1
+    job = session.added[0]
+    assert job.type == "space.auto_replenish.invite.prepare"  # type: ignore[attr-defined]
+    assert job.input_json == {  # type: ignore[attr-defined]
+        "space_id": space.id,
+        "invite_count": 1000,
+        "work_count": 1,
+    }
+    assert result["job_id"] == job.id  # type: ignore[attr-defined]
 
 
 def test_discovery_preserves_operator_disabled_status() -> None:

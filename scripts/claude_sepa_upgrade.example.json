@@ -1,0 +1,40 @@
+{
+  "emails_file": "./claude-emails.txt",
+  "ibans_file": "./claude-ibans.txt",
+  "addresses_file": "./germany-addresses.txt",
+  "names_file": "./germany-names.txt",
+  "billing": {
+    "full_name": "",
+    "country": "DE",
+    "line1": "",
+    "line2": "",
+    "postal_code": "",
+    "city": "",
+    "state": ""
+  },
+  "extension_path": "/Users/chaopenglv/Downloads/claude-sepa-helper-v1.0.8-protected",
+  "output_dir": "../output/claude-sepa",
+  "magic_link_timeout_s": 180,
+  "navigation_timeout_ms": 60000,
+  "success_timeout_s": 120,
+  "headless": false,
+  "browser_concurrency": 3,
+  "step_delay_ms": 2000,
+  "page_settle_ms": 10000,
+  "submit_payment": true,
+  "proxy": {
+    "country": "DE",
+    "gateway_host": "p.webshare.io",
+    "gateway_port": 80,
+    "ip_check_url": "https://ipv4.webshare.io/",
+    "geo_check_url": "https://ipinfo.io/json",
+    "verify_timeout_s": 15,
+    "scan_concurrency": 12,
+    "max_endpoint": 20000
+  },
+  "mail": {
+    "base_url": "https://daboluomail.zeabur.app",
+    "request_timeout_s": 30,
+    "poll_interval_s": 3
+  }
+}

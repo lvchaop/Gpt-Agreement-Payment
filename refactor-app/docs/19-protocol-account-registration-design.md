@@ -702,10 +702,11 @@ activationId、phoneNumber、countryPhoneCode 等只保存在当前 work output_
 流程：
 
 ```text
-1. work 开始后创建 user_accounts 占位行，account_status=registering。
-2. 按 user_account_id 分配代理。
-3. AuthFlow 使用该代理。
-4. 注册成功后的 accounts/check v4 继续使用同一账号代理。
+1. work 开始后先确定目标邮箱，再创建 user_accounts 占位行，account_status=registering。
+2. 规范化目标邮箱后计算 SHA-256，稳定映射到一个 Webshare Backbone endpoint。
+3. endpoint 用户名带国家代码，默认 US，可通过
+   REFACTOR_APP_PROTOCOL_REGISTER_PROXY_COUNTRY 配置。
+4. AuthFlow、注册后的 accounts/check v4 以及 iCloud 密码/2FA 使用同一条注册代理。
 5. 注册成功后账号转 active。
 6. 注册失败后删除 user_accounts 占位行，不保留 invalid 账号。
 ```
@@ -713,7 +714,9 @@ activationId、phoneNumber、countryPhoneCode 等只保存在当前 work output_
 说明：
 
 ```text
-这里使用账号代理逻辑。
+注册生命周期和个人空间绑定支付方式使用静态 Backbone 代理。
+两者都按目标邮箱哈希复用同一 endpoint 和国家配置，且不写入 user_account_proxy_bindings；
+其他登录、补 Session、授权仍使用各自既有代理逻辑。
 不把全局 protocol_register_proxy_url 作为默认代理覆盖账号绑定。
 不使用 team admin 静态住宅代理。
 team admin 静态住宅代理只属于空间管理员操作。

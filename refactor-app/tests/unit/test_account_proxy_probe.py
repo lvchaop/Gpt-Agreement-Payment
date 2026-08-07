@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from refactor_app.application.workflows import account_auth
+from refactor_app.config.browser_fingerprint import BROWSER_IMPERSONATE
 
 
 class _Session:
@@ -20,18 +21,36 @@ class _Session:
 
 
 def test_proxy_probe_requires_successful_chatgpt_csrf(monkeypatch) -> None:
+    session_kwargs: list[dict] = []
     session = _Session(
         SimpleNamespace(status_code=200, json=lambda: {"csrfToken": "csrf-token"})
     )
+
+    def create_session(**kwargs):
+        session_kwargs.append(dict(kwargs))
+        return session
+
     monkeypatch.setattr(
         account_auth.curl_requests,
         "Session",
-        lambda **_kwargs: session,
+        create_session,
     )
 
     assert account_auth._probe_proxy_alive("http://proxy.example") is True
+    assert session_kwargs == [
+        {
+            "impersonate": BROWSER_IMPERSONATE,
+            "proxies": {
+                "http": "http://proxy.example",
+                "https": "http://proxy.example",
+            },
+        }
+    ]
     assert session.request is not None
     assert session.request[0] == "https://chatgpt.com/api/auth/csrf"
+    request_headers = session.request[1]["headers"]
+    assert "user-agent" not in request_headers
+    assert "sec-ch-ua" not in request_headers
 
 
 def test_proxy_probe_rejects_cloudflare_challenge(monkeypatch) -> None:

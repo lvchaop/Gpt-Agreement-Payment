@@ -40,6 +40,7 @@ def test_personal_export_line_reuses_current_sub2api_credentials_shape() -> None
     )
     credential = SimpleNamespace(
         id="credential-1",
+        auth_mode="codex_oauth",
         access_token="access-1",
         id_token="id-1",
         refresh_token="refresh-1",
@@ -58,8 +59,45 @@ def test_personal_export_line_reuses_current_sub2api_credentials_shape() -> None
     assert line["type"] == "codex"
     assert line["access_token"] == "access-1"
     assert line["refresh_token"] == "refresh-1"
+    assert line["account_id"] == "chatgpt-user-1_personal-space-1"
     assert line["chatgpt_account_id"] == "user-1_space-1"
+    assert line["chatgpt_user_id"] == "chatgpt-user-1"
     assert line["last_refresh"] == now.isoformat()
+
+
+def test_business_oauth_export_uses_codex_payload_instead_of_business_at_payload() -> None:
+    now = datetime.now(UTC)
+    user = SimpleNamespace(id="user-2", email="business-oauth@example.test")
+    space = SimpleNamespace(
+        id="space-2",
+        external_space_id="business-space-2",
+        credential_type="team_monthly",
+        plan_type="team",
+    )
+    credential = SimpleNamespace(
+        id="credential-2",
+        auth_mode="codex_oauth",
+        access_token="access-2",
+        id_token="id-2",
+        refresh_token="refresh-2",
+        account_id="chatgpt-user-2",
+        token_chatgpt_account_id="business-space-2",
+        codex_client_id="client-2",
+        expires_at=now,
+    )
+
+    line = _render_rows(
+        rows=[(credential, space, user)],
+        session=SimpleNamespace(),  # type: ignore[arg-type]
+        exported_at=now,
+    )[0]
+
+    assert line["type"] == "codex"
+    assert line["access_token"] == "access-2"
+    assert line["refresh_token"] == "refresh-2"
+    assert line["account_id"] == "chatgpt-user-2_business-space-2"
+    assert line["chatgpt_account_id"] == "user-2_space-2"
+    assert line["chatgpt_user_id"] == "chatgpt-user-2"
 
 
 def test_manual_export_removes_credentials_from_pool_and_allows_redownload() -> None:
@@ -104,6 +142,7 @@ def test_manual_export_removes_credentials_from_pool_and_allows_redownload() -> 
                     space_id=space_id,
                     user_account_id=user_id,
                     space_membership_id=None,
+                    auth_mode="backend_access_token",
                     credential_status="active",
                     access_token=f"at-{suffix}",
                     account_id=f"user-{suffix}",

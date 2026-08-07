@@ -9,13 +9,29 @@ import tempfile
 import time
 from dataclasses import dataclass
 from shutil import rmtree
-from typing import Protocol
-from urllib.parse import parse_qs, urlencode, urlparse
+from typing import Callable, Protocol
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+
+from refactor_app.config.browser_fingerprint import BROWSER_IMPERSONATE
+from refactor_app.plugins.mail_external_api.plugin import prepare_domain_mailbox
 
 
 DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
-CODEX_OAUTH_DEBUG_DIR = "/private/tmp/refactor-app/codex-oauth-debug"
+CODEX_OAUTH_DEBUG_DIR = os.environ.get(
+    "CODEX_OAUTH_DEBUG_DIR",
+    "/tmp/refactor-app/codex-oauth-debug",
+)
+HERO_ADD_PHONE_INVALID_STATE = "hero_add_phone_invalid_state"
+HERO_ADD_PHONE_OTP_TIMEOUT = "hero_add_phone_otp_timeout"
+ADD_PHONE_CONTEXT_SETTLE_MS = max(
+    0,
+    int(os.environ.get("CODEX_ADD_PHONE_CONTEXT_SETTLE_MS", "3000")),
+)
+CALLBACK_CAPTURE_SETTLE_MS = max(
+    0,
+    int(os.environ.get("CODEX_CALLBACK_CAPTURE_SETTLE_MS", "5000")),
+)
 
 
 @dataclass(frozen=True)
@@ -40,8 +56,82 @@ class BrowserOtpProvider(Protocol):
         timeout_s: int = 180,
         issued_after: float | None = None,
         max_polls: int | None = None,
-    ):
-        ...
+    ): ...
+
+
+class BrowserPhoneLease(Protocol):
+    lease_id: str
+    phone_e164: str
+
+
+class BrowserPhoneOtpProvider(Protocol):
+    def allocate(self) -> BrowserPhoneLease: ...
+
+    def poll_otp(self, lease_id: str) -> str: ...
+
+    def mark_verified(self, lease_id: str) -> None: ...
+
+    def mark_failed(self, lease_id: str, reason: str = "") -> None: ...
+
+
+class RetainedBrowserPhoneOtpProvider:
+    """Keep one phone lease while a failed auth flow is restarted."""
+
+    def __init__(self, delegate: BrowserPhoneOtpProvider) -> None:
+        self._delegate = delegate
+        self._lease: BrowserPhoneLease | None = None
+
+    @property
+    def has_retained_lease(self) -> bool:
+        return self._lease is not None
+
+    def allocate(self) -> BrowserPhoneLease:
+        if self._lease is None:
+            self._lease = self._delegate.allocate()
+        return self._lease
+
+    def poll_otp(self, lease_id: str) -> str:
+        return self._delegate.poll_otp(lease_id)
+
+    def mark_verified(self, lease_id: str) -> None:
+        self._delegate.mark_verified(lease_id)
+        self._lease = None
+
+    def mark_failed(self, lease_id: str, reason: str = "") -> None:
+        try:
+            self._delegate.mark_failed(lease_id, reason)
+        finally:
+            self._lease = None
+
+    def release_retained(self, reason: str) -> None:
+        if self._lease is None:
+            return
+        self.mark_failed(str(self._lease.lease_id or ""), reason)
+
+
+class BrowserApiRequestError(RuntimeError):
+    def __init__(self, *, path: str, status: int, data: dict, body_head: str) -> None:
+        self.path = path
+        self.status = status
+        self.data = data
+        self.body_head = body_head
+        error = data.get("error") if isinstance(data, dict) else None
+        self.upstream_error_code = str(error.get("code") or "") if isinstance(error, dict) else ""
+        super().__init__(f"{path} failed: http={status} body={body_head[:300]}")
+
+
+class AddPhoneInvalidStateError(RuntimeError):
+    pass
+
+
+class AddPhoneNumberRejectedError(RuntimeError):
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+class AccountDeactivatedDuringPhoneFlowError(RuntimeError):
+    pass
 
 
 def acquire_codex_rt_with_existing_browser_session(
@@ -50,9 +140,14 @@ def acquire_codex_rt_with_existing_browser_session(
     auth_cookie_header: str = "",
     proxy: str = "",
     codex_client_id: str = DEFAULT_CODEX_CLIENT_ID,
+    account_email: str = "",
     target_workspace_id: str = "",
     target_workspace_name: str = "",
+    phone_provider: BrowserPhoneOtpProvider | None = None,
+    totp_code_provider: Callable[[], str] | None = None,
     timeout_s: int = 45,
+    capture_diagnostics: bool = True,
+    headless: bool | None = None,
 ) -> CodexBrowserRtResult:
     if not cookie_header.strip():
         return CodexBrowserRtResult(
@@ -98,6 +193,7 @@ def acquire_codex_rt_with_existing_browser_session(
     callback = {"url": ""}
     final_url = ""
     diagnostics = {"message": ""}
+    totp_submitted = False
 
     def capture(value: str) -> bool:
         url = _extract_callback_url(value, expected_state=state)
@@ -108,7 +204,11 @@ def acquire_codex_rt_with_existing_browser_session(
 
     try:
         with Camoufox(
-            headless=not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+            headless=(
+                bool(headless)
+                if headless is not None
+                else not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            ),
             humanize=False,
             persistent_context=True,
             user_data_dir=profile_dir,
@@ -124,26 +224,61 @@ def acquire_codex_rt_with_existing_browser_session(
             _seed_account_cookie(ctx, target_workspace_id)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-            def intercept(route):
-                capture(route.request.url)
-                try:
-                    route.fulfill(status=200, content_type="text/html", body="<html>OK</html>")
-                except Exception:
-                    route.abort()
-
-            page.route("http://localhost:1455/**", intercept)
-            page.on("request", lambda req: capture(req.url))
-            page.on("framenavigated", lambda frame: capture(frame.url))
+            _install_callback_capture(ctx, page, capture)
             try:
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                pass
+            except Exception as exc:
+                capture(str(exc))
 
             end = time.time() + max(5, timeout_s)
             while time.time() < end:
                 final_url = str(getattr(page, "url", "") or "")
                 if callback["url"] or capture(final_url):
+                    _wait_after_callback_capture(page)
                     break
+                account_failure = _account_deactivated_result(page, final_url)
+                if account_failure is not None:
+                    return account_failure
+                if _select_existing_account_if_visible(page, account_email):
+                    time.sleep(1)
+                    continue
+                if _is_mfa_challenge_url(final_url):
+                    if totp_code_provider is None:
+                        return CodexBrowserRtResult(
+                            ok=False,
+                            failure_code="totp_code_provider_missing",
+                            failure_message="账号要求 TOTP，但没有可用的 2FAuth 记录或客户端配置",
+                            final_url=final_url,
+                        )
+                    if not _has_otp_input(page) or totp_submitted:
+                        time.sleep(1)
+                        continue
+                    try:
+                        code = str(totp_code_provider() or "").strip()
+                    except Exception as exc:
+                        return CodexBrowserRtResult(
+                            ok=False,
+                            failure_code="totp_code_fetch_failed",
+                            failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+                            final_url=final_url,
+                        )
+                    if not _fill_otp(page, code) or not _click_first_visible(
+                        page,
+                        [
+                            'button[type="submit"]',
+                            'button:has-text("Continue")',
+                            'button:has-text("Verify")',
+                        ],
+                    ):
+                        return CodexBrowserRtResult(
+                            ok=False,
+                            failure_code="totp_submit_failed",
+                            failure_message="检测到 TOTP 页面但填写或提交失败",
+                            final_url=final_url,
+                        )
+                    totp_submitted = True
+                    time.sleep(3)
+                    continue
                 if "/log-in" in final_url:
                     return CodexBrowserRtResult(
                         ok=False,
@@ -151,6 +286,12 @@ def acquire_codex_rt_with_existing_browser_session(
                         failure_message="已有 cookie 未通过 auth.openai.com 登录态校验，回落到登录页",
                         final_url=final_url,
                     )
+                if phone_provider is not None and _is_add_phone_url(final_url):
+                    phone_result = _complete_add_phone_with_provider(page, phone_provider)
+                    if phone_result is not None:
+                        return phone_result
+                    time.sleep(0.5)
+                    continue
                 phone_failure = _phone_verification_failure(page, final_url)
                 if phone_failure:
                     return _phone_failure_result(phone_failure, final_url=final_url)
@@ -190,8 +331,9 @@ def acquire_codex_rt_with_existing_browser_session(
                             'button[data-testid*="authorize"]',
                             'button[data-testid*="allow"]',
                             'button[name="action"][value="accept"]',
-                            'form button',
+                            "form button",
                         ],
+                        capture_exception=capture,
                     ):
                         time.sleep(1)
                         continue
@@ -203,11 +345,14 @@ def acquire_codex_rt_with_existing_browser_session(
                         if submitted:
                             time.sleep(1)
                             continue
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        capture(str(exc))
                 time.sleep(0.5)
-            if not callback["url"]:
+            if not callback["url"] and capture_diagnostics:
                 diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_fast")
+    except Exception as exc:
+        if not capture(str(exc)):
+            raise
     finally:
         rmtree(profile_dir, ignore_errors=True)
 
@@ -242,7 +387,12 @@ def acquire_codex_rt_with_browser_login(
     codex_client_id: str = DEFAULT_CODEX_CLIENT_ID,
     target_workspace_id: str = "",
     target_workspace_name: str = "",
+    phone_provider: BrowserPhoneOtpProvider | None = None,
+    totp_code_provider: Callable[[], str] | None = None,
+    cookie_header: str = "",
+    auth_cookie_header: str = "",
     timeout_s: int = 240,
+    headless: bool | None = None,
 ) -> CodexBrowserRtResult:
     if not email.strip():
         return CodexBrowserRtResult(
@@ -286,6 +436,10 @@ def acquire_codex_rt_with_browser_login(
     otp_submit_at = 0.0
     otp_retry_count = 0
     otp_retry_max = 2
+    totp_submit_at = 0.0
+    totp_retry_count = 0
+    totp_retry_max = 1
+    passwordless_otp_started = False
 
     def capture(value: str) -> bool:
         url = _extract_callback_url(value, expected_state=state)
@@ -295,8 +449,13 @@ def acquire_codex_rt_with_browser_login(
         return True
 
     try:
+        prepare_domain_mailbox(mail_provider, email=email)
         with Camoufox(
-            headless=not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+            headless=(
+                bool(headless)
+                if headless is not None
+                else not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            ),
             humanize=False,
             persistent_context=True,
             user_data_dir=profile_dir,
@@ -306,23 +465,16 @@ def acquire_codex_rt_with_browser_login(
             geoip=True,
             locale="en-US",
         ) as ctx:
+            _seed_context_cookies(ctx, cookie_header, ".chatgpt.com")
+            _seed_context_cookies(ctx, auth_cookie_header, ".auth.openai.com")
+            _seed_context_cookies(ctx, auth_cookie_header, ".openai.com")
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             _seed_account_cookie(ctx, target_workspace_id)
-
-            def intercept(route):
-                capture(route.request.url)
-                try:
-                    route.fulfill(status=200, content_type="text/html", body="<html>OK</html>")
-                except Exception:
-                    route.abort()
-
-            page.route("http://localhost:1455/**", intercept)
-            page.on("request", lambda req: capture(req.url))
-            page.on("framenavigated", lambda frame: capture(frame.url))
+            _install_callback_capture(ctx, page, capture)
             try:
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                pass
+            except Exception as exc:
+                capture(str(exc))
 
             _submit_email_if_visible(page, email)
             otp_sent_at = time.time()
@@ -333,29 +485,127 @@ def acquire_codex_rt_with_browser_login(
             while time.time() < end:
                 final_url = str(getattr(page, "url", "") or "")
                 if callback["url"] or capture(final_url):
+                    _wait_after_callback_capture(page)
                     break
+
+                account_failure = _account_deactivated_result(page, final_url)
+                if account_failure is not None:
+                    return account_failure
+
+                if _select_existing_account_if_visible(page, email):
+                    time.sleep(1)
+                    continue
 
                 if _submit_email_if_visible(page, email):
                     otp_sent_at = time.time()
                     time.sleep(2)
                     continue
 
+                if _is_password_page(page, final_url):
+                    if password:
+                        if _submit_password_if_visible(page, password):
+                            time.sleep(3)
+                            continue
+                        # The password route can become visible before its form is
+                        # hydrated. Keep waiting for that form instead of treating a
+                        # generic Retry control as evidence that an email OTP was sent.
+                        time.sleep(1)
+                        continue
+                    if passwordless_otp_started:
+                        return CodexBrowserRtResult(
+                            ok=False,
+                            failure_code="passwordless_otp_navigation_failed",
+                            failure_message="邮箱验证码已发送，但页面仍停留在密码登录页",
+                            final_url=final_url,
+                        )
+                    otp_sent_at = time.time()
+                    try:
+                        _start_passwordless_email_login(page)
+                    except Exception as exc:
+                        return CodexBrowserRtResult(
+                            ok=False,
+                            failure_code="passwordless_otp_send_failed",
+                            failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+                            final_url=final_url,
+                        )
+                    passwordless_otp_started = True
+                    otp_fetched = False
+                    otp_submit_at = 0.0
+                    time.sleep(1)
+                    continue
+
                 if password and _submit_password_if_visible(page, password):
                     time.sleep(3)
                     continue
 
-                if not password and _has_password_input(page):
-                    return CodexBrowserRtResult(
-                        ok=False,
-                        failure_code="login_password_required_by_upstream",
-                        failure_message="auth.openai.com 当前登录分支要求密码，但该账号未保存密码",
-                        final_url=final_url,
-                    )
-
+                if phone_provider is not None and _is_add_phone_url(final_url):
+                    phone_result = _complete_add_phone_with_provider(page, phone_provider)
+                    if phone_result is not None:
+                        return phone_result
+                    time.sleep(0.5)
+                    continue
                 phone_failure = _phone_verification_failure(page, final_url)
                 if phone_failure:
                     return _phone_failure_result(phone_failure, final_url=final_url)
                 if _is_add_phone_url(final_url):
+                    time.sleep(1)
+                    continue
+
+                if _is_mfa_challenge_url(final_url):
+                    if totp_code_provider is None:
+                        return CodexBrowserRtResult(
+                            ok=False,
+                            failure_code="totp_code_provider_missing",
+                            failure_message="账号要求 TOTP，但没有可用的 2FAuth 记录或客户端配置",
+                            final_url=final_url,
+                        )
+                    if not _has_otp_input(page):
+                        time.sleep(1)
+                        continue
+                    if not totp_submit_at:
+                        try:
+                            code = str(totp_code_provider() or "").strip()
+                        except Exception as exc:
+                            return CodexBrowserRtResult(
+                                ok=False,
+                                failure_code="totp_code_fetch_failed",
+                                failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+                                final_url=final_url,
+                            )
+                        if not _fill_otp(page, code):
+                            return CodexBrowserRtResult(
+                                ok=False,
+                                failure_code="totp_input_not_found",
+                                failure_message="检测到 TOTP 页面但未找到可填写的验证码输入框",
+                                final_url=final_url,
+                            )
+                        if not _click_first_visible(
+                            page,
+                            [
+                                'button[type="submit"]',
+                                'button:has-text("Continue")',
+                                'button:has-text("Verify")',
+                            ],
+                        ):
+                            return CodexBrowserRtResult(
+                                ok=False,
+                                failure_code="totp_submit_not_found",
+                                failure_message="检测到 TOTP 页面但未找到提交按钮",
+                                final_url=final_url,
+                            )
+                        totp_submit_at = time.time()
+                        time.sleep(3)
+                        continue
+                    if time.time() - totp_submit_at > 30:
+                        if totp_retry_count >= totp_retry_max:
+                            return CodexBrowserRtResult(
+                                ok=False,
+                                failure_code="totp_verification_stuck",
+                                failure_message="TOTP 提交后仍停留在 MFA challenge 页面",
+                                final_url=final_url,
+                            )
+                        totp_retry_count += 1
+                        totp_submit_at = 0.0
                     time.sleep(1)
                     continue
 
@@ -393,7 +643,9 @@ def acquire_codex_rt_with_browser_login(
                                 otp_retry_count += 1
                                 time.sleep(2)
                                 continue
-                            diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_otp_input_not_found")
+                            diagnostics["message"] = _capture_page_diagnostics(
+                                page, "codex_rt_otp_input_not_found"
+                            )
                             return CodexBrowserRtResult(
                                 ok=False,
                                 failure_code="otp_input_not_found",
@@ -418,7 +670,9 @@ def acquire_codex_rt_with_browser_login(
                         continue
                     if otp_submit_at and time.time() - otp_submit_at > 30:
                         if otp_retry_count >= otp_retry_max:
-                            diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_otp_stuck")
+                            diagnostics["message"] = _capture_page_diagnostics(
+                                page, "codex_rt_otp_stuck"
+                            )
                             return CodexBrowserRtResult(
                                 ok=False,
                                 failure_code="otp_verification_stuck",
@@ -430,7 +684,9 @@ def acquire_codex_rt_with_browser_login(
                                 final_url=final_url,
                             )
                         if not _click_otp_retry_control(page):
-                            diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_otp_no_retry")
+                            diagnostics["message"] = _capture_page_diagnostics(
+                                page, "codex_rt_otp_no_retry"
+                            )
                             return CodexBrowserRtResult(
                                 ok=False,
                                 failure_code="otp_retry_control_not_found",
@@ -469,8 +725,9 @@ def acquire_codex_rt_with_browser_login(
                             'button[data-testid*="authorize"]',
                             'button[data-testid*="allow"]',
                             'button[name="action"][value="accept"]',
-                            'form button',
+                            "form button",
                         ],
+                        capture_exception=capture,
                     ):
                         time.sleep(2)
                         continue
@@ -482,20 +739,21 @@ def acquire_codex_rt_with_browser_login(
                         if submitted:
                             time.sleep(2)
                             continue
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        capture(str(exc))
 
                 time.sleep(1)
             if not callback["url"]:
                 diagnostics["message"] = _capture_page_diagnostics(page, "codex_rt_login")
     except Exception as exc:
-        return CodexBrowserRtResult(
-            ok=False,
-            failure_code="browser_login_exception",
-            failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
-            callback_url_seen=bool(callback["url"]),
-            final_url=final_url,
-        )
+        if not capture(str(exc)):
+            return CodexBrowserRtResult(
+                ok=False,
+                failure_code="browser_login_exception",
+                failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+                callback_url_seen=False,
+                final_url=final_url,
+            )
     finally:
         rmtree(profile_dir, ignore_errors=True)
 
@@ -520,6 +778,32 @@ def acquire_codex_rt_with_browser_login(
     )
 
 
+def _install_callback_capture(ctx, page, capture: Callable[[str], bool]) -> None:
+    def intercept(route) -> None:
+        capture(route.request.url)
+        try:
+            route.fulfill(status=200, content_type="text/html", body="<html>OK</html>")
+        except Exception:
+            route.abort()
+
+    def bind(candidate) -> None:
+        candidate.on("request", lambda request: capture(request.url))
+        candidate.on("framenavigated", lambda frame: capture(frame.url))
+
+    ctx.route("http://localhost:1455/**", intercept)
+    bind(page)
+    ctx.on("page", bind)
+
+
+def _wait_after_callback_capture(page) -> None:
+    if CALLBACK_CAPTURE_SETTLE_MS <= 0:
+        return
+    try:
+        page.wait_for_timeout(CALLBACK_CAPTURE_SETTLE_MS)
+    except Exception:
+        time.sleep(CALLBACK_CAPTURE_SETTLE_MS / 1000)
+
+
 def _exchange_callback(
     *,
     callback_url: str,
@@ -538,7 +822,7 @@ def _exchange_callback(
     try:
         from curl_cffi.requests import Session as CffiSession
 
-        http = CffiSession(impersonate="chrome136")
+        http = CffiSession(impersonate=BROWSER_IMPERSONATE)
         if proxy:
             http.proxies = {"http": proxy, "https": proxy}
         response = http.post(
@@ -593,10 +877,10 @@ def _submit_email_if_visible(page, email: str) -> bool:
         if not email_input:
             return False
         email_input.click(timeout=3000)
-        email_input.fill(email.strip().lower())
+        email_input.fill(email.strip())
         return _click_first_visible(
             page,
-            ['button[type="submit"]', 'button:has-text("Continue")', '#btnNext'],
+            ['button[type="submit"]', 'button:has-text("Continue")', "#btnNext"],
         )
     except Exception:
         return False
@@ -626,16 +910,40 @@ def _has_password_input(page) -> bool:
         return False
 
 
+def _is_password_page(page, current_url: str) -> bool:
+    url = str(current_url or "").lower()
+    return (
+        "/log-in/password" in url or "/create-account/password" in url or _has_password_input(page)
+    )
+
+
+def _start_passwordless_email_login(page) -> None:
+    _browser_empty_post(page, "/api/accounts/passwordless/send-otp")
+    page.goto(
+        "https://auth.openai.com/email-verification",
+        wait_until="domcontentloaded",
+        timeout=30000,
+    )
+
+
 def _is_otp_page(page, current_url: str) -> bool:
+    if (
+        _is_phone_otp_url(current_url)
+        or _is_mfa_challenge_url(current_url)
+        or _is_password_page(page, current_url)
+    ):
+        return False
     if _has_otp_input(page):
-        return True
-    if _has_otp_retry_control(page):
         return True
     if "email-otp" in current_url or "passwordless" in current_url:
         return True
     if _is_email_verification_url(current_url):
         return True
     return False
+
+
+def _is_mfa_challenge_url(current_url: str) -> bool:
+    return "/mfa-challenge/" in str(current_url or "").lower()
 
 
 def _is_email_verification_url(current_url: str) -> bool:
@@ -657,21 +965,24 @@ def _has_otp_input(page) -> bool:
 
 
 def _has_otp_retry_control(page) -> bool:
-    return _find_first_visible(
-        page,
-        [
-            'button:has-text("Resend email")',
-            'a:has-text("Resend email")',
-            'button:has-text("Resend")',
-            'a:has-text("Resend")',
-            'button:has-text("Try again")',
-            'a:has-text("Try again")',
-            'button:has-text("Retry")',
-            'a:has-text("Retry")',
-            '[data-testid*="resend"]',
-            '[data-testid*="retry"]',
-        ],
-    ) is not None
+    return (
+        _find_first_visible(
+            page,
+            [
+                'button:has-text("Resend email")',
+                'a:has-text("Resend email")',
+                'button:has-text("Resend")',
+                'a:has-text("Resend")',
+                'button:has-text("Try again")',
+                'a:has-text("Try again")',
+                'button:has-text("Retry")',
+                'a:has-text("Retry")',
+                '[data-testid*="resend"]',
+                '[data-testid*="retry"]',
+            ],
+        )
+        is not None
+    )
 
 
 def _click_otp_retry_control(page) -> bool:
@@ -697,16 +1008,16 @@ def _fill_otp(page, code: str) -> bool:
     if not value:
         return False
     try:
-        single = page.query_selector('input[autocomplete="one-time-code"]:visible') or page.query_selector(
-            'input[inputmode="numeric"]:not([maxlength="1"]):visible'
-        )
+        single = page.query_selector(
+            'input[autocomplete="one-time-code"]:visible'
+        ) or page.query_selector('input[inputmode="numeric"]:not([maxlength="1"]):visible')
         if single:
             single.click(timeout=3000)
             single.fill(value)
             return True
-        digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or page.query_selector_all(
-            'input[maxlength="1"]'
-        )
+        digits = page.query_selector_all(
+            'input[maxlength="1"][inputmode="numeric"]'
+        ) or page.query_selector_all('input[maxlength="1"]')
         if len(digits) >= len(value):
             for idx, ch in enumerate(value):
                 digits[idx].click(timeout=3000)
@@ -722,7 +1033,7 @@ def _phone_verification_failure(page, current_url: str) -> str:
     if "phone-otp/select-channel" in url:
         return "phone_otp_select_channel"
     if not _is_add_phone_url(url):
-        return ""
+        return "phone_verification_required" if _is_phone_otp_url(url) else ""
     try:
         if _click_first_visible(
             page,
@@ -745,9 +1056,371 @@ def _phone_verification_failure(page, current_url: str) -> str:
     return "add_phone_blocked"
 
 
+def _complete_add_phone_with_provider(
+    page,
+    phone_provider: BrowserPhoneOtpProvider,
+) -> CodexBrowserRtResult | None:
+    lease = None
+    try:
+        _wait_for_add_phone_context(page)
+        max_number_attempts = _phone_number_retry_limit(phone_provider)
+        send_continue = ""
+        for attempt in range(1, max_number_attempts + 1):
+            lease = phone_provider.allocate()
+            lease_id = str(getattr(lease, "lease_id", "") or "").strip()
+            phone_e164 = str(getattr(lease, "phone_e164", "") or "").strip()
+            if not lease_id or not phone_e164:
+                raise RuntimeError("Hero SMS returned an incomplete phone lease")
+            try:
+                send_continue = _submit_phone_number_in_page(page, phone_e164)
+                break
+            except AddPhoneNumberRejectedError as exc:
+                _mark_phone_lease_failed(phone_provider, lease_id, exc.reason)
+                lease = None
+                if attempt >= max_number_attempts:
+                    raise RuntimeError(
+                        f"phone number rejected after {max_number_attempts} attempts: {exc}"
+                    ) from exc
+        else:
+            raise RuntimeError(f"phone number submit exhausted {max_number_attempts} attempts")
+
+        lease_id = str(getattr(lease, "lease_id", "") or "").strip()
+        if "select-channel" in send_continue:
+            _mark_phone_lease_failed(phone_provider, lease_id, "phone_otp_select_channel")
+            return _phone_failure_result(
+                "phone_otp_select_channel",
+                final_url=send_continue,
+            )
+
+        code = str(phone_provider.poll_otp(lease_id) or "").strip()
+        if not code:
+            raise RuntimeError("Hero SMS returned an empty phone OTP")
+        validate_continue = _submit_phone_otp_in_page(page, code)
+        if "select-channel" in validate_continue:
+            phone_provider.mark_verified(lease_id)
+            return _phone_failure_result(
+                "phone_otp_select_channel",
+                final_url=validate_continue,
+            )
+        phone_provider.mark_verified(lease_id)
+        return None
+    except Exception as exc:
+        lease_id = str(getattr(lease, "lease_id", "") or "").strip()
+        if isinstance(exc, AccountDeactivatedDuringPhoneFlowError):
+            _mark_phone_lease_failed(phone_provider, lease_id, "account_deactivated")
+            return CodexBrowserRtResult(
+                ok=False,
+                failure_code="account_deactivated",
+                failure_message=str(exc),
+                final_url=str(getattr(page, "url", "") or ""),
+            )
+        if isinstance(exc, TimeoutError):
+            _mark_phone_lease_failed(phone_provider, lease_id, "phone_otp_timeout")
+            return CodexBrowserRtResult(
+                ok=False,
+                failure_code=HERO_ADD_PHONE_OTP_TIMEOUT,
+                failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+                final_url=str(getattr(page, "url", "") or ""),
+            )
+        if isinstance(exc, AddPhoneInvalidStateError) or (
+            isinstance(exc, BrowserApiRequestError)
+            and exc.path == "/api/accounts/add-phone/send"
+            and exc.upstream_error_code == "invalid_state"
+        ):
+            return CodexBrowserRtResult(
+                ok=False,
+                failure_code=HERO_ADD_PHONE_INVALID_STATE,
+                failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+                final_url=str(getattr(page, "url", "") or ""),
+            )
+        _mark_phone_lease_failed(
+            phone_provider,
+            lease_id,
+            f"hero_add_phone_failed:{type(exc).__name__}",
+        )
+        return CodexBrowserRtResult(
+            ok=False,
+            failure_code="hero_add_phone_failed",
+            failure_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+            final_url=str(getattr(page, "url", "") or ""),
+        )
+
+
+def _phone_number_retry_limit(phone_provider: BrowserPhoneOtpProvider) -> int:
+    delegate = getattr(phone_provider, "_delegate", None)
+    cfg = getattr(phone_provider, "cfg", None) or getattr(delegate, "cfg", None)
+    raw = (
+        os.environ.get("PHONE_PROTOCOL_MAX_NUMBER_ATTEMPTS", "")
+        or str(getattr(cfg, "max_number_attempts", "") or "")
+        or "3"
+    )
+    try:
+        return max(1, min(int(raw), 10))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _wait_for_add_phone_context(page) -> None:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10_000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_selector(
+            'input[type="tel"], input[name="phone_number"], input[autocomplete="tel"]',
+            state="visible",
+            timeout=10_000,
+        )
+    except Exception:
+        pass
+    if ADD_PHONE_CONTEXT_SETTLE_MS <= 0:
+        return
+    try:
+        page.wait_for_timeout(ADD_PHONE_CONTEXT_SETTLE_MS)
+    except Exception:
+        time.sleep(ADD_PHONE_CONTEXT_SETTLE_MS / 1000)
+
+
+def _submit_phone_number_in_page(page, phone_e164: str) -> str:
+    phone_input = _find_first_visible(
+        page,
+        [
+            'input[type="tel"]',
+            'input[name="phoneNumber"]',
+            'input[name="phone_number"]',
+            'input[autocomplete="tel"]',
+        ],
+    )
+    if phone_input is None:
+        raise RuntimeError("add-phone page phone input not found")
+    phone_input.click(timeout=3_000)
+    phone_input.fill(phone_e164)
+    try:
+        page.wait_for_timeout(500)
+    except Exception:
+        time.sleep(0.5)
+
+    _click_first_visible(
+        page,
+        [
+            '[role="radio"]:has-text("Text Message")',
+            'button:has-text("Text Message")',
+            'label:has-text("Text Message")',
+        ],
+    )
+    if not _click_first_visible(
+        page,
+        [
+            'form button[type="submit"]',
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+        ],
+    ):
+        raise RuntimeError("add-phone page Continue button not found")
+    return _wait_for_phone_page_transition(page, from_phone_otp=False)
+
+
+def _submit_phone_otp_in_page(page, code: str) -> str:
+    if not _fill_otp(page, code):
+        raise RuntimeError("phone verification page OTP input not found")
+    try:
+        page.wait_for_timeout(500)
+    except Exception:
+        time.sleep(0.5)
+    if not _click_first_visible(
+        page,
+        [
+            'form button[type="submit"]',
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+            'button:has-text("Verify")',
+        ],
+    ):
+        raise RuntimeError("phone verification page submit button not found")
+    return _wait_for_phone_page_transition(page, from_phone_otp=True)
+
+
+def _wait_for_phone_page_transition(page, *, from_phone_otp: bool) -> str:
+    end = time.time() + 30
+    while time.time() < end:
+        current_url = str(getattr(page, "url", "") or "")
+        account_failure = _account_deactivated_result(page, current_url)
+        if account_failure is not None:
+            raise AccountDeactivatedDuringPhoneFlowError(account_failure.failure_message)
+        if (
+            _find_first_visible(
+                page,
+                [
+                    'text="Your sign-in session is no longer valid."',
+                    'text="Please start over to continue."',
+                ],
+            )
+            is not None
+        ):
+            raise AddPhoneInvalidStateError(
+                "Your sign-in session is no longer valid. Please start over to continue."
+            )
+        rejection = _visible_phone_number_rejection(page)
+        if not from_phone_otp and rejection is not None:
+            raise rejection
+        if "phone-otp/select-channel" in current_url:
+            return current_url
+        if from_phone_otp:
+            if not _is_phone_otp_url(current_url):
+                return current_url
+        elif _is_phone_otp_url(current_url):
+            return current_url
+        time.sleep(0.25)
+    stage = "phone OTP submit" if from_phone_otp else "phone number submit"
+    raise RuntimeError(f"{stage} did not advance url={getattr(page, 'url', '')}")
+
+
+def _visible_phone_number_rejection(page) -> AddPhoneNumberRejectedError | None:
+    if (
+        _find_first_visible(
+            page,
+            [
+                "text=/virtual phone number/i",
+                "text=/valid, non-virtual phone number/i",
+                "text=/VoIP/i",
+            ],
+        )
+        is not None
+    ):
+        return AddPhoneNumberRejectedError(
+            "phone_number_rejected_virtual",
+            "add-phone page rejected virtual/VoIP phone number",
+        )
+    return None
+
+
+def _browser_empty_post(page, path: str) -> None:
+    result = page.evaluate(
+        """async (path) => {
+            const headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "x-access-flow-invocation-id": crypto.randomUUID(),
+            };
+            const response = await fetch(path, {
+                method: "POST",
+                credentials: "include",
+                headers,
+            });
+            const text = await response.text();
+            return {
+                ok: response.ok,
+                status: response.status,
+                body_head: text.slice(0, 500),
+            };
+        }""",
+        path,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{path} returned an invalid browser response")
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"{path} failed: http={result.get('status')} body={str(result.get('body_head') or '')[:300]}"
+        )
+
+
+def _browser_json_post(page, path: str, payload: dict) -> dict:
+    result = page.evaluate(
+        """async ({ path, payload }) => {
+            const headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "x-access-flow-invocation-id": crypto.randomUUID(),
+            };
+            const response = await fetch(path, {
+                method: "POST",
+                credentials: "include",
+                headers,
+                body: JSON.stringify(payload),
+            });
+            const text = await response.text();
+            let data = {};
+            try { data = JSON.parse(text); } catch (_) {}
+            return {
+                ok: response.ok,
+                status: response.status,
+                data,
+                body_head: text.slice(0, 500),
+            };
+        }""",
+        {"path": path, "payload": payload},
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{path} returned an invalid browser response")
+    if not result.get("ok"):
+        raise BrowserApiRequestError(
+            path=path,
+            status=int(result.get("status") or 0),
+            data=result.get("data") if isinstance(result.get("data"), dict) else {},
+            body_head=str(result.get("body_head") or ""),
+        )
+    data = result.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _phone_continue_url(payload: dict) -> str:
+    page = payload.get("page") if isinstance(payload, dict) else None
+    page_payload = page.get("payload") if isinstance(page, dict) else None
+    value = str(
+        payload.get("continue_url")
+        or (page_payload.get("continue_url") if isinstance(page_payload, dict) else "")
+        or (page_payload.get("url") if isinstance(page_payload, dict) else "")
+        or ""
+    ).strip()
+    return urljoin("https://auth.openai.com", value) if value else ""
+
+
+def _is_select_channel_response(payload: dict, continue_url: str) -> bool:
+    page_type = _phone_page_type(payload)
+    return "select-channel" in str(continue_url or "").lower() or "select_channel" in page_type
+
+
+def _phone_page_type(payload: dict) -> str:
+    page = payload.get("page") if isinstance(payload, dict) else None
+    return str(page.get("type") if isinstance(page, dict) else "").strip().lower()
+
+
+def _navigate_phone_continue(
+    page,
+    continue_url: str,
+    *,
+    reload_if_empty: bool = False,
+) -> None:
+    try:
+        if continue_url:
+            page.goto(continue_url, wait_until="domcontentloaded", timeout=30000)
+        elif reload_if_empty:
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+
+
+def _mark_phone_lease_failed(
+    phone_provider: BrowserPhoneOtpProvider,
+    lease_id: str,
+    reason: str,
+) -> None:
+    if not lease_id:
+        return
+    try:
+        phone_provider.mark_failed(lease_id, reason)
+    except Exception:
+        pass
+
+
 def _is_add_phone_url(current_url: str) -> bool:
     value = str(current_url or "")
     return "/add-phone" in value or "phone-number" in value
+
+
+def _is_phone_otp_url(current_url: str) -> bool:
+    value = str(current_url or "")
+    return "/phone-verification" in value or "/phone-otp/" in value
 
 
 def _phone_failure_result(failure_code: str, *, final_url: str) -> CodexBrowserRtResult:
@@ -756,6 +1429,7 @@ def _phone_failure_result(failure_code: str, *, final_url: str) -> CodexBrowserR
             "auth.openai.com 进入 phone-otp/select-channel，Personal Codex 授权永久跳过"
         ),
         "add_phone_blocked": "auth.openai.com 要求添加手机号且没有可用跳过入口",
+        "phone_verification_required": "auth.openai.com 仍停留在手机验证码流程",
     }
     return CodexBrowserRtResult(
         ok=False,
@@ -765,18 +1439,103 @@ def _phone_failure_result(failure_code: str, *, final_url: str) -> CodexBrowserR
     )
 
 
+def _account_deactivated_result(page, final_url: str) -> CodexBrowserRtResult | None:
+    if (
+        _find_first_visible(
+            page,
+            [
+                "text=/account has been deleted or deactivated/i",
+                "text=/account_deactivated/i",
+            ],
+        )
+        is None
+    ):
+        return None
+    return CodexBrowserRtResult(
+        ok=False,
+        failure_code="account_deactivated",
+        failure_message=("You do not have an account because it has been deleted or deactivated."),
+        final_url=str(final_url or ""),
+    )
+
+
 def _is_workspace_or_consent_page(current_url: str) -> bool:
     return "/workspace" in current_url or "/consent" in current_url or "/authorize" in current_url
 
 
-def _click_first_visible(page, selectors: list[str]) -> bool:
+def _select_existing_account_if_visible(page, email: str) -> bool:
+    expected = str(email or "").strip().casefold()
+    if not expected:
+        return False
+    chooser_selectors = (
+        'form[action*="/choose-an-account"] button[name="session_id"]',
+        'button[data-dd-action-name="Select existing session"]',
+    )
+    try:
+        for selector in chooser_selectors:
+            for element in page.query_selector_all(selector):
+                text = str(element.inner_text() or "").casefold()
+                if expected not in text:
+                    continue
+                try:
+                    element.click(timeout=5_000, no_wait_after=True)
+                except Exception:
+                    element.evaluate(
+                        "(el) => { "
+                        "if (el.form && typeof el.form.requestSubmit === 'function') { "
+                        "el.form.requestSubmit(el); "
+                        "} else { el.click(); } "
+                        "}"
+                    )
+                return True
+
+        current_url = str(getattr(page, "url", "") or "")
+        if "/choose-an-account" not in current_url:
+            return False
+        return bool(
+            page.evaluate(
+                """(expectedEmail) => {
+                    const normalized = String(expectedEmail || '').trim().toLowerCase();
+                    if (!normalized) return false;
+                    const candidates = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"], [tabindex]'
+                    ));
+                    const target = candidates.find((element) =>
+                        String(element.innerText || element.textContent || '')
+                            .toLowerCase()
+                            .includes(normalized)
+                    );
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }""",
+                expected,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _click_first_visible(
+    page,
+    selectors: list[str],
+    *,
+    capture_exception: Callable[[str], bool] | None = None,
+) -> bool:
     button = _find_first_visible(page, selectors)
     if not button:
         return False
     try:
         button.evaluate("(el) => { el.click(); return true; }")
-    except Exception:
-        button.click(timeout=3000, no_wait_after=True)
+    except Exception as evaluate_exc:
+        if capture_exception is not None and capture_exception(str(evaluate_exc)):
+            return True
+        try:
+            button.click(timeout=3000, no_wait_after=True)
+        except Exception as click_exc:
+            if capture_exception is not None and capture_exception(str(click_exc)):
+                return True
+            raise
     return True
 
 

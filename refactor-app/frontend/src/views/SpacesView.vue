@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { Expand, KeyRound, Plus, Power, PowerOff, RefreshCw, Trash2 } from "@lucide/vue";
+import { CreditCard, Expand, KeyRound, Plus, Power, PowerOff, RefreshCw, Server, ServerOff, Trash2, Upload, UserPlus } from "@lucide/vue";
 
 import DataTable from "../components/DataTable.vue";
 import type { Column, TableFilter } from "../components/DataTable.vue";
@@ -11,6 +11,7 @@ import EntitySelect from "../components/EntitySelect.vue";
 import ResourcePage from "../components/ResourcePage.vue";
 import { resourcesApi, type Row } from "../api/resources";
 import { useOpsStore } from "../stores/ops";
+import { splitPaymentImportLines } from "../utils/paymentMethodImport";
 
 const store = useOpsStore();
 const router = useRouter();
@@ -37,8 +38,29 @@ const deleteAdminTarget = ref<Row | null>(null);
 const syncTarget = ref<Row | null>(null);
 const seatExpansionTarget = ref<Row | null>(null);
 const statusTarget = ref<Row | null>(null);
+const autoInviteTarget = ref<Row | null>(null);
+const hostingTarget = ref<Row | null>(null);
+const unhostingTarget = ref<Row | null>(null);
+const paymentBindTarget = ref<Row | null>(null);
+const selectedSpaces = ref<Row[]>([]);
+const selectedPaymentBindOpen = ref(false);
 const expandingSpaceId = ref("");
 const updatingSpaceStatusId = ref("");
+const updatingAutoReplenishId = ref("");
+const preparingAutoInviteId = ref("");
+const updatingHostingSpaceId = ref("");
+const bindingPaymentSpaceId = ref("");
+const bindingSelectedPaymentSpaces = ref(false);
+const showPaymentPoolPanel = ref(false);
+const paymentNamesText = ref("");
+const paymentAddressesText = ref("");
+const paymentCardsText = ref("");
+const paymentInventorySummary = ref<Row>({});
+const importingPaymentInventory = ref(false);
+const showReplenishEmailPanel = ref(false);
+const replenishEmailsText = ref("");
+const replenishEmailSummary = ref<Row>({});
+const importingReplenishEmails = ref(false);
 const importing = ref(false);
 const creatingCredential = ref(false);
 const accountLoader = async (query: string) => (await resourcesApi.accountOptions(query)).items;
@@ -51,6 +73,19 @@ const businessSpaceLoader = async (query: string) => {
     status: String(item.space_status || ""),
   })).filter((item) => item.value);
 };
+const selectedSpaceIds = computed(() => Array.from(new Set(
+  selectedSpaces.value.map((row) => String(row.id || "").trim()).filter(Boolean),
+)));
+const selectedPersonalSpaceCount = computed(() => selectedSpaces.value.filter(
+  (row) => String(row.space_type || "") === "personal",
+).length);
+const selectedUnboundPersonalSpaceCount = computed(() => selectedSpaces.value.filter(
+  (row) => String(row.space_type || "") === "personal"
+    && String(row.space_status || "") === "active"
+    && !Boolean(row.has_payment_method)
+    && String(row.payment_method_status || "") !== "bound"
+    && !Boolean(row.payment_method_cooldown_active),
+).length);
 
 const columns: Column[] = [
   { key: "id", label: "空间 ID", mono: true, summary: 26 },
@@ -63,6 +98,11 @@ const columns: Column[] = [
   { key: "auth_mode", label: "授权模式", badge: true },
   { key: "provider", label: "来源" },
   { key: "seat_limit", label: "席位上限" },
+  { key: "payment_method_status", label: "支付状态", badge: true, sortable: true },
+  { key: "payment_method_last4", label: "卡尾号", mono: true },
+  { key: "payment_method_attempt_count", label: "绑卡次数" },
+  { key: "payment_method_cooldown_until", label: "绑卡冷却至", type: "datetime", relativeTime: true },
+  { key: "auto_replenish_enabled", label: "自动补号", type: "boolean" },
   { key: "space_status", label: "状态", badge: true },
   { key: "source_admin_session_id", label: "管理员 Session", mono: true, summary: 26 },
 ];
@@ -89,6 +129,7 @@ const filters: TableFilter[] = [
     key: "plan_type",
     label: "订阅类型",
     options: [
+      { label: "未知", value: "unknown" },
       { label: "Free", value: "free" },
       { label: "Plus", value: "plus" },
       { label: "Pro", value: "pro" },
@@ -113,6 +154,24 @@ const filters: TableFilter[] = [
     options: [
       { label: "codex_oauth", value: "codex_oauth" },
       { label: "backend_access_token", value: "backend_access_token" },
+    ],
+  },
+  {
+    key: "payment_method_status",
+    label: "支付状态",
+    options: [
+      { label: "未绑定", value: "missing" },
+      { label: "绑定中", value: "binding" },
+      { label: "已绑定", value: "bound" },
+      { label: "失败", value: "failed" },
+    ],
+  },
+  {
+    key: "has_payment_method",
+    label: "是否绑定支付方式",
+    options: [
+      { label: "已绑定", value: "true" },
+      { label: "未绑定", value: "false" },
     ],
   },
   {
@@ -299,7 +358,228 @@ async function updateSpaceStatus() {
   }
 }
 
-onMounted(loadAdminSessions);
+async function updateAutoReplenish(row: Row, event: Event) {
+  const id = String(row.id || "");
+  if (!id) return;
+  const enabled = (event.target as HTMLInputElement).checked;
+  updatingAutoReplenishId.value = id;
+  try {
+    await resourcesApi.patchSpace(id, { auto_replenish_enabled: enabled });
+    store.toast(enabled ? "自动补号已开启" : "自动补号已关闭", String(row.name || row.external_space_id || id), "success");
+    await pageRef.value?.load();
+  } catch (err) {
+    store.toast("自动补号配置失败", String((err as Error).message ?? err), "error");
+    await pageRef.value?.load();
+  } finally {
+    updatingAutoReplenishId.value = "";
+  }
+}
+
+async function loadReplenishEmailSummary() {
+  try {
+    replenishEmailSummary.value = await resourcesApi.spaceReplenishEmailSummary();
+  } catch (err) {
+    store.toast("补号邮箱库存读取失败", String((err as Error).message ?? err), "error");
+  }
+}
+
+async function openReplenishEmailImport() {
+  showReplenishEmailPanel.value = true;
+  await loadReplenishEmailSummary();
+}
+
+async function importReplenishEmails() {
+  const emails = replenishEmailsText.value
+    .split(/[\s,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!emails.length) {
+    store.toast("缺少邮箱", "请填写至少一个邮箱。", "warning");
+    return;
+  }
+  importingReplenishEmails.value = true;
+  try {
+    const result = await resourcesApi.importSpaceReplenishEmails({ emails });
+    replenishEmailSummary.value = result;
+    replenishEmailsText.value = "";
+    store.toast("补号邮箱已导入", `新增=${result.inserted ?? 0} 已存在=${result.existing ?? 0} 可用=${result.available_count ?? 0}`, "success");
+  } catch (err) {
+    store.toast("补号邮箱导入失败", String((err as Error).message ?? err), "error");
+  } finally {
+    importingReplenishEmails.value = false;
+  }
+}
+
+async function prepareAutoReplenishInvites() {
+  const id = String(autoInviteTarget.value?.id || "");
+  if (!id) return;
+  preparingAutoInviteId.value = id;
+  try {
+    const result = await resourcesApi.prepareSpaceAutoReplenishInvites(id, {
+      created_by: "ops:space-server-invite",
+    });
+    const name = String(autoInviteTarget.value?.name || autoInviteTarget.value?.external_space_id || id);
+    autoInviteTarget.value = null;
+    store.toast("服务端邀请 Job 已创建", `${name} · 固定 1000 个补号邮箱`, "success");
+    if (result.job_id) await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("服务端邀请 Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    preparingAutoInviteId.value = "";
+  }
+}
+
+async function hostAutoReplenishment() {
+  const id = String(hostingTarget.value?.id || "");
+  if (!id) return;
+  updatingHostingSpaceId.value = id;
+  try {
+    const result = await resourcesApi.hostSpaceAutoReplenishment(id);
+    const name = String(hostingTarget.value?.name || hostingTarget.value?.external_space_id || id);
+    hostingTarget.value = null;
+    store.toast("空间已托管", `${name} · ${String(result.external_space_id || "")}`, "success");
+    await pageRef.value?.load();
+  } catch (err) {
+    store.toast("手动托管失败", String((err as Error).message ?? err), "error");
+  } finally {
+    updatingHostingSpaceId.value = "";
+  }
+}
+
+async function cancelAutoReplenishmentHosting() {
+  const id = String(unhostingTarget.value?.id || "");
+  if (!id) return;
+  updatingHostingSpaceId.value = id;
+  try {
+    await resourcesApi.cancelSpaceAutoReplenishmentHosting(id);
+    const name = String(unhostingTarget.value?.name || unhostingTarget.value?.external_space_id || id);
+    unhostingTarget.value = null;
+    store.toast("空间已取消托管", name, "success");
+    await pageRef.value?.load();
+  } catch (err) {
+    store.toast("取消托管失败", String((err as Error).message ?? err), "error");
+  } finally {
+    updatingHostingSpaceId.value = "";
+  }
+}
+
+async function loadPaymentInventorySummary() {
+  try {
+    paymentInventorySummary.value = await resourcesApi.paymentMethodPoolSummary();
+  } catch (err) {
+    store.toast("支付资料库存读取失败", String((err as Error).message ?? err), "error");
+  }
+}
+
+async function openPaymentPoolImport() {
+  showPaymentPoolPanel.value = true;
+  await loadPaymentInventorySummary();
+}
+
+async function importPaymentMethodPools() {
+  const names = paymentNamesText.value
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const addresses = splitPaymentImportLines(paymentAddressesText.value);
+  const cards = splitPaymentImportLines(paymentCardsText.value);
+  if (!names.length && !addresses.length && !cards.length) {
+    store.toast("缺少支付资料", "请至少填写姓名、地址或卡片中的一项。", "warning");
+    return;
+  }
+  importingPaymentInventory.value = true;
+  try {
+    const result = await resourcesApi.importPaymentMethodPools({ names, addresses, cards });
+    paymentInventorySummary.value = (result.summary as Row) || {};
+    paymentNamesText.value = "";
+    paymentAddressesText.value = "";
+    paymentCardsText.value = "";
+    store.toast(
+      "支付资料已导入",
+      `新增=${result.inserted_count ?? 0} 已存在=${result.existing_count ?? 0}`,
+      "success",
+    );
+  } catch (err) {
+    store.toast("支付资料导入失败", String((err as Error).message ?? err), "error");
+  } finally {
+    importingPaymentInventory.value = false;
+  }
+}
+
+async function bindPersonalPaymentMethod() {
+  const id = String(paymentBindTarget.value?.id || "");
+  if (!id) return;
+  bindingPaymentSpaceId.value = id;
+  try {
+    const name = String(paymentBindTarget.value?.name || paymentBindTarget.value?.external_space_id || id);
+    const result = await resourcesApi.bindPersonalPaymentMethod(id, {
+      created_by: "ops:personal-payment-method-bind",
+    });
+    paymentBindTarget.value = null;
+    store.toast("绑卡 Job 已创建", name, "success");
+    await pageRef.value?.load();
+    if (result.job_id) {
+      await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+    }
+  } catch (err) {
+    store.toast("绑卡 Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    bindingPaymentSpaceId.value = "";
+  }
+}
+
+function updateSelection(rows: Row[]) {
+  selectedSpaces.value = rows;
+}
+
+async function openSelectedPaymentMethodBind() {
+  if (!selectedSpaceIds.value.length) {
+    store.toast("未选择账号", "请先选择需要绑定支付方式的个人空间。", "warning");
+    return;
+  }
+  selectedPaymentBindOpen.value = true;
+  await loadPaymentInventorySummary();
+}
+
+async function bindSelectedPersonalPaymentMethods() {
+  const spaceIds = selectedSpaceIds.value;
+  if (!spaceIds.length) return;
+  bindingSelectedPaymentSpaces.value = true;
+  try {
+    const result = await resourcesApi.bindSelectedPersonalPaymentMethods({
+      space_ids: spaceIds,
+      created_by: "ops:personal-payment-method-bind-selected",
+    });
+    if (!result.job_id) {
+      const firstReason = result.selection_skipped[0]?.reason || "没有符合条件的个人空间";
+      store.toast(
+        "未创建绑卡 Job",
+        `选中=${result.requested_count} 跳过=${result.selection_skipped_count} · ${firstReason}`,
+        "warning",
+      );
+      return;
+    }
+    selectedPaymentBindOpen.value = false;
+    store.toast(
+      "批量绑卡 Job 已创建",
+      `选中=${result.requested_count} 排队=${result.selected_count} 跳过=${result.selection_skipped_count}`,
+      result.selection_skipped_count ? "warning" : "success",
+    );
+    pageRef.value?.clearSelection();
+    await pageRef.value?.load();
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("批量绑卡 Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    bindingSelectedPaymentSpaces.value = false;
+  }
+}
+
+onMounted(() => {
+  void loadAdminSessions();
+  void loadReplenishEmailSummary();
+  void loadPaymentInventorySummary();
+});
 </script>
 
 <template>
@@ -311,9 +591,15 @@ onMounted(loadAdminSessions);
     :loader="resourcesApi.spaces"
     :filters="filters"
     empty-text="暂无空间。"
+    @selection-change="updateSelection"
   >
     <template #actions>
       <button class="btn primary" @click="showCredentialPanel = true"><KeyRound :size="16" />创建 Business AT</button>
+      <button class="btn" :disabled="!selectedSpaceIds.length || bindingSelectedPaymentSpaces" @click="openSelectedPaymentMethodBind">
+        <CreditCard :size="16" />绑定选中账号（{{ selectedSpaceIds.length }}）
+      </button>
+      <button class="btn" @click="openPaymentPoolImport"><CreditCard :size="16" />支付资料池</button>
+      <button class="btn" @click="openReplenishEmailImport"><Upload :size="16" />导入补号邮箱</button>
       <button class="btn" @click="showImportPanel = true"><Plus :size="16" />导入空间管理员</button>
     </template>
     <template #before>
@@ -347,6 +633,56 @@ onMounted(loadAdminSessions);
     </template>
     <template #rowActions="{ row }">
       <div class="row-actions">
+        <button
+          v-if="String(row.space_type || '') === 'personal' && !Boolean(row.has_payment_method)"
+          class="btn primary small"
+          :disabled="String(row.space_status || '') !== 'active' || Boolean(row.payment_method_cooldown_active) || bindingPaymentSpaceId === String(row.id || '')"
+          title="为个人空间创建绑卡 Job"
+          @click.stop="paymentBindTarget = row"
+        >
+          <CreditCard :size="14" />绑定支付方式
+        </button>
+        <label
+          v-if="String(row.space_type || '') === 'business'"
+          class="auto-replenish-toggle"
+          title="开启或关闭该空间的自动补号"
+          @click.stop
+        >
+          <input
+            type="checkbox"
+            :checked="Boolean(row.auto_replenish_enabled)"
+            :disabled="updatingAutoReplenishId === String(row.id || '')"
+            @change="updateAutoReplenish(row, $event)"
+          />
+          <span>自动补号</span>
+        </label>
+        <button
+          v-if="String(row.space_type || '') === 'business'"
+          class="btn primary small"
+          :disabled="String(row.space_status || '') !== 'active' || preparingAutoInviteId === String(row.id || '')"
+          title="提交 1000 个邮箱到邀请服务器，并启用该空间的服务端自动补号"
+          @click.stop="autoInviteTarget = row"
+        >
+          <UserPlus :size="14" />服务端邀请
+        </button>
+        <button
+          v-if="String(row.space_type || '') === 'business'"
+          class="btn small"
+          :disabled="String(row.space_status || '') !== 'active' || updatingHostingSpaceId === String(row.id || '')"
+          title="将管理员登录态、静态住宅代理和空间配置注册到服务端"
+          @click.stop="hostingTarget = row"
+        >
+          <Server :size="14" />{{ row.auto_replenish_enabled ? '更新托管' : '手动托管' }}
+        </button>
+        <button
+          v-if="String(row.space_type || '') === 'business' && Boolean(row.auto_replenish_enabled)"
+          class="btn danger small"
+          :disabled="updatingHostingSpaceId === String(row.id || '')"
+          title="从服务端删除该空间的自动补号配置"
+          @click.stop="unhostingTarget = row"
+        >
+          <ServerOff :size="14" />取消托管
+        </button>
         <button
           v-if="String(row.space_type || '') === 'business'"
           class="btn small"
@@ -398,9 +734,80 @@ onMounted(loadAdminSessions);
     <label class="field"><span>accounts/check 请求头（可选）</span><textarea v-model="accountsCheckHeadersText" class="textarea large-textarea" /></label>
   </FormDrawer>
 
+  <FormDrawer :open="showReplenishEmailPanel" title="导入补号邮箱" submit-text="导入邮箱" :busy="importingReplenishEmails" width="wide" @close="showReplenishEmailPanel = false" @submit="importReplenishEmails">
+    <div class="inventory-summary">
+      <span>总库存 <strong>{{ replenishEmailSummary.total ?? 0 }}</strong></span>
+      <span>当前可用 <strong>{{ replenishEmailSummary.available_count ?? 0 }}</strong></span>
+    </div>
+    <label class="field"><span>邮箱列表</span><textarea v-model="replenishEmailsText" class="textarea large-textarea" required placeholder="每行一个邮箱" /></label>
+  </FormDrawer>
+
+  <FormDrawer :open="showPaymentPoolPanel" title="支付资料池" description="填哪类就导入哪类，未填写的类型直接跳过。" submit-text="导入资料" :busy="importingPaymentInventory" width="wide" @close="showPaymentPoolPanel = false" @submit="importPaymentMethodPools">
+    <div class="inventory-summary payment-inventory-summary">
+      <span>姓名 <strong>{{ paymentInventorySummary.active_name_count ?? 0 }}</strong></span>
+      <span>地址 <strong>{{ paymentInventorySummary.active_address_count ?? 0 }}</strong></span>
+      <span>可用卡 <strong>{{ paymentInventorySummary.available_card_count ?? 0 }}</strong></span>
+      <span>待绑定空间 <strong>{{ paymentInventorySummary.pending_personal_space_count ?? 0 }}</strong></span>
+    </div>
+    <label class="field"><span>姓名</span><textarea v-model="paymentNamesText" class="textarea compact-textarea" placeholder="Ada Lovelace" /></label>
+    <label class="field"><span>地址列表</span><textarea v-model="paymentAddressesText" class="textarea large-textarea" placeholder="310 Jefferson Street, Middletown, Delaware 19709, United States" /></label>
+    <label class="field"><span>卡片列表</span><textarea v-model="paymentCardsText" class="textarea large-textarea" placeholder="Live | CARD_NUMBER|01|2030|CVC | [BIN: ...] | Charge OK." /></label>
+  </FormDrawer>
+
   <ConfirmModal :open="Boolean(deleteAdminTarget)" title="删除空间管理员及关联空间" message="会删除该管理员、本地空间、空间成员和空间凭证；保留任务与推送记录，不调用远端删除。" :summary="{ '管理员邮箱': deleteAdminTarget?.admin_email, 'Session ID': deleteAdminTarget?.id }" confirm-text="确认删除" danger :busy="Boolean(deletingAdminSessionId)" @close="deleteAdminTarget = null" @confirm="deleteAdminSession" />
   <ConfirmModal :open="Boolean(syncTarget)" title="同步远端成员" message="读取远端 users 和 invites 后覆盖本地成员关系；本地存在但远端不存在的该空间成员关系会被物理删除，不会发送邀请。" :summary="{ '空间': syncTarget?.name, '外部空间 ID': syncTarget?.external_space_id }" confirm-text="开始同步" :busy="Boolean(syncingSpaceId)" @close="syncTarget = null" @confirm="syncRemoteMemberships" />
   <ConfirmModal :open="Boolean(seatExpansionTarget)" title="扩到 999 席位" message="使用该空间管理员登录态和静态住宅代理，分阶段提交席位更新并读取远端结果确认。" :summary="{ '空间': seatExpansionTarget?.name, '外部空间 ID': seatExpansionTarget?.external_space_id, '当前席位': seatExpansionTarget?.seats_entitled }" confirm-text="创建扩席位 Job" :busy="Boolean(expandingSpaceId)" @close="seatExpansionTarget = null" @confirm="expandSeats" />
+  <ConfirmModal
+    :open="Boolean(paymentBindTarget)"
+    title="绑定个人空间支付方式"
+    message="使用该账号绑定的静态代理登录个人空间，并依次尝试最多三张未使用卡片。"
+    :summary="{ '空间': paymentBindTarget?.name, '外部空间 ID': paymentBindTarget?.external_space_id, '已尝试': paymentBindTarget?.payment_method_attempt_count, '冷却至': paymentBindTarget?.payment_method_cooldown_until || '无', '可用卡': paymentInventorySummary.available_card_count ?? 0 }"
+    confirm-text="创建绑卡 Job"
+    :busy="Boolean(bindingPaymentSpaceId)"
+    @close="paymentBindTarget = null"
+    @confirm="bindPersonalPaymentMethod"
+  />
+  <ConfirmModal
+    :open="selectedPaymentBindOpen"
+    title="批量绑定个人空间支付方式"
+    message="为选中的有效个人空间创建绑卡 Work；已绑定、冷却中、非个人空间、无效账号和已有活动绑卡任务的项目会跳过。每个空间仍按现有规则最多尝试三张卡。"
+    :summary="{ '选中空间': selectedSpaceIds.length, '个人空间': selectedPersonalSpaceCount, '未绑定且可尝试': selectedUnboundPersonalSpaceCount, '可用卡': paymentInventorySummary.available_card_count ?? 0 }"
+    confirm-text="创建批量绑卡 Job"
+    :busy="bindingSelectedPaymentSpaces"
+    @close="selectedPaymentBindOpen = false"
+    @confirm="bindSelectedPersonalPaymentMethods"
+  />
+  <ConfirmModal
+    :open="Boolean(autoInviteTarget)"
+    title="服务端邀请"
+    message="只从本地补号邮箱选择 1000 个并提交到邀请服务器，同时开启该 Space 的服务端自动补号；库存不足时不会从账号表补齐。"
+    :summary="{ '空间': autoInviteTarget?.name, '外部空间 ID': autoInviteTarget?.external_space_id, '自动补号': autoInviteTarget?.auto_replenish_enabled ? '已开启' : '确认后开启', '本地邮箱可用': replenishEmailSummary.available_count ?? 0 }"
+    confirm-text="创建服务端邀请 Job"
+    :busy="Boolean(preparingAutoInviteId)"
+    @close="autoInviteTarget = null"
+    @confirm="prepareAutoReplenishInvites"
+  />
+  <ConfirmModal
+    :open="Boolean(hostingTarget)"
+    title="手动托管空间"
+    message="把该空间的管理员登录态、绑定的静态住宅代理和补号配置注册到服务端；不会发送邀请。"
+    :summary="{ '空间': hostingTarget?.name, '外部空间 ID': hostingTarget?.external_space_id, '席位上限': hostingTarget?.seat_limit, '托管状态': hostingTarget?.auto_replenish_enabled ? '更新现有配置' : '新增托管' }"
+    confirm-text="确认托管"
+    :busy="Boolean(updatingHostingSpaceId)"
+    @close="hostingTarget = null"
+    @confirm="hostAutoReplenishment"
+  />
+  <ConfirmModal
+    :open="Boolean(unhostingTarget)"
+    title="取消空间托管"
+    message="从服务端删除该空间的自动补号配置；不会删除本地空间、成员、凭证和历史记录。"
+    :summary="{ '空间': unhostingTarget?.name, '外部空间 ID': unhostingTarget?.external_space_id }"
+    confirm-text="确认取消托管"
+    danger
+    :busy="Boolean(updatingHostingSpaceId)"
+    @close="unhostingTarget = null"
+    @confirm="cancelAutoReplenishmentHosting"
+  />
   <ConfirmModal
     :open="Boolean(statusTarget)"
     :title="String(statusTarget?.space_status || '') === 'disabled' ? '启用空间' : '禁用空间'"
@@ -450,9 +857,34 @@ onMounted(loadAdminSessions);
 details { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; }summary { color: var(--text-muted); cursor: pointer; font-size: 12px; font-weight: 700; }
 
 .row-actions {
+  align-items: center;
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
 }
+
+.auto-replenish-toggle {
+  align-items: center;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 12px;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.auto-replenish-toggle input { accent-color: var(--accent); }
+
+.inventory-summary {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  padding-bottom: 12px;
+}
+
+.inventory-summary span { color: var(--text-muted); font-size: 12px; }
+.inventory-summary strong { color: var(--text); font-size: 16px; margin-left: 5px; }
 
 .small {
   padding: 8px 10px;

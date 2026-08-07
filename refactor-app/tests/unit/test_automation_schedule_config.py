@@ -41,7 +41,7 @@ def test_manual_override_is_merged_without_mutating_saved_config(
 ) -> None:
     schedule = _schedule(
         "automation.space_authorize",
-        {"work_count": 1, "credential_name_prefix": "codex"},
+        {"space_id": "space-business-1", "work_count": 1, "credential_name_prefix": "codex"},
     )
     original_next_run_at = schedule.next_run_at
     captured: dict[str, Any] = {}
@@ -50,21 +50,30 @@ def test_manual_override_is_merged_without_mutating_saved_config(
         captured.update(kwargs)
         return {"job_id": "job-1", "job_status": "queued"}
 
-    monkeypatch.setattr(resources, "_create_pending_business_access_token_work_job", fake_create)
+    monkeypatch.setattr(resources, "_create_space_authorization_work_job", fake_create)
 
     result = resources._execute_space_automation_schedule(
         session=cast(Session, object()),
         schedule=schedule,
-        config_json={"work_count": 2, "credential_name_prefix": "manual"},
+        config_json={
+            "space_id": "space-business-2",
+            "work_count": 2,
+            "credential_name_prefix": "manual",
+        },
         advance_next_run=False,
         created_by="ops:test",
     )
 
     assert result == {"job_id": "job-1", "job_status": "queued"}
     assert captured["work_count"] == 2
+    assert captured["space_id"] == "space-business-2"
     assert captured["credential_name_prefix"] == "manual"
     assert captured["created_by"] == "ops:test"
-    assert schedule.config_json == {"work_count": 1, "credential_name_prefix": "codex"}
+    assert schedule.config_json == {
+        "space_id": "space-business-1",
+        "work_count": 1,
+        "credential_name_prefix": "codex",
+    }
     assert schedule.next_run_at == original_next_run_at
 
 
@@ -111,6 +120,84 @@ def test_space_seat_expand_config_has_fixed_business_parameters() -> None:
     assert resources.TARGET_SEATS == 999
     assert resources.MAX_NO_PROGRESS_COUNT == 10
     assert resources.MAX_HTTP_FAILURE_COUNT == 10
+
+
+def test_space_auto_replenish_schedule_defaults_and_job_mapping() -> None:
+    config = resources._effective_space_schedule_config(
+        schedule_type="automation.space_auto_replenish",
+        saved_config={},
+    )
+
+    assert config == {"space_id": "", "work_count": 20}
+    assert (
+        resources._fixed_automation_schedule_id("automation.space_auto_replenish")
+        == "automation-schedule-space-auto-replenish"
+    )
+    assert (
+        resources._job_type_for_schedule_type("automation.space_auto_replenish")
+        == "space.auto_replenish.tick"
+    )
+
+
+def test_personal_payment_method_schedule_defaults_and_job_mapping() -> None:
+    config = resources._effective_space_schedule_config(
+        schedule_type="automation.personal_payment_method_bind",
+        saved_config={},
+    )
+
+    assert config == {"space_id": "", "limit": 10, "work_count": 1}
+    assert resources._fixed_automation_schedule_id(
+        "automation.personal_payment_method_bind"
+    ) == "automation-schedule-personal-payment-method-bind"
+    assert resources._job_type_for_schedule_type(
+        "automation.personal_payment_method_bind"
+    ) == "space.personal_payment_method_bind.tick"
+
+
+def test_personal_payment_method_schedule_rejects_excess_browser_concurrency() -> None:
+    with pytest.raises(HTTPException) as error:
+        resources._effective_space_schedule_config(
+            schedule_type="automation.personal_payment_method_bind",
+            saved_config={"work_count": 11},
+        )
+
+    assert error.value.status_code == 400
+
+
+def test_space_auto_replenish_schedule_enqueues_one_tick_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = _schedule(
+        "automation.space_auto_replenish",
+        {"space_id": "", "work_count": 20},
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeJobQueue:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def enqueue(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(id="auto-replenish-job-1", job_status="queued")
+
+    monkeypatch.setattr(resources, "JobQueue", FakeJobQueue)
+    monkeypatch.setattr(resources, "_active_work_job_for_type", lambda **_kwargs: None)
+
+    result = resources._execute_space_automation_schedule(
+        session=cast(Session, object()),
+        schedule=schedule,
+        config_json={"space_id": "space-1", "work_count": 8},
+        advance_next_run=False,
+        created_by="ops:test",
+    )
+
+    assert result == {"job_id": "auto-replenish-job-1", "job_status": "queued"}
+    assert captured == {
+        "job_type": "space.auto_replenish.tick",
+        "input_json": {"space_id": "space-1", "work_count": 8},
+        "created_by": "ops:test",
+    }
 
 
 def test_dynamic_invite_schedule_is_one_batch_for_one_space() -> None:
