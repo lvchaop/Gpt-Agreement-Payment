@@ -672,7 +672,7 @@ def test_phone_email_binding_timeout_rotates_up_to_ten_mailboxes(monkeypatch) ->
 
 
 def test_registration_success_persists_claimed_email_case() -> None:
-    account = SimpleNamespace()
+    account = SimpleNamespace(access_token="validated-personal-access-token")
 
     class FakeSession:
         def __enter__(self):
@@ -702,6 +702,7 @@ def test_registration_success_persists_claimed_email_case() -> None:
     )
 
     assert account.email == "DawnMontgomery148200@outlook.com"
+    assert account.access_token == "validated-personal-access-token"
 
 
 def test_registration_does_not_persist_password_when_security_setup_failed() -> None:
@@ -1089,9 +1090,9 @@ def test_icloud_registration_runs_codex_after_mfa_with_same_proxy(monkeypatch) -
         "run_id": "run-icloud-codex",
         "proxy_url_override": current_proxy,
     }
+    assert order.index("personal_space_detected") < order.index("security_configured")
     assert order.index("security_configured") < order.index("account_persisted")
-    assert order.index("account_persisted") < order.index("personal_space_detected")
-    assert order.index("personal_space_detected") < order.index("codex_authorized")
+    assert order.index("account_persisted") < order.index("codex_authorized")
     assert output["codex_authorization"] == {
         "status": "succeeded",
         "authorization_scope": "personal",
@@ -1239,8 +1240,8 @@ def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypa
     assert "write_success:JosephStevenson892165@outlook.com" in order
     assert "claim_complete" in order
     assert "detect_account_spaces" in order
-    assert order.index("write_success:JosephStevenson892165@outlook.com") < order.index(
-        "detect_account_spaces"
+    assert order.index("detect_account_spaces") < order.index(
+        "write_success:JosephStevenson892165@outlook.com"
     )
     assert result["account_detection"]["personal_chatgpt_account_id"] == "personal-1"
     assert "delete_account" not in order
@@ -1802,7 +1803,28 @@ def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> No
     }
 
 
-def test_icloud_promotion_check_uses_email_hashed_tr_proxy(monkeypatch) -> None:
+def test_icloud_promotion_check_is_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENABLED", raising=False)
+    calls: list[str] = []
+    workflow = ProtocolRegistrationWorkflow(session_factory=lambda: None, mail_provider=object())
+
+    result = workflow._run_post_registration_promotion_check(
+        ProtocolRegistrationInput(
+            mode="email_protocol_no_phone",
+            mail_provider="icloud_hide_my_email",
+        ),
+        user_account_id="account-1",
+        email="disabled@icloud.com",
+        run_id="",
+        emit=lambda stage, *_args, **_kwargs: calls.append(stage),
+    )
+
+    assert result is None
+    assert calls == ["promotion_check.skipped"]
+
+
+def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
+    monkeypatch.setenv("ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENABLED", "1")
     calls: list[tuple[str, str]] = []
 
     class Detector:
@@ -1816,13 +1838,13 @@ def test_icloud_promotion_check_uses_email_hashed_tr_proxy(monkeypatch) -> None:
                 "status": "succeeded",
                 "has_promotion": True,
                 "promotion_id": "plus-1-month-free",
-                "proxy_country": "TR",
+                "proxy_country": "JP",
             }
 
     def resolve_proxy(_session_factory, *, email: str, country_code: str):
         calls.append((email, country_code))
         return RegistrationBackboneProxy(
-            proxy_url="http://tr-proxy.example:8080",
+            proxy_url="http://jp-proxy.example:8080",
             endpoint_id="backbone-77",
             endpoint_number=77,
             endpoint_count=20_000,
@@ -1845,14 +1867,14 @@ def test_icloud_promotion_check_uses_email_hashed_tr_proxy(monkeypatch) -> None:
     )
 
     assert calls == [
-        ("MixedCase@icloud.com", "TR"),
-        ("probe", "http://tr-proxy.example:8080"),
+        ("MixedCase@icloud.com", "JP"),
+        ("probe", "http://jp-proxy.example:8080"),
     ]
     assert result == {
         "status": "succeeded",
         "has_promotion": True,
         "promotion_id": "plus-1-month-free",
-        "proxy_country": "TR",
+        "proxy_country": "JP",
         "proxy_endpoint_id": "backbone-77",
     }
 
@@ -1868,6 +1890,7 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
             return "registration-only@example.test"
 
         def wait_for_otp(self, *_args, **_kwargs) -> str:
+            calls.append("wait_for_otp")
             return "123456"
 
     class RegistrationOnlyAuthFlow(AuthFlow):
@@ -1875,30 +1898,37 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
             return True
 
         def get_csrf_token(self) -> str:
+            calls.append("providers_then_csrf")
             return "csrf"
 
         def get_auth_url(self, _csrf_token: str, **kwargs) -> str:
+            calls.append("signin_openai")
             auth_url_kwargs.append(kwargs)
             return "https://auth.example.test/authorize"
 
         def auth_oauth_init(self, _auth_url: str) -> str:
+            calls.extend(("authorize_302", "email_verification_200"))
+            self._last_auth_oauth_init_url = "https://auth.openai.com/email-verification"
             return "device-id"
 
         def get_sentinel_token(self, _device_id: str) -> str:
-            return "sentinel"
+            raise AssertionError("HAR registration must not prefetch authorize_continue sentinel")
 
         def signup(self, _email: str, _sentinel: str) -> bool:
-            return True
+            raise AssertionError("HAR registration must not call authorize/continue")
 
         def register_password(self, _email: str) -> bool:
+            calls.append("register_password")
             self.result.password = "confirmed-registration-password"
             self.result.password_configured = True
             return True
 
         def send_otp(self) -> None:
+            calls.extend(("send_otp_302", "email_verification_after_send_200"))
             return None
 
         def verify_otp(self, _code: str) -> dict:
+            calls.append("validate_otp")
             return {}
 
         def fetch_client_auth_session_dump(self, stage: str = "") -> dict:
@@ -1906,6 +1936,7 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
             return {}
 
         def create_account(self) -> str:
+            calls.append("create_account")
             return "https://chatgpt.com/api/auth/callback/openai?code=chatgpt-code"
 
         def follow_redirect_chain(self, _continue_url: str):
@@ -1934,9 +1965,25 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
     result = flow.run_register(FakeMailProvider())
 
     assert result.is_valid()
-    assert auth_url_kwargs == [{}]
+    assert auth_url_kwargs == [
+        {
+            "prompt": "login",
+            "screen_hint": "login_or_signup",
+            "login_hint": "registration-only@example.test",
+            "include_passkey_capabilities": False,
+        }
+    ]
     assert calls == [
-        "dump:post_verify_otp_new",
+        "providers_then_csrf",
+        "signin_openai",
+        "authorize_302",
+        "email_verification_200",
+        "register_password",
+        "send_otp_302",
+        "email_verification_after_send_200",
+        "wait_for_otp",
+        "validate_otp",
+        "create_account",
         "chatgpt_callback",
         "chatgpt_session",
     ]
@@ -1998,14 +2045,14 @@ def test_auth_flow_legacy_password_registration_does_not_fallback_when_password_
             return "https://auth.example.test/authorize"
 
         def auth_oauth_init(self, _auth_url: str) -> str:
+            self._last_auth_oauth_init_url = "https://auth.openai.com/email-verification"
             return "device-id"
 
         def get_sentinel_token(self, _device_id: str) -> str:
             return "sentinel"
 
         def signup(self, _email: str, _sentinel: str) -> bool:
-            self._existing_email_verification_mode = ""
-            return True
+            raise AssertionError("HAR registration must not call authorize/continue")
 
         def register_password(self, _email: str) -> bool:
             self._last_register_password_error = "invalid_auth_step"
@@ -2021,7 +2068,7 @@ def test_auth_flow_legacy_password_registration_does_not_fallback_when_password_
 
     flow = PasswordFailureAuthFlow(Config())
 
-    with pytest.raises(RuntimeError, match="禁止降级到 OTP-only"):
+    with pytest.raises(RuntimeError, match="注册密码失败"):
         flow.run_register(FakeMailProvider())
 
     assert calls == []
@@ -2051,15 +2098,14 @@ def test_auth_flow_passwordless_signup_still_requires_password_before_otp() -> N
             return "https://auth.example.test/authorize"
 
         def auth_oauth_init(self, _auth_url: str) -> str:
+            self._last_auth_oauth_init_url = "https://auth.openai.com/email-verification"
             return "device-id"
 
         def get_sentinel_token(self, _device_id: str) -> str:
             return "sentinel"
 
         def signup(self, _email: str, _sentinel: str) -> bool:
-            self._existing_email_verification_mode = "passwordless_signup"
-            self._existing_page_type = "email_otp_verification"
-            return True
+            raise AssertionError("HAR registration must not call authorize/continue")
 
         def register_email_password_with_retry(self, _email: str) -> bool:
             calls.append("register_password")
@@ -2072,10 +2118,6 @@ def test_auth_flow_passwordless_signup_still_requires_password_before_otp() -> N
 
         def verify_otp(self, _code: str) -> dict:
             calls.append("verify_otp")
-            return {}
-
-        def fetch_client_auth_session_dump(self, stage: str = "") -> dict:
-            calls.append(f"dump:{stage}")
             return {}
 
         def create_account(self) -> str:
@@ -2106,7 +2148,6 @@ def test_auth_flow_passwordless_signup_still_requires_password_before_otp() -> N
         "send_otp",
         "wait_for_otp",
         "verify_otp",
-        "dump:post_verify_otp_new",
         "create_account",
         "chatgpt_callback",
         "chatgpt_session",
@@ -2278,12 +2319,29 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
     assert "prompt" not in neutral_query
     assert "screen_hint" not in neutral_query
 
+    flow.get_auth_url(
+        "csrf-token",
+        prompt="login",
+        screen_hint="login_or_signup",
+        login_hint="registration-only@example.test",
+        include_passkey_capabilities=False,
+    )
+
+    registration_query = parse_qs(urlparse(requested_urls[2]).query)
+    assert registration_query["prompt"] == ["login"]
+    assert registration_query["screen_hint"] == ["login_or_signup"]
+    assert registration_query["login_hint"] == ["registration-only@example.test"]
+    assert registration_query["ext-oai-did"] == [flow.result.device_id]
+    assert "ext-passkey-client-capabilities" not in registration_query
+
 
 def test_auth_oauth_init_preserves_signin_device_identity() -> None:
     class Response:
-        status_code = 200
-        text = '<html>oai-did="server-device-id"</html>'
-        url = "https://auth.openai.com/log-in"
+        def __init__(self, *, status_code: int, url: str, location: str = "") -> None:
+            self.status_code = status_code
+            self.text = '<html>oai-did="server-device-id"</html>'
+            self.url = url
+            self.headers = {"Location": location} if location else {}
 
     class Cookies:
         def __init__(self) -> None:
@@ -2299,9 +2357,15 @@ def test_auth_oauth_init_preserves_signin_device_identity() -> None:
     class Session:
         def __init__(self) -> None:
             self.cookies = Cookies()
+            self.calls: list[dict] = []
 
-        def get(self, *_args, **_kwargs):
-            return Response()
+        def get(self, url: str, **kwargs):
+            self.calls.append({"url": url, **kwargs})
+            return Response(
+                status_code=302,
+                url=url,
+                location="https://auth.openai.com/email-verification",
+            )
 
     flow = AuthFlow.__new__(AuthFlow)
     flow.result = AuthResult()
@@ -2313,18 +2377,121 @@ def test_auth_oauth_init_preserves_signin_device_identity() -> None:
     flow._last_auth_session_logging_id = ""
     flow._trace_http = lambda *_args, **_kwargs: None
     flow._is_cloudflare_challenge_response = lambda _response: False
-    flow._start_auth_web_runtime = lambda **_kwargs: SimpleNamespace(
+    runtime = SimpleNamespace(
         runtime_info={"deviceId": "bootstrap-device-id"},
         auth_session_logging_id="session-id",
         is_ready=True,
     )
+    def load_document(*_args, **_kwargs):
+        flow._auth_web_runtime = runtime
+        return Response(
+            status_code=200,
+            url="https://auth.openai.com/email-verification",
+        )
+
+    flow._load_auth_web_document = load_document
 
     device_id = flow.auth_oauth_init("https://auth.openai.com/authorize")
 
     assert device_id == "signin-device-id"
     assert flow.result.device_id == "signin-device-id"
+    assert flow.session.calls[0]["allow_redirects"] is False
     assert ("oai-did", "signin-device-id", ".chatgpt.com", "/") in flow.session.cookies.set_calls
     assert ("oai-did", "signin-device-id", ".openai.com", "/") in flow.session.cookies.set_calls
+
+
+def test_send_otp_matches_har_document_redirect_sequence() -> None:
+    requests: list[dict] = []
+    traces: list[str] = []
+    documents: list[dict] = []
+
+    class Response:
+        status_code = 302
+        text = ""
+        headers = {"Location": "https://auth.openai.com/email-verification"}
+
+    flow = AuthFlow.__new__(AuthFlow)
+    flow.result = AuthResult()
+    flow.result.email = "registration@example.test"
+    flow._last_otp_sent_at = 0.0
+    flow._common_headers = lambda *_args, **_kwargs: {
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "User-Agent": BROWSER_USER_AGENT,
+    }
+
+    def request(method: str, url: str, **kwargs):
+        requests.append({"method": method, "url": url, **kwargs})
+        return Response()
+
+    flow._session_request = request
+    flow._trace_http = lambda step, *_args, **_kwargs: traces.append(step)
+    flow._load_auth_web_document = lambda page_url, **kwargs: documents.append(
+        {"page_url": page_url, **kwargs}
+    )
+
+    flow.send_otp()
+
+    assert len(requests) == 1
+    request_record = requests[0]
+    assert request_record["method"] == "GET"
+    assert request_record["url"].endswith("/api/accounts/email-otp/send")
+    assert request_record["allow_redirects"] is False
+    assert request_record["headers"]["Sec-Fetch-Dest"] == "document"
+    assert request_record["headers"]["Sec-Fetch-Mode"] == "navigate"
+    assert request_record["headers"]["Sec-Fetch-Site"] == "same-origin"
+    assert "Sec-Fetch-User" not in request_record["headers"]
+    assert request_record["headers"]["sec-ch-ua"] == BROWSER_SEC_CH_UA
+    assert traces == ["send_email_otp"]
+    assert documents == [
+        {
+            "page_url": "https://auth.openai.com/email-verification",
+            "referer": "https://auth.openai.com/create-account/password",
+            "trace_step": "email_verification_after_otp_send",
+            "include_user_activation": False,
+        }
+    ]
+    assert flow._last_otp_sent_at > 0
+
+
+def test_http_trace_reports_fingerprint_and_cookie_names_without_values() -> None:
+    records: list[dict] = []
+    flow = AuthFlow.__new__(AuthFlow)
+    flow.result = AuthResult()
+    flow.result.email = "registration@example.test"
+    flow.session = SimpleNamespace(cookies=[SimpleNamespace(name="oai-did", value="device")])
+    flow._trace_callback = records.append
+    flow._http_trace_enabled = False
+    flow._trace_dump_enabled = False
+    flow._trace_include_cookie = False
+
+    request = SimpleNamespace(
+        method="GET",
+        url="https://auth.openai.com/email-verification",
+        body=None,
+        headers={
+            "User-Agent": BROWSER_USER_AGENT,
+            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "Cookie": "oai-did=device-secret; auth-session=session-secret",
+        },
+    )
+    response = SimpleNamespace(
+        request=request,
+        status_code=200,
+        url=request.url,
+        headers={},
+        text="ok",
+    )
+
+    flow._trace_http("auth_email_verification_page", response)
+
+    assert records[0]["user_agent"] == BROWSER_USER_AGENT
+    assert records[0]["sec_ch_ua"] == BROWSER_SEC_CH_UA
+    assert records[0]["sec_ch_ua_platform"] == BROWSER_SEC_CH_UA_PLATFORM
+    assert records[0]["request_cookie_names"] == ["auth-session", "oai-did"]
+    assert records[0]["session_cookie_names"] == ["oai-did"]
+    assert "device-secret" not in str(records[0])
+    assert "session-secret" not in str(records[0])
 
 
 def test_registration_headers_match_configured_browser_fingerprint() -> None:

@@ -239,3 +239,15 @@ def test_job_redaction_hides_mailbox_url_credentials() -> None:
     assert "secret-pt" not in redacted["source_mailbox_url"]
     assert "source%40example.test" in redacted["source_mailbox_url"]
     assert redacted["source_mailbox_refresh_token"] == "<redacted>"
+
+
+def test_job_redaction_exposes_cookie_names_but_not_cookie_values() -> None:
+    redacted = _redact_value(
+        {
+            "request_cookie_names": ["oai-did", "auth-session"],
+            "cookie_header": "oai-did=secret-device",
+        }
+    )
+
+    assert redacted["request_cookie_names"] == ["oai-did", "auth-session"]
+    assert redacted["cookie_header"] == "<redacted>"

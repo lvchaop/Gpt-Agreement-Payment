@@ -49,7 +49,10 @@ EMAIL_PROTOCOL_NO_PHONE = "email_protocol_no_phone"
 EMAIL_BROWSER_NO_PHONE = "email_browser_no_phone"
 PHONE_PROTOCOL_BIND_EMAIL = "phone_protocol_bind_email"
 ICLOUD_HIDE_MY_EMAIL_PROVIDER = "icloud_hide_my_email"
-ICLOUD_PROMOTION_PROXY_COUNTRY = "TR"
+ICLOUD_PROMOTION_PROXY_COUNTRY = "JP"
+ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENV = (
+    "ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENABLED"
+)
 SUPPORTED_REGISTRATION_MAIL_PROVIDERS = frozenset(
     {
         "outlook",
@@ -230,22 +233,6 @@ class ProtocolRegistrationWorkflow:
                     "email protocol registration finished without configured password"
                 )
             _hydrate_auth_result_cookie_headers(result, attempt.flow)
-            security_setup = self._run_post_registration_security(
-                input_,
-                result=result,
-                flow=attempt.flow,
-                proxy_url=attempt.proxy_url,
-                emit=emit,
-            )
-            self._write_success_account(
-                user_account_id=user_account_id,
-                result=result,
-                flow=attempt.flow,
-                account_email=claimed.email if claimed is not None else result.email,
-                security_setup=security_setup,
-            )
-            account_persisted = True
-            mail.mark_used(result.email)
             try:
                 account_detection = self._detect_account_spaces_after_registration(
                     user_account_id=user_account_id,
@@ -269,6 +256,22 @@ class ProtocolRegistrationWorkflow:
                     },
                     "WARN",
                 )
+            security_setup = self._run_post_registration_security(
+                input_,
+                result=result,
+                flow=attempt.flow,
+                proxy_url=attempt.proxy_url,
+                emit=emit,
+            )
+            self._write_success_account(
+                user_account_id=user_account_id,
+                result=result,
+                flow=attempt.flow,
+                account_email=claimed.email if claimed is not None else result.email,
+                security_setup=security_setup,
+            )
+            account_persisted = True
+            mail.mark_used(result.email)
             promotion_check = self._run_post_registration_promotion_check(
                 input_,
                 user_account_id=user_account_id,
@@ -581,8 +584,10 @@ class ProtocolRegistrationWorkflow:
                 security_setup.mfa_error_message if security_setup is not None else ""
             )
             account.security_setup_last_attempt_at = now if security_setup is not None else None
-            # The registration response token may reflect the last selected workspace.
-            account.access_token = ""
+            # Account detection stores only a validated personal-space token here.
+            # Do not replace it with the registration bootstrap token.
+            if not getattr(account, "access_token", ""):
+                account.access_token = ""
             account.session_token = result.session_token
             account.cookie_header = result.cookie_header or (
                 _cookie_header_from_session(flow, "chatgpt.com") if flow is not None else ""
@@ -759,6 +764,18 @@ class ProtocolRegistrationWorkflow:
         emit: TraceEmitter,
     ) -> dict[str, Any] | None:
         if input_.mail_provider != ICLOUD_HIDE_MY_EMAIL_PROVIDER:
+            return None
+        promotion_check_enabled = str(
+            os.getenv(ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENV, "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not promotion_check_enabled:
+            emit(
+                "promotion_check.skipped",
+                {
+                    "user_account_id": user_account_id,
+                    "reason": "post_registration_promotion_check_disabled",
+                },
+            )
             return None
         try:
             proxy = self._resolve_registration_proxy(

@@ -410,7 +410,7 @@ class BackfillSessionWorkflow:
             "account_auth.personal_promotion_check",
             {
                 "user_account_id": user_account_id,
-                "proxy_country": "TR",
+                "proxy_country": "JP",
             },
         )
         try:
@@ -469,12 +469,12 @@ class BackfillSessionWorkflow:
                 "personal_chatgpt_account_id": personal_account_id,
                 "has_promotion": has_promotion,
                 "promotion_id": promotion_id if has_promotion else "",
-                "proxy_country": "TR",
+                "proxy_country": "JP",
             }
             self._write_event(
                 run_id,
                 "account_auth.personal_promotion_checked",
-                "personal space promotion checked through TR proxy",
+                "personal space promotion checked through JP proxy",
                 {"user_account_id": user_account_id, **result},
                 step_id=step_id,
             )
@@ -487,7 +487,7 @@ class BackfillSessionWorkflow:
                 "personal space promotion check failed",
                 {
                     "user_account_id": user_account_id,
-                    "proxy_country": "TR",
+                    "proxy_country": "JP",
                     "error_type": type(exc).__name__,
                     "error_message": str(exc)[:1000],
                 },
@@ -2565,12 +2565,12 @@ def _fetch_accounts_check_v4(
         "accept-language": "zh-CN,zh;q=0.9",
         "authorization": f"Bearer {access_token}",
         "cookie": cookie_header,
-        "oai-client-build-number": "7646290",
-        "oai-client-version": "prod-497f333866796e100096ad083b51ca949d22e751",
+        "oai-client-build-number": "9052945",
+        "oai-client-version": "prod-e1d6f2820dd20c3bab36cc42e8668035bf87f7bc",
         "oai-language": "zh-CN",
         "oai-session-id": str(uuid4()),
         "priority": "u=1, i",
-        "referer": "https://chatgpt.com/admin/members?tab=invites",
+        "referer": "https://chatgpt.com/",
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",

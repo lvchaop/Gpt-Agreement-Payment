@@ -1,8 +1,8 @@
 """
 注册/登录流程 - 协议直连方式
 完整链路:
-  chatgpt_csrf -> chatgpt_signin_openai -> auth_oauth_init -> sentinel
-  -> signup -> send_otp -> verify_otp -> create_account
+  chatgpt_providers -> chatgpt_csrf -> chatgpt_signin_openai -> auth_authorize
+  -> register_password -> send_otp -> verify_otp -> create_account
   -> redirect_chain -> auth_session -> (optional) oauth_token_exchange
 """
 
@@ -315,6 +315,7 @@ class AuthFlow:
         referer: str,
         trace_step: str,
         timeout: int = 30,
+        include_user_activation: bool = True,
     ):
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -323,12 +324,16 @@ class AuthFlow:
             ),
             "Referer": referer,
             "User-Agent": self._common_headers(referer)["User-Agent"],
+            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": self._auth_web_navigation_site(page_url, referer),
-            "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
+        if include_user_activation:
+            headers["Sec-Fetch-User"] = "?1"
         response = self._session_request(
             "GET",
             page_url,
@@ -887,6 +892,24 @@ class AuthFlow:
             req_headers_lc = {(str(k).lower()): v for k, v in (req_headers or {}).items()}
             sentinel_header = str(req_headers_lc.get("openai-sentinel-token", "") or "")
             sentinel_so_header = str(req_headers_lc.get("openai-sentinel-so-token", "") or "")
+            request_cookie_header = str(req_headers_lc.get("cookie", "") or "")
+            request_cookie_names = sorted(
+                {
+                    part.split("=", 1)[0].strip()
+                    for part in request_cookie_header.split(";")
+                    if "=" in part and part.split("=", 1)[0].strip()
+                }
+            )
+            session_cookie_names: set[str] = set()
+            try:
+                for cookie in getattr(self.session, "cookies", ()):
+                    name = str(getattr(cookie, "name", "") or "").strip()
+                    if not name and isinstance(cookie, str):
+                        name = cookie.strip()
+                    if name:
+                        session_cookie_names.add(name)
+            except Exception:
+                session_cookie_names = set()
             safe_req_url = self._redact_trace_text(str(req_url))
             safe_final_url = self._redact_trace_text(final_url)
             safe_location = self._redact_trace_text(location)
@@ -912,6 +935,13 @@ class AuthFlow:
                             "body": safe_body[:500],
                             "openai_sentinel_token_len": len(sentinel_header),
                             "openai_sentinel_so_token_len": len(sentinel_so_header),
+                            "user_agent": str(req_headers_lc.get("user-agent", "") or "")[:240],
+                            "sec_ch_ua": str(req_headers_lc.get("sec-ch-ua", "") or "")[:240],
+                            "sec_ch_ua_platform": str(
+                                req_headers_lc.get("sec-ch-ua-platform", "") or ""
+                            )[:80],
+                            "request_cookie_names": request_cookie_names,
+                            "session_cookie_names": sorted(session_cookie_names),
                             "has_set_cookie": bool(set_cookie_raw),
                         }
                     )
@@ -2775,6 +2805,7 @@ class AuthFlow:
         screen_hint: str = "",
         prompt: str = "",
         default_prompt: str = "login",
+        include_passkey_capabilities: bool = True,
     ) -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
         if not self.result.device_id:
@@ -2788,7 +2819,7 @@ class AuthFlow:
             "ext-oai-did": device_id,
             "auth_session_logging_id": generated_session_logging_id,
         }
-        if screen_hint != "signup":
+        if include_passkey_capabilities and screen_hint != "signup":
             query["ext-passkey-client-capabilities"] = "11111"
         if login_hint or screen_hint or prompt:
             if prompt:
@@ -2837,14 +2868,49 @@ class AuthFlow:
         self._last_auth_oauth_init_url = ""
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": self._common_headers("https://chatgpt.com/").get(
+                "Accept-Language", "en-US,en;q=0.9"
+            ),
             "Referer": "https://chatgpt.com/",
             "User-Agent": self._common_headers()["User-Agent"],
+            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
         }
         resp = None
         for attempt in range(1, 4):
-            resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
-            self._trace_http(f"auth_oauth_init_attempt_{attempt}", resp)
-            if not self._is_cloudflare_challenge_response(resp):
+            authorize_resp = self.session.get(
+                auth_url,
+                headers=headers,
+                timeout=30,
+                allow_redirects=False,
+            )
+            self._trace_http(f"auth_authorize_attempt_{attempt}", authorize_resp)
+            if not self._is_cloudflare_challenge_response(authorize_resp):
+                status = int(getattr(authorize_resp, "status_code", 0) or 0)
+                location = str(authorize_resp.headers.get("Location", "") or "").strip()
+                if status == 200:
+                    resp = authorize_resp
+                    self._start_auth_web_runtime(
+                        html_text=str(getattr(resp, "text", "") or ""),
+                        page_url=str(getattr(resp, "url", "") or auth_url),
+                    )
+                    break
+                if status != 302 or not location:
+                    raise RuntimeError(
+                        "auth authorize did not return a document redirect: "
+                        f"HTTP {status} location={location or '<empty>'}"
+                    )
+                resp = self._load_auth_web_document(
+                    urljoin(auth_url, location),
+                    referer="https://chatgpt.com/",
+                    trace_step="auth_email_verification_page",
+                )
                 break
             if attempt < 3:
                 logger.warning(
@@ -2857,10 +2923,9 @@ class AuthFlow:
                 "auth_oauth_init 被 Cloudflare challenge 拦截，纯 HTTP 重试后仍未建立 auth session"
             )
         self._last_auth_oauth_init_url = str(getattr(resp, "url", "") or "")
-        runtime = self._start_auth_web_runtime(
-            html_text=str(getattr(resp, "text", "") or ""),
-            page_url=self._last_auth_oauth_init_url or auth_url,
-        )
+        runtime = getattr(self, "_auth_web_runtime", None)
+        if runtime is None or not runtime.is_ready:
+            raise RuntimeError("auth email-verification page did not initialize the Auth Web runtime")
 
         # 从 cookie 获取 oai-did
         observed_device_id = ""
@@ -3214,18 +3279,6 @@ class AuthFlow:
         )
         self.result.password = password
 
-        # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
-        try:
-            pw_page = self._load_auth_web_document(
-                "https://auth.openai.com/create-account/password",
-                referer="https://auth.openai.com/create-account",
-                trace_step="create_account_password_page",
-                timeout=15,
-            )
-            logger.info(f"create-account/password 页面: {pw_page.status_code}")
-        except Exception as e:
-            logger.warning(f"访问 create-account/password 页面失败: {e}")
-
         # 注册前需要刷新 sentinel token，且 flow 必须为 username_password_create
         fresh_sentinel_token = ""
         fresh_so_token = ""
@@ -3282,19 +3335,44 @@ class AuthFlow:
     # ── Step 7: 发送 OTP ──
     def send_otp(self):
         logger.info("[6/10] 发送 OTP...")
-        headers = self._common_headers("https://auth.openai.com/create-account/password")
-        if self._last_sentinel_token:
-            headers["openai-sentinel-token"] = self._last_sentinel_token
-        # zhuce6 用 GET /api/accounts/email-otp/send
-        resp = self.session.get(
+        referer = "https://auth.openai.com/create-account/password"
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": self._common_headers(referer).get(
+                "Accept-Language", "en-US,en;q=0.9"
+            ),
+            "Referer": referer,
+            "User-Agent": self._common_headers(referer)["User-Agent"],
+            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        sent_at = time.time()
+        resp = self._session_request(
+            "GET",
             "https://auth.openai.com/api/accounts/email-otp/send",
             headers=headers,
             timeout=30,
+            allow_redirects=False,
         )
         self._trace_http("send_email_otp", resp)
-        if resp.status_code != 200:
+        location = str(resp.headers.get("Location", "") or "").strip()
+        if resp.status_code != 302 or not location:
             raise RuntimeError(f"发送 OTP 失败: {resp.status_code} - {resp.text[:200]}")
-        self._mark_otp_sent("email-otp/send")
+        verification_url = urljoin("https://auth.openai.com/", location)
+        if (urlparse(verification_url).path.rstrip("/") or "/") != "/email-verification":
+            raise RuntimeError(f"发送 OTP 返回非预期跳转: {verification_url}")
+        self._load_auth_web_document(
+            verification_url,
+            referer=referer,
+            trace_step="email_verification_after_otp_send",
+            include_user_activation=False,
+        )
+        self._mark_otp_sent("email-otp/send", sent_at=sent_at)
         logger.info("OTP 已发送到邮箱")
 
     def send_passwordless_otp(
@@ -4246,238 +4324,75 @@ class AuthFlow:
             raise
 
     def run_register(self, mail_provider: MailProvider) -> AuthResult:
-        """执行完整注册流程"""
-        # 检查网络
+        """按 ChatGPT Web HAR 顺序执行新邮箱密码注册。"""
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
 
-        # 创建邮箱
         email = mail_provider.create_mailbox()
         self.result.email = email
         persona = getattr(mail_provider, "last_persona", None)
         if persona is not None and getattr(persona, "password", ""):
             self.result.password = persona.password
 
-        # 登录/注册链路
         csrf_token = self.get_csrf_token()
-        # Keep the OAuth bootstrap neutral. The password-registration flow is selected by
-        # authorize/continue below; adding screen_hint=signup here routes current auth
-        # sessions directly into passwordless_signup before a password can be created.
-        auth_url = self.get_auth_url(csrf_token)
-        device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
-        is_new = self.signup(email, sentinel)
+        auth_url = self.get_auth_url(
+            csrf_token,
+            prompt="login",
+            screen_hint="login_or_signup",
+            login_hint=email,
+            include_passkey_capabilities=False,
+        )
+        self.auth_oauth_init(auth_url)
+        initialized_path = urlparse(self._last_auth_oauth_init_url).path.rstrip("/") or "/"
+        if initialized_path != "/email-verification":
+            raise RuntimeError(
+                "注册 authorize 未进入 HAR 的 email-verification 页面: "
+                f"{self._last_auth_oauth_init_url or '<empty>'}"
+            )
 
-        if is_new:
-            # 新账号必须先确认密码，再进入邮箱 OTP；禁止降级到 passwordless_signup。
-            password_registered = self.register_email_password_with_retry(email)
-            otp_sent_at = time.time()
-            if not password_registered or not self.result.password_configured:
-                detail = (self._last_register_password_error or "password was not confirmed")[:260]
-                raise RuntimeError(f"注册密码失败，禁止降级到 OTP-only: {detail}")
-            try:
-                self.send_otp()
-            except RuntimeError as e:
-                # 部分账号会在 register 后直接转入 email-verification，send 接口会报 invalid_auth_step
-                if "invalid_auth_step" in str(e).lower():
-                    logger.warning("send_otp 返回 invalid_auth_step，回退到统一发码策略")
-                    if not self.kickoff_otp_delivery("register_password_invalid_auth_step"):
-                        raise
-                else:
-                    raise
-            if self._last_otp_sent_at:
-                otp_sent_at = self._last_otp_sent_at
+        password_registered = self.register_email_password_with_retry(email)
+        if not password_registered or not self.result.password_configured:
+            detail = (self._last_register_password_error or "password was not confirmed")[:260]
+            raise RuntimeError(f"注册密码失败: {detail}")
 
-            try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
-            except Exception:
-                otp_timeout = 180
+        self.send_otp()
+        otp_sent_at = self._last_otp_sent_at or time.time()
+        try:
+            otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
+        except Exception:
+            otp_timeout = 180
+        otp_code = mail_provider.wait_for_otp(
+            email,
+            timeout=otp_timeout,
+            issued_after=otp_sent_at,
+        )
+        try:
+            self.verify_otp(otp_code)
+        except RuntimeError as e:
+            if "401" not in str(e):
+                raise
+            logger.warning("OTP 首次验证失败，按失败恢复策略重发: %s", e)
+            if not self.kickoff_otp_delivery("verify_otp_retry_new"):
+                raise
+            otp_sent_at = self._last_otp_sent_at or time.time()
             otp_code = mail_provider.wait_for_otp(
                 email,
                 timeout=otp_timeout,
                 issued_after=otp_sent_at,
             )
-            try:
-                self.verify_otp(otp_code)
-                self.fetch_client_auth_session_dump("post_verify_otp_new")
-            except RuntimeError as e:
-                # 偶发 401 错码，补发一次 OTP 并重试
-                if "401" in str(e):
-                    logger.warning(f"OTP 首次验证失败，补发重试: {e}")
-                    otp_sent_at = time.time()
-                    if not self.kickoff_otp_delivery("verify_otp_retry_new"):
-                        self.send_otp()
-                    if self._last_otp_sent_at:
-                        otp_sent_at = self._last_otp_sent_at
-                    otp_code = mail_provider.wait_for_otp(
-                        email,
-                        timeout=otp_timeout,
-                        issued_after=otp_sent_at,
-                    )
-                    self.verify_otp(otp_code)
-                    self.fetch_client_auth_session_dump("post_verify_otp_retry_new")
-                else:
-                    raise
+            self.verify_otp(otp_code)
 
-            try:
-                continue_url = self.create_account()
-            except Exception as e:
-                # registration_disallowed 时尝试 reauthorize 兜底，若仍不可用再抛出
-                if self._is_registration_disallowed_error(e):
-                    logger.warning("create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
-                    continue_url = self._reauthorize_for_session(auth_url) or ""
-                    if not continue_url:
-                        raise
-                else:
-                    raise
-        else:
-            # 已有账号：直接发 OTP → 验证 → 获取 session
-            mode = (self._existing_email_verification_mode or "").lower()
-            page_type = (self._existing_page_type or "").lower()
-            continue_url = ""
-
-            try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
-            except Exception:
-                otp_timeout = 180
-
-            if page_type == "login_password":
-                logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
-                login_password = (os.getenv("LOGIN_PASSWORD", "") or "").strip()
-                if not login_password:
-                    login_password = (
-                        self.result.password or ""
-                    ).strip() or self._default_password_from_email(email)
-                self.result.password = login_password
-                login_resp = self.login_password_verify(login_password)
-                continue_url = self._normalize_continue_url(
-                    (login_resp or {}).get("continue_url", "")
-                    if isinstance(login_resp, dict)
-                    else ""
-                )
-
-                # 部分账号密码校验后仍需 email otp（二次校验）
-                if not continue_url or "/email-verification" in continue_url:
-                    # password/verify 后推荐使用 resend，而不是 /email-otp/send
-                    otp_sent_at = time.time()
-                    self.kickoff_otp_delivery("existing_login_password")
-                    if self._last_otp_sent_at:
-                        otp_sent_at = self._last_otp_sent_at
-                    otp_code = mail_provider.wait_for_otp(
-                        email,
-                        timeout=otp_timeout,
-                        issued_after=otp_sent_at,
-                    )
-                    otp_resp = self.verify_otp(otp_code)
-                    continue_url = self._normalize_continue_url(
-                        (otp_resp or {}).get("continue_url", "")
-                        if isinstance(otp_resp, dict)
-                        else ""
-                    )
-            else:
-                need_send_otp = mode not in ("passwordless_signup", "passwordless_login")
-                if need_send_otp:
-                    otp_sent_at = time.time()
-                    self.send_otp()
-                    if self._last_otp_sent_at:
-                        otp_sent_at = self._last_otp_sent_at
-                else:
-                    # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
-                    # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
-                    forced_resend = self._env_flag("OTP_FORCE_RESEND", "1")
-                    if forced_resend and self.kickoff_otp_delivery("existing_forced_resend"):
-                        otp_sent_at = self._last_otp_sent_at or time.time()
-                        logger.info(f"已有账号验证码模式={mode}，已主动 resend OTP")
-                    else:
-                        # 回看短窗口，避免误读上一轮旧验证码
-                        otp_sent_at = time.time() - 8
-                        logger.info(f"已有账号验证码模式={mode}，跳过额外 send_otp，直接等邮件")
-
-                try:
-                    otp_code = mail_provider.wait_for_otp(
-                        email,
-                        timeout=otp_timeout,
-                        issued_after=otp_sent_at,
-                    )
-                except TimeoutError:
-                    # 若本轮没等到，优先 resend，再兜底 send_otp
-                    logger.warning("未等到已有账号 OTP，先重发后重试等待")
-                    otp_sent_at = time.time()
-                    if not self.kickoff_otp_delivery("existing_timeout_retry"):
-                        self.send_otp()
-                    if self._last_otp_sent_at:
-                        otp_sent_at = self._last_otp_sent_at
-                    otp_code = mail_provider.wait_for_otp(
-                        email,
-                        timeout=otp_timeout,
-                        issued_after=otp_sent_at,
-                    )
-                try:
-                    otp_resp = self.verify_otp(otp_code)
-                    self.fetch_client_auth_session_dump("post_verify_otp_existing")
-                except RuntimeError as e:
-                    if any(code in str(e) for code in ("401", "409")):
-                        logger.warning(f"OTP 首次验证失败，重发重试: {e}")
-                        otp_sent_at = time.time()
-                        if not self.kickoff_otp_delivery("existing_verify_retry"):
-                            self.send_otp()
-                        if self._last_otp_sent_at:
-                            otp_sent_at = self._last_otp_sent_at
-                        otp_code = mail_provider.wait_for_otp(
-                            email,
-                            timeout=otp_timeout,
-                            issued_after=otp_sent_at,
-                        )
-                        otp_resp = self.verify_otp(otp_code)
-                        self.fetch_client_auth_session_dump("post_verify_otp_retry_existing")
-                    else:
-                        raise
-                continue_url = (
-                    (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
-                )
-                continue_url = self._normalize_continue_url(continue_url)
-                if self._is_add_phone_state(
-                    page_type=self._extract_page_type(otp_resp), continue_url=continue_url
-                ):
-                    continue_url = self._normalize_continue_url(
-                        self._handle_add_phone_verification(continue_url=continue_url)
-                    )
-
-            # 某些已有账号在 OTP 后会进入 about-you，需要补一次 create_account
-            if continue_url and "/about-you" in continue_url:
-                try:
-                    continue_url = self.create_account()
-                except Exception as e:
-                    if self._is_registration_disallowed_error(e):
-                        logger.warning(
-                            "about-you create_account 被拒绝，尝试 reauthorize 兜底获取 session ..."
-                        )
-                        continue_url = self._reauthorize_for_session(auth_url) or ""
-                        if continue_url:
-                            logger.info("reauthorize 兜底成功，继续后续 session 获取")
-                            # 下游会走 follow_redirect_chain + get_auth_session
-                            pass
-                        else:
-                            raise
-                    else:
-                        logger.warning(f"已有账号 about-you 创建信息失败，回退 reauthorize: {e}")
-                        continue_url = ""
-
-            # 若 otp 响应未给可用 continue_url，则回退到 reauthorize
-            if not continue_url:
-                # auth.openai.com 的 session cookie 已设置，直接拿 code
-                continue_url = self._reauthorize_for_session(auth_url)
+        continue_url = self.create_account()
 
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
-            refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
             callback_url, final_url = self.follow_redirect_chain(continue_url)
             if (not callback_url) and final_url and ("/workspace" in final_url):
                 normalized = self._normalize_continue_url(final_url)
                 if normalized and normalized != final_url:
                     callback_url, final_url = self.follow_redirect_chain(normalized)
         else:
-            callback_url, final_url = None, None
+            raise RuntimeError("创建账户后未获取 callback URL")
 
         refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
         if not refresh_only_mode:

@@ -521,6 +521,8 @@ _SENSITIVE_TEXT_RE = re.compile(
 
 
 def _redact_value(value: Any, *, key: str = "") -> Any:
+    if key.endswith("_cookie_names") and isinstance(value, list):
+        return [str(item) for item in value]
     if _SENSITIVE_KEY_RE.search(key):
         return "<redacted>" if value not in (None, "") else value
     if isinstance(value, dict):

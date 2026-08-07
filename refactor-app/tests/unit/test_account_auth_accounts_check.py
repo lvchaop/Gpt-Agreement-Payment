@@ -6,9 +6,9 @@ import pytest
 
 from refactor_app.application.workflows import account_auth
 from refactor_app.application.workflows.account_auth import (
+    PLUS_ONE_MONTH_FREE_PROMOTION_ID,
     AccountAuthWorkflowError,
     BackfillSessionWorkflow,
-    PLUS_ONE_MONTH_FREE_PROMOTION_ID,
     _extract_account_promotion_id,
     _extract_accounts_check_identities,
     _extract_personal_accounts_check_identity,
@@ -113,7 +113,40 @@ def test_accounts_check_extracts_plus_promotion_for_target_personal_space() -> N
     assert _extract_account_promotion_id(payload, account_id="personal-space-1") == ""
 
 
-def test_personal_promotion_probe_uses_tr_proxy_and_updates_space(monkeypatch) -> None:
+def test_accounts_check_v4_headers_match_positive_promotion_har(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, url: str, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return SimpleNamespace(status_code=200, json=lambda: {})
+
+    monkeypatch.setattr(account_auth.curl_requests, "Session", lambda **_kwargs: Client())
+
+    account_auth._fetch_accounts_check_v4(
+        access_token="access-token",
+        cookie_header="session=value",
+        proxy_url="http://proxy.example:8080",
+    )
+
+    headers = captured["headers"]
+    assert headers["oai-client-build-number"] == "9052945"
+    assert (
+        headers["oai-client-version"]
+        == "prod-e1d6f2820dd20c3bab36cc42e8668035bf87f7bc"
+    )
+    assert headers["referer"] == "https://chatgpt.com/"
+    assert headers["x-openai-target-path"] == "/backend-api/accounts/check/v4-2023-04-27"
+
+
+def test_personal_promotion_probe_uses_existing_token_and_jp_proxy(monkeypatch) -> None:
     captured: dict = {}
     account = SimpleNamespace(
         access_token="personal-access-token",
@@ -163,14 +196,14 @@ def test_personal_promotion_probe_uses_tr_proxy_and_updates_space(monkeypatch) -
         mail_provider=object(),
     ).probe_personal_space_promotion(
         user_account_id="account-1",
-        proxy_url="http://tr-proxy.example:8080",
+        proxy_url="http://jp-proxy.example:8080",
     )
 
-    assert captured["proxy_url"] == "http://tr-proxy.example:8080"
+    assert captured["proxy_url"] == "http://jp-proxy.example:8080"
     assert captured["chatgpt_account_id"] == "personal-space-1"
     assert captured["access_token"] == "personal-access-token"
     assert "__Secure-next-auth.session-token=session-token" in captured["cookie_header"]
-    assert result["proxy_country"] == "TR"
+    assert result["proxy_country"] == "JP"
     assert result["has_promotion"] is True
     assert space.has_promotion is True
     assert space.promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID
