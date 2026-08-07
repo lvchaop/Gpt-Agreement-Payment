@@ -12,6 +12,8 @@ const router = useRouter();
 const mode = ref("email_protocol_no_phone");
 const count = ref(1);
 const workCount = ref(1);
+const proxyCountry = ref("US");
+const authorizeCodexAfterSecurity = ref(false);
 const mailProvider = ref("outlook");
 const emailDomain = ref("");
 const projectKey = ref("openai-register");
@@ -34,6 +36,8 @@ const submitting = ref(false);
 watch(mailProvider, (provider) => {
   if (provider === "icloud_hide_my_email") {
     emailDomain.value = "";
+  } else {
+    authorizeCodexAfterSecurity.value = false;
   }
 });
 
@@ -59,12 +63,20 @@ function parseCountryMaxPrices(value: string): Record<string, string> {
 }
 
 async function submitJob() {
+  const normalizedProxyCountry = proxyCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(normalizedProxyCountry)) {
+    store.toast("国家代码格式错误", "请输入两位国家代码，例如 US 或 JP", "error");
+    return;
+  }
+  proxyCountry.value = normalizedProxyCountry;
   submitting.value = true;
   try {
     const result = await resourcesApi.createProtocolRegistrationJob({
       mode: mode.value,
       count: count.value,
       work_count: workCount.value,
+      proxy_country: normalizedProxyCountry,
+      authorize_codex_after_security: authorizeCodexAfterSecurity.value,
       mail_provider: mailProvider.value,
       email_domain: emailDomain.value,
       project_key: projectKey.value,
@@ -118,6 +130,19 @@ async function submitJob() {
           <input v-model.number="workCount" class="input" min="1" max="500" type="number" />
         </label>
         <label>
+          <span>注册代理国家</span>
+          <input
+            v-model="proxyCountry"
+            autocapitalize="characters"
+            class="input country-input"
+            maxlength="2"
+            pattern="[A-Za-z]{2}"
+            placeholder="US"
+            required
+            @input="proxyCountry = proxyCountry.toUpperCase()"
+          />
+        </label>
+        <label>
           <span>邮箱 provider</span>
           <select v-model="mailProvider" class="input">
             <option value="outlook">outlook（outlook/hotmail/live）</option>
@@ -126,6 +151,10 @@ async function submitJob() {
             <option value="cloudflare_temp_mail">cloudflare_temp_mail</option>
             <option value="icloud_hide_my_email">iCloud 隐藏邮箱</option>
           </select>
+        </label>
+        <label v-if="mailProvider === 'icloud_hide_my_email'" class="checkbox-field">
+          <span>注册后 Codex 授权</span>
+          <input v-model="authorizeCodexAfterSecurity" type="checkbox" />
         </label>
         <label>
           <span>邮箱域名</span>
@@ -245,6 +274,20 @@ label span {
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 800;
+}
+
+.country-input {
+  text-transform: uppercase;
+}
+
+.checkbox-field {
+  align-content: center;
+}
+
+.checkbox-field input {
+  height: 18px;
+  margin: 3px 0 0;
+  width: 18px;
 }
 
 .actions {

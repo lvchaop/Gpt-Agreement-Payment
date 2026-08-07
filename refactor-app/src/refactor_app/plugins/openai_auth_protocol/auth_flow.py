@@ -1064,6 +1064,28 @@ class AuthFlow:
                     continue
         return ""
 
+    def _bind_oai_device_identity(self, device_id: str) -> str:
+        """Keep the browser-visible device identity stable across auth domains."""
+        normalized = str(device_id or "").strip()
+        if not normalized:
+            return ""
+        self.result.device_id = normalized
+        cookie_jar = getattr(self.session, "cookies", None)
+        setter = getattr(cookie_jar, "set", None)
+        if callable(setter):
+            for domain in (
+                ".chatgpt.com",
+                "chatgpt.com",
+                ".openai.com",
+                "auth.openai.com",
+                "sentinel.openai.com",
+            ):
+                try:
+                    setter("oai-did", normalized, domain=domain, path="/")
+                except Exception:
+                    continue
+        return normalized
+
     def _sniff_login_verifier(self, text: str, source: str = ""):
         """从任意文本中提取 login_verifier/code_verifier。"""
         if not text:
@@ -2645,12 +2667,12 @@ class AuthFlow:
             "Priority": "u=1, i",
         }
 
-        # auth.openai.com 侧请求补设备标识（若可得）
+        # ChatGPT/Auth 两侧都使用同一个设备标识。
         try:
             host = (urlparse(origin).netloc or "").lower()
         except Exception:
             host = ""
-        if "auth.openai.com" in host:
+        if "auth.openai.com" in host or host == "chatgpt.com" or host.endswith(".chatgpt.com"):
             device_id = (self.result.device_id or "").strip() or self._get_oai_did_cookie().strip()
             if device_id:
                 headers["oai-device-id"] = device_id
@@ -2755,14 +2777,15 @@ class AuthFlow:
         default_prompt: str = "login",
     ) -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
+        if not self.result.device_id:
+            self.result.device_id = str(uuid.uuid4())
+        device_id = self._bind_oai_device_identity(self.result.device_id)
         headers = self._common_headers("https://chatgpt.com/")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         signin_url = "https://chatgpt.com/api/auth/signin/openai"
-        if not self.result.device_id:
-            self.result.device_id = str(uuid.uuid4())
         generated_session_logging_id = str(uuid.uuid4())
         query = {
-            "ext-oai-did": self.result.device_id,
+            "ext-oai-did": device_id,
             "auth_session_logging_id": generated_session_logging_id,
         }
         if screen_hint != "signup":
@@ -2808,6 +2831,7 @@ class AuthFlow:
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
     def auth_oauth_init(self, auth_url: str) -> str:
         logger.info("[3/10] OAuth 初始化...")
+        expected_device_id = self._bind_oai_device_identity(self.result.device_id)
         self._stop_auth_web_runtime()
         self._auth_web_runtime_page_url = ""
         self._last_auth_oauth_init_url = ""
@@ -2839,37 +2863,44 @@ class AuthFlow:
         )
 
         # 从 cookie 获取 oai-did
-        device_id = ""
+        observed_device_id = ""
         for cookie in self.session.cookies:
             if hasattr(cookie, "name"):
                 if cookie.name == "oai-did":
-                    device_id = cookie.value
+                    observed_device_id = cookie.value
                     break
             elif isinstance(cookie, str) and cookie == "oai-did":
-                device_id = self._get_oai_did_cookie()
+                observed_device_id = self._get_oai_did_cookie()
                 break
 
         # curl_cffi cookies 访问方式
-        if not device_id:
+        if not observed_device_id:
             try:
-                device_id = self._get_oai_did_cookie()
+                observed_device_id = self._get_oai_did_cookie()
             except Exception:
                 pass
 
-        if not device_id:
-            device_id = str(runtime.runtime_info.get("deviceId") or "").strip()
+        if not observed_device_id:
+            observed_device_id = str(runtime.runtime_info.get("deviceId") or "").strip()
 
         # fallback: 从 HTML 提取
-        if not device_id:
+        if not observed_device_id:
             m = re.search(r'oai-did["\s:=]+([a-f0-9-]{36})', resp.text)
             if m:
-                device_id = m.group(1)
+                observed_device_id = m.group(1)
 
+        device_id = expected_device_id or observed_device_id
         if not device_id:
             device_id = str(uuid.uuid4())
             logger.warning(f"未从响应中获取 device_id，使用生成值: {device_id}")
+        elif expected_device_id and observed_device_id and observed_device_id != expected_device_id:
+            logger.warning(
+                "OAuth 返回的 device_id 与 signin 设备不一致，保持原设备: expected=%s observed=%s",
+                expected_device_id,
+                observed_device_id,
+            )
 
-        self.result.device_id = device_id
+        self._bind_oai_device_identity(device_id)
         logger.info(f"Device ID: {device_id}")
         return device_id
 

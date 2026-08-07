@@ -539,6 +539,8 @@ class ProtocolRegistrationJobRequest(BaseModel):
     count: int = 1
     work_count: int = 1
     use_proxy: bool = True
+    proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    authorize_codex_after_security: bool = False
     mail_provider: str = "outlook"
     email_domain: str = ""
     project_key: str = "openai-register"
@@ -2396,6 +2398,8 @@ def create_protocol_registration_job(
             "count": max(1, int(req.count or 1)),
             "work_count": max(1, int(req.work_count or 1)),
             "use_proxy": bool(req.use_proxy),
+            "proxy_country": str(req.proxy_country or "US").strip().upper(),
+            "authorize_codex_after_security": bool(req.authorize_codex_after_security),
             "mail_provider": mail_provider,
             "email_domain": (
                 "" if mail_provider == ICLOUD_HIDE_MY_EMAIL_PROVIDER else req.email_domain

@@ -1700,10 +1700,52 @@ def test_protocol_registration_work_closes_security_clients_after_failure(monkey
             input_json={
                 "mode": "email_protocol_no_phone",
                 "mail_provider": "icloud_hide_my_email",
+                "authorize_codex_after_security": True,
             },
         )
 
     assert calls == ["grizzly_close", "twofauth_close"]
+
+
+def test_protocol_registration_work_defaults_codex_authorization_to_disabled(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Client:
+        def close(self) -> None:
+            captured["twofauth_closed"] = True
+
+    class Workflow:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self, *_args, **_kwargs):
+            return {"status": "ok"}
+
+    monkeypatch.setattr(handlers, "_twofauth_client", lambda _settings: Client())
+    monkeypatch.setattr(handlers, "_twofauth_otp_resolver", lambda _settings: None)
+    monkeypatch.setattr(
+        handlers,
+        "_registration_codex_grizzly_phone_provider",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled Codex authorization must not create a phone provider")
+        ),
+    )
+    monkeypatch.setattr(handlers, "_mail_plugin", lambda _settings: object())
+    monkeypatch.setattr(handlers, "ProtocolRegistrationWorkflow", Workflow)
+
+    result = handlers._run_protocol_registration_work(
+        session_factory=lambda: None,
+        settings=SimpleNamespace(hero_sms_api_key=""),
+        input_json={
+            "mode": "email_protocol_no_phone",
+            "mail_provider": "icloud_hide_my_email",
+        },
+    )
+
+    assert result == {"status": "ok"}
+    assert captured["authorize_codex_after_security"] is False
+    assert captured["codex_phone_provider"] is None
+    assert captured["twofauth_closed"] is True
 
 
 def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> None:
@@ -2183,6 +2225,12 @@ def test_registration_state_mutations_send_sentinel_so_and_invocation_id() -> No
 
 def test_registration_signin_query_matches_legacy_password_flow() -> None:
     requested_urls: list[str] = []
+    requested_headers: list[dict] = []
+    cookie_sets: list[tuple[str, str, str, str]] = []
+
+    class Cookies:
+        def set(self, name: str, value: str, *, domain: str, path: str) -> None:
+            cookie_sets.append((name, value, domain, path))
 
     class Response:
         def raise_for_status(self) -> None:
@@ -2192,14 +2240,16 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
             return {"url": "https://auth.openai.test/authorize"}
 
     class Session:
-        def post(self, url: str, **_kwargs):
+        cookies = Cookies()
+
+        def post(self, url: str, **kwargs):
             requested_urls.append(url)
+            requested_headers.append(dict(kwargs.get("headers") or {}))
             return Response()
 
     flow = AuthFlow.__new__(AuthFlow)
     flow.result = AuthResult()
     flow.session = Session()
-    flow._common_headers = lambda *_args, **_kwargs: {}
     flow._trace_http = lambda *_args, **_kwargs: None
     flow._remember_oauth_params = lambda *_args, **_kwargs: None
     flow._inject_pkce_into_auth_url = lambda value: value
@@ -2209,6 +2259,9 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
     query = parse_qs(urlparse(requested_urls[0]).query)
     assert query["screen_hint"] == ["signup"]
     assert query["ext-oai-did"] == [flow.result.device_id]
+    assert requested_headers[0]["oai-device-id"] == flow.result.device_id
+    assert ("oai-did", flow.result.device_id, ".chatgpt.com", "/") in cookie_sets
+    assert ("oai-did", flow.result.device_id, "auth.openai.com", "/") in cookie_sets
     assert len(query["auth_session_logging_id"]) == 1
     assert "prompt" not in query
     assert "ext-passkey-client-capabilities" not in query
@@ -2221,6 +2274,54 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
     assert neutral_query["ext-passkey-client-capabilities"] == ["11111"]
     assert "prompt" not in neutral_query
     assert "screen_hint" not in neutral_query
+
+
+def test_auth_oauth_init_preserves_signin_device_identity() -> None:
+    class Response:
+        status_code = 200
+        text = '<html>oai-did="server-device-id"</html>'
+        url = "https://auth.openai.com/log-in"
+
+    class Cookies:
+        def __init__(self) -> None:
+            self.values = [SimpleNamespace(name="oai-did", value="server-device-id")]
+            self.set_calls: list[tuple[str, str, str, str]] = []
+
+        def __iter__(self):
+            return iter(self.values)
+
+        def set(self, name: str, value: str, *, domain: str, path: str) -> None:
+            self.set_calls.append((name, value, domain, path))
+
+    class Session:
+        def __init__(self) -> None:
+            self.cookies = Cookies()
+
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    flow = AuthFlow.__new__(AuthFlow)
+    flow.result = AuthResult()
+    flow.result.device_id = "signin-device-id"
+    flow.session = Session()
+    flow._auth_web_runtime = None
+    flow._auth_web_runtime_page_url = ""
+    flow._last_auth_oauth_init_url = ""
+    flow._last_auth_session_logging_id = ""
+    flow._trace_http = lambda *_args, **_kwargs: None
+    flow._is_cloudflare_challenge_response = lambda _response: False
+    flow._start_auth_web_runtime = lambda **_kwargs: SimpleNamespace(
+        runtime_info={"deviceId": "bootstrap-device-id"},
+        auth_session_logging_id="session-id",
+        is_ready=True,
+    )
+
+    device_id = flow.auth_oauth_init("https://auth.openai.com/authorize")
+
+    assert device_id == "signin-device-id"
+    assert flow.result.device_id == "signin-device-id"
+    assert ("oai-did", "signin-device-id", ".chatgpt.com", "/") in flow.session.cookies.set_calls
+    assert ("oai-did", "signin-device-id", ".openai.com", "/") in flow.session.cookies.set_calls
 
 
 def test_registration_headers_match_configured_browser_fingerprint() -> None:

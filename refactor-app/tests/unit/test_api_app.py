@@ -99,6 +99,54 @@ def test_create_job_api_enqueues_job(monkeypatch: MonkeyPatch) -> None:
         session.commit()
 
 
+def test_protocol_registration_api_normalizes_and_defaults_proxy_country(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    job_ids: list[str] = []
+
+    try:
+        configured = client.post(
+            "/account-protocol-registration/jobs",
+            json={
+                "mode": "email_protocol_no_phone",
+                "proxy_country": "jp",
+                "authorize_codex_after_security": True,
+            },
+        )
+        defaulted = client.post(
+            "/account-protocol-registration/jobs",
+            json={"mode": "email_protocol_no_phone"},
+        )
+        invalid = client.post(
+            "/account-protocol-registration/jobs",
+            json={"mode": "email_protocol_no_phone", "proxy_country": "USA"},
+        )
+
+        assert configured.status_code == 200
+        assert defaulted.status_code == 200
+        assert invalid.status_code == 422
+        job_ids = [configured.json()["job_id"], defaulted.json()["job_id"]]
+
+        session_factory = make_session_factory(make_engine(Settings()))
+        with session_factory() as session:
+            configured_job = session.get(JobModel, job_ids[0])
+            defaulted_job = session.get(JobModel, job_ids[1])
+            assert configured_job is not None
+            assert defaulted_job is not None
+            assert configured_job.input_json["proxy_country"] == "JP"
+            assert defaulted_job.input_json["proxy_country"] == "US"
+            assert configured_job.input_json["authorize_codex_after_security"] is True
+            assert defaulted_job.input_json["authorize_codex_after_security"] is False
+    finally:
+        if job_ids:
+            session_factory = make_session_factory(make_engine(Settings()))
+            with session_factory() as session:
+                session.execute(delete(JobModel).where(JobModel.id.in_(job_ids)))
+                session.commit()
+
+
 def test_delete_selected_user_accounts(monkeypatch: MonkeyPatch) -> None:
     _disable_web_login(monkeypatch)
     client = TestClient(create_app())

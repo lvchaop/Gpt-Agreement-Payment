@@ -1657,6 +1657,7 @@ def _run_protocol_registration_work(
     try:
         authorize_codex_after_security = (
             registration_input.mail_provider == ICLOUD_HIDE_MY_EMAIL_PROVIDER
+            and bool(input_json.get("authorize_codex_after_security", False))
         )
         if authorize_codex_after_security:
             codex_phone_provider = _registration_codex_grizzly_phone_provider(
