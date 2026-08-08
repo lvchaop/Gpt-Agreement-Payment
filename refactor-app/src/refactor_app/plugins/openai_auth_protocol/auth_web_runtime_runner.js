@@ -74,6 +74,123 @@ class RuntimeStorage {
   }
 }
 
+class RuntimePerformanceNavigationTiming {
+  constructor(options) {
+    this.name = options.pageUrl;
+    this.entryType = "navigation";
+    this.startTime = 0;
+    this.duration = Number(options.navigationDuration || 3459.1);
+    this.domInteractive = Number(options.domInteractive || 3425.8);
+    this.domContentLoadedEventStart = this.domInteractive + 8;
+    this.domContentLoadedEventEnd = this.domInteractive + 12;
+    this.loadEventStart = this.duration - 1;
+    this.loadEventEnd = this.duration;
+    this.responseStart = Math.max(1, this.domInteractive - 350);
+    this.responseEnd = this.responseStart + 50;
+    this.requestStart = Math.max(1, this.responseStart - 100);
+    this.fetchStart = 0;
+    this.redirectStart = 0;
+    this.redirectEnd = 0;
+    this.redirectCount = Number(options.redirectCount ?? 1);
+    this.transferSize = Number(options.transferSize || 15989);
+    this.encodedBodySize = Math.max(0, this.transferSize - 300);
+    this.decodedBodySize = this.encodedBodySize;
+    this.type = "navigate";
+  }
+
+  toJSON() {
+    return { ...this };
+  }
+}
+
+class RuntimePerformancePaintTiming {
+  constructor(name, startTime) {
+    this.name = name;
+    this.entryType = "paint";
+    this.startTime = Number(startTime);
+    this.duration = 0;
+  }
+
+  toJSON() {
+    return { ...this };
+  }
+}
+
+class RuntimePerformanceObserver {
+  static entries = [];
+
+  static get supportedEntryTypes() {
+    return [
+      "navigation",
+      "paint",
+      "resource",
+      "mark",
+      "measure",
+      "largest-contentful-paint",
+      "layout-shift",
+      "first-input",
+      "event",
+    ];
+  }
+
+  constructor(callback) {
+    this.callback = callback;
+    this.types = new Set();
+  }
+
+  observe(options = {}) {
+    if (options.type) this.types.add(String(options.type));
+    for (const type of options.entryTypes || []) this.types.add(String(type));
+    if (options.buffered) {
+      const entries = RuntimePerformanceObserver.entries.filter(
+        (entry) => this.types.size === 0 || this.types.has(entry.entryType),
+      );
+      if (entries.length > 0) queueMicrotask(() => this._notify(entries));
+    }
+  }
+
+  disconnect() {}
+
+  takeRecords() {
+    return [];
+  }
+
+  _notify(entries) {
+    this.callback({
+      getEntries: () => entries,
+      getEntriesByType: (type) => entries.filter((entry) => entry.entryType === String(type)),
+      getEntriesByName: (name) => entries.filter((entry) => entry.name === String(name)),
+    });
+  }
+}
+
+function createPluginArray() {
+  const mimeTypes = [
+    { type: "application/pdf", suffixes: "pdf", description: "Portable Document Format" },
+    { type: "text/pdf", suffixes: "pdf", description: "Portable Document Format" },
+  ];
+  const names = [
+    "PDF Viewer",
+    "Chrome PDF Viewer",
+    "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer",
+    "WebKit built-in PDF",
+  ];
+  const plugins = names.map((name) => ({
+    name,
+    filename: "internal-pdf-viewer",
+    description: "Portable Document Format",
+    length: mimeTypes.length,
+    ...Object.fromEntries(mimeTypes.map((mime, index) => [index, mime])),
+  }));
+  plugins.item = (index) => plugins[index] || null;
+  plugins.namedItem = (name) => plugins.find((plugin) => plugin.name === name) || null;
+  plugins.refresh = () => undefined;
+  mimeTypes.item = (index) => mimeTypes[index] || null;
+  mimeTypes.namedItem = (type) => mimeTypes.find((mime) => mime.type === type) || null;
+  return { plugins, mimeTypes };
+}
+
 let relaySequence = 0;
 const relayWaiters = new Map();
 const pendingTransports = new Set();
@@ -419,6 +536,9 @@ function installWebApis(options) {
     rtt: Number(options.rtt || 50),
     saveData: false,
   });
+  const { plugins, mimeTypes } = createPluginArray();
+  const chromeMajor = String(options.chromeMajor || "142");
+  const chromeFullVersion = String(options.chromeFullVersion || `${chromeMajor}.0.0.0`);
   const navigatorValue = {
     language: options.language,
     languages: options.languages,
@@ -427,6 +547,42 @@ function installWebApis(options) {
     vendor: "Google Inc.",
     hardwareConcurrency: Number(options.hardwareConcurrency || 8),
     deviceMemory: Number(options.deviceMemory || 8),
+    cookieEnabled: true,
+    maxTouchPoints: 0,
+    pdfViewerEnabled: true,
+    webdriver: false,
+    plugins,
+    mimeTypes,
+    userAgentData: {
+      brands: [
+        { brand: "Chromium", version: chromeMajor },
+        { brand: "Google Chrome", version: chromeMajor },
+        { brand: "Not_A Brand", version: "99" },
+      ],
+      mobile: false,
+      platform: options.userAgentDataPlatform || "macOS",
+      async getHighEntropyValues(hints = []) {
+        const values = {
+          architecture: "arm",
+          bitness: "64",
+          brands: this.brands,
+          fullVersionList: [
+            { brand: "Chromium", version: chromeFullVersion },
+            { brand: "Google Chrome", version: chromeFullVersion },
+            { brand: "Not_A Brand", version: "99.0.0.0" },
+          ],
+          mobile: false,
+          model: "",
+          platform: this.platform,
+          platformVersion: "15.7.0",
+          uaFullVersion: chromeFullVersion,
+        };
+        return Object.fromEntries(hints.filter((hint) => hint in values).map((hint) => [hint, values[hint]]));
+      },
+      toJSON() {
+        return { brands: this.brands, mobile: this.mobile, platform: this.platform };
+      },
+    },
     onLine: true,
     connection,
     sendBeacon(url, body) {
@@ -462,6 +618,7 @@ function installWebApis(options) {
       availHeight: Number(options.screenHeight || 982) - 35,
       colorDepth: 24,
       pixelDepth: 24,
+      orientation: { angle: 0, type: "landscape-primary" },
     },
     configurable: true,
   });
@@ -476,6 +633,44 @@ function installWebApis(options) {
     value: { navigationStart },
     configurable: true,
   });
+  const navigationEntry = new RuntimePerformanceNavigationTiming(options);
+  const paintEntries = [
+    new RuntimePerformancePaintTiming("first-paint", options.firstContentfulPaint || 3296),
+    new RuntimePerformancePaintTiming(
+      "first-contentful-paint",
+      options.firstContentfulPaint || 3296,
+    ),
+  ];
+  const firstContentfulPaint = Number(options.firstContentfulPaint || 3296);
+  const performanceEntries = [
+    navigationEntry,
+    ...paintEntries,
+    {
+      name: "",
+      entryType: "largest-contentful-paint",
+      startTime: firstContentfulPaint,
+      renderTime: firstContentfulPaint,
+      loadTime: firstContentfulPaint,
+      size: 1,
+    },
+    {
+      name: "",
+      entryType: "layout-shift",
+      startTime: 0,
+      value: 0,
+      hadRecentInput: false,
+      sources: [],
+    },
+  ];
+  RuntimePerformanceObserver.entries = performanceEntries;
+  globalThis.PerformanceNavigationTiming = RuntimePerformanceNavigationTiming;
+  globalThis.PerformancePaintTiming = RuntimePerformancePaintTiming;
+  globalThis.PerformanceObserver = RuntimePerformanceObserver;
+  globalThis.performance.getEntries = () => [...performanceEntries];
+  globalThis.performance.getEntriesByType = (type) =>
+    performanceEntries.filter((entry) => entry.entryType === String(type));
+  globalThis.performance.getEntriesByName = (name) =>
+    performanceEntries.filter((entry) => entry.name === String(name));
   globalThis.requestAnimationFrame = (callback) =>
     setTimeout(() => callback(performance.now()), 16);
   globalThis.cancelAnimationFrame = (handle) => clearTimeout(handle);
@@ -528,6 +723,10 @@ function installWebApis(options) {
     },
     documentElement: {
       lang: options.language,
+      clientWidth: Number(options.screenWidth || 1512),
+      clientHeight: Number(options.screenHeight || 982) - 120,
+      scrollWidth: Number(options.screenWidth || 1512),
+      scrollHeight: Number(options.screenHeight || 982) - 120,
       getAttribute() {
         return null;
       },
@@ -537,6 +736,10 @@ function installWebApis(options) {
     },
     body: {
       childNodes: [],
+      clientWidth: Number(options.screenWidth || 1512),
+      clientHeight: Number(options.screenHeight || 982) - 120,
+      scrollWidth: Number(options.screenWidth || 1512),
+      scrollHeight: Number(options.screenHeight || 982) - 120,
       addEventListener() {},
       removeEventListener() {},
       contains() {
@@ -925,6 +1128,24 @@ async function initializeRuntime(payload) {
     datadogGlobalContext: datadogRum.getGlobalContext() || null,
     intlInitialized: Boolean(intlLocale),
     intlLocale,
+    browserProfile: {
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      languages: navigator.languages,
+      platform: navigator.platform,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory,
+      cookieEnabled: navigator.cookieEnabled,
+      maxTouchPoints: navigator.maxTouchPoints,
+      webdriver: navigator.webdriver,
+      screenWidth: screen.width,
+      screenHeight: screen.height,
+      innerWidth: globalThis.innerWidth,
+      innerHeight: globalThis.innerHeight,
+      devicePixelRatio: globalThis.devicePixelRatio,
+      userAgentData: navigator.userAgentData,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    },
   };
 }
 

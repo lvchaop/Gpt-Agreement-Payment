@@ -32,6 +32,9 @@ from refactor_app.application.workflows.mail import (
 from refactor_app.application.workflows.personal_payment_method import (
     PersonalPaymentMethodBindWorkflow,
 )
+from refactor_app.application.workflows.personal_plus_checkout import (
+    PersonalPlusCheckoutWorkflow,
+)
 from refactor_app.application.workflows.protocol_registration import (
     EMAIL_BROWSER_NO_PHONE,
     EMAIL_PROTOCOL_NO_PHONE,
@@ -46,6 +49,9 @@ from refactor_app.application.workflows.proxy import (
     BindTeamAdminProxyWorkflow,
     HealthcheckProxyWorkflow,
     RefreshWebsharePoolWorkflow,
+)
+from refactor_app.application.workflows.registration_proxy import (
+    resolve_cliproxy_proxy,
 )
 from refactor_app.application.workflows.space_authorization import (
     BUSINESS_ACCESS_TOKEN_MIN_INTERVAL_S,
@@ -347,6 +353,14 @@ def register_core_handlers(
             input_json=input_json,
         ),
     )
+    runner.register(
+        "space.personal_plus_checkout.tick",
+        lambda _session, input_json: _run_personal_plus_checkout_tick_job(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
+    )
     runner.register_work(
         "space.membership_invite.account",
         lambda _session, input_json: {
@@ -495,17 +509,71 @@ def register_core_handlers(
             run_id=str(input_json.get("_run_id") or ""),
         ),
     )
-    runner.register_work(
-        "space.personal_payment_method_bind.space",
-        lambda _session, input_json: PersonalPaymentMethodBindWorkflow(
+
+    def personal_payment_method_workflow(input_json: dict) -> PersonalPaymentMethodBindWorkflow:
+        after_bind_success = None
+        if bool(input_json.get("auto_start_plus_checkout", True)):
+            plus_workflow = PersonalPlusCheckoutWorkflow(
+                session_factory=session_factory,
+                mail_provider=_mail_plugin(settings),
+                us_proxy_country=settings.personal_plus_checkout_create_proxy_country,
+                jp_proxy_country=settings.personal_plus_checkout_promo_proxy_country,
+                promo_campaign_id=settings.personal_plus_checkout_promo_campaign_id,
+                totp_code_resolver=totp_code_resolver,
+            )
+            def after_bind_success(space_id, page, _result):
+                return plus_workflow.run_on_existing_page(
+                    space_id=space_id,
+                    page=page,
+                    work_id=str(input_json.get("_work_id") or "") + "-plus",
+                    run_id=str(input_json.get("_run_id") or ""),
+                )
+        return PersonalPaymentMethodBindWorkflow(
             session_factory=session_factory,
             mail_provider=_mail_plugin(settings),
-            registration_proxy_country=settings.protocol_register_proxy_country,
+            registration_proxy_country=settings.personal_plus_checkout_create_proxy_country,
             totp_code_resolver=totp_code_resolver,
-        ).run(
+            after_bind_success=after_bind_success,
+        )
+
+    runner.register_work(
+        "space.personal_payment_method_bind.space",
+        lambda _session, input_json: personal_payment_method_workflow(input_json).run(
             space_id=str(input_json["space_id"]),
             run_id=str(input_json.get("_run_id") or ""),
             work_id=str(input_json.get("_work_id") or ""),
+        ),
+    )
+    runner.register_work(
+        "space.personal_plus_checkout.space",
+        lambda _session, input_json: PersonalPlusCheckoutWorkflow(
+            session_factory=session_factory,
+            mail_provider=_mail_plugin(settings),
+            us_proxy_country=str(
+                input_json.get("create_proxy_country")
+                or settings.personal_plus_checkout_create_proxy_country
+            ),
+            jp_proxy_country=str(
+                input_json.get("promo_proxy_country")
+                or settings.personal_plus_checkout_promo_proxy_country
+            ),
+            promo_campaign_id=str(
+                input_json.get("promo_campaign_id")
+                or settings.personal_plus_checkout_promo_campaign_id
+            ),
+            totp_code_resolver=totp_code_resolver,
+        ).run(
+            space_id=str(input_json["space_id"]),
+            work_id=str(input_json.get("_work_id") or ""),
+            run_id=str(input_json.get("_run_id") or ""),
+        ),
+    )
+    runner.register_work(
+        "space.personal_promotion_check.space",
+        lambda _session, input_json: _run_personal_promotion_check_work(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
         ),
     )
     runner.register_work(
@@ -1200,6 +1268,7 @@ def _run_personal_payment_method_bind_tick_job(
     requested_space_id = str(input_json.get("space_id") or "").strip()
     limit = max(1, int(input_json.get("limit") or 10))
     work_count = max(1, int(input_json.get("work_count") or 1))
+    auto_start_plus_checkout = bool(input_json.get("auto_start_plus_checkout", True))
     with session_factory() as session:
         now = datetime.now(UTC)
         existing_count = int(
@@ -1225,6 +1294,8 @@ def _run_personal_payment_method_bind_tick_job(
                     SpaceModel.provider == "openai_chatgpt",
                     SpaceModel.space_type == "personal",
                     SpaceModel.space_status == "active",
+                    SpaceModel.has_promotion.is_(True),
+                    SpaceModel.promotion_id != "",
                     SpaceModel.has_payment_method.is_(False),
                     SpaceModel.payment_method_status != "bound",
                     or_(
@@ -1251,7 +1322,11 @@ def _run_personal_payment_method_bind_tick_job(
                     job_id=job_id,
                     work_type="space.personal_payment_method_bind.space",
                     execution_key=f"personal-payment-method:{space.id}",
-                    input_json={"space_id": space.id, "_run_id": run_id},
+                    input_json={
+                        "space_id": space.id,
+                        "auto_start_plus_checkout": auto_start_plus_checkout,
+                        "_run_id": run_id,
+                    },
                 )
             session.commit()
     summary = _work_summary(session_factory=session_factory, job_id=job_id)
@@ -1260,6 +1335,99 @@ def _run_personal_payment_method_bind_tick_job(
         "selected_count": existing_count or len(selected),
         "limit": limit,
         "work_count": work_count,
+        "auto_start_plus_checkout": auto_start_plus_checkout,
+        **summary,
+    }
+
+
+def _run_personal_plus_checkout_tick_job(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    job_id = str(input_json.get("_job_id") or "")
+    run_id = str(input_json.get("_run_id") or "")
+    requested_space_id = str(input_json.get("space_id") or "").strip()
+    requested_space_ids = [
+        str(item).strip()
+        for item in input_json.get("space_ids") or []
+        if str(item).strip()
+    ]
+    limit = max(1, int(input_json.get("limit") or 10))
+    work_count = max(1, int(input_json.get("work_count") or 1))
+    create_country = str(
+        input_json.get("create_proxy_country")
+        or settings.personal_plus_checkout_create_proxy_country
+    ).strip().upper()
+    promo_country = str(
+        input_json.get("promo_proxy_country")
+        or settings.personal_plus_checkout_promo_proxy_country
+    ).strip().upper()
+    promo_campaign_id = str(
+        input_json.get("promo_campaign_id")
+        or settings.personal_plus_checkout_promo_campaign_id
+    ).strip()
+    with session_factory() as session:
+        existing_count = int(
+            session.scalar(
+                select(func.count())
+                .select_from(WorkItemModel)
+                .where(
+                    WorkItemModel.job_id == job_id,
+                    WorkItemModel.work_type == "space.personal_plus_checkout.space",
+                )
+            )
+            or 0
+        )
+        selected: list[SpaceModel] = []
+        if existing_count == 0:
+            stmt = (
+                select(SpaceModel)
+                .join(UserAccountModel, UserAccountModel.id == SpaceModel.owner_user_account_id)
+                .where(
+                    SpaceModel.provider == "openai_chatgpt",
+                    SpaceModel.space_type == "personal",
+                    SpaceModel.space_status == "active",
+                    SpaceModel.has_promotion.is_(True),
+                    SpaceModel.promotion_id != "",
+                    SpaceModel.has_payment_method.is_(True),
+                    SpaceModel.payment_method_status == "bound",
+                    UserAccountModel.account_status == "active",
+                    UserAccountModel.cookie_header != "",
+                    UserAccountModel.auth_cookie_header != "",
+                )
+                .order_by(SpaceModel.updated_at.asc(), SpaceModel.id.asc())
+            )
+            if requested_space_id:
+                stmt = stmt.where(SpaceModel.id == requested_space_id)
+            elif requested_space_ids:
+                stmt = stmt.where(SpaceModel.id.in_(requested_space_ids))
+            selected = session.scalars(stmt.limit(limit)).all()
+            queue = WorkQueue(session)
+            for space in selected:
+                queue.enqueue(
+                    job_id=job_id,
+                    work_type="space.personal_plus_checkout.space",
+                    execution_key=f"personal-plus-checkout:{space.id}",
+                    input_json={
+                        "space_id": space.id,
+                        "create_proxy_country": create_country,
+                        "promo_proxy_country": promo_country,
+                        "promo_campaign_id": promo_campaign_id,
+                        "_run_id": run_id,
+                    },
+                )
+            session.commit()
+    summary = _work_summary(session_factory=session_factory, job_id=job_id)
+    return {
+        "space_id": requested_space_id,
+        "selected_count": existing_count or len(selected),
+        "limit": limit,
+        "work_count": work_count,
+        "create_proxy_country": create_country,
+        "promo_proxy_country": promo_country,
+        "promo_campaign_id": promo_campaign_id,
         **summary,
     }
 
@@ -1397,6 +1565,68 @@ def _run_personal_codex_authorization_work(
     }
 
 
+def _run_personal_promotion_check_work(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    space_id = str(input_json.get("space_id") or "").strip()
+    proxy_country = str(input_json.get("proxy_country") or "JP").strip().upper()
+    with session_factory() as session:
+        space = session.get(SpaceModel, space_id)
+        if space is None:
+            return {
+                "_work_outcome": "skipped",
+                "space_id": space_id,
+                "skipped_reason": "space_not_found",
+            }
+        if (
+            space.provider != "openai_chatgpt"
+            or space.space_type != "personal"
+            or space.space_status != "active"
+        ):
+            return {
+                "_work_outcome": "skipped",
+                "space_id": space_id,
+                "skipped_reason": "personal_promotion_check_space_not_eligible",
+            }
+        account = session.get(UserAccountModel, space.owner_user_account_id)
+        if account is None or account.account_status != "active":
+            return {
+                "_work_outcome": "skipped",
+                "space_id": space_id,
+                "user_account_id": space.owner_user_account_id,
+                "skipped_reason": "personal_promotion_check_owner_account_not_active",
+            }
+        user_account_id = account.id
+        email = account.email
+
+    proxy = resolve_cliproxy_proxy(
+        email=email,
+        country_code=proxy_country,
+    )
+    result = BackfillSessionWorkflow(
+        session_factory=session_factory,
+        mail_provider=_mail_plugin(settings),
+    ).probe_personal_space_promotion(
+        user_account_id=user_account_id,
+        proxy_url=proxy.proxy_url,
+        proxy_country=proxy.country_code,
+        space_id=space_id,
+        run_id=str(input_json.get("_run_id") or ""),
+    )
+    return {
+        **result,
+        "space_id": space_id,
+        "user_account_id": user_account_id,
+        "proxy_provider": proxy.provider,
+        "proxy_country": proxy.country_code,
+        "proxy_sid_source": proxy.sid_source,
+        "proxy_probe_attempts": proxy.probe_attempts,
+    }
+
+
 def _personal_codex_hero_phone_provider(
     *,
     session_factory: SessionFactory,
@@ -1520,6 +1750,9 @@ def _protocol_registration_input(
     raw_phone_countries = input_json.get("phone_countries")
     if raw_phone_countries is None:
         raw_phone_countries = ["151", "73", "16"]
+    raw_browser_close_delay = input_json.get("browser_close_delay_s", 10.0)
+    if raw_browser_close_delay in (None, ""):
+        raw_browser_close_delay = 10.0
     return ProtocolRegistrationInput(
         mode=str(input_json.get("mode") or ""),
         fixed_email=str(input_json.get("fixed_email") or ""),
@@ -1532,6 +1765,10 @@ def _protocol_registration_input(
         caller_id=str(input_json.get("caller_id") or "refactor-app-protocol-registration"),
         browser_headless=bool(input_json.get("browser_headless", True)),
         browser_otp_timeout_s=max(1, int(input_json.get("browser_otp_timeout_s") or 180)),
+        browser_close_delay_s=max(
+            0.0,
+            float(raw_browser_close_delay),
+        ),
         phone_provider=str(input_json.get("phone_provider") or "hero_sms"),
         phone_base_url=str(
             input_json.get("phone_base_url") or "https://hero-sms.com/stubs/handler_api.php"
@@ -1655,6 +1892,7 @@ def _run_protocol_registration_work(
     try:
         authorize_codex_after_security = (
             registration_input.mail_provider == ICLOUD_HIDE_MY_EMAIL_PROVIDER
+            and bool(input_json.get("authorize_codex_after_security", False))
         )
         if authorize_codex_after_security:
             codex_phone_provider = _registration_codex_grizzly_phone_provider(
@@ -1668,6 +1906,15 @@ def _run_protocol_registration_work(
             hero_sms_api_key=settings.hero_sms_api_key,
             twofauth_client=twofauth_client,
             authorize_codex_after_security=authorize_codex_after_security,
+            promotion_check_enabled=(
+                bool(
+                    getattr(
+                        settings,
+                        "icloud_post_registration_promotion_check_enabled",
+                        False,
+                    )
+                )
+            ),
             codex_phone_provider=codex_phone_provider,
             totp_code_resolver=_twofauth_otp_resolver(settings),
         ).run(

@@ -138,11 +138,11 @@ def test_requirements_token_uses_stable_runtime_context() -> None:
     first = _decode_requirements_config(sentinel_quickjs._generate_requirements_token(context))
     second = _decode_requirements_config(sentinel_quickjs._generate_requirements_token(context))
 
-    assert first[0] == 2730
+    assert first[0] == 2969
     assert first[4] == sentinel_quickjs.DEFAULT_UA
     assert first[7:9] == ["en-US", "en-US"]
     assert first[14] == second[14] == context.sentinel_sid
-    assert first[16] == second[16] == 6
+    assert first[16] == second[16] == 12
 
 
 def test_real_sdk_flow_passes_page_cookie_and_context_to_runner(
@@ -341,8 +341,8 @@ def test_runner_command_contains_complete_browser_environment(
     assert values["--request-p"] == "requirements-proof"
     assert values["--time-zone"] == "Asia/Tokyo"
     assert values["--language"] == "ja-JP"
-    assert values["--width"] == "1680"
-    assert values["--height"] == "1050"
+    assert values["--width"] == "1800"
+    assert values["--height"] == "1169"
     assert values["--chrome-major"] == str(sentinel_quickjs.BROWSER_FINGERPRINT.major_version)
     assert kwargs["env"]["TZ"] == "Asia/Tokyo"
     assert json.loads(token)["p"] == "proof"

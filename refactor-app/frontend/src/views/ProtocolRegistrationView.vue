@@ -20,6 +20,7 @@ const projectKey = ref("openai-register");
 const callerId = ref("refactor-app-protocol-registration");
 const browserHeadless = ref(true);
 const browserOtpTimeoutS = ref(180);
+const browserCloseDelayS = ref(10);
 
 const phoneBaseUrl = ref("https://hero-sms.com/stubs/handler_api.php");
 const phoneApiKeyEnv = ref("HERO_SMS_API_KEY");
@@ -83,6 +84,7 @@ async function submitJob() {
       caller_id: callerId.value,
       browser_headless: browserHeadless.value,
       browser_otp_timeout_s: browserOtpTimeoutS.value,
+      browser_close_delay_s: browserCloseDelayS.value,
       phone_provider: "hero_sms",
       phone_base_url: phoneBaseUrl.value,
       phone_api_key_env: phoneApiKeyEnv.value,
@@ -186,6 +188,10 @@ async function submitJob() {
         <label>
           <span>邮箱 OTP timeout 秒</span>
           <input v-model.number="browserOtpTimeoutS" class="input" min="1" type="number" />
+        </label>
+        <label>
+          <span>注册成功后关闭浏览器等待秒数</span>
+          <input v-model.number="browserCloseDelayS" class="input" min="0" step="0.5" type="number" />
         </label>
       </div>
     </section>

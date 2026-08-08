@@ -16,7 +16,7 @@ from refactor_app.application.workflows.protocol_registration import (
     RegistrationMailProviderAdapter,
 )
 from refactor_app.application.workflows.registration_proxy import (
-    resolve_registration_backbone_proxy,
+    resolve_cliproxy_proxy,
 )
 from refactor_app.infrastructure.db.models import (
     PaymentAddressPoolModel,
@@ -39,6 +39,7 @@ from refactor_app.plugins.openai_auth_browser import (
 from refactor_app.plugins.payment_card import normalize_card_cvc, normalize_card_number
 
 MAX_PAYMENT_METHOD_CARD_ATTEMPTS = PAYMENT_METHOD_MAX_ATTEMPTS
+PAYMENT_METHOD_BROWSER_BATCH_SIZE = 3
 
 _NETWORK_ERROR_MARKERS = (
     "network",
@@ -96,9 +97,7 @@ class PersonalPaymentMethodBindError(RuntimeError):
         self.error_code = str(error_code or "personal_payment_method_bind_failed")
         self.error_message = str(error_message or "")
         self.diagnostics = dict(diagnostics or {})
-        super().__init__(
-            f"{self.error_code}: {self.error_message}".rstrip(": ")
-        )
+        super().__init__(f"{self.error_code}: {self.error_message}".rstrip(": "))
 
 
 @dataclass(frozen=True)
@@ -140,12 +139,24 @@ class PersonalPaymentMethodBindWorkflow:
         session_factory: Callable[[], Session],
         mail_provider: ExternalMailApiPlugin,
         registration_proxy_country: str = "US",
+        browser_headless: bool = True,
+        browser_log_enabled: bool = False,
+        browser_log_capture_bodies: bool = False,
+        browser_log_max_body_chars: int = 20_000,
         totp_code_resolver: Callable[[str], str] | None = None,
+        after_bind_success: (
+            Callable[[str, Any, BrowserPaymentMethodResult], dict[str, Any]] | None
+        ) = None,
     ) -> None:
         self._session_factory = session_factory
         self._mail_provider = mail_provider
         self._registration_proxy_country = registration_proxy_country
+        self._browser_headless = browser_headless
+        self._browser_log_enabled = bool(browser_log_enabled)
+        self._browser_log_capture_bodies = bool(browser_log_capture_bodies)
+        self._browser_log_max_body_chars = max(1_000, int(browser_log_max_body_chars or 20_000))
         self._totp_code_resolver = totp_code_resolver
+        self._after_bind_success = after_bind_success
 
     def run(
         self,
@@ -157,6 +168,17 @@ class PersonalPaymentMethodBindWorkflow:
         context, existing = self._load_context(space_id)
         if existing is not None:
             return existing
+
+        # The production implementation keeps one Camoufox context, hosted
+        # Checkout page, and SetupIntent alive for the three-card retry window.
+        # Test/custom subclasses that override the single-attempt hook retain
+        # the legacy hook-driven behavior.
+        if type(self)._bind_attempt is PersonalPaymentMethodBindWorkflow._bind_attempt:
+            return self._run_reused_browser_batch(
+                context=context,
+                work_id=work_id,
+                run_id=run_id,
+            )
 
         last_error: PersonalPaymentMethodBindError | None = None
         while True:
@@ -179,6 +201,7 @@ class PersonalPaymentMethodBindWorkflow:
                     context=context,
                     attempt=attempt,
                     work_id=work_id,
+                    run_id=run_id,
                 )
             except Exception as exc:
                 last_error = _bind_error(exc)
@@ -271,6 +294,182 @@ class PersonalPaymentMethodBindWorkflow:
             )
             return output
 
+    def _run_reused_browser_batch(
+        self,
+        *,
+        context: _BindingContext,
+        work_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        proxy = resolve_cliproxy_proxy(
+            email=context.email,
+            country_code=self._registration_proxy_country,
+        )
+        mail = RegistrationMailProviderAdapter(
+            mail_provider=self._mail_provider,
+            caller_id="personal-payment-method-bind",
+            task_id=work_id,
+            provider=mail_provider_name_for_email(context.email),
+            project_key="personal-payment-method-bind",
+            email_domain=context.email.rpartition("@")[2],
+            fixed_email=context.email,
+        )
+        browser = CamoufoxEmailRegistration(
+            BrowserEmailRegistrationConfig(
+                proxy_url=proxy.proxy_url,
+                headless=self._browser_headless,
+                otp_timeout_s=180,
+                work_id=work_id,
+                browser_log_enabled=self._browser_log_enabled,
+                browser_log_capture_bodies=self._browser_log_capture_bodies,
+                browser_log_max_body_chars=self._browser_log_max_body_chars,
+            ),
+            event_callback=lambda event_type, data, level: self._payment_http_event(
+                run_id=run_id,
+                work_id=work_id,
+                space_id=context.space_id,
+                event_type=event_type,
+                data=data,
+                level=level,
+            ),
+        )
+        totp_code_provider = self._totp_code_provider(context)
+        reserved: dict[int, _ReservedPaymentAttempt] = {}
+        finalized: set[int] = set()
+        successful: dict[str, Any] = {}
+
+        def card_provider(index: int) -> tuple[BrowserPaymentCard, BrowserBillingDetails]:
+            attempt = self._reserve_attempt(
+                context.space_id,
+                billing_template=reserved.get(1),
+            )
+            reserved[index] = attempt
+            self._event(
+                run_id=run_id,
+                event_type="personal_payment_method.attempt_started",
+                message="personal payment method card attempt started",
+                data_json={
+                    "space_id": context.space_id,
+                    "user_account_id": context.user_account_id,
+                    "card_id": attempt.card_id,
+                    "card_last4": attempt.card_last4,
+                    "attempt_count": attempt.attempt_count,
+                    "batch_index": index,
+                    "work_id": work_id,
+                },
+            )
+            try:
+                card_number = normalize_card_number(attempt.card_number)
+                cvc = normalize_card_cvc(attempt.cvc)
+                if card_number[-4:] != attempt.card_last4:
+                    raise PersonalPaymentMethodBindError("payment_card_last4_mismatch")
+            except Exception as exc:
+                self._release_pre_payment_failure(
+                    context=context,
+                    attempt=attempt,
+                    error=_bind_error(exc),
+                )
+                raise
+            return (
+                BrowserPaymentCard(
+                    number=card_number,
+                    cvc=cvc,
+                    exp_month=attempt.exp_month,
+                    exp_year=attempt.exp_year,
+                ),
+                BrowserBillingDetails(
+                    name=attempt.full_name,
+                    email=context.email,
+                    phone=attempt.phone,
+                    line1=attempt.line1,
+                    line2=attempt.line2,
+                    city=attempt.city,
+                    state=attempt.state,
+                    postal_code=attempt.postal_code,
+                    country=attempt.country,
+                ),
+            )
+
+        def on_success(page: Any, index: int, result: BrowserPaymentMethodResult) -> None:
+            attempt = reserved[index]
+            output = self._record_success(context=context, attempt=attempt, result=result)
+            finalized.add(index)
+            if self._after_bind_success is not None:
+                output["after_bind_success"] = self._after_bind_success(
+                    context.space_id,
+                    page,
+                    result,
+                )
+            successful.update(output)
+            self._event(
+                run_id=run_id,
+                event_type="personal_payment_method.succeeded",
+                message="personal payment method bound and verified",
+                data_json={**output, "batch_index": index, "work_id": work_id},
+            )
+
+        def on_failure(page: Any, index: int, exc: Exception) -> None:
+            attempt = reserved[index]
+            error = _bind_error(exc)
+            network_error = _is_network_payment_method_error(error)
+            if network_error:
+                self._release_pre_payment_failure(
+                    context=context,
+                    attempt=attempt,
+                    error=error,
+                )
+            else:
+                self._record_failure(context=context, attempt=attempt, error=error)
+            finalized.add(index)
+            self._event(
+                run_id=run_id,
+                event_type=(
+                    "personal_payment_method.attempt_released"
+                    if network_error
+                    else "personal_payment_method.attempt_failed"
+                ),
+                message="personal payment method batch card attempt failed",
+                level="ERROR",
+                data_json={
+                    "space_id": context.space_id,
+                    "card_id": attempt.card_id,
+                    "card_last4": attempt.card_last4,
+                    "attempt_count": attempt.attempt_count,
+                    "batch_index": index,
+                    "error_code": error.error_code,
+                    "error_message": error.error_message[:500],
+                    "network_error": network_error,
+                    "work_id": work_id,
+                },
+            )
+            if network_error:
+                raise error
+
+        try:
+            browser.bind_personal_payment_cards(
+                mail,
+                expected_personal_account_id=context.external_space_id,
+                card_provider=card_provider,
+                max_attempts=PAYMENT_METHOD_BROWSER_BATCH_SIZE,
+                login_password=context.password,
+                totp_code_provider=totp_code_provider,
+                on_success=on_success,
+                on_failure=on_failure,
+            )
+        except Exception as exc:
+            error = _bind_error(exc)
+            for index, attempt in reserved.items():
+                if index not in finalized:
+                    self._release_pre_payment_failure(
+                        context=context,
+                        attempt=attempt,
+                        error=error,
+                    )
+            raise error from exc
+        if not successful:
+            raise PersonalPaymentMethodBindError("payment_method_batch_no_success")
+        return successful
+
     def _load_context(self, space_id: str) -> tuple[_BindingContext, dict[str, Any] | None]:
         with self._session_factory() as session:
             space = session.get(SpaceModel, space_id)
@@ -330,7 +529,12 @@ class PersonalPaymentMethodBindWorkflow:
                 )
             return context, None
 
-    def _reserve_attempt(self, space_id: str) -> _ReservedPaymentAttempt:
+    def _reserve_attempt(
+        self,
+        space_id: str,
+        *,
+        billing_template: _ReservedPaymentAttempt | None = None,
+    ) -> _ReservedPaymentAttempt:
         now = datetime.now(UTC)
         with self._session_factory() as session:
             space = session.get(SpaceModel, space_id, with_for_update=True)
@@ -354,20 +558,23 @@ class PersonalPaymentMethodBindWorkflow:
                 space.payment_method_cooldown_until = None
                 space.payment_method_status = "missing"
 
-            name = session.scalar(
-                select(PaymentNamePoolModel)
-                .where(PaymentNamePoolModel.name_status == "active")
-                .order_by(func.random())
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
-            address = session.scalar(
-                select(PaymentAddressPoolModel)
-                .where(PaymentAddressPoolModel.address_status == "active")
-                .order_by(func.random())
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
+            name = None
+            address = None
+            if billing_template is None:
+                name = session.scalar(
+                    select(PaymentNamePoolModel)
+                    .where(PaymentNamePoolModel.name_status == "active")
+                    .order_by(func.random())
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+                address = session.scalar(
+                    select(PaymentAddressPoolModel)
+                    .where(PaymentAddressPoolModel.address_status == "active")
+                    .order_by(func.random())
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
             card = session.scalar(
                 select(PaymentCardPoolModel)
                 .where(PaymentCardPoolModel.card_status == "available")
@@ -375,11 +582,10 @@ class PersonalPaymentMethodBindWorkflow:
                 .with_for_update(skip_locked=True)
                 .limit(1)
             )
-            missing = [
-                pool_name
-                for pool_name, row in (("name", name), ("address", address), ("card", card))
-                if row is None
-            ]
+            pool_rows = [("card", card)]
+            if billing_template is None:
+                pool_rows = [("name", name), ("address", address), *pool_rows]
+            missing = [pool_name for pool_name, row in pool_rows if row is None]
             if missing:
                 error_code = f"payment_{'_'.join(missing)}_pool_empty"
                 space.payment_method_status = "failed"
@@ -389,8 +595,6 @@ class PersonalPaymentMethodBindWorkflow:
                 session.commit()
                 raise PersonalPaymentMethodBindError(error_code)
 
-            assert name is not None
-            assert address is not None
             assert card is not None
             space.payment_method_attempt_count += 1
             space.payment_method_status = "binding"
@@ -398,12 +602,14 @@ class PersonalPaymentMethodBindWorkflow:
             space.payment_method_last_error_code = ""
             space.payment_method_last_error_message = ""
             space.updated_at = now
-            name.use_count += 1
-            name.last_used_at = now
-            name.updated_at = now
-            address.use_count += 1
-            address.last_used_at = now
-            address.updated_at = now
+            if name is not None:
+                name.use_count += 1
+                name.last_used_at = now
+                name.updated_at = now
+            if address is not None:
+                address.use_count += 1
+                address.last_used_at = now
+                address.updated_at = now
             card.card_status = "in_use"
             card.reserved_by_space_id = space.id
             card.reserved_at = now
@@ -419,14 +625,22 @@ class PersonalPaymentMethodBindWorkflow:
                 card_last4=card.last4,
                 exp_month=card.exp_month,
                 exp_year=card.exp_year,
-                full_name=name.full_name,
-                line1=address.line1,
-                line2=address.line2,
-                city=address.city,
-                state=address.state,
-                postal_code=address.postal_code,
-                country=address.country,
-                phone=address.phone,
+                full_name=(
+                    billing_template.full_name if billing_template is not None else name.full_name
+                ),
+                line1=billing_template.line1 if billing_template is not None else address.line1,
+                line2=billing_template.line2 if billing_template is not None else address.line2,
+                city=billing_template.city if billing_template is not None else address.city,
+                state=billing_template.state if billing_template is not None else address.state,
+                postal_code=(
+                    billing_template.postal_code
+                    if billing_template is not None
+                    else address.postal_code
+                ),
+                country=(
+                    billing_template.country if billing_template is not None else address.country
+                ),
+                phone=billing_template.phone if billing_template is not None else address.phone,
                 attempt_count=space.payment_method_attempt_count,
             )
             session.commit()
@@ -438,13 +652,13 @@ class PersonalPaymentMethodBindWorkflow:
         context: _BindingContext,
         attempt: _ReservedPaymentAttempt,
         work_id: str,
+        run_id: str = "",
     ) -> BrowserPaymentMethodResult:
         card_number = normalize_card_number(attempt.card_number)
         cvc = normalize_card_cvc(attempt.cvc)
         if card_number[-4:] != attempt.card_last4:
             raise PersonalPaymentMethodBindError("payment_card_last4_mismatch")
-        proxy = resolve_registration_backbone_proxy(
-            self._session_factory,
+        proxy = resolve_cliproxy_proxy(
             email=context.email,
             country_code=self._registration_proxy_country,
         )
@@ -452,7 +666,7 @@ class PersonalPaymentMethodBindWorkflow:
             mail_provider=self._mail_provider,
             caller_id="personal-payment-method-bind",
             task_id=work_id,
-            provider=_mail_provider_name(context.email),
+            provider=mail_provider_name_for_email(context.email),
             project_key="personal-payment-method-bind",
             email_domain=context.email.rpartition("@")[2],
             fixed_email=context.email,
@@ -460,10 +674,21 @@ class PersonalPaymentMethodBindWorkflow:
         browser = CamoufoxEmailRegistration(
             BrowserEmailRegistrationConfig(
                 proxy_url=proxy.proxy_url,
-                headless=True,
+                headless=self._browser_headless,
                 otp_timeout_s=180,
                 work_id=work_id,
-            )
+                browser_log_enabled=self._browser_log_enabled,
+                browser_log_capture_bodies=self._browser_log_capture_bodies,
+                browser_log_max_body_chars=self._browser_log_max_body_chars,
+            ),
+            event_callback=lambda event_type, data, level: self._payment_http_event(
+                run_id=run_id,
+                work_id=work_id,
+                space_id=context.space_id,
+                event_type=event_type,
+                data=data,
+                level=level,
+            ),
         )
         totp_code_provider = self._totp_code_provider(context)
         return browser.bind_personal_payment_method(
@@ -488,8 +713,15 @@ class PersonalPaymentMethodBindWorkflow:
             ),
             login_password=context.password,
             totp_code_provider=totp_code_provider,
-            cookie_header=context.cookie_header,
-            auth_cookie_header=context.auth_cookie_header,
+            after_success=(
+                None
+                if self._after_bind_success is None
+                else lambda page, result: self._after_bind_success(
+                    context.space_id,
+                    page,
+                    result,
+                )
+            ),
         )
 
     def _totp_code_provider(self, context: _BindingContext) -> Callable[[], str] | None:
@@ -499,21 +731,37 @@ class PersonalPaymentMethodBindWorkflow:
 
         def resolve() -> str:
             if not account_id:
-                raise PersonalPaymentMethodBindError(
-                    "payment_method_twofauth_account_missing"
-                )
+                raise PersonalPaymentMethodBindError("payment_method_twofauth_account_missing")
             if self._totp_code_resolver is None:
                 raise PersonalPaymentMethodBindError(
                     "payment_method_twofauth_client_not_configured"
                 )
             code = str(self._totp_code_resolver(account_id) or "").strip()
             if not code.isdigit():
-                raise PersonalPaymentMethodBindError(
-                    "payment_method_twofauth_invalid_code"
-                )
+                raise PersonalPaymentMethodBindError("payment_method_twofauth_invalid_code")
             return code
 
         return resolve
+
+    def _payment_http_event(
+        self,
+        *,
+        run_id: str,
+        work_id: str,
+        space_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        level: str,
+    ) -> None:
+        if not event_type.startswith("payment_method.http."):
+            return
+        self._event(
+            run_id=run_id,
+            event_type=event_type,
+            message=event_type,
+            level=level,
+            data_json={**data, "space_id": space_id, "work_id": work_id},
+        )
 
     def _release_pre_payment_failure(
         self,
@@ -647,7 +895,7 @@ class PersonalPaymentMethodBindWorkflow:
             session.commit()
 
 
-def _mail_provider_name(email: str) -> str:
+def mail_provider_name_for_email(email: str) -> str:
     domain = str(email or "").rpartition("@")[2].lower()
     if domain in {"outlook.com", "hotmail.com", "live.com"}:
         return "outlook"
@@ -678,9 +926,7 @@ def _bind_error(exc: Exception) -> PersonalPaymentMethodBindError:
 
 def _is_network_payment_method_error(error: PersonalPaymentMethodBindError) -> bool:
     haystack = " ".join(
-        part.strip().lower()
-        for part in (error.error_code, error.error_message, str(error))
-        if part
+        part.strip().lower() for part in (error.error_code, error.error_message, str(error)) if part
     )
     return any(marker in haystack for marker in _NETWORK_ERROR_MARKERS)
 

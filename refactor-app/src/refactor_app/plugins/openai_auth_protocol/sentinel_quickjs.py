@@ -43,9 +43,9 @@ _FLOW_PAGE_URL = {
 # browser profile. HTTP UA/client hints still come from this project's configured
 # curl_cffi impersonation so the TLS and JavaScript identities use one Chrome major.
 _SCREEN_PROFILE = {
-    "screen_width": 1680,
-    "screen_height": 1050,
-    "hardware_concurrency": 6,
+    "screen_width": 1800,
+    "screen_height": 1169,
+    "hardware_concurrency": 12,
     "js_heap_size_limit": 4_395_630_592,
     "device_memory": 8,
     "device_pixel_ratio": 2,

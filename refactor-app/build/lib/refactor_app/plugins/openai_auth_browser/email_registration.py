@@ -19,6 +19,7 @@ from refactor_app.plugins.openai_auth_browser.personal_payment_method import (
     BrowserPaymentCard,
     BrowserPaymentMethodResult,
     bind_personal_payment_card,
+    bind_personal_payment_cards,
 )
 from refactor_app.plugins.openai_auth_protocol.auth_flow import (
     AuthResult,
@@ -26,7 +27,6 @@ from refactor_app.plugins.openai_auth_protocol.auth_flow import (
     session_account_fields,
 )
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
-    _click_otp_retry_control,
     _fill_otp,
     _is_mfa_challenge_url,
     _seed_context_cookies,
@@ -63,7 +63,12 @@ class BrowserEmailRegistrationConfig:
     locale: str = "en-US"
     otp_timeout_s: int = 180
     navigation_timeout_ms: int = 60_000
+    # Email submission is an SPA transition. Keep this shorter than the full
+    # navigation timeout so a no-op click reaches the retry path promptly.
+    email_submit_timeout_s: float = 16.0
     completion_timeout_s: int = 120
+    success_close_delay_s: float = 0.0
+    failure_close_delay_s: float = 0.0
     work_id: str = ""
     artifact_root: str = ""
     capture_artifacts: bool = True
@@ -97,13 +102,20 @@ class CamoufoxEmailRegistration:
             self.artifact_dir = root / "protocol-register" / (config.work_id or str(uuid4()))
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self, mail_provider) -> AuthResult:
+    def run(
+        self,
+        mail_provider,
+        *,
+        totp_code_provider: Callable[[], str] | None = None,
+    ) -> AuthResult:
         return self._run_authenticated(
             mail_provider,
             password_for_email=default_password_from_email,
             register_method="email_browser",
             entry_mode="signup",
             passwordless_for_existing_login=True,
+            prefer_password_flow=True,
+            totp_code_provider=totp_code_provider,
             after_session=lambda _context, _page, result: result,
         )
 
@@ -118,6 +130,91 @@ class CamoufoxEmailRegistration:
             after_session=lambda _context, _page, result: result,
         )
 
+    def run_authenticated_page_with_login(
+        self,
+        mail_provider,
+        *,
+        login_password: str = "",
+        totp_code_provider: Callable[[], str] | None = None,
+        after_session: Callable[[Any, Any, AuthResult], Any],
+    ) -> Any:
+        """Complete a fresh login before running an authenticated page callback."""
+        password = str(login_password or "").strip()
+        return self._run_authenticated(
+            mail_provider,
+            password_for_email=default_password_from_email,
+            register_method="email_browser_payment",
+            entry_mode="login",
+            passwordless_for_existing_login=not bool(password),
+            after_session=after_session,
+            login_password=password,
+            totp_code_provider=totp_code_provider,
+        )
+
+    def run_authenticated_page(
+        self,
+        *,
+        email: str,
+        cookie_header: str,
+        auth_cookie_header: str = "",
+        after_session: Callable[[Any, Any, AuthResult], Any],
+    ) -> Any:
+        """Run a browser callback using the account's existing web session only."""
+        normalized_email = str(email or "").strip()
+        if not normalized_email or not str(cookie_header or "").strip():
+            raise BrowserEmailRegistrationError("browser_authenticated_page_session_missing")
+        profile_dir = tempfile.mkdtemp(prefix="refactor_browser_checkout_")
+        result = AuthResult()
+        result.email = normalized_email
+        from browserforge.fingerprints import Screen
+        from camoufox.sync_api import Camoufox
+
+        self._emit("browser.started", {"email": normalized_email, "headless": self.config.headless})
+        try:
+            with _managed_camoufox(
+                Camoufox,
+                headless=self.config.headless,
+                humanize=True,
+                persistent_context=True,
+                user_data_dir=profile_dir,
+                os="windows",
+                screen=Screen(max_width=1920, max_height=1080),
+                proxy=_camoufox_proxy(self.config.proxy_url),
+                main_world_eval=True,
+                geoip=False,
+                locale=self.config.locale,
+            ) as context:
+                _seed_context_cookies(context, cookie_header, ".chatgpt.com")
+                _seed_context_cookies(context, auth_cookie_header, ".auth.openai.com")
+                _seed_context_cookies(context, auth_cookie_header, ".openai.com")
+                page = context.pages[0] if context.pages else context.new_page()
+                page.set_default_timeout(30_000)
+                session_info = self._reuse_existing_session(page)
+                if not session_info:
+                    raise BrowserEmailRegistrationError(
+                        "browser_authenticated_page_session_reuse_failed"
+                    )
+                authenticated = self._hydrate_authenticated_result(
+                    context,
+                    page,
+                    result=result,
+                    session_info=session_info,
+                )
+                output = after_session(context, page, authenticated)
+                delay_s = max(0.0, float(self.config.success_close_delay_s or 0.0))
+                if delay_s:
+                    time.sleep(delay_s)
+                return output
+        except Exception as exc:
+            self._emit(
+                "browser.failed",
+                {"email": normalized_email, "error": f"{type(exc).__name__}: {exc}"},
+                "ERROR",
+            )
+            raise
+        finally:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
     def bind_personal_payment_method(
         self,
         mail_provider,
@@ -130,14 +227,59 @@ class CamoufoxEmailRegistration:
         cookie_header: str = "",
         auth_cookie_header: str = "",
         timeout_s: int = 120,
+        after_success: Callable[[Any, BrowserPaymentMethodResult], Any] | None = None,
     ) -> BrowserPaymentMethodResult:
         def bind(_context, page, _result: AuthResult) -> BrowserPaymentMethodResult:
-            return bind_personal_payment_card(
+            payment_result = bind_personal_payment_card(
                 page,
                 expected_personal_account_id=expected_personal_account_id,
                 card=card,
                 billing=billing,
                 timeout_s=timeout_s,
+                http_trace_emitter=self._emit,
+            )
+            if after_success is not None:
+                after_success(page, payment_result)
+            return payment_result
+
+        return self._run_authenticated(
+            mail_provider,
+            password_for_email=default_password_from_email,
+            register_method="email_browser_passwordless",
+            entry_mode="login",
+            passwordless_for_existing_login=not bool(str(login_password or "").strip()),
+            after_session=bind,
+            login_password=login_password,
+            totp_code_provider=totp_code_provider,
+            cookie_header=cookie_header,
+            auth_cookie_header=auth_cookie_header,
+        )
+
+    def bind_personal_payment_cards(
+        self,
+        mail_provider,
+        *,
+        expected_personal_account_id: str,
+        card_provider,
+        max_attempts: int = 3,
+        login_password: str = "",
+        totp_code_provider: Callable[[], str] | None = None,
+        cookie_header: str = "",
+        auth_cookie_header: str = "",
+        timeout_s: int = 120,
+        on_success=None,
+        on_failure=None,
+    ) -> list[BrowserPaymentMethodResult]:
+        def bind(_context, page, _result: AuthResult) -> list[BrowserPaymentMethodResult]:
+            return bind_personal_payment_cards(
+                page,
+                expected_personal_account_id=expected_personal_account_id,
+                card_provider=card_provider,
+                max_attempts=max_attempts,
+                timeout_s=timeout_s,
+                http_trace_emitter=self._emit,
+                on_success=on_success,
+                on_failure=on_failure,
             )
 
         return self._run_authenticated(
@@ -227,6 +369,7 @@ class CamoufoxEmailRegistration:
         totp_code_provider: Callable[[], str] | None = None,
         cookie_header: str = "",
         auth_cookie_header: str = "",
+        prefer_password_flow: bool = False,
     ) -> Any:
         from browserforge.fingerprints import Screen
         from camoufox.sync_api import Camoufox
@@ -253,6 +396,10 @@ class CamoufoxEmailRegistration:
                 os="windows",
                 screen=Screen(max_width=1920, max_height=1080),
                 proxy=_camoufox_proxy(self.config.proxy_url),
+                # Stripe.js is attached to the page's main world. Camoufox
+                # evaluates automation scripts in an isolated world unless
+                # this bridge is explicitly enabled.
+                main_world_eval=True,
                 # The proxy already determines the egress location. GeoIP is
                 # only fingerprint data here and otherwise causes a 66 MB
                 # database download before the first page can render.
@@ -269,6 +416,7 @@ class CamoufoxEmailRegistration:
                     if session_info:
                         authenticated = self._hydrate_authenticated_result(
                             context,
+                            page,
                             result=result,
                             session_info=session_info,
                         )
@@ -281,14 +429,37 @@ class CamoufoxEmailRegistration:
                             first_name=first_name,
                             last_name=last_name,
                             entry_mode=entry_mode,
-                            passwordless_for_existing_login=(
-                                passwordless_for_existing_login
-                            ),
+                            passwordless_for_existing_login=(passwordless_for_existing_login),
+                            prefer_password_flow=prefer_password_flow,
                             totp_code_provider=totp_code_provider,
                         )
-                    return after_session(context, page, authenticated)
-                except Exception:
-                    self._screenshot(page, "failed.png")
+                    output = after_session(context, page, authenticated)
+                    close_delay_s = max(0.0, float(self.config.success_close_delay_s or 0.0))
+                    if close_delay_s:
+                        self._emit(
+                            "browser.success_close_delay.started",
+                            {"email": email, "delay_s": close_delay_s},
+                        )
+                        time.sleep(close_delay_s)
+                        self._emit(
+                            "browser.success_close_delay.completed",
+                            {"email": email, "delay_s": close_delay_s},
+                        )
+                    return output
+                except Exception as exc:
+                    if not _is_target_closed_error(exc):
+                        self._screenshot(page, "failed.png")
+                    failure_delay_s = max(
+                        0.0,
+                        float(self.config.failure_close_delay_s or 0.0),
+                    )
+                    if failure_delay_s:
+                        self._emit(
+                            "browser.failure_close_delay.started",
+                            {"email": email, "delay_s": failure_delay_s},
+                            "WARN",
+                        )
+                        time.sleep(failure_delay_s)
                     raise
         except Exception as exc:
             self._emit(
@@ -315,6 +486,7 @@ class CamoufoxEmailRegistration:
         last_name: str,
         entry_mode: str = "signup",
         passwordless_for_existing_login: bool = False,
+        prefer_password_flow: bool = False,
         totp_code_provider: Callable[[], str] | None = None,
     ) -> AuthResult:
         self._open_email_registration(page, entry_mode=entry_mode)
@@ -324,6 +496,7 @@ class CamoufoxEmailRegistration:
             result=result,
             email=result.email,
             passwordless_for_existing_login=passwordless_for_existing_login,
+            prefer_password_flow=prefer_password_flow,
             totp_code_provider=totp_code_provider,
         )
         self._complete_about_you(page, first_name=first_name, last_name=last_name)
@@ -338,6 +511,7 @@ class CamoufoxEmailRegistration:
         )
         return self._hydrate_authenticated_result(
             context,
+            page,
             result=result,
             session_info=session_info,
         )
@@ -372,6 +546,7 @@ class CamoufoxEmailRegistration:
     def _hydrate_authenticated_result(
         self,
         context,
+        page,
         *,
         result: AuthResult,
         session_info: dict[str, Any],
@@ -413,6 +588,7 @@ class CamoufoxEmailRegistration:
         result: AuthResult,
         email: str,
         passwordless_for_existing_login: bool,
+        prefer_password_flow: bool = False,
         totp_code_provider: Callable[[], str] | None = None,
     ) -> None:
         otp_issued_after = time.time()
@@ -422,15 +598,19 @@ class CamoufoxEmailRegistration:
             result.password,
             email=email,
             passwordless_for_existing_login=passwordless_for_existing_login,
+            reject_existing_login=prefer_password_flow,
         )
         result.password_configured = result.password_configured or password_submitted
-        self._complete_email_otp(
+        password_flow_submitted = self._complete_email_otp(
             page,
             mail_provider,
             email=email,
             issued_after=otp_issued_after,
+            password=result.password,
+            prefer_password_flow=prefer_password_flow,
             totp_code_provider=totp_code_provider,
         )
+        result.password_configured = result.password_configured or password_flow_submitted
 
     def _resume_existing_login_after_retry(
         self,
@@ -474,20 +654,15 @@ class CamoufoxEmailRegistration:
             raise BrowserEmailRegistrationError(
                 f"unsupported browser email entry mode: {entry_mode}"
             )
-        entry_selectors = (
-            SIGNUP_SELECTORS if normalized_entry_mode == "signup" else LOGIN_SELECTORS
-        )
+        entry_selectors = SIGNUP_SELECTORS if normalized_entry_mode == "signup" else LOGIN_SELECTORS
         entry_text = "sign up" if normalized_entry_mode == "signup" else "log in"
         entry_stage = "signup" if normalized_entry_mode == "signup" else "login"
 
-        # The home page can keep transferring analytics/streaming resources
-        # after the login controls are already usable. Waiting for
-        # ``domcontentloaded`` leaves the browser pointer at its old position
-        # and prevents the click path from running. Match the existing browser
-        # OAuth flow: wait for the response commit, then poll the actual controls.
+        # Start on the auth entrypoint used by the reference browser flow. The
+        # home page adds a replaceable header click before the email form exists.
         try:
             page.goto(
-                _chatgpt_home_url(),
+                _chatgpt_auth_login_url(),
                 wait_until="commit",
                 timeout=self.config.navigation_timeout_ms,
             )
@@ -503,13 +678,17 @@ class CamoufoxEmailRegistration:
                 "WARN",
             )
         self._emit("browser.home.navigation.committed", {"url": page.url})
+        self._accept_cookie_consent(page)
+        self._raise_for_external_idp(page, "open-chatgpt")
         self._raise_for_challenge(page, "open-chatgpt")
         if _visible(page, EMAIL_INPUT_SELECTORS) is not None:
             return
         if not self._wait_for_page_state(
             page,
-            lambda: _visible(page, EMAIL_INPUT_SELECTORS) is not None
-            or _visible(page, entry_selectors) is not None,
+            lambda: (
+                _visible(page, EMAIL_INPUT_SELECTORS) is not None
+                or _visible(page, entry_selectors) is not None
+            ),
             stage=f"wait-email-form-or-{entry_stage}-button",
             timeout_s=30,
         ):
@@ -522,6 +701,7 @@ class CamoufoxEmailRegistration:
             return
 
         def click_entry() -> bool:
+            self._accept_cookie_consent(page)
             self._remove_google_one_tap(page)
             return _click_registration_control(
                 page,
@@ -540,9 +720,7 @@ class CamoufoxEmailRegistration:
             timeout_s=30,
         ):
             self._screenshot(page, f"{entry_stage}-button-missing.png")
-            raise BrowserEmailRegistrationError(
-                f"{entry_stage} button not found url={page.url}"
-            )
+            raise BrowserEmailRegistrationError(f"{entry_stage} button not found url={page.url}")
         self._emit(f"browser.{entry_stage}.clicked", {"attempt": 1})
 
         entry_opened = False
@@ -573,10 +751,9 @@ class CamoufoxEmailRegistration:
             time.sleep(1)
         if not entry_opened:
             self._screenshot(page, f"{entry_stage}-click-no-effect.png")
-            raise BrowserEmailRegistrationError(
-                f"{entry_stage} click had no effect url={page.url}"
-            )
+            raise BrowserEmailRegistrationError(f"{entry_stage} click had no effect url={page.url}")
         if _visible(page, EMAIL_INPUT_SELECTORS) is None:
+            self._accept_cookie_consent(page)
             self._remove_google_one_tap(page)
             if not _click_registration_control(
                 page,
@@ -640,16 +817,13 @@ class CamoufoxEmailRegistration:
         current_value = _input_value(_visible_email_input(page) or submitted_field)
         if current_value != email:
             self._screenshot(page, "email-value-missing-before-submit.png")
-            raise BrowserEmailRegistrationError(
-                "email input is empty or changed before submit"
-            )
+            raise BrowserEmailRegistrationError("email input is empty or changed before submit")
         initial_url = str(page.url or "")
         submit_method = "button"
-        clicked = _click_first(
+        clicked = _click_first_native(
             page,
             EMAIL_CONTINUE_SELECTORS,
             timeout_ms=5_000,
-            physical=True,
         )
         # A successful form submission can navigate before Playwright finishes the
         # element click. In that case the old handle detaches and _click_first
@@ -660,6 +834,27 @@ class CamoufoxEmailRegistration:
             stage="wait-email-submit",
         )
         if not advanced:
+            # Match the reference registration flow: re-query the live React
+            # form, refill the controlled input, and click the submit control
+            # again before falling back to Enter.
+            current = _visible_email_input(page) or submitted_field
+            if current is None:
+                raise BrowserEmailRegistrationError("email continue button not found")
+            try:
+                current.fill(email)
+                clicked = _click_first_native(
+                    page,
+                    EMAIL_CONTINUE_SELECTORS,
+                    timeout_ms=5_000,
+                )
+            except Exception as exc:
+                raise BrowserEmailRegistrationError(f"email form retry failed: {exc}") from exc
+            advanced = self._wait_for_email_submit_transition(
+                page,
+                initial_url=initial_url,
+                stage="wait-email-retry-submit",
+            )
+        if not advanced:
             submit_method = "enter"
             current = _visible_email_input(page) or submitted_field
             if current is None:
@@ -667,9 +862,7 @@ class CamoufoxEmailRegistration:
             try:
                 page.keyboard.press("Enter")
             except Exception as exc:
-                raise BrowserEmailRegistrationError(
-                    f"email form submit failed: {exc}"
-                ) from exc
+                raise BrowserEmailRegistrationError(f"email form submit failed: {exc}") from exc
             advanced = self._wait_for_email_submit_transition(
                 page,
                 initial_url=initial_url,
@@ -677,9 +870,8 @@ class CamoufoxEmailRegistration:
             )
         if not advanced:
             self._screenshot(page, "email-submit-no-effect.png")
-            raise BrowserEmailRegistrationError(
-                f"email submit had no effect url={page.url}"
-            )
+            raise BrowserEmailRegistrationError(f"email submit had no effect url={page.url}")
+        self._raise_for_external_idp(page, "submit-email")
         self._emit(
             "browser.email.submitted",
             {
@@ -698,9 +890,17 @@ class CamoufoxEmailRegistration:
         stage: str,
     ) -> bool:
         """Wait for the post-email page to load before touching its controls."""
+        configured_timeout = float(
+            self.config.email_submit_timeout_s
+            or min(16.0, float(self.config.navigation_timeout_ms or 60_000) / 1_000)
+        )
         timeout_s = max(
-            30.0,
-            min(90.0, float(self.config.navigation_timeout_ms or 60_000) / 1_000),
+            8.0,
+            min(
+                30.0,
+                configured_timeout,
+                float(self.config.navigation_timeout_ms or 60_000) / 1_000,
+            ),
         )
         self._emit(
             "browser.email.submit.waiting",
@@ -736,6 +936,8 @@ class CamoufoxEmailRegistration:
         *,
         email: str = "",
         passwordless_for_existing_login: bool = False,
+        require_password: bool = False,
+        reject_existing_login: bool = False,
     ) -> bool:
         if email:
             _select_existing_account_if_visible(page, email)
@@ -753,6 +955,8 @@ class CamoufoxEmailRegistration:
             # present on the page.
             if email:
                 _select_existing_account_if_visible(page, email)
+            if require_password:
+                return _visible(page, PASSWORD_INPUT_SELECTORS) is not None
             return bool(
                 _visible(page, PASSWORD_INPUT_SELECTORS) is not None
                 or _otp_inputs(page)
@@ -769,17 +973,26 @@ class CamoufoxEmailRegistration:
         self._raise_for_terminal_account_error(page, "password-or-otp")
         field = _visible(page, PASSWORD_INPUT_SELECTORS)
         if field is None:
-            if reached_next_stage and (
-                _otp_inputs(page) or _about_you_visible(page) or _has_authenticated_session(page)
+            if (
+                not require_password
+                and reached_next_stage
+                and (
+                    _otp_inputs(page)
+                    or _about_you_visible(page)
+                    or _has_authenticated_session(page)
+                )
             ):
                 self._emit("browser.password.skipped", {"url": page.url})
                 return False
             self._screenshot(page, "password-or-otp-missing.png")
-            raise BrowserEmailRegistrationError(
-                f"password/OTP stage not reached url={page.url}"
-            )
+            raise BrowserEmailRegistrationError(f"password/OTP stage not reached url={page.url}")
         current_url = str(page.url or "").lower()
         if passwordless_for_existing_login and "/log-in/password" in current_url:
+            if reject_existing_login:
+                self._screenshot(page, "registration-email-already-exists.png")
+                raise BrowserEmailRegistrationError(
+                    f"registration email already exists url={page.url}"
+                )
             _codex_start_passwordless_email_login(page)
             self._emit("browser.passwordless_otp.started", {"url": page.url})
             return False
@@ -796,6 +1009,78 @@ class CamoufoxEmailRegistration:
         self._emit("browser.password.submitted", {})
         return True
 
+    def _submit_preferred_password_flow(self, page, *, email: str, password: str) -> bool:
+        if not _click_continue_with_password_if_present(page):
+            return False
+        self._emit("browser.password_flow.selected", {"email": email, "url": page.url})
+
+        # The OTP page can remain mounted after the click while the auth SPA
+        # switches routes. Do not let its OTP input satisfy the generic
+        # password-or-OTP wait; the password branch must expose a password field.
+        password_ready = self._wait_for_page_state(
+            page,
+            lambda: _visible(page, PASSWORD_INPUT_SELECTORS) is not None,
+            stage="wait-password-flow",
+            timeout_s=12,
+        )
+        if not password_ready:
+            self._emit("browser.password_flow.retrying", {"email": email}, "WARN")
+            _click_continue_with_password_if_present(page)
+            password_ready = self._wait_for_page_state(
+                page,
+                lambda: _visible(page, PASSWORD_INPUT_SELECTORS) is not None,
+                stage="wait-password-flow-retry",
+                timeout_s=12,
+            )
+        if not password_ready:
+            self._screenshot(page, "password-flow-submit-missing.png")
+            raise BrowserEmailRegistrationError(
+                f"continue with password did not reach password page url={page.url}"
+            )
+        password_submitted = self._submit_password_if_requested(
+            page,
+            password,
+            email=email,
+            passwordless_for_existing_login=False,
+            require_password=True,
+        )
+        if not password_submitted:
+            self._screenshot(page, "password-flow-submit-missing.png")
+            raise BrowserEmailRegistrationError(
+                f"continue with password did not submit a password url={page.url}"
+            )
+        return True
+
+    def _restart_email_otp_flow(
+        self,
+        page,
+        mail_provider,
+        *,
+        email: str,
+        password: str,
+        prefer_password_flow: bool,
+    ) -> bool:
+        self._open_email_registration(page, entry_mode="signup")
+        self._submit_email(page, email)
+        password_submitted = self._submit_password_if_requested(
+            page,
+            password,
+            email=email,
+            passwordless_for_existing_login=False,
+            reject_existing_login=prefer_password_flow,
+        )
+        if prefer_password_flow:
+            password_submitted = (
+                self._submit_preferred_password_flow(
+                    page,
+                    email=email,
+                    password=password,
+                )
+                or password_submitted
+            )
+        self._raise_for_external_idp(page, "restart-email-otp")
+        return password_submitted
+
     def _complete_email_otp(
         self,
         page,
@@ -803,18 +1088,69 @@ class CamoufoxEmailRegistration:
         *,
         email: str,
         issued_after: float,
+        password: str = "",
+        prefer_password_flow: bool = False,
         totp_code_provider: Callable[[], str] | None = None,
-    ) -> None:
+    ) -> bool:
+        password_flow_submitted = False
+        if prefer_password_flow and self._submit_preferred_password_flow(
+            page,
+            email=email,
+            password=password,
+        ):
+            password_flow_submitted = True
+            self._emit("browser.password_flow.submitted", {"email": email})
         otp_retry_count = 0
         otp_retry_max = 2
         current_issued_after = issued_after
+
+        def restart_for_retry(reason: str) -> None:
+            nonlocal current_issued_after, password_flow_submitted
+            current_issued_after = time.time()
+            self._emit(
+                "browser.otp.restart.started",
+                {
+                    "email": email,
+                    "attempt": otp_retry_count + 1,
+                    "reason": reason,
+                },
+                "WARN",
+            )
+            try:
+                password_flow_submitted = (
+                    self._restart_email_otp_flow(
+                        page,
+                        mail_provider,
+                        email=email,
+                        password=password,
+                        prefer_password_flow=prefer_password_flow,
+                    )
+                    or password_flow_submitted
+                )
+                self._emit(
+                    "browser.otp.restart.completed",
+                    {"email": email, "attempt": otp_retry_count + 1},
+                )
+            except Exception as exc:
+                self._emit(
+                    "browser.otp.restart.failed",
+                    {
+                        "email": email,
+                        "attempt": otp_retry_count + 1,
+                        "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    },
+                    "WARN",
+                )
+
         while True:
             reached_next_stage = self._wait_for_page_state(
                 page,
-                lambda: bool(_otp_inputs(page))
-                or _is_mfa_challenge_url(str(page.url or ""))
-                or _about_you_visible(page)
-                or _has_authenticated_session(page),
+                lambda: (
+                    bool(_otp_inputs(page))
+                    or _is_mfa_challenge_url(str(page.url or ""))
+                    or _about_you_visible(page)
+                    or _has_authenticated_session(page)
+                ),
                 stage="wait-email-otp",
                 timeout_s=45,
             )
@@ -823,27 +1159,25 @@ class CamoufoxEmailRegistration:
                     page,
                     totp_code_provider=totp_code_provider,
                 )
-                return
+                return password_flow_submitted
             inputs = _otp_inputs(page)
             if not inputs:
                 if reached_next_stage and (
                     _about_you_visible(page) or _has_authenticated_session(page)
                 ):
                     self._emit("browser.otp.skipped", {"url": page.url})
-                    return
-                if otp_retry_count < otp_retry_max and _click_otp_retry_control(page):
+                    return password_flow_submitted
+                if otp_retry_count < otp_retry_max:
                     otp_retry_count += 1
-                    current_issued_after = time.time()
                     self._emit(
                         "browser.otp.retrying",
                         {"email": email, "attempt": otp_retry_count + 1},
                         "WARN",
                     )
+                    restart_for_retry("otp_form_missing")
                     continue
                 self._screenshot(page, "otp-form-missing.png")
-                raise BrowserEmailRegistrationError(
-                    f"email OTP input not found url={page.url}"
-                )
+                raise BrowserEmailRegistrationError(f"email OTP input not found url={page.url}")
             self._emit(
                 "browser.otp.wait.started",
                 {
@@ -852,16 +1186,28 @@ class CamoufoxEmailRegistration:
                     "attempt": otp_retry_count + 1,
                 },
             )
-            code = str(
-                mail_provider.wait_for_otp(
-                    email,
-                    timeout=max(1, int(self.config.otp_timeout_s or 180)),
-                    issued_after=current_issued_after,
+            try:
+                code = str(
+                    mail_provider.wait_for_otp(
+                        email,
+                        timeout=max(1, int(self.config.otp_timeout_s or 180)),
+                        issued_after=current_issued_after,
+                    )
+                    or ""
+                ).strip()
+                if not code:
+                    raise BrowserEmailRegistrationError("mail provider returned empty OTP")
+            except Exception:
+                if otp_retry_count >= otp_retry_max:
+                    raise
+                otp_retry_count += 1
+                self._emit(
+                    "browser.otp.retrying",
+                    {"email": email, "attempt": otp_retry_count + 1},
+                    "WARN",
                 )
-                or ""
-            ).strip()
-            if not code:
-                raise BrowserEmailRegistrationError("mail provider returned empty OTP")
+                restart_for_retry("otp_wait_failed")
+                continue
             if not _type_email_otp(page, inputs, code):
                 raise BrowserEmailRegistrationError("email OTP inputs are incomplete")
             submit_method = "button"
@@ -886,25 +1232,27 @@ class CamoufoxEmailRegistration:
                 raise BrowserEmailRegistrationError("email OTP continue button not found")
             advanced = self._wait_for_page_state(
                 page,
-                lambda: _about_you_visible(page)
-                or _has_authenticated_session(page)
-                or _visible(page, OTP_ERROR_SELECTORS) is not None
-                or _visible(page, ACCOUNT_MISSING_SELECTORS) is not None
-                or _visible(page, ACCOUNT_DEACTIVATED_SELECTORS) is not None,
+                lambda: (
+                    _about_you_visible(page)
+                    or _has_authenticated_session(page)
+                    or _visible(page, OTP_ERROR_SELECTORS) is not None
+                    or _visible(page, ACCOUNT_MISSING_SELECTORS) is not None
+                    or _visible(page, ACCOUNT_DEACTIVATED_SELECTORS) is not None
+                ),
                 stage="wait-email-otp-submit",
                 timeout_s=30,
             )
             self._raise_for_terminal_account_error(page, "email-otp")
             error = _visible(page, OTP_ERROR_SELECTORS)
             if error is not None:
-                if otp_retry_count < otp_retry_max and _click_otp_retry_control(page):
+                if otp_retry_count < otp_retry_max:
                     otp_retry_count += 1
-                    current_issued_after = time.time()
                     self._emit(
                         "browser.otp.retrying",
                         {"email": email, "attempt": otp_retry_count + 1},
                         "WARN",
                     )
+                    restart_for_retry("otp_rejected")
                     continue
                 self._screenshot(page, "otp-rejected.png")
                 raise BrowserEmailRegistrationError("OpenAI rejected email OTP")
@@ -936,7 +1284,7 @@ class CamoufoxEmailRegistration:
                             "browser.otp.submitted",
                             {"email": email, "method": "direct_validate"},
                         )
-                        return
+                        return password_flow_submitted
                 except (BrowserAccountDeactivatedError, BrowserChatGPTAccountMissingError):
                     raise
                 except Exception as exc:
@@ -948,21 +1296,21 @@ class CamoufoxEmailRegistration:
                         },
                         "WARN",
                     )
-                if otp_retry_count < otp_retry_max and _click_otp_retry_control(page):
+                if otp_retry_count < otp_retry_max:
                     otp_retry_count += 1
-                    current_issued_after = time.time()
                     self._emit(
                         "browser.otp.retrying",
                         {"email": email, "attempt": otp_retry_count + 1},
                         "WARN",
                     )
+                    restart_for_retry("otp_submit_no_effect")
                     continue
                 self._screenshot(page, "otp-submit-no-effect.png")
                 raise BrowserEmailRegistrationError(
                     f"email OTP submit had no effect url={page.url}"
                 )
             self._emit("browser.otp.submitted", {"email": email})
-            return
+            return password_flow_submitted
 
     def _complete_totp_challenge(
         self,
@@ -984,8 +1332,9 @@ class CamoufoxEmailRegistration:
         self._emit("browser.totp.submitted", {"url": page.url})
         if not self._wait_for_page_state(
             page,
-            lambda: not _is_mfa_challenge_url(str(page.url or ""))
-            or _has_authenticated_session(page),
+            lambda: (
+                not _is_mfa_challenge_url(str(page.url or "")) or _has_authenticated_session(page)
+            ),
             stage="wait-totp-submit",
             timeout_s=30,
         ):
@@ -1015,9 +1364,7 @@ class CamoufoxEmailRegistration:
                 ),
                 None,
             )
-            if name is not None and (
-                birthday is not None or len(birthday_segments) >= 3
-            ):
+            if name is not None and (birthday is not None or len(birthday_segments) >= 3):
                 break
             if birthday is None and len(inputs) >= 2:
                 name = next((item for item in inputs if _is_name_input(item)), None)
@@ -1117,8 +1464,10 @@ class CamoufoxEmailRegistration:
                 )
                 if not self._wait_for_page_state(
                     page,
-                    lambda: _visible(page, USER_ALREADY_EXISTS_SELECTORS) is None
-                    or _has_authenticated_session(page),
+                    lambda: (
+                        _visible(page, USER_ALREADY_EXISTS_SELECTORS) is None
+                        or _has_authenticated_session(page)
+                    ),
                     stage="wait-user-already-exists-retry",
                     timeout_s=20,
                 ):
@@ -1172,6 +1521,30 @@ class CamoufoxEmailRegistration:
         except Exception:
             pass
 
+    def _accept_cookie_consent(self, page) -> None:
+        if _click_first(
+            page,
+            COOKIE_ACCEPT_SELECTORS,
+            timeout_ms=2_500,
+            physical=True,
+        ):
+            self._emit("browser.cookie_consent.accepted", {"url": page.url})
+
+    def _raise_for_external_idp(self, page, stage: str) -> None:
+        url = str(page.url or "").lower()
+        bad_hosts = (
+            "accounts.google.com",
+            "appleid.apple.com",
+            "login.microsoftonline.com",
+            "github.com/login",
+            "facebook.com/login",
+        )
+        if any(host in url for host in bad_hosts):
+            self._screenshot(page, f"external-idp-{stage}.png")
+            raise BrowserEmailRegistrationError(
+                f"browser flow entered third-party login during {stage}: {url}"
+            )
+
     def _wait_for_page_state(
         self,
         page,
@@ -1187,8 +1560,19 @@ class CamoufoxEmailRegistration:
             try:
                 if predicate():
                     return True
-            except Exception:
-                pass
+            except Exception as exc:
+                if _is_target_closed_error(exc):
+                    raise BrowserEmailRegistrationError(
+                        f"browser target closed during {stage}: {exc}"
+                    ) from exc
+                self._emit(
+                    "browser.wait.predicate_error",
+                    {
+                        "stage": stage,
+                        "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    },
+                    "WARN",
+                )
             self._raise_for_challenge(page, stage)
             if not screenshot_taken and time.monotonic() >= screenshot_at:
                 self._screenshot(page, f"waiting-{stage}.png")
@@ -1227,6 +1611,17 @@ PASSWORD_INPUT_SELECTORS = (
     'input[type="password"]',
     'input[name="password"]',
 )
+CONTINUE_WITH_PASSWORD_SELECTORS = (
+    'a[href*="/log-in/password"]',
+    'button:has-text("Continue with password")',
+    'a:has-text("Continue with password")',
+    'button:has-text("使用密码")',
+    'a:has-text("使用密码")',
+    'button:has-text("使用密碼")',
+    'a:has-text("使用密碼")',
+    'button:has-text("パスワードで続行")',
+    'a:has-text("パスワードで続行")',
+)
 LOGIN_SELECTORS = (
     'button[data-testid="login-button"]',
     'a[data-testid="login-button"]',
@@ -1255,6 +1650,14 @@ GOOGLE_ONE_TAP_CLOSE_SELECTORS = (
     'div#credential_picker_container button[aria-label*="Close"]',
     '[aria-label="Close"][role="button"]',
 )
+COOKIE_ACCEPT_SELECTORS = (
+    "button#onetrust-accept-btn-handler",
+    'button:has-text("Accept all")',
+    'button:has-text("Accept")',
+    'button:has-text("I agree")',
+    'button:has-text("同意")',
+    'button:has-text("接受")',
+)
 CONTINUE_SELECTORS = (
     'button[type="submit"]',
     'button:has-text("Continue")',
@@ -1282,17 +1685,13 @@ FINISH_SELECTORS = (
     'button[type="submit"]',
     'button:has-text("Continue")',
 )
-OTP_ERROR_SELECTORS = (
-    'text=/incorrect code|invalid code|wrong code|验证码不正确|验证码错误/i',
-)
-ACCOUNT_MISSING_SELECTORS = (
-    'text=/No eligible ChatGPT account found|chatgpt_account_missing/i',
-)
+OTP_ERROR_SELECTORS = ("text=/incorrect code|invalid code|wrong code|验证码不正确|验证码错误/i",)
+ACCOUNT_MISSING_SELECTORS = ("text=/No eligible ChatGPT account found|chatgpt_account_missing/i",)
 ACCOUNT_DEACTIVATED_SELECTORS = (
-    'text=/account has been deleted or deactivated|account_deactivated/i',
+    "text=/account has been deleted or deactivated|account_deactivated/i",
 )
 USER_ALREADY_EXISTS_SELECTORS = (
-    'text=/user_already_exists|An account already exists for this email address or phone number/i',
+    "text=/user_already_exists|An account already exists for this email address or phone number/i",
 )
 TRY_AGAIN_SELECTORS = (
     'button:has-text("Try again")',
@@ -1338,6 +1737,25 @@ def _registration_name() -> tuple[str, str]:
 
 def _chatgpt_home_url() -> str:
     return "https://chatgpt.com/"
+
+
+def _chatgpt_auth_login_url() -> str:
+    return "https://chatgpt.com/auth/login"
+
+
+def _is_target_closed_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "target page, context or browser has been closed",
+            "page has been closed",
+            "browser has been closed",
+            "target closed",
+            "execution context was destroyed",
+            "connection closed while reading from the driver",
+        )
+    )
 
 
 def _camoufox_proxy(proxy_url: str) -> dict[str, str] | None:
@@ -1444,12 +1862,23 @@ def _click_first(
     *,
     timeout_ms: int,
     physical: bool = False,
+    native_first: bool = False,
 ) -> bool:
     element = _visible(page, selectors)
     if element is None:
         return False
     if physical:
         return _physical_click_element(page, element, timeout_ms=timeout_ms)
+    if native_first:
+        try:
+            element.scroll_into_view_if_needed(timeout=2_000)
+        except Exception:
+            pass
+        try:
+            element.click(timeout=timeout_ms, no_wait_after=True)
+            return True
+        except Exception:
+            return _physical_click_element(page, element, timeout_ms=timeout_ms)
     try:
         element.scroll_into_view_if_needed(timeout=2_000)
     except Exception:
@@ -1466,6 +1895,31 @@ def _click_first(
         except Exception:
             return False
     return True
+
+
+def _click_first_native(
+    page,
+    selectors: tuple[str, ...],
+    *,
+    timeout_ms: int,
+) -> bool:
+    """Click a live control natively, falling back to DOM dispatch."""
+    return _click_first(page, selectors, timeout_ms=timeout_ms, native_first=True)
+
+
+def _click_continue_with_password_if_present(page) -> bool:
+    """Switch the registration OTP screen to the explicit password branch."""
+    element = _visible(page, CONTINUE_WITH_PASSWORD_SELECTORS)
+    if element is None:
+        return False
+    try:
+        # This control is a React route transition. A native Playwright click
+        # drives the same browser event path as a user click; DOM dispatch alone
+        # can report success while leaving the OTP page mounted.
+        element.click(timeout=5_000, no_wait_after=True)
+        return True
+    except Exception:
+        return _physical_click_element(page, element, timeout_ms=5_000)
 
 
 def _physical_click_element(page, element, *, timeout_ms: int) -> bool:
@@ -1582,9 +2036,7 @@ def _validate_email_otp_in_browser(
         str(code or "").strip(),
     )
     if not isinstance(result, dict):
-        raise BrowserEmailRegistrationError(
-            "browser email OTP validation returned invalid data"
-        )
+        raise BrowserEmailRegistrationError("browser email OTP validation returned invalid data")
     status = int(result.get("status") or 0)
     payload = result.get("payload")
     payload = payload if isinstance(payload, dict) else {}
@@ -1878,13 +2330,22 @@ def _managed_camoufox(
     try:
         yield context
     finally:
-        manager.__exit__(None, None, None)
+        if not _camoufox_driver_disconnected(manager):
+            manager.__exit__(None, None, None)
+
+
+def _camoufox_driver_disconnected(manager: Any) -> bool:
+    try:
+        browser = manager.browser
+        connection = browser._impl_obj._connection
+        return bool(connection._transport.on_error_future.done())
+    except (AttributeError, TypeError):
+        return False
 
 
 def _input_text(item: dict[str, Any]) -> str:
     return " ".join(
-        str(item.get(key) or "")
-        for key in ("type", "name", "placeholder", "ariaLabel", "label")
+        str(item.get(key) or "") for key in ("type", "name", "placeholder", "ariaLabel", "label")
     ).lower()
 
 

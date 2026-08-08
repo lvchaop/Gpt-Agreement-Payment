@@ -403,14 +403,17 @@ class BackfillSessionWorkflow:
         *,
         user_account_id: str,
         proxy_url: str,
+        proxy_country: str = "JP",
+        space_id: str = "",
         run_id: str = "",
     ) -> dict:
+        normalized_proxy_country = str(proxy_country or "JP").strip().upper()
         step_id = self._start_step(
             run_id,
             "account_auth.personal_promotion_check",
             {
                 "user_account_id": user_account_id,
-                "proxy_country": "JP",
+                "proxy_country": normalized_proxy_country,
             },
         )
         try:
@@ -418,13 +421,16 @@ class BackfillSessionWorkflow:
                 account = session.get(UserAccountModel, user_account_id)
                 if account is None:
                     raise AccountAuthWorkflowError("user_account row disappeared")
+                space_filters = [
+                    SpaceModel.provider == "openai_chatgpt",
+                    SpaceModel.owner_user_account_id == user_account_id,
+                    SpaceModel.space_type == "personal",
+                    SpaceModel.credential_type == "personal_account",
+                ]
+                if space_id:
+                    space_filters.append(SpaceModel.id == space_id)
                 space = session.scalars(
-                    select(SpaceModel).where(
-                        SpaceModel.provider == "openai_chatgpt",
-                        SpaceModel.owner_user_account_id == user_account_id,
-                        SpaceModel.space_type == "personal",
-                        SpaceModel.credential_type == "personal_account",
-                    )
+                    select(SpaceModel).where(*space_filters)
                 ).first()
                 if space is None:
                     raise AccountAuthWorkflowError("missing_personal_chatgpt_account_id")
@@ -454,6 +460,7 @@ class BackfillSessionWorkflow:
                         SpaceModel.owner_user_account_id == user_account_id,
                         SpaceModel.space_type == "personal",
                         SpaceModel.external_space_id == personal_account_id,
+                        *([SpaceModel.id == space_id] if space_id else []),
                     )
                     .with_for_update()
                 ).first()
@@ -469,12 +476,12 @@ class BackfillSessionWorkflow:
                 "personal_chatgpt_account_id": personal_account_id,
                 "has_promotion": has_promotion,
                 "promotion_id": promotion_id if has_promotion else "",
-                "proxy_country": "JP",
+                "proxy_country": normalized_proxy_country,
             }
             self._write_event(
                 run_id,
                 "account_auth.personal_promotion_checked",
-                "personal space promotion checked through JP proxy",
+                "personal space promotion checked through configured proxy",
                 {"user_account_id": user_account_id, **result},
                 step_id=step_id,
             )
@@ -487,7 +494,7 @@ class BackfillSessionWorkflow:
                 "personal space promotion check failed",
                 {
                     "user_account_id": user_account_id,
-                    "proxy_country": "JP",
+                    "proxy_country": normalized_proxy_country,
                     "error_type": type(exc).__name__,
                     "error_message": str(exc)[:1000],
                 },

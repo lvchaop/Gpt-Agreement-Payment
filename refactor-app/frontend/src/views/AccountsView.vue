@@ -143,7 +143,11 @@ async function deleteAccount() {
   deleting.value = true;
   try {
     const result = await resourcesApi.deleteAccount(id);
-    store.toast("账号已删除", `账号=${result.user_account_id} 代理绑定=${result.deleted_proxy_bindings}`, "success");
+    store.toast(
+      "账号已删除",
+      `账号=${result.user_account_id} 个人空间=${result.deleted_personal_spaces} 代理绑定=${result.deleted_proxy_bindings}`,
+      "success",
+    );
     deleteTarget.value = null;
     await pageRef.value?.load();
   } catch (err) { store.toast("删除失败", String((err as Error).message ?? err), "error"); }
@@ -166,7 +170,7 @@ async function deleteSelectedAccounts() {
     const result = await resourcesApi.deleteAccounts(ids);
     store.toast(
       "选中账号已删除",
-      `删除=${result.deleted_count} 未找到=${result.missing_count} 代理绑定=${result.deleted_proxy_bindings}`,
+      `删除=${result.deleted_count} 未找到=${result.missing_count} 个人空间=${result.deleted_personal_spaces} 代理绑定=${result.deleted_proxy_bindings}`,
       result.missing_count ? "warning" : "success",
     );
     bulkDeleteOpen.value = false;
@@ -218,11 +222,11 @@ async function deleteSelectedAccounts() {
       <button class="btn danger" @click="deleteTarget = row"><Trash2 :size="15" />删除</button>
     </template>
   </ResourcePage>
-  <ConfirmModal :open="Boolean(deleteTarget)" title="删除账号" message="会同时删除该账号的代理绑定。" :summary="{ '账号邮箱': deleteTarget?.email, '账号 ID': deleteTarget?.id }" confirm-text="确认删除" danger :busy="deleting" @close="deleteTarget = null" @confirm="deleteAccount" />
+  <ConfirmModal :open="Boolean(deleteTarget)" title="删除账号" message="会同时删除该账号拥有的个人空间、个人空间关联数据和代理绑定。" :summary="{ '账号邮箱': deleteTarget?.email, '账号 ID': deleteTarget?.id }" confirm-text="确认删除" danger :busy="deleting" @close="deleteTarget = null" @confirm="deleteAccount" />
   <ConfirmModal
     :open="bulkDeleteOpen"
     title="删除选中账号"
-    message="会删除选中账号及其关联数据，该操作不可撤销。"
+    message="会删除选中账号、账号拥有的个人空间、个人空间关联数据和代理绑定，该操作不可撤销。"
     :summary="{ '选中数量': selectedCount, '账号示例': selectedEmailPreview }"
     confirm-text="确认批量删除"
     danger

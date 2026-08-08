@@ -146,7 +146,7 @@ def test_accounts_check_v4_headers_match_positive_promotion_har(monkeypatch) -> 
     assert headers["x-openai-target-path"] == "/backend-api/accounts/check/v4-2023-04-27"
 
 
-def test_personal_promotion_probe_uses_existing_token_and_jp_proxy(monkeypatch) -> None:
+def test_personal_promotion_probe_uses_existing_token_and_configured_proxy(monkeypatch) -> None:
     captured: dict = {}
     account = SimpleNamespace(
         access_token="personal-access-token",
@@ -196,14 +196,15 @@ def test_personal_promotion_probe_uses_existing_token_and_jp_proxy(monkeypatch) 
         mail_provider=object(),
     ).probe_personal_space_promotion(
         user_account_id="account-1",
-        proxy_url="http://jp-proxy.example:8080",
+        proxy_url="http://tr-proxy.example:8080",
+        proxy_country="TR",
     )
 
-    assert captured["proxy_url"] == "http://jp-proxy.example:8080"
+    assert captured["proxy_url"] == "http://tr-proxy.example:8080"
     assert captured["chatgpt_account_id"] == "personal-space-1"
     assert captured["access_token"] == "personal-access-token"
     assert "__Secure-next-auth.session-token=session-token" in captured["cookie_header"]
-    assert result["proxy_country"] == "JP"
+    assert result["proxy_country"] == "TR"
     assert result["has_promotion"] is True
     assert space.has_promotion is True
     assert space.promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID

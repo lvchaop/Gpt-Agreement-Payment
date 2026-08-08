@@ -44,3 +44,11 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/refactor_app/plugins/openai_auth_protocol/*.py" = ["E", "F", "I", "UP", "B"]
+
+[tool.setuptools.package-data]
+"refactor_app.plugins.openai_auth_browser" = [
+  "personal_checkout_create.js",
+  "personal_payment_method_form.js",
+  "personal_plus_checkout.js",
+  "personal_plus_checkout_oaics.js",
+]

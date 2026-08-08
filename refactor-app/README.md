@@ -30,6 +30,23 @@
 `com.gpt-agreement-payment.refactor-worker` launchd 服务，则由 launchd 重启并唯一
 管理 Worker，避免重复 Worker 抢占 Job。
 
+Cliproxy 账号静态代理：
+
+```dotenv
+CLIPROXY_HOST=us.cliproxy.io
+CLIPROXY_PORT=<控制台代理端口>
+CLIPROXY_SCHEME=http
+CLIPROXY_USERNAME=<基础用户名>
+CLIPROXY_PASSWORD=<密码>
+CLIPROXY_SESSION_DURATION_MINUTES=15
+CLIPROXY_MAX_SID_ATTEMPTS=4
+```
+
+注册、iCloud 优惠检测、个人空间绑支付方式及 Checkout 共用该配置。首次按规范化
+邮箱的 SHA-256 生成稳定 `sid`；使用前访问 ChatGPT CSRF 接口探测，失败后改用随机
+UUID `sid`，直到达到 `CLIPROXY_MAX_SID_ATTEMPTS`。该链路不读取
+`proxy_inventory`，也不回退旧 Webshare Backbone。
+
 边界：
 
 ```text

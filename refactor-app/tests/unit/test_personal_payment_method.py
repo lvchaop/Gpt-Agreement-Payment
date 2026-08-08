@@ -3,16 +3,17 @@ from __future__ import annotations
 import pytest
 
 import refactor_app.application.workflows.personal_payment_method as payment_workflow
+from refactor_app.api.routes.resources import PersonalPaymentMethodBindJobRequest
 from refactor_app.application.workflows.personal_payment_method import (
     PersonalPaymentMethodBindError,
     PersonalPaymentMethodBindWorkflow,
     _BindingContext,
     _is_network_payment_method_error,
-    _mail_provider_name,
     _ReservedPaymentAttempt,
+    mail_provider_name_for_email,
 )
 from refactor_app.application.workflows.registration_proxy import (
-    RegistrationBackboneProxy,
+    CliproxyProxy,
 )
 from refactor_app.plugins.openai_auth_browser import (
     BrowserPaymentMethodConfirmError,
@@ -54,6 +55,146 @@ def test_payment_method_workflow_tries_three_distinct_cards_then_stops() -> None
 
     assert failures == ["card-1", "card-2", "card-3"]
     assert attempts == []
+
+
+def test_payment_method_bind_job_defaults_to_continue_into_plus_checkout() -> None:
+    assert PersonalPaymentMethodBindJobRequest().auto_start_plus_checkout is True
+
+
+def test_payment_method_workflow_reuses_one_browser_for_three_card_window(
+    monkeypatch,
+) -> None:
+    attempts = [_attempt(1), _attempt(2), _attempt(3)]
+    first_attempt = attempts[0]
+    browser_instances: list[object] = []
+    billing_templates: list[_ReservedPaymentAttempt | None] = []
+    failed: list[str] = []
+    browser_auth: dict = {}
+
+    class Browser:
+        def __init__(self, _config, *, event_callback=None):
+            browser_instances.append(self)
+
+        def bind_personal_payment_cards(
+            self,
+            _mail,
+            *,
+            card_provider,
+            max_attempts,
+            on_success,
+            on_failure,
+            **kwargs,
+        ):
+            browser_auth.update(kwargs)
+            assert max_attempts == 3
+            for index in range(1, 4):
+                card, _billing = card_provider(index)
+                if index < 3:
+                    on_failure(
+                        object(),
+                        index,
+                        BrowserPaymentMethodConfirmError("card_declined"),
+                    )
+                    continue
+                result = BrowserPaymentMethodResult(
+                    personal_account_id="personal-1",
+                    payment_method_id="pm_test_3",
+                    last4=card.number[-4:],
+                    brand="visa",
+                )
+                on_success(object(), index, result)
+                return [result]
+            return []
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id, *, billing_template=None):
+            billing_templates.append(billing_template)
+            return attempts.pop(0)
+
+        def _record_failure(self, *, attempt, **_kwargs):
+            failed.append(attempt.card_id)
+
+        def _record_success(self, *, attempt, result, **_kwargs):
+            return {
+                "space_id": "space-1",
+                "payment_method_id": result.payment_method_id,
+                "payment_method_last4": result.last4,
+                "attempt_count": attempt.attempt_count,
+            }
+
+        def _event(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(payment_workflow, "CamoufoxEmailRegistration", Browser)
+    monkeypatch.setattr(
+        payment_workflow,
+        "resolve_cliproxy_proxy",
+        lambda *_args, **_kwargs: CliproxyProxy(
+            proxy_url="http://proxy.example:8080",
+            country_code="US",
+        ),
+    )
+    workflow = Workflow(session_factory=lambda: None, mail_provider=object())
+
+    result = workflow.run(space_id="space-1")
+
+    assert result["payment_method_id"] == "pm_test_3"
+    assert len(browser_instances) == 1
+    assert failed == ["card-1", "card-2"]
+    assert billing_templates == [None, first_attempt, first_attempt]
+    assert browser_auth["login_password"] == "test-password"
+    assert "cookie_header" not in browser_auth
+    assert "auth_cookie_header" not in browser_auth
+
+
+def test_payment_method_workflow_releases_reserved_card_when_browser_aborts(
+    monkeypatch,
+) -> None:
+    attempt = _attempt(1)
+    released: list[str] = []
+
+    class Browser:
+        def __init__(self, _config, *, event_callback=None):
+            pass
+
+        def bind_personal_payment_cards(self, _mail, *, card_provider, **_kwargs):
+            card_provider(1)
+            raise RuntimeError("browser aborted before result callback")
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id, *, billing_template=None):
+            return attempt
+
+        def _release_pre_payment_failure(self, *, attempt, **_kwargs):
+            released.append(attempt.card_id)
+
+        def _event(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(payment_workflow, "CamoufoxEmailRegistration", Browser)
+    monkeypatch.setattr(
+        payment_workflow,
+        "resolve_cliproxy_proxy",
+        lambda *_args, **_kwargs: CliproxyProxy(
+            proxy_url="http://proxy.example:8080",
+            country_code="US",
+        ),
+    )
+
+    workflow = Workflow(session_factory=lambda: None, mail_provider=object())
+    with pytest.raises(
+        PersonalPaymentMethodBindError,
+        match="browser aborted before result callback",
+    ):
+        workflow.run(space_id="space-1")
+
+    assert released == ["card-1"]
 
 
 def test_payment_method_workflow_stops_before_reserving_card_without_promotion() -> None:
@@ -150,8 +291,7 @@ def test_payment_method_workflow_writes_structured_stripe_diagnostics() -> None:
         workflow.run(space_id="space-1", run_id="run-1")
 
     failed = next(
-        event for event in events
-        if event["event_type"] == "personal_payment_method.attempt_failed"
+        event for event in events if event["event_type"] == "personal_payment_method.attempt_failed"
     )
     assert failed["data_json"]["stripe_diagnostics"] == {
         "error_type": "card_error",
@@ -160,23 +300,22 @@ def test_payment_method_workflow_writes_structured_stripe_diagnostics() -> None:
     }
 
 
-def test_bind_attempt_uses_registration_backbone_proxy_and_plaintext_card(monkeypatch) -> None:
+def test_bind_attempt_uses_cliproxy_and_plaintext_card(monkeypatch) -> None:
     captured: dict = {}
 
-    def resolve_proxy(_session_factory, *, email, country_code):
+    def resolve_proxy(*, email, country_code):
         captured["proxy_email"] = email
         captured["proxy_country"] = country_code
-        return RegistrationBackboneProxy(
+        return CliproxyProxy(
             proxy_url="http://backbone-proxy.example:8080",
-            endpoint_id="backbone-42",
-            endpoint_number=42,
-            endpoint_count=20_000,
             country_code=country_code,
         )
 
     class Browser:
-        def __init__(self, config):
+        def __init__(self, config, *, event_callback=None):
             captured["browser_proxy"] = config.proxy_url
+            captured["browser_headless"] = config.headless
+            captured["event_callback"] = event_callback
 
         def bind_personal_payment_method(
             self,
@@ -185,12 +324,13 @@ def test_bind_attempt_uses_registration_backbone_proxy_and_plaintext_card(monkey
             expected_personal_account_id,
             card,
             billing,
-            **_kwargs,
+            **kwargs,
         ):
             captured["mail"] = mail
             captured["expected_personal_account_id"] = expected_personal_account_id
             captured["card"] = card
             captured["billing"] = billing
+            captured["browser_auth"] = kwargs
             return BrowserPaymentMethodResult(
                 personal_account_id=expected_personal_account_id,
                 payment_method_id="pm_test_1",
@@ -200,7 +340,7 @@ def test_bind_attempt_uses_registration_backbone_proxy_and_plaintext_card(monkey
 
     monkeypatch.setattr(
         payment_workflow,
-        "resolve_registration_backbone_proxy",
+        "resolve_cliproxy_proxy",
         resolve_proxy,
     )
     monkeypatch.setattr(payment_workflow, "CamoufoxEmailRegistration", Browser)
@@ -208,6 +348,7 @@ def test_bind_attempt_uses_registration_backbone_proxy_and_plaintext_card(monkey
         session_factory=lambda: None,
         mail_provider=object(),
         registration_proxy_country="JP",
+        browser_headless=False,
     )
     attempt = _attempt(1)
 
@@ -221,15 +362,20 @@ def test_bind_attempt_uses_registration_backbone_proxy_and_plaintext_card(monkey
     assert captured["proxy_email"] == "member@outlook.com"
     assert captured["proxy_country"] == "JP"
     assert captured["browser_proxy"] == "http://backbone-proxy.example:8080"
+    assert captured["browser_headless"] is False
+    assert callable(captured["event_callback"])
     assert captured["card"].number == "4242424242424242"
     assert captured["card"].cvc == "123"
     assert captured["billing"].email == "member@outlook.com"
+    assert captured["browser_auth"]["login_password"] == "test-password"
+    assert "cookie_header" not in captured["browser_auth"]
+    assert "auth_cookie_header" not in captured["browser_auth"]
 
 
 def test_payment_mail_provider_mapping_matches_supported_mail_sources() -> None:
-    assert _mail_provider_name("member@hotmail.com") == "outlook"
-    assert _mail_provider_name("member@icloud.com") == "icloud_hide_my_email"
-    assert _mail_provider_name("member@example.test") == "cloudflare_temp_mail"
+    assert mail_provider_name_for_email("member@hotmail.com") == "outlook"
+    assert mail_provider_name_for_email("member@icloud.com") == "icloud_hide_my_email"
+    assert mail_provider_name_for_email("member@example.test") == "cloudflare_temp_mail"
 
 
 @pytest.mark.parametrize(

@@ -703,19 +703,22 @@ activationId、phoneNumber、countryPhoneCode 等只保存在当前 work output_
 
 ```text
 1. work 开始后先确定目标邮箱，再创建 user_accounts 占位行，account_status=registering。
-2. 规范化目标邮箱后计算 SHA-256，稳定映射到一个 Webshare Backbone endpoint。
-3. endpoint 用户名带国家代码，默认 US，可通过
+2. 规范化目标邮箱后计算 SHA-256，作为 Cliproxy 的稳定 sid。
+3. Cliproxy 用户名带国家代码，默认 US，可通过
    REFACTOR_APP_PROTOCOL_REGISTER_PROXY_COUNTRY 配置。
-4. AuthFlow、注册后的 accounts/check v4 以及 iCloud 密码/2FA 使用同一条注册代理。
-5. 注册成功后账号转 active。
-6. 注册失败后删除 user_accounts 占位行，不保留 invalid 账号。
+4. 使用前通过 ChatGPT CSRF 接口探测；失败时改用随机 UUID sid，最多尝试
+   CLIPROXY_MAX_SID_ATTEMPTS 次。
+5. AuthFlow、注册后的 accounts/check v4 以及 iCloud 密码/2FA 使用同一条注册代理。
+6. 注册成功后账号转 active。
+7. 注册失败后删除 user_accounts 占位行，不保留 invalid 账号。
 ```
 
 说明：
 
 ```text
-注册生命周期和个人空间绑定支付方式使用静态 Backbone 代理。
-两者都按目标邮箱哈希复用同一 endpoint 和国家配置，且不写入 user_account_proxy_bindings；
+注册生命周期和个人空间绑定支付方式使用 Cliproxy 静态代理。
+两者都按目标邮箱哈希复用同一 sid 和国家配置，且不写入 user_account_proxy_bindings；
+该链路不读取 proxy_inventory，也不回退 Webshare Backbone；
 其他登录、补 Session、授权仍使用各自既有代理逻辑。
 不把全局 protocol_register_proxy_url 作为默认代理覆盖账号绑定。
 不使用 team admin 静态住宅代理。
@@ -783,7 +786,7 @@ OpenAI 不会返回邮箱已被注册。
 注册流程已经拿到 session / access_token / cookie。
 user_accounts.account_status = active。
 user_accounts.session_status = active。
-使用同一账号代理调用 GET /backend-api/accounts/check/v4-2023-04-27。
+使用同一 Cliproxy 代理调用 GET /backend-api/accounts/check/v4-2023-04-27。
 按 v4 返回创建或更新 personal space。
 对 v4 可见且本地已存在的 Business Space，写入或更新 space_memberships。
 space_memberships.membership_status = active。

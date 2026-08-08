@@ -16,7 +16,7 @@ from refactor_app.application.workflows.protocol_registration import (
     _extract_otp,
     _hero_phone_parts,
 )
-from refactor_app.application.workflows.registration_proxy import RegistrationBackboneProxy
+from refactor_app.application.workflows.registration_proxy import CliproxyProxy
 from refactor_app.config.browser_fingerprint import (
     BROWSER_SEC_CH_UA,
     BROWSER_SEC_CH_UA_PLATFORM,
@@ -153,20 +153,17 @@ def test_email_registration_keeps_hashed_proxy_after_cloudflare_403(monkeypatch)
             email = mail.create_mailbox()
             raise RuntimeError(f"cloudflare_csrf_403_after_3_retries:{email}")
 
-    def resolve_proxy(_session_factory, *, email: str, country_code: str):
+    def resolve_proxy(*, email: str, country_code: str):
         assigned.append((email, country_code))
-        return RegistrationBackboneProxy(
+        return CliproxyProxy(
             proxy_url=proxy_url,
-            endpoint_id="backbone-17",
-            endpoint_number=17,
-            endpoint_count=20_000,
             country_code="US",
         )
 
     monkeypatch.setattr(protocol_registration, "AuthFlow", Flow)
     monkeypatch.setattr(
         protocol_registration,
-        "resolve_registration_backbone_proxy",
+        "resolve_cliproxy_proxy",
         resolve_proxy,
     )
 
@@ -882,12 +879,9 @@ def test_icloud_security_exception_keeps_registration_successful(monkeypatch) ->
     monkeypatch.setattr(protocol_registration, "ProtocolAccountSecurity", FailingSecurity)
     monkeypatch.setattr(
         protocol_registration,
-        "resolve_registration_backbone_proxy",
-        lambda *_args, **_kwargs: RegistrationBackboneProxy(
+        "resolve_cliproxy_proxy",
+        lambda *_args, **_kwargs: CliproxyProxy(
             proxy_url="http://icloud-proxy.example",
-            endpoint_id="backbone-19",
-            endpoint_number=19,
-            endpoint_count=20_000,
             country_code="US",
         ),
     )
@@ -964,7 +958,6 @@ def test_icloud_registration_adapter_ignores_email_domain() -> None:
         "caller_id": "caller",
         "task_id": "task",
         "provider": "icloud_hide_my_email",
-        "project_key": "openai-register",
         "email_domain": "",
     }
     assert provider.wait_email == "ocelots_plover_3p@icloud.com"
@@ -1010,12 +1003,9 @@ def test_icloud_registration_runs_codex_after_mfa_with_same_proxy(monkeypatch) -
         def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
             return None
 
-        def _resolve_registration_proxy(self, **_kwargs) -> RegistrationBackboneProxy:
-            return RegistrationBackboneProxy(
+        def _resolve_registration_proxy(self, **_kwargs) -> CliproxyProxy:
+            return CliproxyProxy(
                 proxy_url=current_proxy,
-                endpoint_id="backbone-187",
-                endpoint_number=187,
-                endpoint_count=1000,
                 country_code="US",
             )
 
@@ -1187,13 +1177,10 @@ def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypa
         def _merge_work_output(self, work_id: str, patch: dict) -> None:
             order.append(f"persist_account:{patch.get('user_account_id', '')}")
 
-    def fake_registration_proxy(_session_factory, *, email: str, country_code: str):
+    def fake_registration_proxy(*, email: str, country_code: str):
         order.append(f"hash_proxy:{email}:{country_code}")
-        return RegistrationBackboneProxy(
+        return CliproxyProxy(
             proxy_url="http://127.0.0.1:18088",
-            endpoint_id="backbone-21",
-            endpoint_number=21,
-            endpoint_count=20_000,
             country_code=country_code,
         )
 
@@ -1213,7 +1200,7 @@ def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypa
 
     monkeypatch.setattr(
         protocol_registration,
-        "resolve_registration_backbone_proxy",
+        "resolve_cliproxy_proxy",
         fake_registration_proxy,
     )
     monkeypatch.setattr(protocol_registration, "AuthFlow", FakeAuthFlow)
@@ -1283,12 +1270,9 @@ def test_email_protocol_rejects_valid_tokens_without_confirmed_password(
         def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
             return None
 
-        def _resolve_registration_proxy(self, **_kwargs) -> RegistrationBackboneProxy:
-            return RegistrationBackboneProxy(
+        def _resolve_registration_proxy(self, **_kwargs) -> CliproxyProxy:
+            return CliproxyProxy(
                 proxy_url="http://proxy.example",
-                endpoint_id="backbone-1",
-                endpoint_number=1,
-                endpoint_count=10,
                 country_code="US",
             )
 
@@ -1359,12 +1343,21 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
             return {"success": True}
 
     class FakeBrowser:
+        resolver = None
+
         def __init__(self, config, *, event_callback=None) -> None:
             order.append(f"browser_proxy:{config.proxy_url}")
             assert config.headless is True
             assert config.otp_timeout_s == 180
+            assert config.success_close_delay_s == 3.5
 
-        def run(self, mail: RegistrationMailProviderAdapter) -> AuthResult:
+        def run(
+            self,
+            mail: RegistrationMailProviderAdapter,
+            *,
+            totp_code_provider=None,
+        ) -> AuthResult:
+            FakeBrowser.resolver = totp_code_provider
             email = mail.create_mailbox()
             order.append(f"browser_run:{email}")
             result = AuthResult()
@@ -1406,28 +1399,29 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
         def _merge_work_output(self, work_id: str, patch: dict) -> None:
             order.append("persist_account")
 
-    def fake_proxy(_session_factory, *, email: str, country_code: str):
+    def fake_proxy(*, email: str, country_code: str):
         order.append(f"hash_proxy:{email}:{country_code}")
-        return RegistrationBackboneProxy(
+        return CliproxyProxy(
             proxy_url="http://browser-proxy.example:8080",
-            endpoint_id="backbone-22",
-            endpoint_number=22,
-            endpoint_count=20_000,
             country_code=country_code,
         )
 
     monkeypatch.setattr(protocol_registration, "CamoufoxEmailRegistration", FakeBrowser)
-    monkeypatch.setattr(protocol_registration, "resolve_registration_backbone_proxy", fake_proxy)
+    monkeypatch.setattr(protocol_registration, "resolve_cliproxy_proxy", fake_proxy)
 
+    def totp_resolver(_account_id: str) -> str:
+        return "123456"
     result = TestWorkflow(
         session_factory=lambda: None,
         mail_provider=FakeMailProvider(),
+        totp_code_resolver=totp_resolver,
     ).run(
         ProtocolRegistrationInput(
             mode="email_browser_no_phone",
             caller_id="caller",
             project_key="openai-register",
             use_proxy=False,
+            browser_close_delay_s=3.5,
         ),
         work_id="work-1",
         run_id="run-1",
@@ -1441,6 +1435,7 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
     assert "claim_complete" in order
     assert "claim_release" not in order
     assert "delete_account" not in order
+    assert FakeBrowser.resolver is totp_resolver
 
 
 def test_email_browser_failure_releases_mail_and_deletes_placeholder(monkeypatch) -> None:
@@ -1464,7 +1459,12 @@ def test_email_browser_failure_releases_mail_and_deletes_placeholder(monkeypatch
         def __init__(self, config, *, event_callback=None) -> None:
             pass
 
-        def run(self, mail: RegistrationMailProviderAdapter) -> AuthResult:
+        def run(
+            self,
+            mail: RegistrationMailProviderAdapter,
+            *,
+            totp_code_provider=None,
+        ) -> AuthResult:
             mail.create_mailbox()
             raise RuntimeError("browser failed")
 
@@ -1490,12 +1490,9 @@ def test_email_browser_failure_releases_mail_and_deletes_placeholder(monkeypatch
     monkeypatch.setattr(protocol_registration, "CamoufoxEmailRegistration", FakeBrowser)
     monkeypatch.setattr(
         protocol_registration,
-        "resolve_registration_backbone_proxy",
-        lambda *_args, **_kwargs: RegistrationBackboneProxy(
+        "resolve_cliproxy_proxy",
+        lambda *_args, **_kwargs: CliproxyProxy(
             proxy_url="http://browser-proxy.example:8080",
-            endpoint_id="backbone-23",
-            endpoint_number=23,
-            endpoint_count=20_000,
             country_code="US",
         ),
     )
@@ -1547,12 +1544,9 @@ def test_post_registration_detection_failure_keeps_persisted_account() -> None:
         def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
             return None
 
-        def _resolve_registration_proxy(self, **_kwargs) -> RegistrationBackboneProxy:
-            return RegistrationBackboneProxy(
+        def _resolve_registration_proxy(self, **_kwargs) -> CliproxyProxy:
+            return CliproxyProxy(
                 proxy_url="http://proxy.example",
-                endpoint_id="backbone-3",
-                endpoint_number=3,
-                endpoint_count=10,
                 country_code="US",
             )
 
@@ -1803,8 +1797,7 @@ def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> No
     }
 
 
-def test_icloud_promotion_check_is_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENABLED", raising=False)
+def test_icloud_promotion_check_is_disabled_by_default() -> None:
     calls: list[str] = []
     workflow = ProtocolRegistrationWorkflow(session_factory=lambda: None, mail_provider=object())
 
@@ -1824,7 +1817,6 @@ def test_icloud_promotion_check_is_disabled_by_default(monkeypatch) -> None:
 
 
 def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
-    monkeypatch.setenv("ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENABLED", "1")
     calls: list[tuple[str, str]] = []
 
     class Detector:
@@ -1841,19 +1833,20 @@ def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
                 "proxy_country": "JP",
             }
 
-    def resolve_proxy(_session_factory, *, email: str, country_code: str):
+    def resolve_proxy(*, email: str, country_code: str):
         calls.append((email, country_code))
-        return RegistrationBackboneProxy(
+        return CliproxyProxy(
             proxy_url="http://jp-proxy.example:8080",
-            endpoint_id="backbone-77",
-            endpoint_number=77,
-            endpoint_count=20_000,
             country_code=country_code,
         )
 
     monkeypatch.setattr(protocol_registration, "BackfillSessionWorkflow", Detector)
-    monkeypatch.setattr(protocol_registration, "resolve_registration_backbone_proxy", resolve_proxy)
-    workflow = ProtocolRegistrationWorkflow(session_factory=lambda: None, mail_provider=object())
+    monkeypatch.setattr(protocol_registration, "resolve_cliproxy_proxy", resolve_proxy)
+    workflow = ProtocolRegistrationWorkflow(
+        session_factory=lambda: None,
+        mail_provider=object(),
+        promotion_check_enabled=True,
+    )
 
     result = workflow._run_post_registration_promotion_check(
         ProtocolRegistrationInput(
@@ -1875,7 +1868,9 @@ def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
         "has_promotion": True,
         "promotion_id": "plus-1-month-free",
         "proxy_country": "JP",
-        "proxy_endpoint_id": "backbone-77",
+        "proxy_provider": "cliproxy",
+        "proxy_sid_source": "email_sha256",
+        "proxy_probe_attempts": 1,
     }
 
 

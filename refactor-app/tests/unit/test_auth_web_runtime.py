@@ -499,6 +499,10 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
         assert runtime.runtime_info["datadogSessionReady"] is True
         assert runtime.runtime_info["statsigSessionReady"] is True
         assert runtime.runtime_info["intlInitialized"] is True
+        browser_profile = runtime.runtime_info["browserProfile"]
+        assert browser_profile["webdriver"] is False
+        assert browser_profile["cookieEnabled"] is True
+        assert browser_profile["userAgentData"]["platform"] == "macOS"
         assert runtime.page_url == "https://auth.openai.com/about-you"
         assert auth_call[2]["allow_redirects"] is False
         assert {
@@ -533,6 +537,18 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
             event.get("type") == "vital" and event.get("vital", {}).get("name") == "initialize_intl"
             for event in events
         )
+        performance_event = next(
+            event
+            for event in statsig_events
+            if event.get("eventName") == "auto_capture::performance"
+        )
+        assert {
+            "load_time_ms",
+            "dom_interactive_time_ms",
+            "redirect_count",
+            "transfer_bytes",
+            "first_contentful_paint_time_ms",
+        }.issubset(performance_event.get("metadata", {}))
         assert any(
             event.get("type") == "resource"
             and event.get("resource", {})
@@ -545,6 +561,13 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
         assert any(url.startswith("https://chatgpt.com/ces/v1/rgstr") for url in statsig_urls)
         assert not any(url.startswith("https://ab.chatgpt.com/v1/rgstr") for url in statsig_urls)
         assert any("https://ab.chatgpt.com/v1/initialize" in call[1] for call in session.calls)
+        statsig_call = next(call for call in session.calls if "/ces/v1/rgstr" in call[1])
+        assert statsig_call[2]["headers"]["Sec-Fetch-Site"] == "cross-site"
+        assert statsig_call[2]["headers"]["Priority"] == "u=1, i"
+        assert statsig_call[2]["headers"]["Referer"] == "https://auth.openai.com/"
+        rum_call = next(call for call in session.calls if "/awe/api/v2/rum" in call[1])
+        assert rum_call[2]["headers"]["Sec-Fetch-Site"] == "same-origin"
+        assert rum_call[2]["headers"]["Priority"] == "u=1, i"
         assert {
             "bootstrap_parse_duration_ms",
             "statsig_initialize_duration_ms",

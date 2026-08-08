@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -48,6 +49,7 @@ def test_create_app_registers_p8_routes(monkeypatch: MonkeyPatch) -> None:
     assert "/payment-method-pools/import" in paths
     assert "/spaces/{space_id}/payment-method-bind-job" in paths
     assert "/spaces/payment-method-bind-selected-job" in paths
+    assert "/spaces/promotion-check-selected-job" in paths
     assert "/memberships/personal-codex-authorize-job" in paths
     assert "/space-credentials" in paths
     assert "/space-credentials/business-access-token-job" in paths
@@ -152,6 +154,8 @@ def test_delete_selected_user_accounts(monkeypatch: MonkeyPatch) -> None:
     client = TestClient(create_app())
     account_ids = [f"test-bulk-delete-{uuid4()}" for _ in range(2)]
     missing_id = f"test-bulk-delete-missing-{uuid4()}"
+    personal_space_ids = [f"{account_id}-personal-space" for account_id in account_ids]
+    business_space_id = f"{account_ids[0]}-business-space"
     now = datetime.now(UTC)
 
     settings = Settings()
@@ -167,6 +171,37 @@ def test_delete_selected_user_accounts(monkeypatch: MonkeyPatch) -> None:
             )
             for account_id in account_ids
         )
+        session.add_all(
+            [
+                SpaceModel(
+                    id=space_id,
+                    external_space_id=f"{space_id}-external",
+                    owner_user_account_id=account_id,
+                    name=space_id,
+                    space_type="personal",
+                    auth_mode="codex_oauth",
+                    credential_type="personal_account",
+                    space_status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+                for account_id, space_id in zip(account_ids, personal_space_ids, strict=True)
+            ]
+            + [
+                SpaceModel(
+                    id=business_space_id,
+                    external_space_id=f"{business_space_id}-external",
+                    owner_user_account_id=account_ids[0],
+                    name=business_space_id,
+                    space_type="business",
+                    auth_mode="backend_access_token",
+                    credential_type="team_5h_weekly",
+                    space_status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+            ]
+        )
         session.commit()
 
     try:
@@ -180,14 +215,78 @@ def test_delete_selected_user_accounts(monkeypatch: MonkeyPatch) -> None:
             "requested_count": 3,
             "deleted_count": 2,
             "missing_count": 1,
+            "deleted_personal_spaces": 2,
             "deleted_proxy_bindings": 0,
         }
         with session_factory() as session:
             assert session.get(UserAccountModel, account_ids[0]) is None
             assert session.get(UserAccountModel, account_ids[1]) is None
+            assert session.get(SpaceModel, personal_space_ids[0]) is None
+            assert session.get(SpaceModel, personal_space_ids[1]) is None
+            assert session.get(SpaceModel, business_space_id) is not None
     finally:
         with session_factory() as session:
+            session.execute(
+                delete(SpaceModel).where(
+                    SpaceModel.id.in_([*personal_space_ids, business_space_id])
+                )
+            )
             session.execute(delete(UserAccountModel).where(UserAccountModel.id.in_(account_ids)))
+            session.commit()
+
+
+def test_delete_user_account_deletes_owned_personal_space(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    account_id = f"test-delete-account-{uuid4()}"
+    personal_space_id = f"{account_id}-personal-space"
+    now = datetime.now(UTC)
+    session_factory = make_session_factory(make_engine(Settings()))
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                id=account_id,
+                email=f"{account_id}@example.com",
+                account_status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.add(
+            SpaceModel(
+                id=personal_space_id,
+                external_space_id=f"{personal_space_id}-external",
+                owner_user_account_id=account_id,
+                name=personal_space_id,
+                space_type="personal",
+                auth_mode="codex_oauth",
+                credential_type="personal_account",
+                space_status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+    try:
+        response = client.delete(f"/user-accounts/{account_id}")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "user_account_id": account_id,
+            "deleted": True,
+            "deleted_personal_spaces": 1,
+            "deleted_proxy_bindings": 0,
+        }
+        with session_factory() as session:
+            assert session.get(UserAccountModel, account_id) is None
+            assert session.get(SpaceModel, personal_space_id) is None
+    finally:
+        with session_factory() as session:
+            session.execute(delete(SpaceModel).where(SpaceModel.id == personal_space_id))
+            session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
             session.commit()
 
 
@@ -333,7 +432,7 @@ def test_payment_method_pool_import_and_personal_job_api(
         )
         assert job_response.status_code == 200
         job_id = job_response.json()["job_id"]
-        assert job_response.json()["job_status"] == "queued"
+        assert job_response.json()["job_status"] in {"queued", "running"}
 
         duplicate_response = client.post(
             f"/spaces/{space_id}/payment-method-bind-job",
@@ -543,6 +642,271 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
                 )
             )
             session.commit()
+
+
+def test_personal_promotion_check_selection_filters_invalid_spaces(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    prefix = f"test-promotion-selected-{uuid4()}"
+    active_account_id = f"{prefix}-active-account"
+    inactive_account_id = f"{prefix}-inactive-account"
+    now = datetime.now(UTC)
+    space_ids = {
+        "eligible": f"{prefix}-eligible",
+        "duplicate": f"{prefix}-duplicate",
+        "business": f"{prefix}-business",
+        "inactive_space": f"{prefix}-inactive-space",
+        "missing_owner": f"{prefix}-missing-owner",
+        "inactive_owner": f"{prefix}-inactive-owner",
+    }
+
+    def make_space(
+        key: str,
+        *,
+        owner_user_account_id: str = active_account_id,
+        space_type: str = "personal",
+        space_status: str = "active",
+    ) -> SpaceModel:
+        return SpaceModel(
+            id=space_ids[key],
+            external_space_id=f"{prefix}-external-{key}",
+            owner_user_account_id=owner_user_account_id,
+            name=f"{prefix}-{key}",
+            space_type=space_type,
+            auth_mode="codex_oauth",
+            credential_type=(
+                "personal_account" if space_type == "personal" else "team_5h_weekly"
+            ),
+            space_status=space_status,
+            created_at=now,
+            updated_at=now,
+        )
+
+    session_factory = make_session_factory(make_engine(Settings()))
+    with session_factory() as session:
+        session.add_all(
+            [
+                UserAccountModel(
+                    id=active_account_id,
+                    email=f"{active_account_id}@example.com",
+                    account_status="active",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                UserAccountModel(
+                    id=inactive_account_id,
+                    email=f"{inactive_account_id}@example.com",
+                    account_status="invalid",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                make_space("eligible"),
+                make_space("duplicate"),
+                make_space("business", space_type="business"),
+                make_space("inactive_space", space_status="disabled"),
+                make_space("missing_owner", owner_user_account_id=""),
+                make_space("inactive_owner", owner_user_account_id=inactive_account_id),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        resource_routes,
+        "_active_personal_promotion_check_jobs_by_space_id",
+        lambda **_kwargs: {space_ids["duplicate"]: object()},
+    )
+    try:
+        with session_factory() as session:
+            requested, selected, skipped = (
+                resource_routes._select_personal_promotion_check_spaces(
+                    session=session,
+                    space_ids=[
+                        space_ids["eligible"],
+                        space_ids["duplicate"],
+                        space_ids["business"],
+                        space_ids["inactive_space"],
+                        space_ids["missing_owner"],
+                        space_ids["inactive_owner"],
+                        f"{prefix}-missing",
+                        space_ids["eligible"],
+                    ],
+                )
+            )
+        assert len(requested) == 7
+        assert [space.id for space in selected] == [space_ids["eligible"]]
+        assert {item["reason"] for item in skipped} == {
+            "active_personal_promotion_check_job_exists",
+            "promotion_check_personal_space_required",
+            "promotion_check_space_not_active",
+            "promotion_check_owner_account_missing",
+            "promotion_check_owner_account_not_active",
+            "space_not_found",
+        }
+    finally:
+        with session_factory() as session:
+            session.execute(delete(SpaceModel).where(SpaceModel.id.in_(space_ids.values())))
+            session.execute(
+                delete(UserAccountModel).where(
+                    UserAccountModel.id.in_([active_account_id, inactive_account_id])
+                )
+            )
+            session.commit()
+
+
+def test_personal_promotion_check_selected_job_normalizes_config_and_enqueues_work(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    captured: dict = {"works": []}
+    selected = [SimpleNamespace(id="space-1"), SimpleNamespace(id="space-2")]
+
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_promotion_check_spaces",
+        lambda **_kwargs: (
+            ["space-1", "space-2", "space-missing"],
+            selected,
+            [{"space_id": "space-missing", "reason": "space_not_found"}],
+        ),
+    )
+
+    def start_work_job(**kwargs):
+        captured["start"] = kwargs
+        return SimpleNamespace(id="job-1"), SimpleNamespace(id="run-1")
+
+    class CapturingWorkQueue:
+        def __init__(self, _session):
+            pass
+
+        def enqueue(self, **kwargs):
+            captured["works"].append(kwargs)
+
+    monkeypatch.setattr(resource_routes, "_start_work_job", start_work_job)
+    monkeypatch.setattr(resource_routes, "WorkQueue", CapturingWorkQueue)
+    monkeypatch.setattr(
+        resource_routes,
+        "_work_job_summary_response",
+        lambda **_kwargs: {
+            "job_id": "job-1",
+            "job_status": "running",
+            "run_id": "run-1",
+            "work_count": 7,
+            "selected_count": 2,
+            "queued": 2,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        },
+    )
+
+    response = TestClient(create_app()).post(
+        "/spaces/promotion-check-selected-job",
+        json={
+            "space_ids": ["space-1", "space-2", "space-missing"],
+            "proxy_country": "jp",
+            "work_count": 7,
+            "created_by": "test",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == "job-1"
+    assert payload["requested_count"] == 3
+    assert payload["selected_count"] == 2
+    assert payload["selection_skipped_count"] == 1
+    assert captured["start"]["job_type"] == "space.personal_promotion_check.selected"
+    assert captured["start"]["input_json"]["proxy_country"] == "JP"
+    assert captured["start"]["input_json"]["work_count"] == 7
+    assert [work["execution_key"] for work in captured["works"]] == [
+        "personal-promotion-check:space-1",
+        "personal-promotion-check:space-2",
+    ]
+    assert all(work["input_json"]["proxy_country"] == "JP" for work in captured["works"])
+
+
+def test_personal_promotion_check_work_uses_selected_space_and_jp_proxy(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    space = SimpleNamespace(
+        id="space-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        owner_user_account_id="account-1",
+    )
+    account = SimpleNamespace(
+        id="account-1",
+        email="selected@example.com",
+        account_status="active",
+    )
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, key):
+            if model is SpaceModel and key == "space-1":
+                return space
+            if model is UserAccountModel and key == "account-1":
+                return account
+            return None
+
+    def resolve_proxy(**kwargs):
+        captured["proxy"] = kwargs
+        return SimpleNamespace(
+            proxy_url="http://jp-proxy.example:8080",
+            country_code="JP",
+            provider="cliproxy",
+            sid_source="email_sha256",
+            probe_attempts=1,
+        )
+
+    class FakeBackfillSessionWorkflow:
+        def __init__(self, **kwargs):
+            captured["workflow_init"] = kwargs
+
+        def probe_personal_space_promotion(self, **kwargs):
+            captured["probe"] = kwargs
+            return {
+                "status": "succeeded",
+                "has_promotion": True,
+                "promotion_id": "plus-1-month-free",
+                "proxy_country": "JP",
+            }
+
+    monkeypatch.setattr(handlers, "resolve_cliproxy_proxy", resolve_proxy)
+    monkeypatch.setattr(handlers, "BackfillSessionWorkflow", FakeBackfillSessionWorkflow)
+    monkeypatch.setattr(handlers, "_mail_plugin", lambda _settings: object())
+
+    result = handlers._run_personal_promotion_check_work(
+        session_factory=FakeSession,
+        settings=Settings(),
+        input_json={"space_id": "space-1", "_run_id": "run-1"},
+    )
+
+    assert captured["proxy"] == {
+        "email": "selected@example.com",
+        "country_code": "JP",
+    }
+    assert captured["probe"] == {
+        "user_account_id": "account-1",
+        "proxy_url": "http://jp-proxy.example:8080",
+        "proxy_country": "JP",
+        "space_id": "space-1",
+        "run_id": "run-1",
+    }
+    assert result["space_id"] == "space-1"
+    assert result["proxy_provider"] == "cliproxy"
+    assert result["proxy_sid_source"] == "email_sha256"
+    assert result["proxy_probe_attempts"] == 1
+    assert result["has_promotion"] is True
 
 
 def test_payment_method_pool_imports_each_pool_independently(

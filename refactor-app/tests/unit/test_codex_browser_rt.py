@@ -16,6 +16,7 @@ from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
     _complete_add_phone_with_provider,
     _exchange_callback,
     _extract_callback_url,
+    _fill_otp,
     _has_password_input,
     _install_callback_capture,
     _is_add_phone_url,
@@ -321,6 +322,32 @@ def test_generic_retry_control_does_not_make_unrelated_page_an_otp_page() -> Non
     page = RetryOnlyPage()
 
     assert _is_otp_page(page, "https://auth.openai.com/log-in") is False
+
+
+def test_fill_otp_accepts_visible_text_input_with_authenticator_label() -> None:
+    class Input:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def click(self, **_kwargs) -> None:
+            return None
+
+        def fill(self, value: str) -> None:
+            self.value = value
+
+    field = Input()
+
+    class Page:
+        @staticmethod
+        def query_selector(selector: str):
+            return field if selector == 'input[type="text"]:visible' else None
+
+        @staticmethod
+        def query_selector_all(_selector: str):
+            return []
+
+    assert _fill_otp(Page(), "654321") is True
+    assert field.value == "654321"
 
 
 def test_account_deactivated_page_returns_terminal_failure() -> None:

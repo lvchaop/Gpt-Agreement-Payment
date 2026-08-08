@@ -12,6 +12,7 @@ from refactor_app.plugins.openai_auth_browser.email_registration import (
     _has_authenticated_session,
     _session_token,
 )
+from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthResult
 
 
 def test_camoufox_proxy_preserves_authenticated_http_proxy() -> None:
@@ -46,6 +47,53 @@ def test_managed_camoufox_cleans_up_when_browser_launch_fails() -> None:
             pytest.fail("launch failure must not enter the browser body")
 
     assert calls == ["init", "enter", "exit"]
+
+
+def test_managed_camoufox_skips_close_after_driver_disconnect() -> None:
+    calls: list[str] = []
+
+    class Future:
+        @staticmethod
+        def done() -> bool:
+            return True
+
+    class Manager:
+        def __init__(self, **_launch_options) -> None:
+            self.browser = type(
+                "Browser",
+                (),
+                {
+                    "_impl_obj": type(
+                        "Impl",
+                        (),
+                        {
+                            "_connection": type(
+                                "Connection",
+                                (),
+                                {
+                                    "_transport": type(
+                                        "Transport",
+                                        (),
+                                        {"on_error_future": Future()},
+                                    )()
+                                },
+                            )()
+                        },
+                    )()
+                },
+            )()
+
+        def __enter__(self):
+            calls.append("enter")
+            return self.browser
+
+        def __exit__(self, *_args) -> None:
+            calls.append("exit")
+
+    with browser_registration._managed_camoufox(Manager, headless=True):
+        calls.append("body")
+
+    assert calls == ["enter", "body"]
 
 
 def test_browser_cookie_export_separates_domains_and_reassembles_session_chunks() -> None:
@@ -235,11 +283,124 @@ def test_open_email_registration_accepts_delayed_compatibility_email_form(
     monkeypatch.setattr(browser_registration, "_visible", visible)
     monkeypatch.setattr(browser_registration, "_click_first", click_first)
     monkeypatch.setattr(runner, "_raise_for_challenge", lambda _page, _stage: None)
+    monkeypatch.setattr(runner, "_accept_cookie_consent", lambda _page: None)
     monkeypatch.setattr(runner, "_wait_for_page_state", wait_for_page_state)
 
     runner._open_email_registration(page)
 
     assert state == {"compat_ready": True, "login_clicks": 0}
+
+
+def test_open_email_registration_starts_at_auth_login(monkeypatch, tmp_path) -> None:
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    email_field = object()
+    monkeypatch.setattr(
+        browser_registration,
+        "_visible",
+        lambda _page, selectors: (
+            email_field if selectors is browser_registration.EMAIL_INPUT_SELECTORS else None
+        ),
+    )
+    monkeypatch.setattr(runner, "_accept_cookie_consent", lambda _page: None)
+    monkeypatch.setattr(runner, "_raise_for_challenge", lambda _page, _stage: None)
+    monkeypatch.setattr(runner, "_raise_for_external_idp", lambda _page, _stage: None)
+
+    runner._open_email_registration(page, entry_mode="signup")
+
+    assert page.url == "https://chatgpt.com/auth/login"
+
+
+def test_restart_email_otp_flow_reenters_email_and_password_branch(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    monkeypatch.setattr(
+        runner,
+        "_open_email_registration",
+        lambda _page, *, entry_mode: calls.append(f"open:{entry_mode}"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_submit_email",
+        lambda _page, email: calls.append(f"email:{email}"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_submit_password_if_requested",
+        lambda *_args, **_kwargs: calls.append("password") or False,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_submit_preferred_password_flow",
+        lambda *_args, **_kwargs: calls.append("preferred-password") or True,
+    )
+
+    runner._restart_email_otp_flow(
+        page,
+        object(),
+        email="user@example.com",
+        password="generated-password",
+        prefer_password_flow=True,
+    )
+
+    assert calls == [
+        "open:signup",
+        "email:user@example.com",
+        "password",
+        "preferred-password",
+    ]
+
+
+def test_email_otp_wait_failure_restarts_registration_flow(monkeypatch, tmp_path) -> None:
+    restarts: list[dict[str, object]] = []
+    waits = {"count": 0}
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+
+    class Mailbox:
+        def wait_for_otp(self, *_args, **_kwargs) -> str:
+            waits["count"] += 1
+            if waits["count"] == 1:
+                raise TimeoutError("mailbox timeout")
+            return "123456"
+
+    monkeypatch.setattr(runner, "_wait_for_page_state", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        runner,
+        "_restart_email_otp_flow",
+        lambda *_args, **kwargs: restarts.append(kwargs),
+    )
+    monkeypatch.setattr(browser_registration, "_otp_inputs", lambda _page: [object()])
+    monkeypatch.setattr(browser_registration, "_type_email_otp", lambda *_args: True)
+    monkeypatch.setattr(browser_registration, "_click_first", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(browser_registration, "_visible", lambda *_args: None)
+
+    runner._complete_email_otp(
+        page,
+        Mailbox(),
+        email="user@example.com",
+        issued_after=0,
+        password="generated-password",
+    )
+
+    assert waits["count"] == 2
+    assert restarts == [
+        {
+            "email": "user@example.com",
+            "password": "generated-password",
+            "prefer_password_flow": False,
+        }
+    ]
 
 
 def test_open_email_registration_uses_commit_before_polling_controls(
@@ -345,6 +506,61 @@ def test_submit_email_retries_when_react_replaces_the_input(monkeypatch, tmp_pat
     assert attached.filled == "MixedCase@outlook.com"
 
 
+def test_preferred_password_submission_marks_auth_result_configured(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    result = AuthResult()
+    result.email = "member@example.com"
+    result.password = "registered-password"
+
+    monkeypatch.setattr(runner, "_submit_email", lambda *_args: None)
+    monkeypatch.setattr(runner, "_submit_password_if_requested", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(runner, "_complete_email_otp", lambda *_args, **_kwargs: True)
+
+    runner._complete_email_authentication(
+        page,
+        object(),
+        result=result,
+        email=result.email,
+        passwordless_for_existing_login=False,
+        prefer_password_flow=True,
+    )
+
+    assert result.password_configured is True
+
+
+def test_registration_rejects_existing_login_before_totp_challenge(monkeypatch) -> None:
+    runner = CamoufoxEmailRegistration(BrowserEmailRegistrationConfig())
+    page = _FakePage()
+    page.url = "https://auth.openai.com/log-in/password"
+    password_field = _FakeInput()
+
+    monkeypatch.setattr(
+        browser_registration,
+        "_visible",
+        lambda _page, selectors: password_field
+        if selectors is browser_registration.PASSWORD_INPUT_SELECTORS
+        else None,
+    )
+    monkeypatch.setattr(runner, "_raise_for_terminal_account_error", lambda *_args: None)
+    monkeypatch.setattr(runner, "_screenshot", lambda *_args: None)
+    monkeypatch.setattr(runner, "_wait_for_page_state", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(BrowserEmailRegistrationError, match="registration email already exists"):
+        runner._submit_password_if_requested(
+            page,
+            "registered-password",
+            email="member@example.com",
+            passwordless_for_existing_login=True,
+            reject_existing_login=True,
+        )
+
+
 def test_submit_email_uses_scoped_email_continue_button(monkeypatch, tmp_path) -> None:
     runner = CamoufoxEmailRegistration(
         BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
@@ -382,7 +598,7 @@ def test_submit_email_falls_back_to_enter_when_click_has_no_effect(
     )
     page = _FakePage()
     field = _FakeInput()
-    waits = iter((False, True))
+    waits = iter((False, False, True))
 
     monkeypatch.setattr(browser_registration, "_visible", lambda *_args: field)
     monkeypatch.setattr(browser_registration, "_click_first", lambda *_args, **_kwargs: True)
@@ -455,7 +671,7 @@ def test_submit_email_waits_for_document_load_before_next_stage_poll(
     runner._submit_email(page, "member@example.com")
 
     assert load_states == ["domcontentloaded", "load"]
-    assert wait_calls == [("wait-email-submit", 60.0)]
+    assert wait_calls == [("wait-email-submit", 16.0)]
 
 
 def test_email_submit_does_not_treat_a_closed_email_modal_as_advance(monkeypatch) -> None:
@@ -557,6 +773,22 @@ def test_browser_click_uses_codex_dom_click_before_native_fallback(monkeypatch) 
     assert calls == ["scroll", "evaluate"]
 
 
+def test_continue_with_password_prefers_native_navigation_click(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Element:
+        def click(self, **_kwargs) -> None:
+            calls.append("native")
+
+        def evaluate(self, _script: str) -> None:
+            calls.append("dom")
+
+    monkeypatch.setattr(browser_registration, "_visible", lambda *_args: Element())
+
+    assert browser_registration._click_continue_with_password_if_present(_FakePage())
+    assert calls == ["native"]
+
+
 def test_registration_email_input_falls_back_to_dom_click_after_native_timeout() -> None:
     calls: list[str] = []
 
@@ -652,6 +884,162 @@ def test_run_enables_passwordless_existing_account_branch(monkeypatch, tmp_path)
 
     assert runner.run(object()) == "authenticated"
     assert captured["passwordless_for_existing_login"] is True
+    assert captured["prefer_password_flow"] is True
+
+
+def test_run_waits_before_closing_browser_after_success(monkeypatch, tmp_path) -> None:
+    sleeps: list[float] = []
+    events: list[str] = []
+    state: dict[str, bool] = {"exited": False}
+
+    class Context:
+        pages: list[object] = []
+
+        def new_page(self):
+            page = type("Page", (), {"set_default_timeout": lambda *_args: None})()
+            self.pages.append(page)
+            return page
+
+    context = Context()
+
+    class Managed:
+        def __enter__(self):
+            return context
+
+        def __exit__(self, *_args) -> None:
+            state["exited"] = True
+
+    class Mailbox:
+        def create_mailbox(self) -> str:
+            return "user@example.com"
+
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(
+            artifact_root=str(tmp_path),
+            success_close_delay_s=10.0,
+        ),
+        event_callback=lambda stage, _data, _level: events.append(stage),
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "prepare_domain_mailbox",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "_managed_camoufox",
+        lambda *_args, **_kwargs: Managed(),
+    )
+    monkeypatch.setattr(runner, "_run_in_context", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(browser_registration.time, "sleep", sleeps.append)
+
+    result = runner._run_authenticated(
+        Mailbox(),
+        password_for_email=lambda _email: "password",
+        register_method="email_browser",
+        entry_mode="signup",
+        passwordless_for_existing_login=False,
+        after_session=lambda _context, _page, authenticated: authenticated,
+    )
+
+    assert result is not None
+    assert sleeps == [10.0]
+    assert state["exited"] is True
+    assert events[-2:] == [
+        "browser.success_close_delay.started",
+        "browser.success_close_delay.completed",
+    ]
+
+
+def test_registration_otp_flow_clicks_continue_with_password(monkeypatch, tmp_path) -> None:
+    calls: list[dict[str, object]] = []
+    events: list[str] = []
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path)),
+        event_callback=lambda stage, _data, _level: events.append(stage),
+    )
+    page = _FakePage()
+    monkeypatch.setattr(
+        browser_registration,
+        "_click_continue_with_password_if_present",
+        lambda _page: True,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_submit_password_if_requested",
+        lambda *_args, **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(runner, "_wait_for_page_state", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(browser_registration, "_otp_inputs", lambda _page: [])
+    monkeypatch.setattr(browser_registration, "_about_you_visible", lambda _page: True)
+
+    runner._complete_email_otp(
+        page,
+        object(),
+        email="user@example.com",
+        issued_after=0,
+        password="generated-password",
+        prefer_password_flow=True,
+    )
+
+    assert calls == [
+        {
+            "email": "user@example.com",
+            "passwordless_for_existing_login": False,
+            "require_password": True,
+        }
+    ]
+    assert events[:2] == [
+        "browser.password_flow.selected",
+        "browser.password_flow.submitted",
+    ]
+
+
+def test_preferred_password_flow_retries_when_otp_page_stays_mounted(monkeypatch, tmp_path) -> None:
+    clicks = 0
+    waits = 0
+    calls: list[dict[str, object]] = []
+    events: list[str] = []
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path)),
+        event_callback=lambda stage, _data, _level: events.append(stage),
+    )
+
+    def click_continue(_page) -> bool:
+        nonlocal clicks
+        clicks += 1
+        return True
+
+    def wait_for_password(*_args, **_kwargs) -> bool:
+        nonlocal waits
+        waits += 1
+        return waits == 2
+
+    monkeypatch.setattr(
+        browser_registration,
+        "_click_continue_with_password_if_present",
+        click_continue,
+    )
+    monkeypatch.setattr(runner, "_wait_for_page_state", wait_for_password)
+    monkeypatch.setattr(
+        runner,
+        "_submit_password_if_requested",
+        lambda *_args, **kwargs: calls.append(kwargs) or True,
+    )
+
+    assert runner._submit_preferred_password_flow(
+        _FakePage(), email="user@example.com", password="generated-password"
+    )
+    assert clicks == 2
+    assert waits == 2
+    assert calls == [
+        {
+            "email": "user@example.com",
+            "passwordless_for_existing_login": False,
+            "require_password": True,
+        }
+    ]
+    assert "browser.password_flow.retrying" in events
 
 
 def test_email_otp_is_typed_with_browser_keyboard() -> None:
@@ -1184,11 +1572,12 @@ def test_resume_existing_login_after_retry_reuses_passwordless_otp_flow(
     )
 
     assert calls == [
-        {
-            "result": result,
-            "email": "member@icloud.com",
-            "passwordless_for_existing_login": True,
-        }
+            {
+                "result": result,
+                "email": "member@icloud.com",
+                "passwordless_for_existing_login": True,
+                "totp_code_provider": None,
+            }
     ]
     assert events[0][0] == "browser.user_already_exists.login.started"
     assert events[-1][0] == "browser.user_already_exists.login.completed"

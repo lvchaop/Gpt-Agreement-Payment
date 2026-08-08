@@ -18,6 +18,29 @@ class Settings(BaseSettings):
     openai_probe_path_template: str = ""
     browser_impersonate: str = Field(default="chrome142", pattern=r"^chrome\d+[a-z]*$")
     browser_static_asset_cache_enabled: bool = False
+    browser_log_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "BROWSER_LOG_ENABLED",
+            "REFACTOR_APP_BROWSER_LOG_ENABLED",
+        ),
+    )
+    browser_log_capture_bodies: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "BROWSER_LOG_CAPTURE_BODIES",
+            "REFACTOR_APP_BROWSER_LOG_CAPTURE_BODIES",
+        ),
+    )
+    browser_log_max_body_chars: int = Field(
+        default=100_000,
+        ge=1_000,
+        le=100_000,
+        validation_alias=AliasChoices(
+            "BROWSER_LOG_MAX_BODY_CHARS",
+            "REFACTOR_APP_BROWSER_LOG_MAX_BODY_CHARS",
+        ),
+    )
     external_mail_api_base_url: str = ""
     external_mail_api_key: str = ""
     external_mail_provider_name: str = "cloudflare_temp_mail"
@@ -71,6 +94,111 @@ class Settings(BaseSettings):
     )
     protocol_register_proxy_url: str = ""
     protocol_register_proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    cliproxy_host: str = Field(
+        default="us.cliproxy.io",
+        validation_alias=AliasChoices(
+            "CLIPROXY_HOST",
+            "REFACTOR_APP_CLIPROXY_HOST",
+        ),
+    )
+    cliproxy_port: int = Field(
+        default=0,
+        ge=0,
+        le=65535,
+        validation_alias=AliasChoices(
+            "CLIPROXY_PORT",
+            "REFACTOR_APP_CLIPROXY_PORT",
+        ),
+    )
+    cliproxy_scheme: str = Field(
+        default="http",
+        validation_alias=AliasChoices(
+            "CLIPROXY_SCHEME",
+            "REFACTOR_APP_CLIPROXY_SCHEME",
+        ),
+    )
+    cliproxy_username: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "CLIPROXY_USERNAME",
+            "REFACTOR_APP_CLIPROXY_USERNAME",
+        ),
+    )
+    cliproxy_password: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "CLIPROXY_PASSWORD",
+            "REFACTOR_APP_CLIPROXY_PASSWORD",
+        ),
+    )
+    cliproxy_state: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CLIPROXY_STATE",
+            "REFACTOR_APP_CLIPROXY_STATE",
+        ),
+    )
+    cliproxy_session_duration_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=120,
+        validation_alias=AliasChoices(
+            "CLIPROXY_SESSION_DURATION_MINUTES",
+            "REFACTOR_APP_CLIPROXY_SESSION_DURATION_MINUTES",
+        ),
+    )
+    cliproxy_probe_url: str = Field(
+        default="https://chatgpt.com/api/auth/csrf",
+        validation_alias=AliasChoices(
+            "CLIPROXY_PROBE_URL",
+            "REFACTOR_APP_CLIPROXY_PROBE_URL",
+        ),
+    )
+    cliproxy_probe_timeout_s: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        validation_alias=AliasChoices(
+            "CLIPROXY_PROBE_TIMEOUT_S",
+            "REFACTOR_APP_CLIPROXY_PROBE_TIMEOUT_S",
+        ),
+    )
+    cliproxy_probe_require_csrf_token: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "CLIPROXY_PROBE_REQUIRE_CSRF_TOKEN",
+            "REFACTOR_APP_CLIPROXY_PROBE_REQUIRE_CSRF_TOKEN",
+        ),
+    )
+    cliproxy_max_sid_attempts: int = Field(
+        default=4,
+        ge=1,
+        le=20,
+        validation_alias=AliasChoices(
+            "CLIPROXY_MAX_SID_ATTEMPTS",
+            "REFACTOR_APP_CLIPROXY_MAX_SID_ATTEMPTS",
+        ),
+    )
+    personal_plus_checkout_create_proxy_country: str = Field(
+        default="US",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_CREATE_PROXY_COUNTRY",
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_plus_checkout_promo_proxy_country: str = Field(
+        default="JP",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_PROMO_PROXY_COUNTRY",
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_plus_checkout_promo_campaign_id: str = Field(
+        default="plus-1-month-free",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_PROMO_CAMPAIGN_ID",
+    )
+    icloud_post_registration_promotion_check_enabled: bool = Field(
+        default=False,
+        validation_alias="ICLOUD_POST_REGISTRATION_PROMOTION_CHECK_ENABLED",
+    )
     web_login_password: str = ""
 
     model_config = SettingsConfigDict(env_prefix="REFACTOR_APP_", env_file=".env")

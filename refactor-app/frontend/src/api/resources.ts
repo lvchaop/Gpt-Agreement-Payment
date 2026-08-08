@@ -23,6 +23,11 @@ export type PersonalPaymentMethodBindSelectedJobResult = AccountWorkJobResult & 
   selection_skipped_count: number;
   selection_skipped: Array<{ space_id: string; reason: string }>;
 };
+export type PersonalPromotionCheckSelectedJobResult = AccountWorkJobResult & {
+  requested_count: number;
+  selection_skipped_count: number;
+  selection_skipped: Array<{ space_id: string; reason: string }>;
+};
 
 export const resourcesApi = {
   overview: () => getJson<{ generated_at: string; metrics: Record<string, number>; recent_failed_jobs: Row[] }>("/ops/overview"),
@@ -54,7 +59,7 @@ export const resourcesApi = {
   patchAccount: (id: string, body: Record<string, unknown>) =>
     patchJson(`/user-accounts/${encodeURIComponent(id)}`, body),
   deleteAccount: (id: string) =>
-    deleteJson<{ user_account_id: string; deleted: boolean; deleted_proxy_bindings: number }>(
+    deleteJson<{ user_account_id: string; deleted: boolean; deleted_personal_spaces: number; deleted_proxy_bindings: number }>(
       `/user-accounts/${encodeURIComponent(id)}`,
     ),
   deleteAccounts: (ids: string[]) =>
@@ -62,6 +67,7 @@ export const resourcesApi = {
       requested_count: number;
       deleted_count: number;
       missing_count: number;
+      deleted_personal_spaces: number;
       deleted_proxy_bindings: number;
     }>("/user-accounts/delete-selected", { user_account_ids: ids }),
   importTeamAdminSession: (body: Record<string, unknown>) =>
@@ -107,9 +113,19 @@ export const resourcesApi = {
       `/spaces/${encodeURIComponent(id)}/payment-method-bind-job`,
       body,
     ),
+  createPersonalPlusCheckout: (id: string, body: Record<string, unknown> = {}) =>
+    postJson<AccountWorkJobResult>(
+      `/spaces/${encodeURIComponent(id)}/plus-checkout-job`,
+      body,
+    ),
   bindSelectedPersonalPaymentMethods: (body: Record<string, unknown>) =>
     postJson<PersonalPaymentMethodBindSelectedJobResult>(
       "/spaces/payment-method-bind-selected-job",
+      body,
+    ),
+  checkSelectedPersonalPromotions: (body: Record<string, unknown>) =>
+    postJson<PersonalPromotionCheckSelectedJobResult>(
+      "/spaces/promotion-check-selected-job",
       body,
     ),
   spaceReplenishEmailSummary: () =>

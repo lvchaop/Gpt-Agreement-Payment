@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re
@@ -18,8 +19,8 @@ from refactor_app.application.workflows.account_auth import (
     BackfillSessionWorkflow,
 )
 from refactor_app.application.workflows.registration_proxy import (
-    RegistrationBackboneProxy,
-    resolve_registration_backbone_proxy,
+    CliproxyProxy,
+    resolve_cliproxy_proxy,
 )
 from refactor_app.infrastructure.db.models import UserAccountModel
 from refactor_app.infrastructure.logging.event_writer import EventWriter
@@ -29,21 +30,26 @@ from refactor_app.plugins.mail_external_api.plugin import (
     prepare_domain_mailbox,
 )
 from refactor_app.plugins.openai_auth_browser import (
-    AccountSecuritySetupResult,
-    BrowserAccountSecurityConfig,
     BrowserEmailRegistrationConfig,
-    CamoufoxAccountSecurity,
     CamoufoxEmailRegistration,
+)
+from refactor_app.plugins.openai_auth_protocol.account_security import (
+    AccountSecuritySetupResult,
+    ProtocolAccountSecurity,
+    ProtocolAccountSecurityConfig,
 )
 from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthFlow, AuthResult
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import BrowserPhoneOtpProvider
 from refactor_app.plugins.openai_auth_protocol.config import Config, PhoneConfig
 from refactor_app.plugins.twofauth import TwoFAuthClient
 
+logger = logging.getLogger(__name__)
+
 EMAIL_PROTOCOL_NO_PHONE = "email_protocol_no_phone"
 EMAIL_BROWSER_NO_PHONE = "email_browser_no_phone"
 PHONE_PROTOCOL_BIND_EMAIL = "phone_protocol_bind_email"
 ICLOUD_HIDE_MY_EMAIL_PROVIDER = "icloud_hide_my_email"
+ICLOUD_PROMOTION_PROXY_COUNTRY = "JP"
 SUPPORTED_REGISTRATION_MAIL_PROVIDERS = frozenset(
     {
         "outlook",
@@ -75,6 +81,7 @@ class ProtocolRegistrationInput:
     caller_id: str = "refactor-app-protocol-registration"
     browser_headless: bool = True
     browser_otp_timeout_s: int = 180
+    browser_close_delay_s: float = 10.0
     phone_provider: str = "hero_sms"
     phone_base_url: str = "https://hero-sms.com/stubs/handler_api.php"
     phone_api_key_env: str = "HERO_SMS_API_KEY"
@@ -95,6 +102,15 @@ class _RegistrationAttempt:
     proxy_url: str
 
 
+def _close_auth_flow(flow: AuthFlow | None) -> None:
+    if flow is None:
+        return
+    try:
+        flow.close()
+    except Exception as exc:
+        logger.warning("AuthFlow close failed: %s", exc)
+
+
 class ProtocolRegistrationWorkflow:
     def __init__(
         self,
@@ -104,6 +120,7 @@ class ProtocolRegistrationWorkflow:
         hero_sms_api_key: str = "",
         twofauth_client: TwoFAuthClient | None = None,
         authorize_codex_after_security: bool = False,
+        promotion_check_enabled: bool = False,
         codex_phone_provider: BrowserPhoneOtpProvider | None = None,
         totp_code_resolver: Callable[[str], str] | None = None,
     ) -> None:
@@ -112,6 +129,7 @@ class ProtocolRegistrationWorkflow:
         self._hero_sms_api_key = str(hero_sms_api_key or "").strip()
         self._twofauth_client = twofauth_client
         self._authorize_codex_after_security = bool(authorize_codex_after_security)
+        self._promotion_check_enabled = bool(promotion_check_enabled)
         self._codex_phone_provider = codex_phone_provider
         self._totp_code_resolver = totp_code_resolver
 
@@ -164,6 +182,7 @@ class ProtocolRegistrationWorkflow:
         )
         user_account_id = ""
         account_persisted = False
+        attempt: _RegistrationAttempt | None = None
         try:
             claimed = mail.claim_mailbox()
             target_email = claimed.email.strip()
@@ -186,10 +205,12 @@ class ProtocolRegistrationWorkflow:
                     "user_account_id": user_account_id,
                     "has_proxy": True,
                     "proxy_type": "static_proxy",
-                    "proxy_mode": "webshare_backbone",
+                    "proxy_mode": "cliproxy_sticky",
                     "proxy_source": "target_email_hash",
+                    "proxy_provider": proxy.provider,
                     "proxy_country": proxy.country_code,
-                    "proxy_endpoint_id": proxy.endpoint_id,
+                    "proxy_sid_source": proxy.sid_source,
+                    "proxy_probe_attempts": proxy.probe_attempts,
                 },
             )
             attempt = runner(
@@ -214,22 +235,6 @@ class ProtocolRegistrationWorkflow:
                     "email protocol registration finished without configured password"
                 )
             _hydrate_auth_result_cookie_headers(result, attempt.flow)
-            security_setup = self._run_post_registration_security(
-                input_,
-                result=result,
-                mail=mail,
-                proxy_url=attempt.proxy_url,
-                emit=emit,
-            )
-            self._write_success_account(
-                user_account_id=user_account_id,
-                result=result,
-                flow=attempt.flow,
-                account_email=claimed.email if claimed is not None else result.email,
-                security_setup=security_setup,
-            )
-            account_persisted = True
-            mail.mark_used(result.email)
             try:
                 account_detection = self._detect_account_spaces_after_registration(
                     user_account_id=user_account_id,
@@ -253,6 +258,29 @@ class ProtocolRegistrationWorkflow:
                     },
                     "WARN",
                 )
+            security_setup = self._run_post_registration_security(
+                input_,
+                result=result,
+                flow=attempt.flow,
+                proxy_url=attempt.proxy_url,
+                emit=emit,
+            )
+            self._write_success_account(
+                user_account_id=user_account_id,
+                result=result,
+                flow=attempt.flow,
+                account_email=claimed.email if claimed is not None else result.email,
+                security_setup=security_setup,
+            )
+            account_persisted = True
+            mail.mark_used(result.email)
+            promotion_check = self._run_post_registration_promotion_check(
+                input_,
+                user_account_id=user_account_id,
+                email=result.email or target_email,
+                run_id=run_id,
+                emit=emit,
+            )
             codex_authorization = self._run_post_registration_codex_authorization(
                 input_,
                 user_account_id=user_account_id,
@@ -269,9 +297,13 @@ class ProtocolRegistrationWorkflow:
                 "has_access_token": bool(result.access_token),
                 "account_detection": account_detection,
                 "mail_claim": _safe_claim_dict(claimed),
+                "proxy_provider": proxy.provider,
                 "proxy_country": proxy.country_code,
-                "proxy_endpoint_id": proxy.endpoint_id,
+                "proxy_sid_source": proxy.sid_source,
+                "proxy_probe_attempts": proxy.probe_attempts,
             }
+            if promotion_check is not None:
+                output["promotion_check"] = promotion_check
             if security_setup is not None:
                 output["security_setup"] = security_setup.to_dict()
             if codex_authorization is not None:
@@ -314,15 +346,16 @@ class ProtocolRegistrationWorkflow:
                 if user_account_id:
                     self._delete_placeholder_account(user_account_id)
             raise
+        finally:
+            _close_auth_flow(attempt.flow if attempt is not None else None)
 
     def _resolve_registration_proxy(
         self,
         *,
         target_email: str,
         country_code: str,
-    ) -> RegistrationBackboneProxy:
-        return resolve_registration_backbone_proxy(
-            self._session_factory,
+    ) -> CliproxyProxy:
+        return resolve_cliproxy_proxy(
             email=target_email,
             country_code=country_code,
         )
@@ -344,11 +377,15 @@ class ProtocolRegistrationWorkflow:
             "register": {
                 "region": input_.proxy_country.upper(),
                 "country_code": input_.proxy_country.upper(),
-                "mode": "webshare_backbone",
+                "mode": "cliproxy_sticky",
             }
         }
         flow = AuthFlow(cfg, trace_callback=self._make_http_trace_callback(emit))
-        result = flow.run_register(mail)
+        try:
+            result = flow.run_register(mail)
+        except Exception:
+            _close_auth_flow(flow)
+            raise
         return _RegistrationAttempt(result=result, flow=flow, proxy_url=proxy_url)
 
     def _execute_email_browser(
@@ -367,11 +404,15 @@ class ProtocolRegistrationWorkflow:
                 proxy_url=proxy_url,
                 headless=bool(input_.browser_headless),
                 otp_timeout_s=max(1, int(input_.browser_otp_timeout_s or 180)),
+                success_close_delay_s=max(0.0, float(input_.browser_close_delay_s or 0.0)),
                 work_id=work_id,
             ),
             event_callback=emit,
         )
-        result = browser.run(mail)
+        result = browser.run(
+            mail,
+            totp_code_provider=self._totp_code_resolver,
+        )
         return _RegistrationAttempt(result=result, flow=None, proxy_url=proxy_url)
 
     def _execute_phone_protocol(
@@ -391,7 +432,7 @@ class ProtocolRegistrationWorkflow:
             "register": {
                 "region": input_.proxy_country.upper(),
                 "country_code": input_.proxy_country.upper(),
-                "mode": "webshare_backbone",
+                "mode": "cliproxy_sticky",
             }
         }
         cfg.phone = _phone_config(input_)
@@ -401,7 +442,11 @@ class ProtocolRegistrationWorkflow:
             event_callback=emit,
         )
         flow = AuthFlow(cfg, trace_callback=self._make_http_trace_callback(emit))
-        result = flow.run_phone_register(mail, phone)
+        try:
+            result = flow.run_phone_register(mail, phone)
+        except Exception:
+            _close_auth_flow(flow)
+            raise
         return _RegistrationAttempt(result=result, flow=flow, proxy_url=proxy_url)
 
     def _make_event_emitter(self, *, run_id: str, work_id: str, mode: str) -> TraceEmitter:
@@ -546,8 +591,10 @@ class ProtocolRegistrationWorkflow:
                 security_setup.mfa_error_message if security_setup is not None else ""
             )
             account.security_setup_last_attempt_at = now if security_setup is not None else None
-            # The registration response token may reflect the last selected workspace.
-            account.access_token = ""
+            # Account detection stores only a validated personal-space token here.
+            # Do not replace it with the registration bootstrap token.
+            if not getattr(account, "access_token", ""):
+                account.access_token = ""
             account.session_token = result.session_token
             account.cookie_header = result.cookie_header or (
                 _cookie_header_from_session(flow, "chatgpt.com") if flow is not None else ""
@@ -570,7 +617,7 @@ class ProtocolRegistrationWorkflow:
         input_: ProtocolRegistrationInput,
         *,
         result: AuthResult,
-        mail: RegistrationMailProviderAdapter,
+        flow: AuthFlow | None,
         proxy_url: str,
         emit: TraceEmitter,
     ) -> AccountSecuritySetupResult | None:
@@ -581,23 +628,25 @@ class ProtocolRegistrationWorkflow:
             "account_security.started",
             {
                 "email": result.email,
-                "password_preconfigured": bool(result.password_configured),
+                "password_configured_by_registration": bool(result.password_configured),
                 "twofauth_configured": self._twofauth_client is not None,
+                "transport": "protocol",
             },
         )
         try:
-            setup = CamoufoxAccountSecurity(
-                BrowserAccountSecurityConfig(
+            setup = ProtocolAccountSecurity(
+                ProtocolAccountSecurityConfig(
                     proxy_url=proxy_url,
-                    headless=bool(input_.browser_headless),
-                    password_timeout_s=max(1, int(input_.browser_otp_timeout_s or 180)),
+                    request_timeout_s=min(
+                        60,
+                        max(1, int(input_.browser_otp_timeout_s or 30)),
+                    ),
                 ),
                 event_callback=emit,
             ).run(
                 auth_result=result,
-                mail_provider=mail,
                 twofauth_client=self._twofauth_client,
-                password_preconfigured=bool(result.password_configured),
+                http_session=flow.session if flow is not None else None,
             )
         except Exception as exc:
             error_message = _safe_security_error(exc)
@@ -712,6 +761,84 @@ class ProtocolRegistrationWorkflow:
             "add_phone_provider": "grizzly_sms",
         }
 
+    def _run_post_registration_promotion_check(
+        self,
+        input_: ProtocolRegistrationInput,
+        *,
+        user_account_id: str,
+        email: str,
+        run_id: str,
+        emit: TraceEmitter,
+    ) -> dict[str, Any] | None:
+        if input_.mail_provider != ICLOUD_HIDE_MY_EMAIL_PROVIDER:
+            return None
+        if not self._promotion_check_enabled:
+            emit(
+                "promotion_check.skipped",
+                {
+                    "user_account_id": user_account_id,
+                    "reason": "post_registration_promotion_check_disabled",
+                },
+            )
+            return None
+        try:
+            proxy = self._resolve_registration_proxy(
+                target_email=email,
+                country_code=ICLOUD_PROMOTION_PROXY_COUNTRY,
+            )
+            emit(
+                "promotion_check.proxy_assigned",
+                {
+                    "user_account_id": user_account_id,
+                    "proxy_provider": proxy.provider,
+                    "proxy_country": proxy.country_code,
+                    "proxy_source": "target_email_hash",
+                    "proxy_sid_source": proxy.sid_source,
+                    "proxy_probe_attempts": proxy.probe_attempts,
+                },
+            )
+            result = BackfillSessionWorkflow(
+                session_factory=self._session_factory,
+                mail_provider=self._mail_provider,
+            ).probe_personal_space_promotion(
+                user_account_id=user_account_id,
+                proxy_url=proxy.proxy_url,
+                run_id=run_id,
+            )
+            emit(
+                "promotion_check.succeeded",
+                {
+                    "user_account_id": user_account_id,
+                    "has_promotion": bool(result.get("has_promotion")),
+                    "promotion_id": str(result.get("promotion_id") or ""),
+                    "proxy_provider": proxy.provider,
+                    "proxy_country": proxy.country_code,
+                    "proxy_sid_source": proxy.sid_source,
+                    "proxy_probe_attempts": proxy.probe_attempts,
+                },
+            )
+            return {
+                **result,
+                "proxy_provider": proxy.provider,
+                "proxy_sid_source": proxy.sid_source,
+                "proxy_probe_attempts": proxy.probe_attempts,
+            }
+        except Exception as exc:
+            result = {
+                "status": "failed",
+                "has_promotion": False,
+                "promotion_id": "",
+                "proxy_country": ICLOUD_PROMOTION_PROXY_COUNTRY,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:1000],
+            }
+            emit(
+                "promotion_check.failed",
+                {"user_account_id": user_account_id, **result},
+                "WARN",
+            )
+            return result
+
     def _detect_account_spaces_after_registration(
         self,
         *,
@@ -794,11 +921,14 @@ class RegistrationMailProviderAdapter:
             self._emit(
                 "mail.claim.started", {"provider": self._provider, "project_key": self._project_key}
             )
+            # Registration claims must use the pool's global availability path.
+            # Keep project_key in trace metadata for compatibility, but omit it
+            # from claim-random so a successful mailbox is not retained in a
+            # project-specific reusable branch.
             self.claim = self._mail_provider.claim_random(
                 caller_id=self._caller_id,
                 task_id=self._task_id,
                 provider=self._provider,
-                project_key=self._project_key,
                 email_domain=self._email_domain,
             )
             self._emit(

@@ -1008,16 +1008,26 @@ def _fill_otp(page, code: str) -> bool:
     if not value:
         return False
     try:
-        single = page.query_selector(
-            'input[autocomplete="one-time-code"]:visible'
-        ) or page.query_selector('input[inputmode="numeric"]:not([maxlength="1"]):visible')
+        single = None
+        for selector in (
+            'input[autocomplete="one-time-code"]:visible',
+            'input[inputmode="numeric"]:not([maxlength="1"]):visible',
+            'input[aria-label*="one-time" i]:visible',
+            'input[aria-label*="authentication" i]:visible',
+            'input[placeholder*="one-time" i]:visible',
+            'input[placeholder*="code" i]:visible',
+            'input[type="text"]:visible',
+        ):
+            single = page.query_selector(selector)
+            if single:
+                break
         if single:
             single.click(timeout=3000)
             single.fill(value)
             return True
         digits = page.query_selector_all(
-            'input[maxlength="1"][inputmode="numeric"]'
-        ) or page.query_selector_all('input[maxlength="1"]')
+            'input[maxlength="1"][inputmode="numeric"]:visible'
+        ) or page.query_selector_all('input[maxlength="1"]:visible')
         if len(digits) >= len(value):
             for idx, ch in enumerate(value):
                 digits[idx].click(timeout=3000)

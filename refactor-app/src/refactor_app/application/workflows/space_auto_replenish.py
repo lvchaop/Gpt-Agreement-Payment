@@ -350,6 +350,9 @@ class SpaceAutoReplenishWorkflow:
         invite_executor_base_url: str,
         invite_executor_api_key: str,
         registration_proxy_country: str = "US",
+        browser_log_enabled: bool = False,
+        browser_log_capture_bodies: bool = False,
+        browser_log_max_body_chars: int = 20_000,
         totp_code_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self._session_factory = session_factory
@@ -358,6 +361,9 @@ class SpaceAutoReplenishWorkflow:
         self._invite_executor_base_url = invite_executor_base_url
         self._invite_executor_api_key = invite_executor_api_key
         self._registration_proxy_country = registration_proxy_country
+        self._browser_log_enabled = bool(browser_log_enabled)
+        self._browser_log_capture_bodies = bool(browser_log_capture_bodies)
+        self._browser_log_max_body_chars = max(1_000, int(browser_log_max_body_chars or 20_000))
         self._totp_code_resolver = totp_code_resolver
 
     def import_emails(self, emails: Sequence[str]) -> dict[str, int]:
@@ -1184,6 +1190,9 @@ class SpaceAutoReplenishWorkflow:
                     mail_provider="outlook",
                     project_key="space-auto-replenish",
                     caller_id="space-auto-replenish",
+                    browser_log_enabled=self._browser_log_enabled,
+                    browser_log_capture_bodies=self._browser_log_capture_bodies,
+                    browser_log_max_body_chars=self._browser_log_max_body_chars,
                 ),
                 work_id=work_id,
                 run_id=run_id,

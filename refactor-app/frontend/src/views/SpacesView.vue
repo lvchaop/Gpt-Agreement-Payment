@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { CreditCard, Expand, KeyRound, Plus, Power, PowerOff, RefreshCw, Server, ServerOff, Trash2, Upload, UserPlus } from "@lucide/vue";
+import { BadgePercent, CreditCard, Expand, KeyRound, Plus, Power, PowerOff, RefreshCw, Server, ServerOff, Trash2, Upload, UserPlus } from "@lucide/vue";
 
 import DataTable from "../components/DataTable.vue";
 import type { Column, TableFilter } from "../components/DataTable.vue";
@@ -42,14 +42,25 @@ const autoInviteTarget = ref<Row | null>(null);
 const hostingTarget = ref<Row | null>(null);
 const unhostingTarget = ref<Row | null>(null);
 const paymentBindTarget = ref<Row | null>(null);
+const plusCheckoutTarget = ref<Row | null>(null);
 const selectedSpaces = ref<Row[]>([]);
 const selectedPaymentBindOpen = ref(false);
+const selectedPromotionCheckOpen = ref(false);
+const checkingSelectedPromotions = ref(false);
+const promotionProxyCountry = ref("JP");
+const promotionWorkCount = ref(5);
 const expandingSpaceId = ref("");
 const updatingSpaceStatusId = ref("");
 const updatingAutoReplenishId = ref("");
 const preparingAutoInviteId = ref("");
 const updatingHostingSpaceId = ref("");
 const bindingPaymentSpaceId = ref("");
+const plusCheckoutSpaceId = ref("");
+const plusCheckoutCreateCountry = ref("US");
+const plusCheckoutPromoCountry = ref("JP");
+const plusCheckoutCampaign = ref("plus-1-month-free");
+const browserHeadless = ref(true);
+const autoStartPlusCheckout = ref(true);
 const bindingSelectedPaymentSpaces = ref(false);
 const showPaymentPoolPanel = ref(false);
 const paymentNamesText = ref("");
@@ -524,6 +535,8 @@ async function bindPersonalPaymentMethod() {
   try {
     const name = String(paymentBindTarget.value?.name || paymentBindTarget.value?.external_space_id || id);
     const result = await resourcesApi.bindPersonalPaymentMethod(id, {
+      auto_start_plus_checkout: autoStartPlusCheckout.value,
+      browser_headless: browserHeadless.value,
       created_by: "ops:personal-payment-method-bind",
     });
     paymentBindTarget.value = null;
@@ -536,6 +549,37 @@ async function bindPersonalPaymentMethod() {
     store.toast("绑卡 Job 创建失败", String((err as Error).message ?? err), "error");
   } finally {
     bindingPaymentSpaceId.value = "";
+  }
+}
+
+async function createPersonalPlusCheckout() {
+  const id = String(plusCheckoutTarget.value?.id || "");
+  if (!id) return;
+  const createCountry = plusCheckoutCreateCountry.value.trim().toUpperCase();
+  const promoCountry = plusCheckoutPromoCountry.value.trim().toUpperCase();
+  const campaign = plusCheckoutCampaign.value.trim();
+  if (!/^[A-Z]{2}$/.test(createCountry) || !/^[A-Z]{2}$/.test(promoCountry) || !campaign) {
+    store.toast("支付配置无效", "US/JP 必须是两位国家代码，优惠 ID 不能为空。", "warning");
+    return;
+  }
+  plusCheckoutSpaceId.value = id;
+  try {
+    const name = String(plusCheckoutTarget.value?.name || plusCheckoutTarget.value?.external_space_id || id);
+    const result = await resourcesApi.createPersonalPlusCheckout(id, {
+      create_proxy_country: createCountry,
+      promo_proxy_country: promoCountry,
+      promo_campaign_id: campaign,
+      browser_headless: browserHeadless.value,
+      created_by: "ops:personal-plus-checkout",
+    });
+    plusCheckoutTarget.value = null;
+    store.toast("Plus 支付 Job 已创建", `${name} · ${createCountry}/${promoCountry}`, "success");
+    await pageRef.value?.load();
+    if (result.job_id) await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("Plus 支付 Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    plusCheckoutSpaceId.value = "";
   }
 }
 
@@ -559,6 +603,8 @@ async function bindSelectedPersonalPaymentMethods() {
   try {
     const result = await resourcesApi.bindSelectedPersonalPaymentMethods({
       space_ids: spaceIds,
+      auto_start_plus_checkout: autoStartPlusCheckout.value,
+      browser_headless: browserHeadless.value,
       created_by: "ops:personal-payment-method-bind-selected",
     });
     if (!result.job_id) {
@@ -586,6 +632,61 @@ async function bindSelectedPersonalPaymentMethods() {
   }
 }
 
+function openSelectedPromotionCheck() {
+  if (!selectedSpaceIds.value.length) {
+    store.toast("未选择账号", "请先选择需要检测优惠的个人空间。", "warning");
+    return;
+  }
+  selectedPromotionCheckOpen.value = true;
+}
+
+async function checkSelectedPersonalPromotions() {
+  const spaceIds = selectedSpaceIds.value;
+  if (!spaceIds.length) return;
+  const proxyCountry = promotionProxyCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(proxyCountry)) {
+    store.toast("代理国家无效", "请输入两位国家代码，例如 JP。", "warning");
+    return;
+  }
+  const workCount = Number(promotionWorkCount.value);
+  if (!Number.isInteger(workCount) || workCount < 1 || workCount > 50) {
+    store.toast("并发数无效", "并发数必须是 1 到 50 的整数。", "warning");
+    return;
+  }
+  checkingSelectedPromotions.value = true;
+  try {
+    const result = await resourcesApi.checkSelectedPersonalPromotions({
+      space_ids: spaceIds,
+      proxy_country: proxyCountry,
+      work_count: workCount,
+      created_by: "ops:personal-promotion-check-selected",
+    });
+    if (!result.job_id) {
+      const firstReason = result.selection_skipped[0]?.reason || "没有符合条件的个人空间";
+      store.toast(
+        "未创建优惠检测 Job",
+        `选中=${result.requested_count} 跳过=${result.selection_skipped_count} · ${firstReason}`,
+        "warning",
+      );
+      return;
+    }
+    promotionProxyCountry.value = proxyCountry;
+    selectedPromotionCheckOpen.value = false;
+    store.toast(
+      "优惠检测 Job 已创建",
+      `国家=${proxyCountry} 选中=${result.requested_count} 排队=${result.selected_count} 跳过=${result.selection_skipped_count}`,
+      result.selection_skipped_count ? "warning" : "success",
+    );
+    pageRef.value?.clearSelection();
+    await pageRef.value?.load();
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("优惠检测 Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    checkingSelectedPromotions.value = false;
+  }
+}
+
 onMounted(() => {
   void loadAdminSessions();
   void loadReplenishEmailSummary();
@@ -608,6 +709,9 @@ onMounted(() => {
       <button class="btn primary" @click="showCredentialPanel = true"><KeyRound :size="16" />创建 Business AT</button>
       <button class="btn" :disabled="!selectedSpaceIds.length || bindingSelectedPaymentSpaces" @click="openSelectedPaymentMethodBind">
         <CreditCard :size="16" />绑定选中账号（{{ selectedSpaceIds.length }}）
+      </button>
+      <button class="btn" :disabled="!selectedSpaceIds.length || checkingSelectedPromotions" @click="openSelectedPromotionCheck">
+        <BadgePercent :size="16" />检测选中优惠（{{ selectedSpaceIds.length }}）
       </button>
       <button class="btn" @click="openPaymentPoolImport"><CreditCard :size="16" />支付资料池</button>
       <button class="btn" @click="openReplenishEmailImport"><Upload :size="16" />导入补号邮箱</button>
@@ -652,6 +756,15 @@ onMounted(() => {
           @click.stop="paymentBindTarget = row"
         >
           <CreditCard :size="14" />绑定支付方式
+        </button>
+        <button
+          v-if="String(row.space_type || '') === 'personal' && Boolean(row.has_promotion) && Boolean(row.has_payment_method) && String(row.payment_method_status || '') === 'bound'"
+          class="btn primary small"
+          :disabled="String(row.space_status || '') !== 'active' || plusCheckoutSpaceId === String(row.id || '')"
+          title="使用已有支付方式提交 Plus Checkout"
+          @click.stop="plusCheckoutTarget = row"
+        >
+          <BadgePercent :size="14" />Plus 支付
         </button>
         <label
           v-if="String(row.space_type || '') === 'business'"
@@ -777,7 +890,36 @@ onMounted(() => {
     :busy="Boolean(bindingPaymentSpaceId)"
     @close="paymentBindTarget = null"
     @confirm="bindPersonalPaymentMethod"
-  />
+  >
+    <label class="auto-replenish-toggle">
+      <input v-model="autoStartPlusCheckout" type="checkbox" />
+      <span>绑卡成功后继续 Plus 支付</span>
+    </label>
+    <label class="auto-replenish-toggle">
+      <input v-model="browserHeadless" type="checkbox" />
+      <span>使用无头浏览器</span>
+    </label>
+  </ConfirmModal>
+  <ConfirmModal
+    :open="Boolean(plusCheckoutTarget)"
+    title="提交 Plus Checkout"
+    message="前置要求为有效优惠和已绑定支付方式；先用 US 创建 Checkout，再用 JP 更新优惠并提交。支付成功后重新获取 Session。"
+    :summary="{ '空间': plusCheckoutTarget?.name, '优惠': plusCheckoutTarget?.promotion_id, '支付卡': plusCheckoutTarget?.payment_method_last4 || '已绑定' }"
+    confirm-text="创建 Plus 支付 Job"
+    :busy="Boolean(plusCheckoutSpaceId)"
+    @close="plusCheckoutTarget = null"
+    @confirm="createPersonalPlusCheckout"
+  >
+    <div class="promotion-check-config">
+      <label class="field"><span>创建 Checkout 代理国家</span><input v-model="plusCheckoutCreateCountry" class="input" maxlength="2" autocomplete="off" /></label>
+      <label class="field"><span>更新优惠代理国家</span><input v-model="plusCheckoutPromoCountry" class="input" maxlength="2" autocomplete="off" /></label>
+      <label class="field"><span>优惠 campaign</span><input v-model="plusCheckoutCampaign" class="input" autocomplete="off" /></label>
+      <label class="auto-replenish-toggle">
+        <input v-model="browserHeadless" type="checkbox" />
+        <span>使用无头浏览器</span>
+      </label>
+    </div>
+  </ConfirmModal>
   <ConfirmModal
     :open="selectedPaymentBindOpen"
     title="批量绑定个人空间支付方式"
@@ -787,7 +929,37 @@ onMounted(() => {
     :busy="bindingSelectedPaymentSpaces"
     @close="selectedPaymentBindOpen = false"
     @confirm="bindSelectedPersonalPaymentMethods"
-  />
+  >
+    <label class="auto-replenish-toggle">
+      <input v-model="autoStartPlusCheckout" type="checkbox" />
+      <span>绑卡成功后继续 Plus 支付</span>
+    </label>
+    <label class="auto-replenish-toggle">
+      <input v-model="browserHeadless" type="checkbox" />
+      <span>使用无头浏览器</span>
+    </label>
+  </ConfirmModal>
+  <ConfirmModal
+    :open="selectedPromotionCheckOpen"
+    title="检测选中个人空间优惠"
+    message="使用配置国家的 Backbone 代理检测选中个人空间，检测结果会更新空间列表中的优惠状态。"
+    :summary="{ '选中空间': selectedSpaceIds.length, '个人空间': selectedPersonalSpaceCount }"
+    confirm-text="创建优惠检测 Job"
+    :busy="checkingSelectedPromotions"
+    @close="selectedPromotionCheckOpen = false"
+    @confirm="checkSelectedPersonalPromotions"
+  >
+    <div class="promotion-check-config">
+      <label class="field">
+        <span>代理国家</span>
+        <input v-model="promotionProxyCountry" class="input" maxlength="2" autocomplete="off" placeholder="JP" />
+      </label>
+      <label class="field">
+        <span>并发数</span>
+        <input v-model.number="promotionWorkCount" class="input" type="number" min="1" max="50" step="1" />
+      </label>
+    </div>
+  </ConfirmModal>
   <ConfirmModal
     :open="Boolean(autoInviteTarget)"
     title="服务端邀请"
@@ -902,10 +1074,20 @@ details { border: 1px solid var(--border); border-radius: var(--radius-sm); padd
   white-space: nowrap;
 }
 
+.promotion-check-config {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 @media (max-width: 767px) {
   .panel-heading {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .promotion-check-config {
+    grid-template-columns: 1fr;
   }
 }
 </style>
