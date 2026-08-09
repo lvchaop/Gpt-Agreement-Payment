@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from threading import Event, current_thread, main_thread
+from typing import Any
 
 import typer
 from sqlalchemy import text
@@ -81,21 +86,22 @@ def migrate() -> None:
         if sql_path.name in applied:
             typer.echo(f"skip {sql_path.name}")
             continue
-        connection = engine.raw_connection()
+        raw_connection = engine.raw_connection()
+        cursor = raw_connection.cursor()
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql_path.read_text())
-                cursor.execute(
-                    """
-                    INSERT INTO schema_migrations(filename)
-                    VALUES (%s)
-                    ON CONFLICT (filename) DO NOTHING
-                    """,
-                    (sql_path.name,),
-                )
-            connection.commit()
+            cursor.execute(sql_path.read_text())
+            cursor.execute(
+                """
+                INSERT INTO schema_migrations(filename)
+                VALUES (%s)
+                ON CONFLICT (filename) DO NOTHING
+                """,
+                (sql_path.name,),
+            )
+            raw_connection.commit()
         finally:
-            connection.close()
+            cursor.close()
+            raw_connection.close()
         typer.echo(f"applied {sql_path.name}")
     typer.echo("ok")
 
@@ -124,76 +130,184 @@ def worker_run(
 
 
 def _run_worker_dispatch_loop(*, session_factory, settings: Settings, capacity: int) -> None:
-    runner = JobRunner(session_factory)
+    runner = JobRunner(
+        session_factory,
+        work_lease_seconds=settings.worker_lease_seconds,
+    )
     register_core_handlers(runner, session_factory=session_factory, settings=settings)
     runner.requeue_expired_work()
-    futures: dict[Future, tuple[str, str]] = {}
+    futures: dict[Future, tuple[str, str, datetime | None]] = {}
     last_lease_renewal = time.monotonic()
     last_expired_requeue = time.monotonic()
+    stop_requested = Event()
+    previous_signal_handlers: dict[int, Any] = {}
 
-    with ThreadPoolExecutor(max_workers=capacity) as executor:
-        while True:
-            for future in [item for item in futures if item.done()]:
-                task_type, task_id = futures.pop(future)
-                try:
-                    future.result()
-                except Exception as exc:
-                    typer.echo(f"worker {task_type} {task_id} crashed: {type(exc).__name__}: {exc}")
+    def request_stop(_signum, _frame) -> None:
+        stop_requested.set()
 
-            now = time.monotonic()
-            if now - last_lease_renewal >= 30:
-                active_work_ids = [
-                    task_id for task_type, task_id in futures.values() if task_type == "work"
-                ]
-                runner.renew_work_leases(active_work_ids)
-                last_lease_renewal = now
-            if now - last_expired_requeue >= 60:
-                runner.requeue_expired_work()
-                last_expired_requeue = now
+    if current_thread() is main_thread():
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            previous_signal_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, request_stop)
 
-            free_slots = capacity - len(futures)
-            made_progress = False
-            blocks_normal_dispatch = False
-            if free_slots > 0:
-                work_ids, blocks_normal_dispatch = runner.claim_all_at_once_work_batch(
-                    max_count=free_slots
+    executor = ThreadPoolExecutor(max_workers=capacity)
+    try:
+        while not stop_requested.is_set():
+            try:
+                last_lease_renewal, last_expired_requeue, made_progress = _dispatch_worker_once(
+                    runner=runner,
+                    executor=executor,
+                    futures=futures,
+                    settings=settings,
+                    capacity=capacity,
+                    last_lease_renewal=last_lease_renewal,
+                    last_expired_requeue=last_expired_requeue,
                 )
-                for work_id in work_ids:
-                    future = executor.submit(runner.run_claimed_work, work_id)
-                    futures[future] = ("work", work_id)
-                free_slots -= len(work_ids)
-                if work_ids:
-                    made_progress = True
-
-            if free_slots > 0 and not blocks_normal_dispatch:
-                claimed_job = runner.claim_next_job()
-                if claimed_job is not None:
-                    job_id, run_id = claimed_job
-                    future = executor.submit(
-                        runner.run_claimed_job,
-                        job_id=job_id,
-                        run_id=run_id,
+            except Exception as exc:
+                typer.echo(f"worker dispatch iteration failed: {type(exc).__name__}: {exc}")
+                time.sleep(1)
+            else:
+                time.sleep(0.05 if made_progress else 0.5)
+    finally:
+        for future, (task_type, task_id, claimed_at) in list(futures.items()):
+            if task_type == "work" and future.cancel():
+                try:
+                    runner.release_claimed_work(
+                        claim_generations={task_id: claimed_at},
                     )
-                    futures[future] = ("job", job_id)
-                    free_slots -= 1
-                    made_progress = True
+                except Exception as exc:
+                    typer.echo(
+                        "worker cancelled work release failed "
+                        f"{task_id}: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    futures.pop(future)
 
-            while free_slots > 0 and not blocks_normal_dispatch:
-                work_ids = runner.claim_work_batch(max_count=free_slots)
-                if not work_ids:
-                    break
-                for work_id in work_ids:
-                    future = executor.submit(runner.run_claimed_work, work_id)
-                    futures[future] = ("work", work_id)
-                free_slots -= len(work_ids)
-                made_progress = True
+        shutdown_deadline = time.monotonic() + settings.worker_shutdown_grace_s
+        while futures and time.monotonic() < shutdown_deadline:
+            try:
+                _collect_completed_worker_futures(futures=futures, runner=runner)
+            except Exception as exc:
+                typer.echo(f"worker shutdown collection failed: {type(exc).__name__}: {exc}")
+            active_work_claims = {
+                task_id: claimed_at
+                for future, (task_type, task_id, claimed_at) in futures.items()
+                if task_type == "work" and not future.done()
+            }
+            if active_work_claims:
+                try:
+                    runner.renew_work_leases(claim_generations=active_work_claims)
+                except Exception as exc:
+                    typer.echo(f"worker shutdown lease renewal failed: {type(exc).__name__}: {exc}")
+            time.sleep(0.1)
 
-            time.sleep(0.05 if made_progress else 0.5)
+        force_exit = bool(futures)
+        if force_exit:
+            executor.shutdown(wait=False, cancel_futures=True)
+            try:
+                runner.expire_claimed_work(
+                    handoff_delay_s=settings.worker_shutdown_handoff_delay_s,
+                )
+            except Exception as exc:
+                typer.echo(f"worker forced lease expiry failed: {type(exc).__name__}: {exc}")
+        else:
+            executor.shutdown(wait=True)
+            runner.release_claimed_work()
+        for saved_signal_number, previous_handler in previous_signal_handlers.items():
+            signal.signal(saved_signal_number, previous_handler)
+        if force_exit:
+            os._exit(0)
+
+
+def _dispatch_worker_once(
+    *,
+    runner: JobRunner,
+    executor: ThreadPoolExecutor,
+    futures: dict[Future, tuple[str, str, datetime | None]],
+    settings: Settings,
+    capacity: int,
+    last_lease_renewal: float,
+    last_expired_requeue: float,
+) -> tuple[float, float, bool]:
+    _collect_completed_worker_futures(futures=futures, runner=runner)
+
+    now = time.monotonic()
+    if now - last_lease_renewal >= 30:
+        active_work_claims = {
+            task_id: claimed_at
+            for task_type, task_id, claimed_at in futures.values()
+            if task_type == "work"
+        }
+        runner.renew_work_leases(claim_generations=active_work_claims)
+        last_lease_renewal = now
+    if now - last_expired_requeue >= settings.worker_lease_requeue_interval_s:
+        runner.requeue_expired_work()
+        last_expired_requeue = now
+
+    free_slots = capacity - len(futures)
+    made_progress = False
+    blocks_normal_dispatch = False
+    if free_slots > 0:
+        claims, blocks_normal_dispatch = runner.claim_all_at_once_work_batch_with_generations(
+            max_count=free_slots
+        )
+        for work_id, claimed_at in claims:
+            future = executor.submit(runner.run_claimed_work, work_id, claimed_at=claimed_at)
+            futures[future] = ("work", work_id, claimed_at)
+        free_slots -= len(claims)
+        if claims:
+            made_progress = True
+
+    if free_slots > 0 and not blocks_normal_dispatch:
+        claimed_job = runner.claim_next_job()
+        if claimed_job is not None:
+            job_id, run_id = claimed_job
+            future = executor.submit(
+                runner.run_claimed_job,
+                job_id=job_id,
+                run_id=run_id,
+            )
+            futures[future] = ("job", job_id, None)
+            free_slots -= 1
+            made_progress = True
+
+    while free_slots > 0 and not blocks_normal_dispatch:
+        claims = runner.claim_work_batch_with_generations(max_count=free_slots)
+        if not claims:
+            break
+        for work_id, claimed_at in claims:
+            future = executor.submit(runner.run_claimed_work, work_id, claimed_at=claimed_at)
+            futures[future] = ("work", work_id, claimed_at)
+        free_slots -= len(claims)
+        made_progress = True
+
+    return last_lease_renewal, last_expired_requeue, made_progress
+
+
+def _collect_completed_worker_futures(
+    *,
+    futures: dict[Future, tuple[str, str, datetime | None]],
+    runner: JobRunner,
+) -> None:
+    for future in [item for item in futures if item.done()]:
+        task_type, task_id, claimed_at = futures[future]
+        try:
+            future.result()
+        except Exception as exc:
+            typer.echo(f"worker {task_type} {task_id} crashed: {type(exc).__name__}: {exc}")
+            if task_type == "work":
+                runner.release_claimed_work(
+                    claim_generations={task_id: claimed_at},
+                )
+        futures.pop(future)
 
 
 def _run_worker_loop(session_factory, settings: Settings, once: bool) -> list[str]:
     results: list[str] = []
-    runner = JobRunner(session_factory)
+    runner = JobRunner(
+        session_factory,
+        work_lease_seconds=settings.worker_lease_seconds,
+    )
     register_core_handlers(runner, session_factory=session_factory, settings=settings)
     while True:
         job_id = runner.run_one()

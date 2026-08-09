@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     database_max_overflow: int = 60
     database_pool_timeout_s: int = 60
     worker_capacity: int = 2000
+    worker_lease_seconds: int = Field(default=120, ge=60, le=3600)
+    worker_lease_requeue_interval_s: int = Field(default=15, ge=1, le=60)
+    worker_shutdown_grace_s: float = Field(default=1.0, ge=0, le=30)
+    worker_shutdown_handoff_delay_s: float = Field(default=1.0, ge=0.1, le=30)
     webshare_api_token: str = ""
     webshare_base_url: str = "https://proxy.webshare.io"
     webshare_download_url: str = ""
@@ -94,11 +98,49 @@ class Settings(BaseSettings):
     )
     protocol_register_proxy_url: str = ""
     protocol_register_proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    cliproxy_gateway_mode: str = Field(
+        default="auto",
+        pattern=r"^(?:auto|fixed)$",
+        validation_alias=AliasChoices(
+            "CLIPROXY_GATEWAY_MODE",
+            "REFACTOR_APP_CLIPROXY_GATEWAY_MODE",
+        ),
+    )
     cliproxy_host: str = Field(
-        default="us.cliproxy.io",
+        default="us.arxlabs.io",
         validation_alias=AliasChoices(
             "CLIPROXY_HOST",
             "REFACTOR_APP_CLIPROXY_HOST",
+        ),
+    )
+    cliproxy_us_host: str = Field(
+        default="us.arxlabs.io",
+        validation_alias=AliasChoices(
+            "CLIPROXY_US_HOST",
+            "REFACTOR_APP_CLIPROXY_US_HOST",
+        ),
+    )
+    cliproxy_sg_host: str = Field(
+        default="sg.arxlabs.io",
+        validation_alias=AliasChoices(
+            "CLIPROXY_SG_HOST",
+            "REFACTOR_APP_CLIPROXY_SG_HOST",
+        ),
+    )
+    cliproxy_egress_trace_url: str = Field(
+        default="https://www.cloudflare.com/cdn-cgi/trace",
+        validation_alias=AliasChoices(
+            "CLIPROXY_EGRESS_TRACE_URL",
+            "REFACTOR_APP_CLIPROXY_EGRESS_TRACE_URL",
+        ),
+    )
+    cliproxy_egress_trace_timeout_s: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=30.0,
+        validation_alias=AliasChoices(
+            "CLIPROXY_EGRESS_TRACE_TIMEOUT_S",
+            "REFACTOR_APP_CLIPROXY_EGRESS_TRACE_TIMEOUT_S",
         ),
     )
     cliproxy_port: int = Field(
@@ -194,6 +236,14 @@ class Settings(BaseSettings):
     personal_plus_checkout_promo_campaign_id: str = Field(
         default="plus-1-month-free",
         validation_alias="PERSONAL_PLUS_CHECKOUT_PROMO_CAMPAIGN_ID",
+    )
+    personal_plus_checkout_captcha_api_url: str = Field(
+        default="",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_CAPTCHA_API_URL",
+    )
+    personal_plus_checkout_captcha_client_key: str = Field(
+        default="",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_CAPTCHA_CLIENT_KEY",
     )
     icloud_post_registration_promotion_check_enabled: bool = Field(
         default=False,

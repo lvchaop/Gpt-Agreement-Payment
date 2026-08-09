@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from hashlib import sha256
 from urllib.parse import quote
+from urllib.request import ProxyHandler, Request, build_opener
 from uuid import uuid4
 
 try:
@@ -21,8 +23,76 @@ from refactor_app.config.browser_fingerprint import BROWSER_IMPERSONATE
 
 CLIPROXY_PROVIDER = "cliproxy"
 DEFAULT_CLIPROXY_PROBE_URL = "https://chatgpt.com/api/auth/csrf"
+DEFAULT_CLIPROXY_EGRESS_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 _COUNTRY_CODE_PATTERN = re.compile(r"^[A-Z]{2}$")
 _SUPPORTED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+_SUPPORTED_GATEWAY_MODES = frozenset({"auto", "fixed"})
+_SG_GATEWAY_COUNTRIES = frozenset(
+    {
+        "AF",
+        "AM",
+        "AU",
+        "AZ",
+        "BD",
+        "BH",
+        "BN",
+        "BT",
+        "CN",
+        "FJ",
+        "FM",
+        "GE",
+        "HK",
+        "ID",
+        "IL",
+        "IN",
+        "IQ",
+        "IR",
+        "JO",
+        "JP",
+        "KG",
+        "KH",
+        "KI",
+        "KP",
+        "KR",
+        "KW",
+        "KZ",
+        "LA",
+        "LB",
+        "LK",
+        "MH",
+        "MM",
+        "MN",
+        "MO",
+        "MV",
+        "MY",
+        "NP",
+        "NR",
+        "NZ",
+        "OM",
+        "PG",
+        "PH",
+        "PK",
+        "PW",
+        "PS",
+        "QA",
+        "SA",
+        "SB",
+        "SG",
+        "SY",
+        "TH",
+        "TJ",
+        "TL",
+        "TM",
+        "TO",
+        "TV",
+        "TW",
+        "UZ",
+        "VN",
+        "VU",
+        "WS",
+        "YE",
+    }
+)
 ProxyProbe = Callable[[str], bool]
 
 
@@ -45,6 +115,11 @@ class CliproxyProxyConfig:
     probe_timeout_s: float = 10.0
     probe_require_csrf_token: bool = True
     max_sid_attempts: int = 4
+    gateway_mode: str = "auto"
+    us_host: str = "us.arxlabs.io"
+    sg_host: str = "sg.arxlabs.io"
+    egress_trace_url: str = DEFAULT_CLIPROXY_EGRESS_TRACE_URL
+    egress_trace_timeout_s: float = 5.0
 
     @classmethod
     def from_settings(cls, settings: object) -> CliproxyProxyConfig:
@@ -67,13 +142,43 @@ class CliproxyProxyConfig:
                 getattr(settings, "cliproxy_probe_require_csrf_token", True)
             ),
             max_sid_attempts=int(getattr(settings, "cliproxy_max_sid_attempts", 4) or 4),
+            gateway_mode=str(getattr(settings, "cliproxy_gateway_mode", "auto") or "auto"),
+            us_host=str(getattr(settings, "cliproxy_us_host", "us.arxlabs.io") or ""),
+            sg_host=str(getattr(settings, "cliproxy_sg_host", "sg.arxlabs.io") or ""),
+            egress_trace_url=str(
+                getattr(
+                    settings,
+                    "cliproxy_egress_trace_url",
+                    DEFAULT_CLIPROXY_EGRESS_TRACE_URL,
+                )
+                or DEFAULT_CLIPROXY_EGRESS_TRACE_URL
+            ),
+            egress_trace_timeout_s=float(
+                getattr(settings, "cliproxy_egress_trace_timeout_s", 5.0) or 5.0
+            ),
         )
 
     def validate(self) -> None:
         host = self.host.strip()
         scheme = self.scheme.strip().lower()
+        gateway_mode = self.gateway_mode.strip().lower()
         if not host or any(char.isspace() for char in host) or "://" in host:
             raise CliproxyProxyError("Cliproxy host is invalid")
+        if gateway_mode not in _SUPPORTED_GATEWAY_MODES:
+            raise CliproxyProxyError(f"Cliproxy gateway mode is unsupported: {gateway_mode}")
+        if gateway_mode == "auto":
+            for gateway_name, gateway_host in (("US", self.us_host), ("SG", self.sg_host)):
+                normalized_gateway_host = gateway_host.strip()
+                if (
+                    not normalized_gateway_host
+                    or any(char.isspace() for char in normalized_gateway_host)
+                    or "://" in normalized_gateway_host
+                ):
+                    raise CliproxyProxyError(f"Cliproxy {gateway_name} host is invalid")
+            if not self.egress_trace_url.strip():
+                raise CliproxyProxyError("Cliproxy egress trace URL is missing")
+            if float(self.egress_trace_timeout_s) <= 0:
+                raise CliproxyProxyError("Cliproxy egress trace timeout must be positive")
         if not 1 <= int(self.port) <= 65535:
             raise CliproxyProxyError("Cliproxy port must be between 1 and 65535")
         if scheme not in _SUPPORTED_PROXY_SCHEMES:
@@ -120,6 +225,7 @@ def resolve_cliproxy_proxy(
     config.validate()
     normalized_email = normalize_registration_proxy_email(email)
     normalized_country = normalize_registration_proxy_country(country_code)
+    gateway_host = select_cliproxy_gateway_host(config)
     # Cliproxy keeps a SID pinned to its first resolved exit. Scope the stable
     # hash by country so one account's US browser and JP promo request cannot
     # reuse the same pinned route.
@@ -146,7 +252,7 @@ def resolve_cliproxy_proxy(
             email=normalized_email,
             country_code=normalized_country,
             sid=sid,
-            host=config.host,
+            host=gateway_host,
             port=config.port,
             scheme=config.scheme,
             username=config.username,
@@ -169,6 +275,51 @@ def resolve_cliproxy_proxy(
     raise CliproxyProxyError(
         f"Cliproxy proxy probe failed after {attempt_limit} attempts: {failure_types}"
     )
+
+
+def select_cliproxy_gateway_host(config: CliproxyProxyConfig) -> str:
+    """Select the nearest Cliproxy ingress from this process's direct egress."""
+
+    if config.gateway_mode.strip().lower() == "fixed":
+        return config.host.strip()
+    try:
+        egress_country = detect_machine_egress_country(
+            config.egress_trace_url,
+            float(config.egress_trace_timeout_s),
+        )
+    except Exception:
+        return config.host.strip()
+    if egress_country in _SG_GATEWAY_COUNTRIES:
+        return config.sg_host.strip()
+    return config.us_host.strip()
+
+
+@lru_cache(maxsize=8)
+def detect_machine_egress_country(
+    trace_url: str = DEFAULT_CLIPROXY_EGRESS_TRACE_URL,
+    timeout_s: float = 5.0,
+) -> str:
+    """Read Cloudflare Trace directly, bypassing system and Cliproxy settings."""
+
+    request = Request(
+        str(trace_url or "").strip(),
+        headers={"Accept": "text/plain", "User-Agent": "refactor-app-egress-probe/1.0"},
+    )
+    opener = build_opener(ProxyHandler({}))
+    with opener.open(request, timeout=float(timeout_s)) as response:
+        status = int(getattr(response, "status", 200) or 200)
+        payload = response.read().decode("utf-8", errors="replace")
+    if status != 200:
+        raise CliproxyProxyError(f"Cliproxy egress trace returned HTTP {status}")
+    trace = dict(
+        line.split("=", 1)
+        for line in payload.splitlines()
+        if "=" in line
+    )
+    country_code = str(trace.get("loc") or "").strip().upper()
+    if not trace.get("ip") or not _COUNTRY_CODE_PATTERN.fullmatch(country_code) or country_code == "XX":
+        raise CliproxyProxyError("Cliproxy egress trace did not return a usable IP location")
+    return country_code
 
 
 def build_cliproxy_proxy(

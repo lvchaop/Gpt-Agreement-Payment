@@ -33,7 +33,10 @@
 Cliproxy 账号静态代理：
 
 ```dotenv
-CLIPROXY_HOST=us.cliproxy.io
+CLIPROXY_GATEWAY_MODE=auto
+CLIPROXY_HOST=us.arxlabs.io
+CLIPROXY_US_HOST=us.arxlabs.io
+CLIPROXY_SG_HOST=sg.arxlabs.io
 CLIPROXY_PORT=<控制台代理端口>
 CLIPROXY_SCHEME=http
 CLIPROXY_USERNAME=<基础用户名>
@@ -41,6 +44,10 @@ CLIPROXY_PASSWORD=<密码>
 CLIPROXY_SESSION_DURATION_MINUTES=15
 CLIPROXY_MAX_SID_ATTEMPTS=4
 ```
+
+`auto` 模式在进程启动后的首次使用时直连 Cloudflare Trace 探测机器出口地区：
+亚洲及大洋洲使用 `sg` 接入地址，欧洲及美洲使用 `us` 接入地址；结果在当前进程内
+缓存，探测失败时回退 `CLIPROXY_HOST`。`fixed` 模式始终使用 `CLIPROXY_HOST`。
 
 注册、iCloud 优惠检测、个人空间绑支付方式及 Checkout 共用该配置。首次按规范化
 邮箱的 SHA-256 生成稳定 `sid`；使用前访问 ChatGPT CSRF 接口探测，失败后改用随机

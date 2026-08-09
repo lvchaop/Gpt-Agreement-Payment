@@ -5,15 +5,17 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from pytest import MonkeyPatch
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from refactor_app.api.routes import resources
 from refactor_app.config.settings import Settings
 from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
 from refactor_app.infrastructure.db.models import (
+    JobModel,
     SpaceMembershipModel,
     SpaceModel,
     UserAccountModel,
+    WorkItemModel,
 )
 
 
@@ -224,6 +226,103 @@ def test_personal_codex_hero_options_accept_price_above_default() -> None:
         "hero_sms_country": "151",
         "hero_sms_max_price": "1.25",
     }
+
+
+def test_scheduled_space_authorization_supports_personal_plus() -> None:
+    prefix = f"test-scheduled-personal-authorize-{uuid4()}"
+    account_id = f"{prefix}-account"
+    space_id = f"{prefix}-space"
+    membership_id = f"{prefix}-membership"
+    job_id = ""
+    now = datetime.now(UTC)
+    session_factory = make_session_factory(make_engine(Settings()))
+
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                id=account_id,
+                email=f"{account_id}@example.test",
+                openai_user_id=f"user-{account_id}",
+                cookie_header="session=personal-plus",
+                account_status="active",
+                session_status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.flush()
+        session.add(
+            SpaceModel(
+                id=space_id,
+                external_space_id=f"{prefix}-external",
+                owner_user_account_id=account_id,
+                name="Personal Plus",
+                space_type="personal",
+                auth_mode="codex_oauth",
+                credential_type="personal_account",
+                plan_type="plus",
+                space_status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.flush()
+        session.add(
+            SpaceMembershipModel(
+                id=membership_id,
+                space_id=space_id,
+                user_account_id=account_id,
+                membership_status="active",
+                session_account_detected=True,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+    try:
+        with session_factory() as session:
+            result = resources._create_space_authorization_work_job(
+                session=session,
+                space_id=space_id,
+                work_count=3,
+                created_by="test",
+                credential_name_prefix="codex",
+                use_hero_sms_for_add_phone=True,
+                hero_sms_country="187",
+                hero_sms_max_price="0.18",
+                force_clean_browser_login=True,
+            )
+            job_id = str(result["job_id"])
+
+        assert result["selected_count"] == 1
+        assert result["work_count"] == 3
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            work = session.scalars(
+                select(WorkItemModel).where(WorkItemModel.job_id == job_id)
+            ).one()
+            assert job is not None
+            assert job.type == "automation.space_authorize"
+            assert job.input_json["authorization_mode"] == "personal_codex_oauth"
+            assert work.work_type == "space.personal_codex.authorize.account"
+            assert work.input_json == {
+                "space_membership_id": membership_id,
+                "space_id": space_id,
+                "user_account_id": account_id,
+                "external_space_id": f"{prefix}-external",
+                "force_clean_browser_login": True,
+                "use_hero_sms_for_add_phone": True,
+                "hero_sms_country": "187",
+                "hero_sms_max_price": "0.18",
+            }
+    finally:
+        with session_factory() as session:
+            if job_id:
+                session.execute(delete(JobModel).where(JobModel.id == job_id))
+            session.execute(delete(SpaceModel).where(SpaceModel.id == space_id))
+            session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
+            session.commit()
 
 
 def test_personal_codex_hero_options_accept_numeric_price_from_browser() -> None:

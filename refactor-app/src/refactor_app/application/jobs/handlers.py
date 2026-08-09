@@ -66,6 +66,10 @@ from refactor_app.application.workflows.space_auto_replenish import (
     MAX_INVITE_BATCH_SIZE,
     SpaceAutoReplenishWorkflow,
 )
+from refactor_app.application.workflows.space_credential_heartbeat import (
+    PersonalCodexCredentialHeartbeatInput,
+    PersonalCodexCredentialHeartbeatWorkflow,
+)
 from refactor_app.application.workflows.space_direct_push import (
     SpaceDirectPushInput,
     SpaceDirectPushWorkflow,
@@ -233,6 +237,12 @@ def register_core_handlers(
         },
     )
     runner.register(
+        "space.personal_codex_credential_heartbeat.tick",
+        lambda _session, input_json: {
+            "work_count": len(input_json.get("space_credential_ids") or []),
+        },
+    )
+    runner.register(
         "account.backfill_session_rt",
         lambda _session, input_json: {
             "work_count": len(input_json.get("user_account_ids") or []),
@@ -350,6 +360,7 @@ def register_core_handlers(
         "space.personal_payment_method_bind.tick",
         lambda _session, input_json: _run_personal_payment_method_bind_tick_job(
             session_factory=session_factory,
+            settings=settings,
             input_json=input_json,
         ),
     )
@@ -466,6 +477,14 @@ def register_core_handlers(
         },
     )
     runner.register_work(
+        "space.personal_codex_credential_heartbeat.account",
+        lambda _session, input_json: _run_personal_codex_credential_heartbeat_work(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
+    )
+    runner.register_work(
         "space.recycle.binding",
         lambda _session, input_json: (
             SpaceRecycleSweepWorkflow(
@@ -530,6 +549,16 @@ def register_core_handlers(
                     getattr(settings, "browser_log_max_body_chars", 20_000)
                 ),
                 totp_code_resolver=totp_code_resolver,
+                captcha_api_url=str(
+                    input_json.get("captcha_api_url")
+                    or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+                    or ""
+                ),
+                captcha_client_key=str(
+                    input_json.get("captcha_client_key")
+                    or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+                    or ""
+                ),
             )
             def after_bind_success(space_id, page, _result):
                 return plus_workflow.run_on_existing_page(
@@ -556,11 +585,12 @@ def register_core_handlers(
 
     runner.register_work(
         "space.personal_payment_method_bind.space",
-        lambda _session, input_json: personal_payment_method_workflow(input_json).run(
-            space_id=str(input_json["space_id"]),
-            run_id=str(input_json.get("_run_id") or ""),
-            work_id=str(input_json.get("_work_id") or ""),
-        ),
+            lambda _session, input_json: personal_payment_method_workflow(input_json).run(
+                space_id=str(input_json["space_id"]),
+                run_id=str(input_json.get("_run_id") or ""),
+                work_id=str(input_json.get("_work_id") or ""),
+                payment_card_id=str(input_json.get("payment_card_id") or ""),
+            ),
     )
     runner.register_work(
         "space.personal_plus_checkout.space",
@@ -600,6 +630,16 @@ def register_core_handlers(
                 )
             ),
             totp_code_resolver=totp_code_resolver,
+            captcha_api_url=str(
+                input_json.get("captcha_api_url")
+                or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+                or ""
+            ),
+            captcha_client_key=str(
+                input_json.get("captcha_client_key")
+                or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+                or ""
+            ),
         ).run(
             space_id=str(input_json["space_id"]),
             work_id=str(input_json.get("_work_id") or ""),
@@ -1299,6 +1339,7 @@ def _run_space_auto_replenish_invite_job(
 def _run_personal_payment_method_bind_tick_job(
     *,
     session_factory: SessionFactory,
+    settings: Settings,
     input_json: dict,
 ) -> dict:
     job_id = str(input_json.get("_job_id") or "")
@@ -1308,6 +1349,17 @@ def _run_personal_payment_method_bind_tick_job(
     work_count = max(1, int(input_json.get("work_count") or 1))
     auto_start_plus_checkout = bool(input_json.get("auto_start_plus_checkout", True))
     browser_headless = bool(input_json.get("browser_headless", True))
+    captcha_api_url = str(
+        input_json.get("captcha_api_url")
+        or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+        or ""
+    ).strip()
+    captcha_client_key = str(
+        input_json.get("captcha_client_key")
+        or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+        or ""
+    ).strip()
+    payment_card_id = str(input_json.get("payment_card_id") or "").strip()
     with session_factory() as session:
         now = datetime.now(UTC)
         existing_count = int(
@@ -1357,16 +1409,21 @@ def _run_personal_payment_method_bind_tick_job(
             selected = session.scalars(stmt.limit(limit)).all()
             queue = WorkQueue(session)
             for space in selected:
+                work_input = {
+                    "space_id": space.id,
+                    "auto_start_plus_checkout": auto_start_plus_checkout,
+                    "browser_headless": browser_headless,
+                    "captcha_api_url": captcha_api_url,
+                    "captcha_client_key": captcha_client_key,
+                    "_run_id": run_id,
+                }
+                if payment_card_id:
+                    work_input["payment_card_id"] = payment_card_id
                 queue.enqueue(
                     job_id=job_id,
                     work_type="space.personal_payment_method_bind.space",
                     execution_key=f"personal-payment-method:{space.id}",
-                    input_json={
-                        "space_id": space.id,
-                        "auto_start_plus_checkout": auto_start_plus_checkout,
-                        "browser_headless": browser_headless,
-                        "_run_id": run_id,
-                    },
+                    input_json=work_input,
                 )
             session.commit()
     summary = _work_summary(session_factory=session_factory, job_id=job_id)
@@ -1410,6 +1467,16 @@ def _run_personal_plus_checkout_tick_job(
         or settings.personal_plus_checkout_promo_campaign_id
     ).strip()
     browser_headless = bool(input_json.get("browser_headless", True))
+    captcha_api_url = str(
+        input_json.get("captcha_api_url")
+        or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+        or ""
+    ).strip()
+    captcha_client_key = str(
+        input_json.get("captcha_client_key")
+        or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+        or ""
+    ).strip()
     with session_factory() as session:
         existing_count = int(
             session.scalar(
@@ -1458,6 +1525,8 @@ def _run_personal_plus_checkout_tick_job(
                         "promo_proxy_country": promo_country,
                         "promo_campaign_id": promo_campaign_id,
                         "browser_headless": browser_headless,
+                        "captcha_api_url": captcha_api_url,
+                        "captcha_client_key": captcha_client_key,
                         "_run_id": run_id,
                     },
                 )
@@ -1560,6 +1629,62 @@ def _run_remote_session_otp_submit_work(
     return result
 
 
+def _run_personal_codex_credential_heartbeat_work(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    def reauthorize(space_membership_id: str) -> dict:
+        result = _run_personal_codex_authorization_work(
+            session_factory=session_factory,
+            settings=settings,
+            input_json={
+                **input_json,
+                "space_membership_id": space_membership_id,
+            },
+        )
+        if result.get("_work_outcome") == "skipped":
+            reason = str(
+                result.get("skip_reason")
+                or result.get("skipped_reason")
+                or "personal_codex_reauthorization_skipped"
+            )
+            raise RuntimeError(reason)
+        return result
+
+    def repush(space_credential_id: str, downstream_channel_id: str) -> str:
+        return SpaceDirectPushWorkflow(
+            session_factory=session_factory,
+            downstream_provider=_downstream_plugin_from_channel_id(
+                session_factory,
+                downstream_channel_id,
+            ),
+        ).run(
+            SpaceDirectPushInput(
+                space_credential_id=space_credential_id,
+                downstream_channel_id=downstream_channel_id,
+                is_retry=True,
+            )
+        )
+
+    return PersonalCodexCredentialHeartbeatWorkflow(
+        session_factory=session_factory,
+        openai_provider=_openai_plugin(settings),
+        proxy_resolver=lambda user_account_id: ensure_account_proxy_url(
+            session_factory,
+            user_account_id,
+            bind_reason="space_personal_codex_credential_heartbeat",
+        ),
+        reauthorize=reauthorize,
+        repush=repush,
+    ).run(
+        PersonalCodexCredentialHeartbeatInput(
+            space_credential_id=str(input_json["space_credential_id"]),
+        )
+    )
+
+
 def _run_personal_codex_authorization_work(
     *,
     session_factory: SessionFactory,
@@ -1580,7 +1705,7 @@ def _run_personal_codex_authorization_work(
         }
 
     run_id = str(input_json.get("_run_id") or "")
-    phone_provider = _personal_codex_hero_phone_provider(
+    phone_provider = _personal_codex_grizzly_phone_provider(
         session_factory=session_factory,
         settings=settings,
         input_json=input_json,
@@ -1677,7 +1802,7 @@ def _run_personal_promotion_check_work(
     }
 
 
-def _personal_codex_hero_phone_provider(
+def _personal_codex_grizzly_phone_provider(
     *,
     session_factory: SessionFactory,
     settings: Settings,
@@ -1686,16 +1811,24 @@ def _personal_codex_hero_phone_provider(
 ):
     if not bool(input_json.get("use_hero_sms_for_add_phone")):
         return None
-    country = str(input_json.get("hero_sms_country") or "").strip()
-    max_price = str(input_json.get("hero_sms_max_price") or "0.05").strip()
+    country = str(
+        input_json.get("hero_sms_country")
+        or getattr(settings, "grizzly_sms_country", "187")
+        or "187"
+    ).strip()
+    max_price = str(
+        input_json.get("hero_sms_max_price")
+        or getattr(settings, "grizzly_sms_max_price", "0.18")
+        or "0.18"
+    ).strip()
     if not country or not country.isdigit():
-        raise RuntimeError("hero_sms_country must be a numeric Hero country id")
+        raise RuntimeError("grizzly_sms_country must be a numeric GrizzlySMS country id")
     try:
         parsed_max_price = Decimal(max_price)
     except InvalidOperation as exc:
-        raise RuntimeError("hero_sms_max_price must be a positive number") from exc
+        raise RuntimeError("grizzly_sms_max_price must be a positive number") from exc
     if not parsed_max_price.is_finite() or parsed_max_price <= 0:
-        raise RuntimeError("hero_sms_max_price must be a positive number")
+        raise RuntimeError("grizzly_sms_max_price must be a positive number")
 
     def emit(stage: str, data: dict, level: str = "INFO") -> None:
         if not run_id:
@@ -1703,8 +1836,8 @@ def _personal_codex_hero_phone_provider(
         with session_factory() as session:
             EventWriter(session).write(
                 run_id=run_id,
-                event_type=f"account_auth.hero_sms.{stage}",
-                message=f"Hero SMS {stage}",
+                event_type=f"account_auth.grizzly_sms.{stage}",
+                message=f"GrizzlySMS {stage}",
                 level=level,
                 data_json=data,
             )
@@ -1713,20 +1846,45 @@ def _personal_codex_hero_phone_provider(
     return HeroSmsPhoneProviderAdapter(
         PhoneConfig(
             enabled=True,
-            provider="hero_sms",
-            base_url="https://hero-sms.com/stubs/handler_api.php",
-            api_key_env="HERO_SMS_API_KEY",
-            service="dr",
-            country="",
+            provider="grizzly_sms",
+            base_url=str(
+                getattr(
+                    settings,
+                    "grizzly_sms_base_url",
+                    "https://api.grizzlysms.com/stubs/handler_api.php",
+                )
+                or "https://api.grizzlysms.com/stubs/handler_api.php"
+            ).strip(),
+            api_key_env="GRIZZLY_SMS_API_KEY",
+            service=str(getattr(settings, "grizzly_sms_service", "dr") or "dr").strip(),
+            country=country,
             countries=[country],
             maxPrice=max_price,
-            max_number_attempts=3,
-            otp_timeout_s=180,
-            otp_poll_interval_s=3.0,
+            max_number_attempts=max(
+                1,
+                int(getattr(settings, "grizzly_sms_max_number_attempts", 3) or 3),
+            ),
+            request_timeout_s=max(
+                1,
+                int(getattr(settings, "grizzly_sms_request_timeout_s", 20) or 20),
+            ),
+            otp_timeout_s=max(
+                1,
+                int(getattr(settings, "grizzly_sms_otp_timeout_s", 120) or 120),
+            ),
+            otp_poll_interval_s=max(
+                0.1,
+                float(getattr(settings, "grizzly_sms_poll_interval_s", 3.0) or 3.0),
+            ),
         ),
-        api_key=settings.hero_sms_api_key,
+        api_key=str(getattr(settings, "grizzly_sms_api_key", "") or "").strip(),
         event_callback=emit,
     )
+
+
+def _personal_codex_hero_phone_provider(**kwargs):
+    """Compatibility alias; the standalone Codex path now uses GrizzlySMS."""
+    return _personal_codex_grizzly_phone_provider(**kwargs)
 
 
 def _registration_codex_grizzly_phone_provider(

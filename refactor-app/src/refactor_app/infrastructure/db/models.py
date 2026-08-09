@@ -869,7 +869,8 @@ class AutomationScheduleModel(Base):
             "'automation.space_recycle_sweep', "
             "'automation.space_seat_expand', "
             "'automation.space_auto_replenish', "
-            "'automation.personal_payment_method_bind'"
+            "'automation.personal_payment_method_bind', "
+            "'automation.personal_codex_credential_heartbeat'"
             ")"
         ),
         CheckConstraint("schedule_status IN ('active', 'paused', 'error')"),

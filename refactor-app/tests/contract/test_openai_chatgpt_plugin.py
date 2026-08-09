@@ -15,6 +15,7 @@ from refactor_app.plugins.openai_chatgpt import (
     OpenAIChatGPTClientError,
     OpenAIChatGPTPlugin,
     OpenAIChatGPTTimeoutError,
+    OpenAIOAuthRefreshError,
     WorkspaceMismatchError,
     decode_access_token_claims,
 )
@@ -120,6 +121,39 @@ def test_refresh_workspace_token_rejects_workspace_mismatch() -> None:
             external_workspace_id="workspace-1",
             client_id="client-1",
         )
+
+
+def test_refresh_workspace_token_exposes_structured_oauth_error() -> None:
+    client = OpenAIChatGPTClient(
+        OpenAIChatGPTClientConfig(),
+        auth_http_client=httpx.Client(
+            base_url="https://auth.openai.com",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    400,
+                    json={
+                        "error": "invalid_grant",
+                        "error_description": "refresh token is invalid",
+                    },
+                )
+            ),
+        ),
+        chatgpt_http_client=httpx.Client(
+            base_url="https://chatgpt.com",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        ),
+    )
+
+    with pytest.raises(OpenAIOAuthRefreshError) as exc_info:
+        client.refresh_workspace_token(
+            refresh_token="rt-invalid",
+            external_workspace_id="workspace-1",
+            client_id="client-1",
+        )
+
+    assert exc_info.value.http_status == 400
+    assert exc_info.value.error_code == "invalid_grant"
+    assert exc_info.value.error_description == "refresh token is invalid"
 
 
 def test_invite_and_accept_use_team_backend_endpoints_and_headers() -> None:

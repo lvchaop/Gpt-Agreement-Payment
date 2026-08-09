@@ -45,6 +45,25 @@ class OpenAIChatGPTTimeoutError(OpenAIChatGPTClientError):
     pass
 
 
+class OpenAIOAuthRefreshError(OpenAIChatGPTClientError):
+    def __init__(
+        self,
+        *,
+        http_status: int,
+        error_code: str = "",
+        error_description: str = "",
+    ) -> None:
+        self.http_status = int(http_status)
+        self.error_code = str(error_code or "")
+        self.error_description = str(error_description or "")
+        super().__init__(
+            "oauth refresh failed: "
+            f"http_status={self.http_status} "
+            f"error_code={self.error_code or 'unknown'} "
+            f"error_description={self.error_description or 'unknown'}"
+        )
+
+
 class WorkspaceMismatchError(OpenAIChatGPTClientError):
     def __init__(self, *, expected: str, actual: str) -> None:
         super().__init__(f"workspace mismatch: expected={expected} actual={actual}")
@@ -134,8 +153,11 @@ class OpenAIChatGPTClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         if response.is_error:
-            raise OpenAIChatGPTClientError(
-                f"oauth refresh failed: http_status={response.status_code}"
+            error_code, error_description = _oauth_error_details(response)
+            raise OpenAIOAuthRefreshError(
+                http_status=response.status_code,
+                error_code=error_code,
+                error_description=error_description,
             )
         payload = response.json()
         if not isinstance(payload, dict):
@@ -357,17 +379,22 @@ class OpenAIChatGPTClient:
         headers = {str(key).lower(): str(value) for key, value in dict(response.headers).items()}
         status_code = int(getattr(response, "status_code", 0) or 0)
         if status_code < 200 or status_code >= 300:
-            return {
-                "status": "failed",
-                "token_chatgpt_account_id": claims.token_chatgpt_account_id
-                if claims is not None
-                else team_id,
-                "headers": headers,
-                "http_status": status_code,
-                "error_code": f"http_{status_code}",
-                "payment_required": status_code == 402,
-                "unauthorized": status_code == 401,
-            }
+            try:
+                return {
+                    "status": "failed",
+                    "token_chatgpt_account_id": claims.token_chatgpt_account_id
+                    if claims is not None
+                    else team_id,
+                    "headers": headers,
+                    "http_status": status_code,
+                    "error_code": f"http_{status_code}",
+                    "payment_required": status_code == 402,
+                    "unauthorized": status_code == 401,
+                }
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
         _assert_codex_heartbeat_http_ok(response)
         return {
             "status": "ok",
@@ -1017,6 +1044,33 @@ def validate_invite_member_payload(*, email: str, payload: dict) -> dict:
 
 def parse_chatgpt_response_payload(response) -> dict:
     return _response_payload(response)
+
+
+def _oauth_error_details(response) -> tuple[str, str]:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    raw_error = payload.get("error")
+    if isinstance(raw_error, dict):
+        error_code = str(raw_error.get("code") or raw_error.get("type") or "")
+        error_description = str(
+            raw_error.get("message")
+            or payload.get("error_description")
+            or payload.get("message")
+            or ""
+        )
+    else:
+        error_code = str(raw_error or payload.get("error_code") or "")
+        error_description = str(
+            payload.get("error_description") or payload.get("message") or ""
+        )
+    if not error_description:
+        error_description = str(getattr(response, "text", "") or "")[:500]
+    return error_code, error_description
 
 
 def _account_change_email_headers(

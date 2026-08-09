@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, aliased
 
 from refactor_app.infrastructure.db.models import JobModel, WorkItemModel
 
-DEFAULT_WORK_LEASE_SECONDS = 900
+DEFAULT_WORK_LEASE_SECONDS = 120
 
 
 class JobQueue:
@@ -150,10 +150,6 @@ class WorkQueue:
         if job is None:
             return [], False
 
-        required_slots = _job_required_slots(job)
-        if max(0, int(limit or 0)) < required_slots:
-            return [], True
-
         running_count = int(
             self.session.scalar(
                 select(func.count())
@@ -168,17 +164,36 @@ class WorkQueue:
         if running_count > 0:
             return [], True
 
-        rows = self.session.scalars(
-            select(WorkItemModel)
-            .where(
-                WorkItemModel.job_id == job.id,
-                WorkItemModel.work_status == "queued",
+        finished_count = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(WorkItemModel)
+                .where(
+                    WorkItemModel.job_id == job.id,
+                    WorkItemModel.work_status.not_in(("queued", "running")),
+                )
             )
-            .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .limit(required_slots)
-        ).all()
-        if len(rows) != required_slots:
+            or 0
+        )
+        remaining_required_slots = max(0, _job_required_slots(job) - finished_count)
+        if remaining_required_slots == 0:
+            return [], True
+        if max(0, int(limit or 0)) < remaining_required_slots:
+            return [], True
+
+        rows = list(
+            self.session.scalars(
+                select(WorkItemModel)
+                .where(
+                    WorkItemModel.job_id == job.id,
+                    WorkItemModel.work_status == "queued",
+                )
+                .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .limit(remaining_required_slots)
+            ).all()
+        )
+        if len(rows) != remaining_required_slots:
             return [], True
 
         now = datetime.now(UTC)
@@ -196,23 +211,121 @@ class WorkQueue:
         self,
         *,
         worker_id: str,
-        work_ids: list[str],
+        work_ids: list[str] | None = None,
+        claim_generations: dict[str, datetime | None] | None = None,
         lease_seconds: int = DEFAULT_WORK_LEASE_SECONDS,
     ) -> int:
-        if not work_ids:
+        normalized_claim_generations = dict(claim_generations or {})
+        normalized_work_ids = list(
+            normalized_claim_generations
+            if claim_generations is not None
+            else dict.fromkeys(work_ids or [])
+        )
+        if not normalized_work_ids:
             return 0
         rows = self.session.scalars(
             select(WorkItemModel).where(
-                WorkItemModel.id.in_(work_ids),
+                WorkItemModel.id.in_(normalized_work_ids),
                 WorkItemModel.work_status == "running",
                 WorkItemModel.claimed_by == worker_id,
             )
         ).all()
         now = datetime.now(UTC)
         lease_expires_at = now + timedelta(seconds=max(30, int(lease_seconds or 0)))
+        renewed_count = 0
         for work in rows:
+            if (
+                claim_generations is not None
+                and work.claimed_at != normalized_claim_generations.get(work.id)
+            ):
+                continue
             work.lease_expires_at = lease_expires_at
             work.updated_at = now
+            renewed_count += 1
+        return renewed_count
+
+    def release_claimed(
+        self,
+        *,
+        worker_id: str,
+        work_ids: list[str] | None = None,
+        claim_generations: dict[str, datetime | None] | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Return completed-thread claims to the queue without touching other workers."""
+        normalized_worker_id = worker_id.strip()
+        if not normalized_worker_id:
+            return 0
+        normalized_claim_generations = dict(claim_generations or {})
+        normalized_work_ids = list(
+            normalized_claim_generations
+            if claim_generations is not None
+            else dict.fromkeys(work_ids or [])
+        )
+        if (work_ids is not None or claim_generations is not None) and not normalized_work_ids:
+            return 0
+
+        stmt = (
+            select(WorkItemModel)
+            .join(JobModel, JobModel.id == WorkItemModel.job_id)
+            .where(
+                WorkItemModel.work_status == "running",
+                WorkItemModel.claimed_by == normalized_worker_id,
+                JobModel.job_status == "running",
+            )
+            .with_for_update(skip_locked=True)
+        )
+        if work_ids is not None or claim_generations is not None:
+            stmt = stmt.where(WorkItemModel.id.in_(normalized_work_ids))
+        rows = self.session.scalars(stmt).all()
+        released_at = now or datetime.now(UTC)
+        released_count = 0
+        for work in rows:
+            if (
+                claim_generations is not None
+                and work.claimed_at != normalized_claim_generations.get(work.id)
+            ):
+                continue
+            work.work_status = "queued"
+            work.claimed_by = ""
+            work.claimed_at = None
+            work.lease_expires_at = None
+            work.started_at = None
+            work.updated_at = released_at
+            released_count += 1
+        return released_count
+
+    def expire_claimed(
+        self,
+        *,
+        worker_id: str,
+        handoff_delay_s: float = 0,
+        now: datetime | None = None,
+    ) -> int:
+        """Expire this worker's claims after a short process-handoff delay."""
+        normalized_worker_id = worker_id.strip()
+        if not normalized_worker_id:
+            return 0
+        rows = self.session.scalars(
+            select(WorkItemModel)
+            .join(JobModel, JobModel.id == WorkItemModel.job_id)
+            .where(
+                WorkItemModel.work_status == "running",
+                WorkItemModel.claimed_by == normalized_worker_id,
+                JobModel.job_status == "running",
+            )
+            .with_for_update(skip_locked=True)
+        ).all()
+        expired_at = now or datetime.now(UTC)
+        normalized_handoff_delay_s = max(0.0, float(handoff_delay_s or 0))
+        lease_expires_at = (
+            expired_at + timedelta(seconds=normalized_handoff_delay_s)
+            if normalized_handoff_delay_s
+            else expired_at - timedelta(microseconds=1)
+        )
+        for work in rows:
+            work.lease_expires_at = lease_expires_at
+            work.updated_at = expired_at
         return len(rows)
 
     def requeue_expired(self, *, now: datetime | None = None) -> int:
@@ -308,17 +421,19 @@ class WorkQueue:
         ).first()
 
     def _lock_queued_work(self, *, job_id: str, limit: int) -> list[WorkItemModel]:
-        rows = self.session.scalars(
-            select(WorkItemModel)
-            .where(
-                WorkItemModel.job_id == job_id,
-                WorkItemModel.work_status == "queued",
-                WorkItemModel.execution_key == "",
-            )
-            .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .limit(limit)
-        ).all()
+        rows = list(
+            self.session.scalars(
+                select(WorkItemModel)
+                .where(
+                    WorkItemModel.job_id == job_id,
+                    WorkItemModel.work_status == "queued",
+                    WorkItemModel.execution_key == "",
+                )
+                .order_by(WorkItemModel.priority.desc(), WorkItemModel.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+            ).all()
+        )
         remaining = limit - len(rows)
         if remaining <= 0:
             return rows

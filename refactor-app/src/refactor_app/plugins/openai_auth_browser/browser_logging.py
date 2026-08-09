@@ -30,6 +30,7 @@ _TEXT_CONTENT_TYPE = re.compile(
     r"text/|xml|javascript)",
     re.IGNORECASE,
 )
+_BODY_RESOURCE_TYPES = frozenset({"document", "xhr", "fetch"})
 
 
 def _redact_url(value: str) -> str:
@@ -110,7 +111,11 @@ def _read_attr(obj: Any, name: str, default: Any = "") -> Any:
     try:
         value = getattr(obj, name, default)
         return value() if callable(value) else value
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as exc:
+        return f"<read-error:{type(exc).__name__}>"
+    except BaseException as exc:
         return f"<read-error:{type(exc).__name__}>"
 
 
@@ -141,6 +146,7 @@ class BrowserLogRecorder:
         self._lock = threading.Lock()
         self._sequence = 0
         self._closed = False
+        self._accept_events = True
         self._bindings: list[tuple[Any, str, Callable[..., Any]]] = []
         self._request_ids: dict[int, tuple[str, float]] = {}
         if self.path is not None:
@@ -167,12 +173,16 @@ class BrowserLogRecorder:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        # Stop new callbacks before removing listeners. Playwright may still
+        # deliver an already queued response while a page/context is closing.
+        self._accept_events = False
         for target, event, callback in reversed(self._bindings):
             try:
                 target.remove_listener(event, callback)
             except Exception:
                 pass
+        self._bindings.clear()
+        self._closed = True
         self.record(
             "browser.log.closed",
             {"path": str(self.path) if self.path else ""},
@@ -211,9 +221,27 @@ class BrowserLogRecorder:
                 pass
 
     def _bind(self, target: Any, event: str, callback: Callable[..., Any]) -> None:
+        def guarded_callback(*args: Any) -> None:
+            if not self._accept_events:
+                return
+            try:
+                callback(*args)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                # Playwright can deliver a response callback after the target
+                # has begun closing. Never let an observability callback
+                # replace the business exception or reach the event loop.
+                self.record(
+                    "browser.log.listener_error",
+                    {"event": event, "error": f"{type(exc).__name__}: {exc}"},
+                    "WARN",
+                    notify=False,
+                )
+
         try:
-            target.on(event, callback)
-            self._bindings.append((target, event, callback))
+            target.on(event, guarded_callback)
+            self._bindings.append((target, event, guarded_callback))
         except Exception as exc:
             self.record(
                 "browser.log.listener_error",
@@ -260,6 +288,8 @@ class BrowserLogRecorder:
         self.record("browser.request", self._request_data(request))
 
     def _on_response(self, response: Any) -> None:
+        if not self._accept_events:
+            return
         request = _read_attr(response, "request", None)
         data = self._request_data(request) if request is not None else {}
         data.update(
@@ -271,7 +301,7 @@ class BrowserLogRecorder:
         headers = _read_attr(response, "all_headers", {})
         if isinstance(headers, dict):
             data["response_headers"] = redact_browser_value(headers)
-        if self._capture_bodies:
+        if self._capture_bodies and data.get("resource_type") in _BODY_RESOURCE_TYPES:
             raw_content_type = next(
                 (
                     str(value)
@@ -304,7 +334,9 @@ class BrowserLogRecorder:
                             max_chars=self._max_body_chars,
                         )
                     )
-                except Exception as exc:
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
                     data["body_error"] = f"{type(exc).__name__}: {exc}"
         self.record("browser.response", data, "WARN" if data.get("status", 0) >= 400 else "INFO")
 

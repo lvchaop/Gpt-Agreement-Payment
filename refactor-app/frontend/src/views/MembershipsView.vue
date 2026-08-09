@@ -18,9 +18,9 @@ const spaceDetectionBusy = ref(false);
 const authorizationWorkCount = ref(1);
 const authorizationBusy = ref(false);
 const authorizationConfirmOpen = ref(false);
-const authorizationUseHeroSms = ref(false);
-const authorizationHeroCountry = ref("");
-const authorizationHeroMaxPrice = ref("0.05");
+const authorizationUseGrizzlySms = ref(false);
+const authorizationGrizzlyCountry = ref("187");
+const authorizationGrizzlyMaxPrice = ref("0.18");
 const otpSpaceIds = ref<string[]>([]);
 const otpPrepareWorkCount = ref(50);
 const otpPrepareAccountCount = ref<number | "">("");
@@ -279,9 +279,9 @@ function openPersonalCodexAuthorization() {
     store.toast("未选择成员", "请先勾选个人空间成员。", "warning");
     return;
   }
-  authorizationUseHeroSms.value = false;
-  authorizationHeroCountry.value = "";
-  authorizationHeroMaxPrice.value = "0.05";
+  authorizationUseGrizzlySms.value = false;
+  authorizationGrizzlyCountry.value = "187";
+  authorizationGrizzlyMaxPrice.value = "0.18";
   authorizationConfirmOpen.value = true;
 }
 
@@ -291,12 +291,12 @@ function closePersonalCodexAuthorization() {
 
 async function authorizeSelectedPersonalCodex() {
   const ids = selectedMembershipIds.value;
-  if (authorizationUseHeroSms.value) {
-    if (!/^\d+$/.test(authorizationHeroCountry.value.trim())) {
-      store.toast("国家编号无效", "请输入 Hero 的数字国家编号。", "warning");
+  if (authorizationUseGrizzlySms.value) {
+    if (!/^\d+$/.test(authorizationGrizzlyCountry.value.trim())) {
+      store.toast("国家编号无效", "请输入 GrizzlySMS 的数字国家编号。", "warning");
       return;
     }
-    const maxPrice = Number(authorizationHeroMaxPrice.value);
+    const maxPrice = Number(authorizationGrizzlyMaxPrice.value);
     if (!Number.isFinite(maxPrice) || maxPrice <= 0) {
       store.toast("最大价格无效", "最大价格必须是大于 0 的数字。", "warning");
       return;
@@ -308,10 +308,10 @@ async function authorizeSelectedPersonalCodex() {
       space_membership_ids: ids,
       created_by: "ops-ui",
       work_count: authorizationWorkCount.value,
-      use_hero_sms_for_add_phone: authorizationUseHeroSms.value,
-      ...(authorizationUseHeroSms.value ? {
-        hero_sms_country: authorizationHeroCountry.value.trim(),
-        hero_sms_max_price: String(authorizationHeroMaxPrice.value),
+      use_hero_sms_for_add_phone: authorizationUseGrizzlySms.value,
+      ...(authorizationUseGrizzlySms.value ? {
+        hero_sms_country: authorizationGrizzlyCountry.value.trim(),
+        hero_sms_max_price: String(authorizationGrizzlyMaxPrice.value),
       } : {}),
     });
     if (!result.job_id) {
@@ -395,8 +395,8 @@ async function authorizeSelectedPersonalCodex() {
   <ConfirmModal
     :open="authorizationConfirmOpen"
     title="个人 Codex 授权"
-    message="为选中的个人空间成员创建授权 Job。Hero 仅在授权进入 add_phone 时申请号码。"
-    :summary="{ '选中成员': selectedMembershipIds.length, '同时执行 Work': authorizationWorkCount, 'Hero 接码': authorizationUseHeroSms ? '启用' : '关闭' }"
+    message="为选中的个人空间成员创建授权 Job。GrizzlySMS 仅在授权进入 add_phone 时申请号码。"
+    :summary="{ '选中成员': selectedMembershipIds.length, '同时执行 Work': authorizationWorkCount, 'GrizzlySMS 接码': authorizationUseGrizzlySms ? '启用' : '关闭' }"
     confirm-text="创建授权 Job"
     :busy="authorizationBusy"
     @close="closePersonalCodexAuthorization"
@@ -404,17 +404,17 @@ async function authorizeSelectedPersonalCodex() {
   >
     <div class="authorization-options">
       <label class="authorization-check">
-        <input v-model="authorizationUseHeroSms" type="checkbox" />
-        <span>add_phone 时使用 Hero 接码</span>
+        <input v-model="authorizationUseGrizzlySms" type="checkbox" />
+        <span>add_phone 时使用 GrizzlySMS 接码</span>
       </label>
-      <div v-if="authorizationUseHeroSms" class="authorization-fields">
+      <div v-if="authorizationUseGrizzlySms" class="authorization-fields">
         <label>
           <span>国家编号</span>
-          <input v-model.trim="authorizationHeroCountry" class="input" type="text" inputmode="numeric" placeholder="Hero country ID" />
+          <input v-model.trim="authorizationGrizzlyCountry" class="input" type="text" inputmode="numeric" placeholder="GrizzlySMS country ID" />
         </label>
         <label>
           <span>最大价格</span>
-          <input v-model="authorizationHeroMaxPrice" class="input" type="number" min="0.0001" step="0.01" />
+          <input v-model="authorizationGrizzlyMaxPrice" class="input" type="number" min="0.0001" step="0.01" />
         </label>
       </div>
     </div>

@@ -17,6 +17,7 @@ from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
     _exchange_callback,
     _extract_callback_url,
     _fill_otp,
+    _has_otp_input,
     _has_password_input,
     _install_callback_capture,
     _is_add_phone_url,
@@ -329,6 +330,10 @@ def test_fill_otp_accepts_visible_text_input_with_authenticator_label() -> None:
         def __init__(self) -> None:
             self.value = ""
 
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
         def click(self, **_kwargs) -> None:
             return None
 
@@ -338,9 +343,11 @@ def test_fill_otp_accepts_visible_text_input_with_authenticator_label() -> None:
     field = Input()
 
     class Page:
+        url = "https://auth.openai.com/mfa-challenge/totp-factor"
+
         @staticmethod
         def query_selector(selector: str):
-            return field if selector == 'input[type="text"]:visible' else None
+            return field if selector == 'input[type="text"]' else None
 
         @staticmethod
         def query_selector_all(_selector: str):
@@ -348,6 +355,84 @@ def test_fill_otp_accepts_visible_text_input_with_authenticator_label() -> None:
 
     assert _fill_otp(Page(), "654321") is True
     assert field.value == "654321"
+
+
+def test_totp_detection_and_fill_use_standard_selectors_across_frames() -> None:
+    class Input:
+        def __init__(self) -> None:
+            self.value = ""
+
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
+        @staticmethod
+        def click(**_kwargs) -> None:
+            return None
+
+        def fill(self, value: str) -> None:
+            self.value = value
+
+    field = Input()
+
+    class Frame:
+        @staticmethod
+        def query_selector_all(selector: str):
+            if selector == 'input[autocomplete="one-time-code"]':
+                return [field]
+            return []
+
+    class Page:
+        url = "https://auth.openai.com/mfa-challenge/totp-factor"
+        frames = [Frame()]
+
+        @staticmethod
+        def query_selector_all(_selector: str):
+            return []
+
+    page = Page()
+
+    assert _has_otp_input(page) is True
+    assert _fill_otp(page, "654321") is True
+    assert field.value == "654321"
+
+
+def test_totp_fill_uses_react_controlled_input_fallback() -> None:
+    class Input:
+        value = ""
+        fallback_script = ""
+
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
+        @staticmethod
+        def click(**_kwargs) -> None:
+            return None
+
+        @staticmethod
+        def fill(_value: str) -> None:
+            raise RuntimeError("controlled input rejected native fill")
+
+        def evaluate(self, script: str, value: str) -> None:
+            self.fallback_script = script
+            self.value = value
+
+    field = Input()
+
+    class Page:
+        url = "https://auth.openai.com/mfa-challenge/totp-factor"
+
+        @staticmethod
+        def query_selector_all(selector: str):
+            if selector == 'input[autocomplete="one-time-code"]':
+                return [field]
+            return []
+
+    assert _fill_otp(Page(), "654321") is True
+    assert field.value == "654321"
+    assert "HTMLInputElement.prototype" in field.fallback_script
+    assert "new Event('input'" in field.fallback_script
 
 
 def test_account_deactivated_page_returns_terminal_failure() -> None:
@@ -697,10 +782,13 @@ def test_add_phone_invalid_state_reuses_same_hero_number_after_auth_restart() ->
     assert provider.has_retained_lease is False
 
 
-def test_personal_codex_hero_provider_uses_dr_and_requested_country_price() -> None:
+def test_personal_codex_grizzly_provider_uses_dr_and_requested_country_price() -> None:
     provider = _personal_codex_hero_phone_provider(
         session_factory=lambda: None,
-        settings=SimpleNamespace(hero_sms_api_key="hero-key"),
+        settings=SimpleNamespace(
+            grizzly_sms_api_key="grizzly-key",
+            grizzly_sms_base_url="https://api.grizzlysms.com/stubs/handler_api.php",
+        ),
         input_json={
             "use_hero_sms_for_add_phone": True,
             "hero_sms_country": "16",
@@ -710,6 +798,8 @@ def test_personal_codex_hero_provider_uses_dr_and_requested_country_price() -> N
     )
 
     assert provider is not None
+    assert provider.base_url == "https://api.grizzlysms.com/stubs/handler_api.php"
+    assert provider.api_key == "grizzly-key"
     assert provider.cfg.service == "dr"
     assert provider.cfg.countries == ["16"]
     assert provider.cfg.maxPrice == "0.75"

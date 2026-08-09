@@ -514,6 +514,7 @@
     confirmResult: null,
     sessionAfterConfirm: null,
     redirectUrl: null,
+    submitAttemptCount: 0,
     lastError: null,
     status() {
       return {
@@ -532,6 +533,7 @@
         approvalRequests: this.approvalRequests,
         approvalClientHeaderNames: this.approvalClientHeaderNames,
         confirmResult: this.confirmResult,
+        submitAttemptCount: this.submitAttemptCount,
         lastError: this.lastError,
       };
     },
@@ -680,48 +682,53 @@
       defaultPaymentMethodId,
     );
 
+    let approvalPromise = null;
     async function approveCheckout() {
-      const sentinelHeaders = await freshSentinelHeaders();
-      const clientHeaders = currentClientHeaders("/payments/checkout/approve");
-      state.approvalClientHeaderNames = Object.keys(clientHeaders);
-      const payload = {
-        checkout_session_id: identifiers.checkoutSessionId,
-        processor_entity: identifiers.processorEntity,
-      };
-      const response = await fetch(CheckoutApprovePath, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${authSession.accessToken}`,
-          "Content-Type": "application/json",
-          "chatgpt-account-id": accountId,
-          ...clientHeaders,
-          ...sentinelHeaders,
-        },
-        body: JSON.stringify(payload),
-      });
-      const body = await readJsonOrText(response);
-      const record = {
-        at: now(),
-        ok: response.ok,
-        httpStatus: response.status,
-        request: payload,
-        response: body,
-      };
-      state.approvalRequests.push(record);
-      console.log("[cs-live-default-mount] checkout/approve response", record);
-      if (!response.ok) {
-        throw new Error(
-          `Checkout approve failed (${response.status}): ${JSON.stringify(body)}`,
-        );
-      }
-      if (["blocked", "exception", "denied", "error"].includes(body?.result)) {
-        throw new Error(
-          `Checkout approve returned result=${body.result}: ${JSON.stringify(body)}`,
-        );
-      }
-      return body;
+      if (approvalPromise) return approvalPromise;
+      approvalPromise = (async () => {
+        const sentinelHeaders = await freshSentinelHeaders();
+        const clientHeaders = currentClientHeaders("/payments/checkout/approve");
+        state.approvalClientHeaderNames = Object.keys(clientHeaders);
+        const payload = {
+          checkout_session_id: identifiers.checkoutSessionId,
+          processor_entity: identifiers.processorEntity,
+        };
+        const response = await fetch(CheckoutApprovePath, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${authSession.accessToken}`,
+            "Content-Type": "application/json",
+            "chatgpt-account-id": accountId,
+            ...clientHeaders,
+            ...sentinelHeaders,
+          },
+          body: JSON.stringify(payload),
+        });
+        const body = await readJsonOrText(response);
+        const record = {
+          at: now(),
+          ok: response.ok,
+          httpStatus: response.status,
+          request: payload,
+          response: body,
+        };
+        state.approvalRequests.push(record);
+        console.log("[cs-live-default-mount] checkout/approve response", record);
+        if (!response.ok) {
+          throw new Error(
+            `Checkout approve failed (${response.status}): ${JSON.stringify(body)}`,
+          );
+        }
+        if (["blocked", "exception", "denied", "error"].includes(body?.result)) {
+          throw new Error(
+            `Checkout approve returned result=${body.result}: ${JSON.stringify(body)}`,
+          );
+        }
+        return body;
+      })();
+      return approvalPromise;
     }
 
     async function onRequiresApproval(...args) {
@@ -762,10 +769,11 @@
     paymentElement.mount(`#${HostId} [data-role="element"]`);
 
     state.submitCheckout = async function submitCheckout() {
-      if (!["ready", "submit_failed"].includes(this.phase)) {
+      if (this.phase !== "ready" || this.submitAttemptCount !== 0) {
         throw new Error(`Checkout SDK is not ready (phase=${this.phase}).`);
       }
 
+      this.submitAttemptCount = 1;
       this.phase = "submitting";
       this.lastError = null;
       setSubmitEnabled(false, "Submitting...");
@@ -804,8 +812,8 @@
         this.redirectUrl = redirectUrl;
 
         this.phase = "submitted";
-        setStatus("Checkout submitted successfully.", "#087443");
-        setSubmitEnabled(false, "Submitted");
+        setStatus("Checkout submitted. Verifying payment...", "#087443");
+        setSubmitEnabled(false, "Verifying...");
 
         if (NavigateOnSuccess && redirectUrl) {
           location.assign(redirectUrl);
@@ -820,7 +828,7 @@
         this.phase = "submit_failed";
         this.lastError = error;
         setStatus(error?.message || String(error), "#b42318");
-        setSubmitEnabled(true, `Retry with ${defaultMethodLabel}`);
+        setSubmitEnabled(false, "Submission failed");
         console.error("[cs-live-default-mount] submit failed", error, this.status());
         throw error;
       }

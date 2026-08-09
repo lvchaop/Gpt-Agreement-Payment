@@ -95,6 +95,107 @@ def test_schedule_config_rejects_unknown_and_out_of_range_fields() -> None:
     assert out_of_range.value.status_code == 400
 
 
+def test_space_authorize_schedule_without_space_id_targets_all_spaces() -> None:
+    config = resources._effective_space_schedule_config(
+        schedule_type="automation.space_authorize",
+        saved_config={"work_count": 1},
+    )
+
+    assert config["space_id"] == ""
+    assert config["use_hero_sms_for_add_phone"] is True
+
+
+def test_space_authorize_without_space_id_enqueues_business_and_personal_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    business_space = SimpleNamespace(id="space-business", external_space_id="ext-business")
+    personal_space = SimpleNamespace(id="space-personal", external_space_id="ext-personal")
+    captured: dict[str, Any] = {"works": []}
+
+    monkeypatch.setattr(
+        resources,
+        "_select_space_authorization_target_spaces",
+        lambda **_kwargs: [(business_space, "business"), (personal_space, "personal")],
+    )
+    monkeypatch.setattr(resources, "_active_work_job_for_type", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        resources,
+        "_select_pending_business_access_token_items",
+        lambda **_kwargs: [
+            {
+                "space_membership_id": "membership-business",
+                "space_id": "space-business",
+                "user_account_id": "account-business",
+                "external_space_id": "ext-business",
+                "cookie_header": "session=business",
+                "space_name": "Business",
+                "owner_user_account_id": "owner-business",
+                "source_admin_session_id": "admin-session-business",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        resources,
+        "_select_pending_personal_codex_items",
+        lambda **_kwargs: [
+            {
+                "space_membership_id": "membership-personal",
+                "space_id": "space-personal",
+                "user_account_id": "account-personal",
+                "external_space_id": "ext-personal",
+            }
+        ],
+    )
+
+    class FakeJobQueue:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def enqueue(self, **kwargs: Any) -> Any:
+            captured["job"] = kwargs
+            return SimpleNamespace(id="authorize-all-job", job_status="queued")
+
+    class FakeWorkQueue:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def enqueue(self, **kwargs: Any) -> None:
+            captured["works"].append(kwargs)
+
+    class FakeSession:
+        def commit(self) -> None:
+            pass
+
+    monkeypatch.setattr(resources, "JobQueue", FakeJobQueue)
+    monkeypatch.setattr(resources, "WorkQueue", FakeWorkQueue)
+
+    result = resources._create_space_authorization_work_job(
+        session=cast(Session, FakeSession()),
+        space_id="",
+        work_count=2,
+        created_by="test",
+        credential_name_prefix="codex",
+        use_hero_sms_for_add_phone=True,
+        hero_sms_country="187",
+        hero_sms_max_price="0.18",
+    )
+
+    assert result["selected_count"] == 2
+    assert captured["job"]["input_json"]["space_id"] == ""
+    assert captured["job"]["input_json"]["space_ids"] == [
+        "space-business",
+        "space-personal",
+    ]
+    assert captured["job"]["input_json"]["authorization_mode"] == (
+        "mixed_business_and_personal_codex_oauth"
+    )
+    assert [work["work_type"] for work in captured["works"]] == [
+        "space.business_codex.authorize.account",
+        "space.personal_codex.authorize.account",
+    ]
+    assert captured["works"][1]["input_json"]["use_hero_sms_for_add_phone"] is True
+
+
 def test_space_invite_schedule_has_fixed_1000_work_direct_network_shape() -> None:
     config = resources._effective_space_schedule_config(
         schedule_type="automation.space_membership_invite_sync",
@@ -145,7 +246,12 @@ def test_personal_payment_method_schedule_defaults_and_job_mapping() -> None:
         saved_config={},
     )
 
-    assert config == {"space_id": "", "limit": 10, "work_count": 1}
+    assert config == {
+        "space_id": "",
+        "limit": 10,
+        "work_count": 1,
+        "auto_start_plus_checkout": True,
+    }
     assert resources._fixed_automation_schedule_id(
         "automation.personal_payment_method_bind"
     ) == "automation-schedule-personal-payment-method-bind"
@@ -162,6 +268,132 @@ def test_personal_payment_method_schedule_rejects_excess_browser_concurrency() -
         )
 
     assert error.value.status_code == 400
+
+
+def test_personal_payment_method_schedule_propagates_plus_checkout_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = _schedule(
+        "automation.personal_payment_method_bind",
+        {
+            "space_id": "",
+            "limit": 10,
+            "work_count": 1,
+            "auto_start_plus_checkout": True,
+        },
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeJobQueue:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def enqueue(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(id="payment-bind-job-1", job_status="queued")
+
+    monkeypatch.setattr(resources, "JobQueue", FakeJobQueue)
+    monkeypatch.setattr(resources, "_active_work_job_for_type", lambda **_kwargs: None)
+
+    result = resources._execute_space_automation_schedule(
+        session=cast(Session, object()),
+        schedule=schedule,
+        config_json={
+            "space_id": "space-personal-1",
+            "limit": 5,
+            "work_count": 2,
+            "auto_start_plus_checkout": False,
+        },
+        advance_next_run=False,
+        created_by="ops:test",
+    )
+
+    assert result == {"job_id": "payment-bind-job-1", "job_status": "queued"}
+    assert captured == {
+        "job_type": "space.personal_payment_method_bind.tick",
+        "input_json": {
+            "space_id": "space-personal-1",
+            "limit": 5,
+            "work_count": 2,
+            "auto_start_plus_checkout": False,
+        },
+        "created_by": "ops:test",
+    }
+
+
+def test_personal_codex_credential_heartbeat_schedule_defaults_and_mapping() -> None:
+    config = resources._effective_space_schedule_config(
+        schedule_type="automation.personal_codex_credential_heartbeat",
+        saved_config={},
+    )
+
+    assert config == {
+        "space_id": "",
+        "limit": 100,
+        "work_count": 10,
+        "use_hero_sms_for_add_phone": True,
+        "hero_sms_country": "187",
+        "hero_sms_max_price": "0.18",
+        "force_clean_browser_login": False,
+    }
+    assert resources._fixed_automation_schedule_id(
+        "automation.personal_codex_credential_heartbeat"
+    ) == "automation-schedule-personal-codex-credential-heartbeat"
+    assert resources._job_type_for_schedule_type(
+        "automation.personal_codex_credential_heartbeat"
+    ) == "space.personal_codex_credential_heartbeat.tick"
+
+
+def test_personal_codex_credential_heartbeat_schedule_creates_personal_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule = _schedule(
+        "automation.personal_codex_credential_heartbeat",
+        {"space_id": "", "limit": 100, "work_count": 10},
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"job_id": "heartbeat-job-1", "job_status": "running"}
+
+    monkeypatch.setattr(
+        resources,
+        "_create_personal_codex_credential_heartbeat_work_job",
+        fake_create,
+    )
+    fake_session = cast(Session, object())
+
+    result = resources._execute_space_automation_schedule(
+        session=fake_session,
+        schedule=schedule,
+        config_json={
+            "space_id": "space-personal-1",
+            "limit": 25,
+            "work_count": 4,
+            "use_hero_sms_for_add_phone": False,
+            "hero_sms_country": "187",
+            "hero_sms_max_price": "0.18",
+            "force_clean_browser_login": True,
+        },
+        advance_next_run=False,
+        created_by="ops:test",
+    )
+
+    assert result == {"job_id": "heartbeat-job-1", "job_status": "running"}
+    assert captured == {
+        "session": fake_session,
+        "space_id": "space-personal-1",
+        "limit": 25,
+        "work_count": 4,
+        "created_by": "ops:test",
+        "use_hero_sms_for_add_phone": False,
+        "hero_sms_country": "187",
+        "hero_sms_max_price": "0.18",
+        "force_clean_browser_login": True,
+    }
+    assert schedule.last_job_id == "heartbeat-job-1"
+    assert schedule.last_run_status == "running"
 
 
 def test_space_auto_replenish_schedule_enqueues_one_tick_job(

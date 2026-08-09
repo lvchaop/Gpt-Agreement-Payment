@@ -32,6 +32,7 @@ from refactor_app.plugins.openai_auth_protocol.auth_flow import (
 )
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
     _fill_otp,
+    _has_otp_input,
     _is_mfa_challenge_url,
     _seed_context_cookies,
     _select_existing_account_if_visible,
@@ -1342,12 +1343,32 @@ class CamoufoxEmailRegistration:
             raise BrowserEmailRegistrationError(
                 "TOTP challenge requires a configured 2FAuth account"
             )
+        if not self._wait_for_page_state(
+            page,
+            lambda: _has_otp_input(page),
+            stage="wait-totp-input",
+            timeout_s=30,
+        ):
+            self._screenshot(page, "totp-input-missing.png")
+            raise BrowserEmailRegistrationError(f"TOTP input not found url={page.url}")
         code = str(totp_code_provider() or "").strip()
         if not code.isdigit():
             raise BrowserEmailRegistrationError("2FAuth returned an invalid TOTP code")
         if not _fill_otp(page, code):
             raise BrowserEmailRegistrationError("TOTP input not found")
-        if not _click_first(page, CONTINUE_SELECTORS, timeout_ms=5_000, physical=True):
+        submitted = _click_first(
+            page,
+            CONTINUE_SELECTORS,
+            timeout_ms=5_000,
+            physical=True,
+        )
+        if not submitted:
+            try:
+                page.keyboard.press("Enter")
+                submitted = True
+            except Exception:
+                submitted = False
+        if not submitted:
             raise BrowserEmailRegistrationError("TOTP continue button not found")
         self._emit("browser.totp.submitted", {"url": page.url})
         if not self._wait_for_page_state(
@@ -2356,6 +2377,7 @@ def _managed_camoufox(
     **launch_options: Any,
 ) -> Iterator[Any]:
     manager = manager_factory(**launch_options)
+    active_error: tuple[Any, Any, Any] | None = None
     try:
         context = manager.__enter__()
     except BaseException:
@@ -2367,9 +2389,20 @@ def _managed_camoufox(
         raise
     try:
         yield context
+    except BaseException:
+        active_error = sys.exc_info()
+        raise
     finally:
         if not _camoufox_driver_disconnected(manager):
-            manager.__exit__(None, None, None)
+            try:
+                manager.__exit__(None, None, None)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                # Cleanup must not replace the original browser/workflow
+                # exception. If cleanup is the first failure, preserve it.
+                if active_error is None:
+                    raise
 
 
 def _camoufox_driver_disconnected(manager: Any) -> bool:

@@ -28,6 +28,69 @@ def test_camoufox_proxy_rejects_authenticated_socks() -> None:
         _camoufox_proxy("socks5://user:password@proxy.example:1080")
 
 
+def test_totp_challenge_waits_for_input_before_fetching_and_filling_code(monkeypatch) -> None:
+    events: list[str] = []
+
+    class Input:
+        value = ""
+
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
+        @staticmethod
+        def click(**_kwargs) -> None:
+            return None
+
+        def fill(self, value: str) -> None:
+            events.append("fill")
+            self.value = value
+
+    class Button:
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
+        def evaluate(self, _script: str) -> bool:
+            events.append("submit")
+            page.url = "https://chatgpt.com/"
+            return True
+
+    class Page:
+        url = "https://auth.openai.com/mfa-challenge/totp-factor"
+        input_poll_count = 0
+        field = Input()
+        button = Button()
+
+        def query_selector(self, selector: str):
+            if selector == 'input[autocomplete="one-time-code"]':
+                self.input_poll_count += 1
+                events.append(f"poll:{self.input_poll_count}")
+                return self.field if self.input_poll_count >= 2 else None
+            if selector in browser_registration.CONTINUE_SELECTORS:
+                return self.button
+            return None
+
+        def query_selector_all(self, selector: str):
+            return [self.button] if selector in browser_registration.CONTINUE_SELECTORS else []
+
+    page = Page()
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(capture_artifacts=False)
+    )
+    monkeypatch.setattr(browser_registration.time, "sleep", lambda _seconds: None)
+
+    runner._complete_totp_challenge(
+        page,
+        totp_code_provider=lambda: events.append("fetch") or "654321",
+    )
+
+    assert page.field.value == "654321"
+    assert events[:3] == ["poll:1", "poll:2", "fetch"]
+    assert events.index("fill") > events.index("fetch")
+    assert events[-1] == "submit"
+
+
 def test_managed_camoufox_cleans_up_when_browser_launch_fails() -> None:
     calls: list[str] = []
 
@@ -47,6 +110,22 @@ def test_managed_camoufox_cleans_up_when_browser_launch_fails() -> None:
             pytest.fail("launch failure must not enter the browser body")
 
     assert calls == ["init", "enter", "exit"]
+
+
+def test_managed_camoufox_cleanup_does_not_replace_original_error() -> None:
+    class Manager:
+        def __init__(self, **_launch_options) -> None:
+            pass
+
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args) -> None:
+            raise RuntimeError("cleanup failed")
+
+    with pytest.raises(ValueError, match="workflow failed"):
+        with browser_registration._managed_camoufox(Manager):
+            raise ValueError("workflow failed")
 
 
 def test_managed_camoufox_skips_close_after_driver_disconnect() -> None:

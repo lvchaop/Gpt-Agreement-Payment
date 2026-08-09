@@ -6,7 +6,11 @@ import pytest
 from sqlalchemy import delete, select
 
 from refactor_app.api.routes.jobs import cancel_job
-from refactor_app.application.jobs.queue import JobQueue, WorkQueue
+from refactor_app.application.jobs.queue import (
+    DEFAULT_WORK_LEASE_SECONDS,
+    JobQueue,
+    WorkQueue,
+)
 from refactor_app.application.jobs.runner import JobRunner
 from refactor_app.config.settings import Settings
 from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
@@ -181,6 +185,75 @@ def test_all_at_once_work_is_never_claimed_partially() -> None:
         session.commit()
 
 
+def test_all_at_once_claims_all_remaining_work_after_partial_completion() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    job_type = "test.all-at-once-partially-completed"
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={
+                "work_count": 3,
+                "dispatch_mode": "all_at_once",
+                "required_slots": 3,
+            },
+            created_by="test",
+            priority=2_147_483_647,
+        )
+        job.job_status = "running"
+        queue = WorkQueue(session)
+        works = [
+            queue.enqueue(job_id=job.id, work_type="test.atomic.remaining", input_json={"i": i})
+            for i in range(3)
+        ]
+        session.flush()
+        works[0].work_status = "succeeded"
+        works[0].finished_at = datetime.now(UTC)
+        job_id = job.id
+        succeeded_work_id = works[0].id
+        remaining_work_ids = {works[1].id, works[2].id}
+        session.commit()
+
+    with session_factory() as session:
+        claimed, blocks_normal = WorkQueue(session).claim_all_at_once_available(
+            worker_id="worker-partial-atomic",
+            limit=1,
+        )
+        assert claimed == []
+        assert blocks_normal is True
+        session.commit()
+
+    with session_factory() as session:
+        claimed, blocks_normal = WorkQueue(session).claim_all_at_once_available(
+            worker_id="worker-partial-atomic",
+            limit=2,
+        )
+        assert {work.id for work in claimed} == remaining_work_ids
+        assert blocks_normal is True
+        session.commit()
+
+    with session_factory() as session:
+        succeeded = session.get(WorkItemModel, succeeded_work_id)
+        remaining = session.scalars(
+            select(WorkItemModel).where(WorkItemModel.id.in_(remaining_work_ids))
+        ).all()
+        assert succeeded is not None
+        assert succeeded.work_status == "succeeded"
+        assert succeeded.claimed_by == ""
+        assert {work.work_status for work in remaining} == {"running"}
+        assert {work.claimed_by for work in remaining} == {"worker-partial-atomic"}
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
 def test_work_count_is_job_wide_and_execution_key_is_mutually_exclusive() -> None:
     settings = Settings()
     engine = make_engine(settings)
@@ -287,6 +360,400 @@ def test_expired_work_lease_is_requeued() -> None:
         assert work.work_status == "queued"
         assert work.claimed_by == ""
         assert work.lease_expires_at is None
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_default_work_lease_recovers_without_fifteen_minute_stall() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    job_type = "test.default-work-lease"
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 1},
+            created_by="test",
+        )
+        job.job_status = "running"
+        work = WorkQueue(session).enqueue(
+            job_id=job.id,
+            work_type="test.default-work-lease.one",
+            input_json={},
+        )
+        job_id = job.id
+        work_id = work.id
+        session.commit()
+
+    before = datetime.now(UTC)
+    with session_factory() as session:
+        claimed = WorkQueue(session).claim_available(worker_id="lease-worker", limit=1)
+        assert [row.id for row in claimed] == [work_id]
+        session.commit()
+    after = datetime.now(UTC)
+
+    with session_factory() as session:
+        saved = session.get(WorkItemModel, work_id)
+        assert saved is not None
+        assert DEFAULT_WORK_LEASE_SECONDS == 120
+        assert before + timedelta(seconds=120) <= saved.lease_expires_at
+        assert saved.lease_expires_at <= after + timedelta(seconds=120)
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_release_claimed_requeues_only_selected_work_owned_by_worker() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    job_type = "test.release-owned-work"
+    claimed_at = datetime.now(UTC) - timedelta(minutes=1)
+    released_at = datetime.now(UTC)
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 4},
+            created_by="test",
+        )
+        job.job_status = "running"
+        queue = WorkQueue(session)
+        works = [
+            queue.enqueue(job_id=job.id, work_type="test.release.one", input_json={})
+            for _ in range(4)
+        ]
+        session.flush()
+        for work in works[:3]:
+            work.work_status = "running"
+            work.claimed_at = claimed_at
+            work.started_at = claimed_at
+            work.lease_expires_at = claimed_at + timedelta(minutes=15)
+        works[0].claimed_by = "worker-a"
+        works[1].claimed_by = "worker-a"
+        works[2].claimed_by = "worker-b"
+        works[3].work_status = "succeeded"
+        works[3].claimed_by = "worker-a"
+        works[3].finished_at = claimed_at
+        job_id = job.id
+        work_ids = [work.id for work in works]
+        session.commit()
+
+    with session_factory() as session:
+        assert (
+            WorkQueue(session).release_claimed(
+                worker_id="worker-a",
+                work_ids=[work_ids[0], work_ids[2], work_ids[3]],
+                now=released_at,
+            )
+            == 1
+        )
+        session.commit()
+
+    with session_factory() as session:
+        released, unselected, foreign, completed = [
+            session.get(WorkItemModel, work_id) for work_id in work_ids
+        ]
+        assert released.work_status == "queued"
+        assert released.claimed_by == ""
+        assert released.claimed_at is None
+        assert released.started_at is None
+        assert released.lease_expires_at is None
+        assert released.updated_at == released_at
+        assert unselected.work_status == "running"
+        assert unselected.claimed_by == "worker-a"
+        assert foreign.work_status == "running"
+        assert foreign.claimed_by == "worker-b"
+        assert completed.work_status == "succeeded"
+        assert completed.claimed_by == "worker-a"
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_runner_release_claimed_work_commits_all_owned_claims() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    runner = JobRunner(session_factory)
+    job_type = "test.runner-release-owned-work"
+    claimed_at = datetime.now(UTC) - timedelta(minutes=1)
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 3},
+            created_by="test",
+        )
+        job.job_status = "running"
+        queue = WorkQueue(session)
+        works = [
+            queue.enqueue(job_id=job.id, work_type="test.runner-release.one", input_json={})
+            for _ in range(3)
+        ]
+        session.flush()
+        for work in works:
+            work.work_status = "running"
+            work.claimed_at = claimed_at
+            work.started_at = claimed_at
+            work.lease_expires_at = claimed_at + timedelta(minutes=15)
+        works[0].claimed_by = runner.worker_id
+        works[1].claimed_by = runner.worker_id
+        works[2].claimed_by = "another-worker"
+        job_id = job.id
+        work_ids = [work.id for work in works]
+        session.commit()
+
+    assert runner.release_claimed_work() == 2
+
+    with session_factory() as session:
+        first, second, foreign = [session.get(WorkItemModel, work_id) for work_id in work_ids]
+        assert {first.work_status, second.work_status} == {"queued"}
+        assert first.claimed_by == second.claimed_by == ""
+        assert foreign.work_status == "running"
+        assert foreign.claimed_by == "another-worker"
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_release_claimed_rejects_a_stale_claim_generation() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    job_type = "test.release-claim-generation"
+    stale_claimed_at = datetime(2001, 1, 1, tzinfo=UTC)
+    current_claimed_at = datetime(2001, 1, 2, tzinfo=UTC)
+    current_lease_expires_at = current_claimed_at + timedelta(seconds=120)
+    released_at = datetime(2001, 1, 3, tzinfo=UTC)
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 1},
+            created_by="test",
+        )
+        job.job_status = "running"
+        work = WorkQueue(session).enqueue(
+            job_id=job.id,
+            work_type="test.release-claim-generation.one",
+            input_json={},
+        )
+        session.flush()
+        worker_id = f"generation-worker-{job.id}"
+        work.work_status = "running"
+        work.claimed_by = worker_id
+        work.claimed_at = current_claimed_at
+        work.started_at = current_claimed_at
+        work.lease_expires_at = current_lease_expires_at
+        job_id = job.id
+        work_id = work.id
+        session.commit()
+
+    with session_factory() as session:
+        assert (
+            WorkQueue(session).release_claimed(
+                worker_id=worker_id,
+                claim_generations={work_id: stale_claimed_at},
+                now=released_at,
+            )
+            == 0
+        )
+        session.commit()
+
+    with session_factory() as session:
+        saved = session.get(WorkItemModel, work_id)
+        assert saved is not None
+        assert saved.work_status == "running"
+        assert saved.claimed_by == worker_id
+        assert saved.claimed_at == current_claimed_at
+        assert saved.started_at == current_claimed_at
+        assert saved.lease_expires_at == current_lease_expires_at
+
+    with session_factory() as session:
+        assert (
+            WorkQueue(session).release_claimed(
+                worker_id=worker_id,
+                claim_generations={work_id: current_claimed_at},
+                now=released_at,
+            )
+            == 1
+        )
+        session.commit()
+
+    with session_factory() as session:
+        saved = session.get(WorkItemModel, work_id)
+        assert saved is not None
+        assert saved.work_status == "queued"
+        assert saved.claimed_by == ""
+        assert saved.claimed_at is None
+        assert saved.started_at is None
+        assert saved.lease_expires_at is None
+        assert saved.updated_at == released_at
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_expire_claimed_only_expires_owned_work_before_immediate_requeue() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    job_type = "test.expire-owned-work"
+    expired_at = datetime(1980, 1, 2, tzinfo=UTC)
+    owned_claimed_at = datetime(1980, 1, 1, tzinfo=UTC)
+    foreign_claimed_at = datetime(1980, 1, 1, 1, tzinfo=UTC)
+    owned_initial_lease = expired_at + timedelta(minutes=2)
+    foreign_initial_lease = expired_at + timedelta(minutes=3)
+
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 2},
+            created_by="test",
+        )
+        job.job_status = "running"
+        queue = WorkQueue(session)
+        owned = queue.enqueue(job_id=job.id, work_type="test.expire.one", input_json={})
+        foreign = queue.enqueue(job_id=job.id, work_type="test.expire.one", input_json={})
+        session.flush()
+        worker_id = f"expire-worker-{job.id}"
+        foreign_worker_id = f"foreign-worker-{job.id}"
+        owned.work_status = "running"
+        owned.claimed_by = worker_id
+        owned.claimed_at = owned_claimed_at
+        owned.started_at = owned_claimed_at
+        owned.lease_expires_at = owned_initial_lease
+        foreign.work_status = "running"
+        foreign.claimed_by = foreign_worker_id
+        foreign.claimed_at = foreign_claimed_at
+        foreign.started_at = foreign_claimed_at
+        foreign.lease_expires_at = foreign_initial_lease
+        job_id = job.id
+        owned_work_id = owned.id
+        foreign_work_id = foreign.id
+        session.commit()
+
+    with session_factory() as session:
+        assert WorkQueue(session).expire_claimed(worker_id=worker_id, now=expired_at) == 1
+        session.commit()
+
+    with session_factory() as session:
+        owned = session.get(WorkItemModel, owned_work_id)
+        foreign = session.get(WorkItemModel, foreign_work_id)
+        assert owned is not None
+        assert foreign is not None
+        assert owned.work_status == "running"
+        assert owned.claimed_by == worker_id
+        assert owned.claimed_at == owned_claimed_at
+        assert owned.started_at == owned_claimed_at
+        assert owned.lease_expires_at == expired_at - timedelta(microseconds=1)
+        assert owned.updated_at == expired_at
+        assert foreign.work_status == "running"
+        assert foreign.claimed_by == foreign_worker_id
+        assert foreign.claimed_at == foreign_claimed_at
+        assert foreign.started_at == foreign_claimed_at
+        assert foreign.lease_expires_at == foreign_initial_lease
+
+    with session_factory() as session:
+        assert WorkQueue(session).requeue_expired(now=expired_at) == 1
+        session.commit()
+
+    with session_factory() as session:
+        owned = session.get(WorkItemModel, owned_work_id)
+        foreign = session.get(WorkItemModel, foreign_work_id)
+        assert owned is not None
+        assert foreign is not None
+        assert owned.work_status == "queued"
+        assert owned.claimed_by == ""
+        assert owned.claimed_at is None
+        assert owned.started_at is None
+        assert owned.lease_expires_at is None
+        assert foreign.work_status == "running"
+        assert foreign.claimed_by == foreign_worker_id
+        assert foreign.claimed_at == foreign_claimed_at
+        assert foreign.lease_expires_at == foreign_initial_lease
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_stale_handler_cannot_overwrite_a_new_claim_generation() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    runner = JobRunner(session_factory)
+    job_type = "test.claim-generation-fence"
+    work_type = "test.claim-generation-fence.one"
+    first_claimed_at = datetime.now(UTC) - timedelta(minutes=1)
+    second_claimed_at = datetime.now(UTC)
+
+    def replace_claim(session, input_json):
+        saved = session.get(WorkItemModel, input_json["_work_id"])
+        saved.claimed_at = second_claimed_at
+        saved.lease_expires_at = second_claimed_at + timedelta(seconds=120)
+        session.commit()
+        return {"stale_result": True}
+
+    runner.register_work(work_type, replace_claim)
+    with session_factory() as session:
+        session.execute(
+            delete(WorkItemModel).where(
+                WorkItemModel.job_id.in_(select(JobModel.id).where(JobModel.type == job_type))
+            )
+        )
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 1},
+            created_by="test",
+        )
+        job.job_status = "running"
+        work = WorkQueue(session).enqueue(job_id=job.id, work_type=work_type, input_json={})
+        session.flush()
+        work.work_status = "running"
+        work.claimed_by = runner.worker_id
+        work.claimed_at = first_claimed_at
+        work.started_at = first_claimed_at
+        work.lease_expires_at = first_claimed_at + timedelta(seconds=120)
+        job_id = job.id
+        work_id = work.id
+        session.commit()
+
+    assert runner.run_claimed_work(work_id) == work_id
+
+    with session_factory() as session:
+        saved = session.get(WorkItemModel, work_id)
+        assert saved.work_status == "running"
+        assert saved.claimed_at == second_claimed_at
+        assert saved.output_json == {}
+        assert session.get(JobModel, job_id).job_status == "running"
         session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
         session.execute(delete(JobModel).where(JobModel.id == job_id))
         session.commit()

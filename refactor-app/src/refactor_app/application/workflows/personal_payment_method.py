@@ -164,6 +164,7 @@ class PersonalPaymentMethodBindWorkflow:
         space_id: str,
         work_id: str = "",
         run_id: str = "",
+        payment_card_id: str = "",
     ) -> dict[str, Any]:
         context, existing = self._load_context(space_id)
         if existing is not None:
@@ -178,11 +179,17 @@ class PersonalPaymentMethodBindWorkflow:
                 context=context,
                 work_id=work_id,
                 run_id=run_id,
+                payment_card_id=payment_card_id,
             )
 
         last_error: PersonalPaymentMethodBindError | None = None
+        preferred_card_id = str(payment_card_id or "").strip()
         while True:
-            attempt = self._reserve_attempt(context.space_id)
+            reserve_kwargs = (
+                {"payment_card_id": preferred_card_id} if preferred_card_id else {}
+            )
+            attempt = self._reserve_attempt(context.space_id, **reserve_kwargs)
+            preferred_card_id = ""
             self._event(
                 run_id=run_id,
                 event_type="personal_payment_method.attempt_started",
@@ -300,6 +307,7 @@ class PersonalPaymentMethodBindWorkflow:
         context: _BindingContext,
         work_id: str,
         run_id: str,
+        payment_card_id: str = "",
     ) -> dict[str, Any]:
         proxy = resolve_cliproxy_proxy(
             email=context.email,
@@ -339,10 +347,10 @@ class PersonalPaymentMethodBindWorkflow:
         successful: dict[str, Any] = {}
 
         def card_provider(index: int) -> tuple[BrowserPaymentCard, BrowserBillingDetails]:
-            attempt = self._reserve_attempt(
-                context.space_id,
-                billing_template=reserved.get(1),
-            )
+            reserve_kwargs = {"billing_template": reserved.get(1)}
+            if index == 1 and str(payment_card_id or "").strip():
+                reserve_kwargs["payment_card_id"] = str(payment_card_id).strip()
+            attempt = self._reserve_attempt(context.space_id, **reserve_kwargs)
             reserved[index] = attempt
             self._event(
                 run_id=run_id,
@@ -534,6 +542,7 @@ class PersonalPaymentMethodBindWorkflow:
         space_id: str,
         *,
         billing_template: _ReservedPaymentAttempt | None = None,
+        payment_card_id: str = "",
     ) -> _ReservedPaymentAttempt:
         now = datetime.now(UTC)
         with self._session_factory() as session:
@@ -575,12 +584,16 @@ class PersonalPaymentMethodBindWorkflow:
                     .with_for_update(skip_locked=True)
                     .limit(1)
                 )
+            card_query = select(PaymentCardPoolModel).where(
+                PaymentCardPoolModel.card_status == "available"
+            )
+            normalized_card_id = str(payment_card_id or "").strip()
+            if normalized_card_id:
+                card_query = card_query.where(PaymentCardPoolModel.id == normalized_card_id)
+            else:
+                card_query = card_query.order_by(func.random())
             card = session.scalar(
-                select(PaymentCardPoolModel)
-                .where(PaymentCardPoolModel.card_status == "available")
-                .order_by(func.random())
-                .with_for_update(skip_locked=True)
-                .limit(1)
+                card_query.with_for_update(skip_locked=True).limit(1)
             )
             pool_rows = [("card", card)]
             if billing_template is None:

@@ -3,6 +3,7 @@ from refactor_app.plugins.openai_chatgpt.client import (
     OpenAIChatGPTClientConfig,
     OpenAIChatGPTClientError,
     OpenAIChatGPTTimeoutError,
+    OpenAIOAuthRefreshError,
     WorkspaceMismatchError,
     decode_access_token_claims,
 )
@@ -13,6 +14,7 @@ __all__ = [
     "OpenAIChatGPTClientConfig",
     "OpenAIChatGPTClientError",
     "OpenAIChatGPTTimeoutError",
+    "OpenAIOAuthRefreshError",
     "OpenAIChatGPTPlugin",
     "WorkspaceMismatchError",
     "decode_access_token_claims",

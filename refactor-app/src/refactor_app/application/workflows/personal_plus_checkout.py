@@ -27,6 +27,7 @@ from refactor_app.plugins.openai_auth_browser.email_registration import Camoufox
 from refactor_app.plugins.openai_auth_browser.personal_plus_checkout import (
     READ_PLUS_CHECKOUT_SESSION_SCRIPT,
     create_plus_checkout_with_script,
+    solve_plus_checkout_challenge,
     submit_plus_checkout_with_plugin,
     update_plus_checkout_promotion,
 )
@@ -52,6 +53,9 @@ class PersonalPlusCheckoutWorkflow:
         totp_code_resolver: Callable[[str], str] | None = None,
         promotion_updater: Callable[..., Any] | None = None,
         openai_provider: OpenAIChatGPTProvider | None = None,
+        captcha_api_url: str = "",
+        captcha_client_key: str = "",
+        captcha_solver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._mail_provider = mail_provider
@@ -65,6 +69,9 @@ class PersonalPlusCheckoutWorkflow:
         self._totp_code_resolver = totp_code_resolver
         self._promotion_updater = promotion_updater or update_plus_checkout_promotion
         self._openai_provider = openai_provider
+        self._captcha_api_url = str(captcha_api_url or "").strip()
+        self._captcha_client_key = str(captcha_client_key or "").strip()
+        self._captcha_solver = captcha_solver
 
     def run(self, *, space_id: str, work_id: str = "", run_id: str = "") -> dict[str, Any]:
         context = self._load_context(space_id)
@@ -411,8 +418,13 @@ class PersonalPlusCheckoutWorkflow:
             checkout_url=checkout_url,
             account_id=context["external_space_id"],
         )
-        # The plugin has already reported a successful payment here. Re-open
-        # the hosted Checkout page before reading the post-payment web session.
+        payment_state = str(
+            (submitted.get("payment_result") or {}).get("state") or ""
+        ).strip().lower()
+        if payment_state != "succeeded":
+            raise PersonalPlusCheckoutError(
+                f"plus_checkout_payment_not_succeeded:{payment_state or 'missing'}"
+            )
         session_after_payment = self._refresh_session_after_payment(
             page=page,
             checkout_url=checkout_url,
@@ -544,8 +556,8 @@ class PersonalPlusCheckoutWorkflow:
             if cookie.get("name") and cookie.get("value") is not None
         )
 
-    @staticmethod
     def _submit_checkout(
+        self,
         page: Any,
         *,
         checkout_url: str,
@@ -555,4 +567,16 @@ class PersonalPlusCheckoutWorkflow:
             raise PersonalPlusCheckoutError("plus_checkout_page_url_mismatch")
         if not str(account_id or "").strip():
             raise PersonalPlusCheckoutError("plus_checkout_account_id_missing")
-        return submit_plus_checkout_with_plugin(page)
+        captcha_solver = self._captcha_solver
+        if captcha_solver is None and self._captcha_api_url and self._captcha_client_key:
+            def remote_solver(challenge: dict[str, Any]) -> dict[str, Any]:
+                return solve_plus_checkout_challenge(
+                    challenge,
+                    api_url=self._captcha_api_url,
+                    client_key=self._captcha_client_key,
+                )
+
+            captcha_solver = remote_solver
+        if captcha_solver is None:
+            return submit_plus_checkout_with_plugin(page)
+        return submit_plus_checkout_with_plugin(page, captcha_solver=captcha_solver)

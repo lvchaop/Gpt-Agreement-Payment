@@ -3,12 +3,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 from socket import gethostname
+from typing import TypeGuard
 from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from refactor_app.application.jobs.queue import JobQueue, WorkQueue
+from refactor_app.application.jobs.queue import (
+    DEFAULT_WORK_LEASE_SECONDS,
+    JobQueue,
+    WorkQueue,
+)
 from refactor_app.infrastructure.db.models import (
     JobModel,
     JobRunModel,
@@ -25,11 +30,17 @@ WorkHandler = Callable[[Session, dict], dict | None]
 
 
 class JobRunner:
-    def __init__(self, session_factory: Callable[[], Session]) -> None:
+    def __init__(
+        self,
+        session_factory: Callable[[], Session],
+        *,
+        work_lease_seconds: int = DEFAULT_WORK_LEASE_SECONDS,
+    ) -> None:
         self.session_factory = session_factory
         self._handlers: dict[str, JobHandler] = {}
         self._work_handlers: dict[str, WorkHandler] = {}
         self.worker_id = f"{gethostname()}-{uuid4()}"
+        self.work_lease_seconds = max(30, int(work_lease_seconds or 0))
 
     def register(self, job_type: str, handler: JobHandler) -> None:
         self._handlers[job_type] = handler
@@ -170,30 +181,85 @@ class JobRunner:
             return job.id
 
     def claim_work_batch(self, *, max_count: int) -> list[str]:
+        return [
+            work_id
+            for work_id, _claimed_at in self.claim_work_batch_with_generations(
+                max_count=max_count
+            )
+        ]
+
+    def claim_work_batch_with_generations(
+        self,
+        *,
+        max_count: int,
+    ) -> list[tuple[str, datetime | None]]:
         with self.session_factory() as session:
             rows = WorkQueue(session).claim_available(
                 worker_id=self.worker_id,
                 limit=max_count,
+                lease_seconds=self.work_lease_seconds,
             )
-            work_ids = [row.id for row in rows]
+            claims = [(row.id, row.claimed_at) for row in rows]
             session.commit()
-            return work_ids
+            return claims
 
     def claim_all_at_once_work_batch(self, *, max_count: int) -> tuple[list[str], bool]:
+        claims, blocks_normal_dispatch = self.claim_all_at_once_work_batch_with_generations(
+            max_count=max_count
+        )
+        return [work_id for work_id, _claimed_at in claims], blocks_normal_dispatch
+
+    def claim_all_at_once_work_batch_with_generations(
+        self,
+        *,
+        max_count: int,
+    ) -> tuple[list[tuple[str, datetime | None]], bool]:
         with self.session_factory() as session:
             rows, blocks_normal_dispatch = WorkQueue(session).claim_all_at_once_available(
                 worker_id=self.worker_id,
                 limit=max_count,
+                lease_seconds=self.work_lease_seconds,
             )
-            work_ids = [row.id for row in rows]
+            claims = [(row.id, row.claimed_at) for row in rows]
             session.commit()
-            return work_ids, blocks_normal_dispatch
+            return claims, blocks_normal_dispatch
 
-    def renew_work_leases(self, work_ids: list[str]) -> int:
+    def renew_work_leases(
+        self,
+        work_ids: list[str] | None = None,
+        *,
+        claim_generations: dict[str, datetime | None] | None = None,
+    ) -> int:
         with self.session_factory() as session:
             count = WorkQueue(session).renew_leases(
                 worker_id=self.worker_id,
                 work_ids=work_ids,
+                claim_generations=claim_generations,
+                lease_seconds=self.work_lease_seconds,
+            )
+            session.commit()
+            return count
+
+    def release_claimed_work(
+        self,
+        work_ids: list[str] | None = None,
+        *,
+        claim_generations: dict[str, datetime | None] | None = None,
+    ) -> int:
+        with self.session_factory() as session:
+            count = WorkQueue(session).release_claimed(
+                worker_id=self.worker_id,
+                work_ids=work_ids,
+                claim_generations=claim_generations,
+            )
+            session.commit()
+            return count
+
+    def expire_claimed_work(self, *, handoff_delay_s: float = 0) -> int:
+        with self.session_factory() as session:
+            count = WorkQueue(session).expire_claimed(
+                worker_id=self.worker_id,
+                handoff_delay_s=handoff_delay_s,
             )
             session.commit()
             return count
@@ -207,12 +273,21 @@ class JobRunner:
     def run_one_work_for_job(self, job_id: str) -> str | None:
         return self._run_one_work(job_id=job_id)
 
-    def run_claimed_work(self, work_id: str) -> str | None:
-        return self._run_claimed_work(work_id)
+    def run_claimed_work(
+        self,
+        work_id: str,
+        *,
+        claimed_at: datetime | None = None,
+    ) -> str | None:
+        return self._run_claimed_work(work_id, expected_claimed_at=claimed_at)
 
     def _run_one_work(self, *, job_id: str = "") -> str | None:
         with self.session_factory() as session:
-            work = WorkQueue(session).claim_next(worker_id=self.worker_id, job_id=job_id)
+            work = WorkQueue(session).claim_next(
+                worker_id=self.worker_id,
+                job_id=job_id,
+                lease_seconds=self.work_lease_seconds,
+            )
             if work is None:
                 session.commit()
                 return None
@@ -221,11 +296,19 @@ class JobRunner:
             session.commit()
         return self._run_claimed_work(work_id)
 
-    def _run_claimed_work(self, work_id: str) -> str | None:
+    def _run_claimed_work(
+        self,
+        work_id: str,
+        *,
+        expected_claimed_at: datetime | None = None,
+    ) -> str | None:
         with self.session_factory() as session:
             work = session.get(WorkItemModel, work_id)
             if work is None or work.work_status != "running" or work.claimed_by != self.worker_id:
                 return None
+            if expected_claimed_at is not None and work.claimed_at != expected_claimed_at:
+                return None
+            claimed_at = work.claimed_at
             job_id_value = work.job_id
             job = session.get(JobModel, job_id_value)
             if job is None or job.job_status == "cancelled":
@@ -288,7 +371,11 @@ class JobRunner:
             except Exception as exc:
                 session.expire_all()
                 work = session.get(WorkItemModel, work_id)
-                if work is None or work.claimed_by != self.worker_id:
+                if not _is_current_work_claim(
+                    work,
+                    worker_id=self.worker_id,
+                    claimed_at=claimed_at,
+                ):
                     return work_id
                 failure_context = {
                     **work_context,
@@ -321,7 +408,11 @@ class JobRunner:
             now = datetime.now(UTC)
             session.expire_all()
             work = session.get(WorkItemModel, work_id)
-            if work is None or work.claimed_by != self.worker_id:
+            if not _is_current_work_claim(
+                work,
+                worker_id=self.worker_id,
+                claimed_at=claimed_at,
+            ):
                 return work_id
             work.work_status = work_outcome
             work.finished_at = now
@@ -350,6 +441,20 @@ class JobRunner:
             _finalize_parent_work_job(session, job_id=job_id_value, run_id=run_id)
             session.commit()
             return work_id
+
+
+def _is_current_work_claim(
+    work: WorkItemModel | None,
+    *,
+    worker_id: str,
+    claimed_at: datetime | None,
+) -> TypeGuard[WorkItemModel]:
+    return bool(
+        work is not None
+        and work.work_status == "running"
+        and work.claimed_by == worker_id
+        and work.claimed_at == claimed_at
+    )
 
 
 def _fail_work(

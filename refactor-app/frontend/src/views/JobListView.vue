@@ -10,15 +10,15 @@ import FormDrawer from "../components/FormDrawer.vue";
 import PageHeader from "../components/PageHeader.vue";
 import { useOpsStore } from "../stores/ops";
 
-type ConfigValue = string | number;
+type ConfigValue = string | number | boolean;
 type ConfigField = {
   key: string;
   label: string;
-  type: "number" | "text" | "channel" | "space";
+  type: "number" | "text" | "checkbox" | "channel" | "space";
   min?: number;
   max?: number;
   required?: boolean;
-  spaceType?: "business" | "personal";
+  spaceType?: "" | "business" | "personal";
 };
 
 const router = useRouter();
@@ -70,11 +70,23 @@ const definitions: Record<string, { label: string; defaults: Record<string, Conf
   },
   "automation.space_authorize": {
     label: "空间授权",
-    defaults: { space_id: "", work_count: 1, credential_name_prefix: "codex" },
+    defaults: {
+      space_id: "",
+      work_count: 1,
+      credential_name_prefix: "codex",
+      use_hero_sms_for_add_phone: true,
+      hero_sms_country: "187",
+      hero_sms_max_price: "0.18",
+      force_clean_browser_login: false,
+    },
     fields: [
-      { key: "space_id", label: "Business 空间（必选）", type: "space", required: true },
+      { key: "space_id", label: "Business / 个人 Plus 空间（留空处理全部）", type: "space", spaceType: "" },
       { key: "work_count", label: "同时执行 Work 数", type: "number", min: 1, max: 350 },
       { key: "credential_name_prefix", label: "凭证名称前缀", type: "text" },
+      { key: "use_hero_sms_for_add_phone", label: "add_phone 时使用 GrizzlySMS", type: "checkbox" },
+      { key: "hero_sms_country", label: "GrizzlySMS 国家编号", type: "text" },
+      { key: "hero_sms_max_price", label: "GrizzlySMS 最大价格", type: "text" },
+      { key: "force_clean_browser_login", label: "强制清理浏览器登录状态", type: "checkbox" },
     ],
   },
   "automation.space_downstream_push": {
@@ -111,11 +123,33 @@ const definitions: Record<string, { label: string; defaults: Record<string, Conf
   },
   "automation.personal_payment_method_bind": {
     label: "个人空间绑卡",
-    defaults: { space_id: "", limit: 10, work_count: 1 },
+    defaults: { space_id: "", limit: 10, work_count: 1, auto_start_plus_checkout: true },
     fields: [
       { key: "space_id", label: "个人空间（留空处理全部待绑定空间）", type: "space", spaceType: "personal" },
       { key: "limit", label: "每轮处理上限", type: "number", min: 1, max: 100 },
       { key: "work_count", label: "同时执行 Work 数", type: "number", min: 1, max: 10 },
+      { key: "auto_start_plus_checkout", label: "绑卡成功后继续 Plus 支付", type: "checkbox" },
+    ],
+  },
+  "automation.personal_codex_credential_heartbeat": {
+    label: "Personal Codex 凭证心跳",
+    defaults: {
+      space_id: "",
+      limit: 100,
+      work_count: 10,
+      use_hero_sms_for_add_phone: true,
+      hero_sms_country: "187",
+      hero_sms_max_price: "0.18",
+      force_clean_browser_login: false,
+    },
+    fields: [
+      { key: "space_id", label: "个人空间（留空处理全部）", type: "space", spaceType: "personal" },
+      { key: "limit", label: "每轮处理上限", type: "number", min: 1, max: 1000 },
+      { key: "work_count", label: "同时执行 Work 数", type: "number", min: 1, max: 350 },
+      { key: "use_hero_sms_for_add_phone", label: "add_phone 时使用 GrizzlySMS", type: "checkbox" },
+      { key: "hero_sms_country", label: "GrizzlySMS 国家编号", type: "text" },
+      { key: "hero_sms_max_price", label: "GrizzlySMS 最大价格", type: "text" },
+      { key: "force_clean_browser_login", label: "强制清理浏览器登录状态", type: "checkbox" },
     ],
   },
 };
@@ -268,7 +302,7 @@ async function loadChannels(query: string) {
   return (await resourcesApi.channelOptions(query)).items;
 }
 
-async function loadSpaces(query: string, spaceType: "business" | "personal") {
+async function loadSpaces(query: string, spaceType: "" | "business" | "personal") {
   return (await resourcesApi.spaceOptions(query, spaceType)).items.filter(
     (item) => String(item.status || "") === "active",
   );
@@ -276,15 +310,15 @@ async function loadSpaces(query: string, spaceType: "business" | "personal") {
 
 function entityLoader(field: ConfigField) {
   if (field.type === "space") {
-    return (query: string) => loadSpaces(query, field.spaceType || "business");
+    return (query: string) => loadSpaces(query, field.spaceType ?? "business");
   }
   return loadChannels;
 }
 
 function entityPlaceholder(field: ConfigField) {
-  if (field.required) return "请选择 active Business 空间";
+  if (field.required) return "请选择 active Business / 个人 Plus 空间";
   return field.type === "space"
-    ? "留空表示全部 active Business 空间"
+    ? "留空表示全部 active Business / 个人 Plus 空间"
     : "留空表示全部启用渠道";
 }
 
@@ -310,7 +344,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageHeader title="Job 列表" description="空间邀请、授权、推送、回收、扩席位、自动补号与个人空间绑卡。">
+  <PageHeader title="Job 列表" description="空间邀请、授权、凭证心跳、推送、回收、扩席位、自动补号与个人空间绑卡。">
     <button class="icon-btn labeled" @click="load">
       <RefreshCw :size="16" :class="{ spin: loading }" />刷新
     </button>
@@ -375,6 +409,10 @@ onBeforeUnmount(() => {
             <span>{{ field.label }}</span>
             <input v-model="scheduleConfig[field.key]" class="input" />
           </label>
+          <label v-else-if="field.type === 'checkbox'" class="check">
+            <input v-model="scheduleConfig[field.key]" type="checkbox" />
+            <span>{{ field.label }}</span>
+          </label>
           <div v-else class="field wide">
             <span>{{ field.label }}</span>
             <EntitySelect
@@ -409,6 +447,10 @@ onBeforeUnmount(() => {
           <label v-else-if="field.type === 'text'" class="field">
             <span>{{ field.label }}</span>
             <input v-model="runConfig[field.key]" class="input" />
+          </label>
+          <label v-else-if="field.type === 'checkbox'" class="check">
+            <input v-model="runConfig[field.key]" type="checkbox" />
+            <span>{{ field.label }}</span>
           </label>
           <div v-else class="field wide">
             <span>{{ field.label }}</span>

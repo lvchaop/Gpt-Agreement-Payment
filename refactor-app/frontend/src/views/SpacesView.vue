@@ -914,9 +914,12 @@ onMounted(() => {
       <label class="field"><span>创建 Checkout 代理国家</span><input v-model="plusCheckoutCreateCountry" class="input" maxlength="2" autocomplete="off" /></label>
       <label class="field"><span>更新优惠代理国家</span><input v-model="plusCheckoutPromoCountry" class="input" maxlength="2" autocomplete="off" /></label>
       <label class="field"><span>优惠 campaign</span><input v-model="plusCheckoutCampaign" class="input" autocomplete="off" /></label>
-      <label class="auto-replenish-toggle">
-        <input v-model="browserHeadless" type="checkbox" />
-        <span>使用无头浏览器</span>
+      <label class="field">
+        <span>浏览器模式</span>
+        <span class="browser-mode-checkbox">
+          <input v-model="browserHeadless" type="checkbox" />
+          <span>使用无头浏览器</span>
+        </span>
       </label>
     </div>
   </ConfirmModal>
@@ -1056,6 +1059,20 @@ details { border: 1px solid var(--border); border-radius: var(--radius-sm); padd
 }
 
 .auto-replenish-toggle input { accent-color: var(--accent); }
+
+.browser-mode-checkbox {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+  min-height: 42px;
+  padding: 0 12px;
+}
+
+.browser-mode-checkbox input { accent-color: var(--accent); }
 
 .inventory-summary {
   align-items: center;

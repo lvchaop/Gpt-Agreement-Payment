@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -123,6 +124,85 @@ def test_browser_log_recorder_captures_events_and_redacts_sensitive_values(tmp_p
         assert secret not in serialized
     assert "generic_decline" in serialized
     assert any(event == "browser.response" and level == "WARN" for event, _, level in emitted)
+
+
+def test_browser_log_recorder_swallows_cancelled_response_body_reads(tmp_path) -> None:
+    page = _Page()
+    context = _EventTarget()
+    context.pages = [page]
+    path = tmp_path / "browser.log.jsonl"
+    recorder = BrowserLogRecorder(
+        path=path,
+        emitter=None,
+        capture_bodies=True,
+        max_body_chars=20_000,
+    )
+    recorder.install(context)
+
+    class _CancelledResponse(_Response):
+        def text(self) -> str:
+            raise asyncio.CancelledError()
+
+    request = _Request(page)
+    context.emit("response", _CancelledResponse(request))
+    recorder.close()
+
+    serialized = path.read_text()
+    assert "CancelledError" in serialized
+
+
+def test_browser_log_recorder_does_not_read_static_script_bodies(tmp_path) -> None:
+    page = _Page()
+    context = _EventTarget()
+    context.pages = [page]
+    path = tmp_path / "browser.log.jsonl"
+    recorder = BrowserLogRecorder(
+        path=path,
+        emitter=None,
+        capture_bodies=True,
+        max_body_chars=20_000,
+    )
+    recorder.install(context)
+
+    class _ScriptRequest(_Request):
+        resource_type = "script"
+
+    class _UnexpectedBodyResponse(_Response):
+        def text(self) -> str:
+            raise AssertionError("static script body must not be read")
+
+    request = _ScriptRequest(page)
+    context.emit("response", _UnexpectedBodyResponse(request))
+    recorder.close()
+
+    serialized = path.read_text()
+    assert "static script body must not be read" not in serialized
+
+
+def test_browser_log_recorder_ignores_queued_response_after_close(tmp_path) -> None:
+    page = _Page()
+    context = _EventTarget()
+    context.pages = [page]
+    path = tmp_path / "browser.log.jsonl"
+    recorder = BrowserLogRecorder(
+        path=path,
+        emitter=None,
+        capture_bodies=True,
+        max_body_chars=20_000,
+    )
+    recorder.install(context)
+    queued_callback = context.handlers["response"][0]
+
+    class _LateResponse(_Response):
+        def text(self) -> str:
+            raise AssertionError("closed recorder must not read response body")
+
+    recorder.close()
+    queued_callback(_LateResponse(_Request(page)))
+
+    serialized = path.read_text()
+    assert "closed recorder must not read response body" not in serialized
+    assert serialized.count('"event":"browser.log.closed"') == 1
 
 
 def test_browser_logging_disabled_does_not_install_or_create_log(tmp_path) -> None:

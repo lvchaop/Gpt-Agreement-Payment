@@ -950,18 +950,80 @@ def _is_email_verification_url(current_url: str) -> bool:
     return "email-verification" in str(current_url or "")
 
 
-def _has_otp_input(page) -> bool:
+_OTP_INPUT_SELECTORS = (
+    'input[autocomplete="one-time-code"]',
+    'input[name="code"]',
+    'input[name="otp"]',
+    'input[inputmode="numeric"]:not([type="password"])',
+    'input[aria-label*="one-time" i]',
+    'input[aria-label*="authentication" i]',
+    'input[placeholder*="one-time" i]',
+    'input[placeholder*="code" i]',
+)
+
+
+def _page_search_contexts(page):
+    contexts = [page]
     try:
-        if page.query_selector('input[autocomplete="one-time-code"]:visible'):
-            return True
-        if page.query_selector('input[inputmode="numeric"]:visible:not([type="password"])'):
-            return True
-        digit_inputs = page.query_selector_all(
-            'input[maxlength="1"]:visible:not([type="password"])'
-        )
-        return len(digit_inputs or []) >= 4
+        contexts.extend(frame for frame in page.frames if frame not in contexts)
     except Exception:
-        return False
+        pass
+    return contexts
+
+
+def _first_visible_input(page, selectors):
+    for context in _page_search_contexts(page):
+        for selector in selectors:
+            try:
+                elements = context.query_selector_all(selector)
+            except Exception:
+                elements = []
+            if not elements:
+                try:
+                    element = context.query_selector(selector)
+                    elements = [element] if element is not None else []
+                except Exception:
+                    continue
+            for element in elements or []:
+                try:
+                    if element.is_visible():
+                        return element
+                except Exception:
+                    continue
+    return None
+
+
+def _visible_digit_inputs(page):
+    for context in _page_search_contexts(page):
+        try:
+            elements = context.query_selector_all(
+                'input[maxlength="1"]:not([type="password"])'
+            )
+        except Exception:
+            continue
+        visible = []
+        for element in elements or []:
+            try:
+                if element.is_visible():
+                    visible.append(element)
+            except Exception:
+                continue
+        if len(visible) >= 4:
+            return visible
+    return []
+
+
+def _has_otp_input(page) -> bool:
+    if _first_visible_input(page, _OTP_INPUT_SELECTORS) is not None:
+        return True
+    if _visible_digit_inputs(page):
+        return True
+    if _is_mfa_challenge_url(str(getattr(page, "url", "") or "")):
+        return _first_visible_input(
+            page,
+            ('input[type="text"]', 'input:not([type])'),
+        ) is not None
+    return False
 
 
 def _has_otp_retry_control(page) -> bool:
@@ -1007,34 +1069,52 @@ def _fill_otp(page, code: str) -> bool:
     value = "".join(ch for ch in str(code or "") if ch.isdigit())[:6]
     if not value:
         return False
-    try:
-        single = None
-        for selector in (
-            'input[autocomplete="one-time-code"]:visible',
-            'input[inputmode="numeric"]:not([maxlength="1"]):visible',
-            'input[aria-label*="one-time" i]:visible',
-            'input[aria-label*="authentication" i]:visible',
-            'input[placeholder*="one-time" i]:visible',
-            'input[placeholder*="code" i]:visible',
-            'input[type="text"]:visible',
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        single = _first_visible_input(page, _OTP_INPUT_SELECTORS)
+        if single is None and _is_mfa_challenge_url(
+            str(getattr(page, "url", "") or "")
         ):
-            single = page.query_selector(selector)
-            if single:
-                break
+            single = _first_visible_input(
+                page,
+                ('input[type="text"]', 'input:not([type])'),
+            )
         if single:
-            single.click(timeout=3000)
-            single.fill(value)
-            return True
-        digits = page.query_selector_all(
-            'input[maxlength="1"][inputmode="numeric"]:visible'
-        ) or page.query_selector_all('input[maxlength="1"]:visible')
+            try:
+                single.click(timeout=3000)
+            except Exception:
+                pass
+            try:
+                single.fill(value)
+                return True
+            except Exception:
+                pass
+            try:
+                single.evaluate(
+                    """(el, nextValue) => {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        )?.set;
+                        if (setter) setter.call(el, nextValue);
+                        else el.value = nextValue;
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    }""",
+                    value,
+                )
+                return True
+            except Exception:
+                pass
+        digits = _visible_digit_inputs(page)
         if len(digits) >= len(value):
-            for idx, ch in enumerate(value):
-                digits[idx].click(timeout=3000)
-                digits[idx].fill(ch)
-            return True
-    except Exception:
-        return False
+            try:
+                for idx, ch in enumerate(value):
+                    digits[idx].click(timeout=3000)
+                    digits[idx].fill(ch)
+                return True
+            except Exception:
+                pass
+        time.sleep(0.25)
     return False
 
 
