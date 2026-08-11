@@ -9,6 +9,9 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from refactor_app.application.jobs.attempt_disposition import (
+    personal_plus_checkout_failure_metadata,
+)
 from refactor_app.application.jobs.queue import (
     DEFAULT_WORK_LEASE_SECONDS,
     JobQueue,
@@ -377,14 +380,16 @@ class JobRunner:
                     claimed_at=claimed_at,
                 ):
                     return work_id
+                failure_metadata = personal_plus_checkout_failure_metadata(exc)
                 failure_context = {
                     **work_context,
                     "error": f"{type(exc).__name__}: {exc}",
+                    **failure_metadata,
                 }
                 existing_output = dict(work.output_json or {})
                 _fail_work(
                     work,
-                    error_code="handler_error",
+                    error_code=str(failure_metadata.get("error_code") or "handler_error"),
                     error_message=f"{type(exc).__name__}: {exc}",
                     output_json={**existing_output, **failure_context},
                 )
@@ -399,6 +404,7 @@ class JobRunner:
                             "work_type": work_type,
                             **work_context,
                             "error": f"{type(exc).__name__}: {exc}",
+                            **failure_metadata,
                         },
                     )
                 _finalize_parent_work_job(session, job_id=job_id_value, run_id=run_id)

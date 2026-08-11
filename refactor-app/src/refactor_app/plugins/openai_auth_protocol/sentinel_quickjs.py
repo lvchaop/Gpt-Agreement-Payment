@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from refactor_app.config.browser_fingerprint import BROWSER_FINGERPRINT
 
@@ -38,6 +39,7 @@ _FLOW_PAGE_URL = {
     "create_account": "https://auth.openai.com/about-you",
     "oauth_create_account": "https://auth.openai.com/about-you",
 }
+_CHECKOUT_FLOW = "checkout_session_approval"
 
 # These values are copied from the known-good registration project's captured
 # browser profile. HTTP UA/client hints still come from this project's configured
@@ -424,6 +426,18 @@ def _cookie_header_for_domain(session: Any, domain: str, device_id: str) -> str:
         pairs[name] = value
     pairs["oai-did"] = device_id
     return "; ".join(f"{name}={value}" for name, value in pairs.items())
+
+
+def _resolve_page_url(flow: str, page_url: str | None) -> tuple[str, str]:
+    resolved = str(page_url or "").strip()
+    if not resolved:
+        if flow == _CHECKOUT_FLOW:
+            raise ValueError("page_url is required for checkout_session_approval")
+        resolved = _FLOW_PAGE_URL.get(flow, "https://auth.openai.com/create-account/password")
+    parsed = urlsplit(resolved)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"invalid Sentinel page_url: {resolved!r}")
+    return resolved, parsed.hostname.lower()
 
 
 def _generate_requirements_token(context: SentinelRuntimeContext) -> str:
@@ -854,6 +868,7 @@ def get_sentinel_tokens_via_quickjs(
     *,
     flow: str = "authorize_continue",
     initialize_first: bool = False,
+    page_url: str | None = None,
     timeout_ms: int = 45_000,
     log: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, str]:
@@ -863,18 +878,18 @@ def get_sentinel_tokens_via_quickjs(
     did = str(device_id or "").strip()
     if not did:
         raise ValueError("device_id is required")
+    resolved_page_url, cookie_domain = _resolve_page_url(flow, page_url)
     context = get_sentinel_runtime_context(session)
     _ensure_oai_did_cookies(session, did)
     sdk_file = _ensure_sdk_file(session, timeout_ms)
-    page_url = _FLOW_PAGE_URL.get(flow, "https://auth.openai.com/create-account/password")
-    cookie = _cookie_header_for_domain(session, "auth.openai.com", did)
+    cookie = _cookie_header_for_domain(session, cookie_domain, did)
     if initialize_first:
         token_text = _run_sentinel_lifecycle_runner(
             session=session,
             sdk_file=sdk_file,
             device_id=did,
             flow=flow,
-            page_url=page_url,
+            page_url=resolved_page_url,
             cookie=cookie,
             context=context,
             timeout_ms=timeout_ms,
@@ -894,7 +909,7 @@ def get_sentinel_tokens_via_quickjs(
             sdk_file=sdk_file,
             device_id=did,
             flow=flow,
-            page_url=page_url,
+            page_url=resolved_page_url,
             cookie=cookie,
             context=context,
             timeout_ms=timeout_ms,
@@ -928,6 +943,7 @@ def get_sentinel_token_via_quickjs(
     device_id: str,
     *,
     flow: str = "authorize_continue",
+    page_url: str | None = None,
     timeout_ms: int = 45_000,
     log: Optional[Callable[[str], None]] = None,
 ) -> str:
@@ -935,6 +951,7 @@ def get_sentinel_token_via_quickjs(
         session,
         device_id=device_id,
         flow=flow,
+        page_url=page_url,
         timeout_ms=timeout_ms,
         log=log,
     )[0]

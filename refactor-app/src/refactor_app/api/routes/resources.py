@@ -19,6 +19,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from refactor_app.api.dependencies import get_db_session
 from refactor_app.api.pagination import page_payload, page_values, total_for
+from refactor_app.application.jobs.attempt_disposition import (
+    has_personal_plus_checkout_consume_stop,
+    has_personal_plus_checkout_sync_failure,
+)
 from refactor_app.application.jobs.queue import JobQueue, WorkQueue
 from refactor_app.application.workflows.account_email_change import (
     ACCOUNT_EMAIL_CHANGE_MODE_AUTO_CLAIM,
@@ -459,10 +463,11 @@ class SpaceSeatExpansionJobRequest(BaseModel):
 
 class PersonalPaymentMethodBindJobRequest(BaseModel):
     auto_start_plus_checkout: bool = True
+    checkout_ui_mode: str | None = Field(default=None, pattern=r"^(?:hosted|custom)$")
     payment_card_id: str = ""
     browser_headless: bool = True
-    browser_log_enabled: bool = True
-    browser_log_capture_bodies: bool = True
+    browser_log_enabled: bool = False
+    browser_log_capture_bodies: bool = False
     browser_log_max_body_chars: int = Field(default=100_000, ge=1_000, le=100_000)
     captcha_api_url: str = ""
     captcha_client_key: str = ""
@@ -473,9 +478,10 @@ class PersonalPlusCheckoutJobRequest(BaseModel):
     create_proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
     promo_proxy_country: str = Field(default="JP", pattern=r"^[A-Za-z]{2}$")
     promo_campaign_id: str = Field(default="plus-1-month-free", min_length=1, max_length=120)
+    checkout_ui_mode: str | None = Field(default=None, pattern=r"^(?:hosted|custom)$")
     browser_headless: bool = True
-    browser_log_enabled: bool = True
-    browser_log_capture_bodies: bool = True
+    browser_log_enabled: bool = False
+    browser_log_capture_bodies: bool = False
     browser_log_max_body_chars: int = Field(default=100_000, ge=1_000, le=100_000)
     captcha_api_url: str = ""
     captcha_client_key: str = ""
@@ -485,9 +491,10 @@ class PersonalPlusCheckoutJobRequest(BaseModel):
 class PersonalPaymentMethodBindSelectedJobRequest(BaseModel):
     space_ids: list[str] = Field(min_length=1)
     auto_start_plus_checkout: bool = True
+    checkout_ui_mode: str | None = Field(default=None, pattern=r"^(?:hosted|custom)$")
     browser_headless: bool = True
-    browser_log_enabled: bool = True
-    browser_log_capture_bodies: bool = True
+    browser_log_enabled: bool = False
+    browser_log_capture_bodies: bool = False
     browser_log_max_body_chars: int = Field(default=100_000, ge=1_000, le=100_000)
     created_by: str = ""
 
@@ -2050,6 +2057,18 @@ def create_selected_personal_payment_method_bind_job(
             detail={"message": "payment method inventory is empty", "pools": missing_pools},
         )
 
+    settings = get_settings()
+    checkout_ui_mode = str(
+        req.checkout_ui_mode
+        or getattr(settings, "personal_payment_method_checkout_ui_mode", "custom")
+        or "custom"
+    ).strip().lower()
+    captcha_api_url = str(
+        getattr(settings, "personal_plus_checkout_captcha_api_url", "") or ""
+    ).strip()
+    captcha_client_key = str(
+        getattr(settings, "personal_plus_checkout_captcha_client_key", "") or ""
+    ).strip()
     job, run = _start_work_job(
         session=session,
         job_type="space.personal_payment_method_bind.tick",
@@ -2061,10 +2080,13 @@ def create_selected_personal_payment_method_bind_job(
             "selected_count": len(selected),
             "selection_skipped": selection_skipped,
             "auto_start_plus_checkout": req.auto_start_plus_checkout,
+            "checkout_ui_mode": checkout_ui_mode,
             "browser_headless": req.browser_headless,
             "browser_log_enabled": req.browser_log_enabled,
             "browser_log_capture_bodies": req.browser_log_capture_bodies,
             "browser_log_max_body_chars": req.browser_log_max_body_chars,
+            "captcha_api_url": captcha_api_url,
+            "captcha_client_key": captcha_client_key,
         },
         created_by=req.created_by.strip() or "ops:personal-payment-method-bind-selected",
     )
@@ -2077,10 +2099,13 @@ def create_selected_personal_payment_method_bind_job(
             input_json={
                 "space_id": space.id,
                 "auto_start_plus_checkout": req.auto_start_plus_checkout,
+                "checkout_ui_mode": checkout_ui_mode,
                 "browser_headless": req.browser_headless,
                 "browser_log_enabled": req.browser_log_enabled,
                 "browser_log_capture_bodies": req.browser_log_capture_bodies,
                 "browser_log_max_body_chars": req.browser_log_max_body_chars,
+                "captcha_api_url": captcha_api_url,
+                "captcha_client_key": captcha_client_key,
                 "_run_id": run.id,
             },
         )
@@ -2183,16 +2208,21 @@ def create_personal_payment_method_bind_job(
     session: DbSession,
 ) -> dict:
     settings = get_settings()
+    checkout_ui_mode = str(
+        req.checkout_ui_mode
+        or getattr(settings, "personal_payment_method_checkout_ui_mode", "custom")
+        or "custom"
+    ).strip().lower()
     captcha_api_url = str(
         req.captcha_api_url.strip()
         or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
         or ""
-    )
+    ).strip()
     captcha_client_key = str(
         req.captcha_client_key.strip()
         or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
         or ""
-    )
+    ).strip()
     space = session.get(SpaceModel, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="space not found")
@@ -2208,6 +2238,11 @@ def create_personal_payment_method_bind_job(
         )
     if space.has_payment_method and space.payment_method_status == "bound":
         raise HTTPException(status_code=409, detail="personal space already has a payment method")
+    if space.payment_method_status == "binding":
+        raise HTTPException(
+            status_code=409,
+            detail="personal space payment method binding requires manual review",
+        )
     if (
         space.payment_method_attempt_count >= PAYMENT_METHOD_MAX_ATTEMPTS
         and (
@@ -2267,6 +2302,7 @@ def create_personal_payment_method_bind_job(
             "limit": 1,
             "work_count": 1,
             "auto_start_plus_checkout": req.auto_start_plus_checkout,
+            "checkout_ui_mode": checkout_ui_mode,
             "payment_card_id": req.payment_card_id.strip(),
             "browser_headless": req.browser_headless,
             "browser_log_enabled": req.browser_log_enabled,
@@ -2284,6 +2320,7 @@ def create_personal_payment_method_bind_job(
         input_json={
             "space_id": space.id,
             "auto_start_plus_checkout": req.auto_start_plus_checkout,
+            "checkout_ui_mode": checkout_ui_mode,
             "payment_card_id": req.payment_card_id.strip(),
             "browser_headless": req.browser_headless,
             "browser_log_enabled": req.browser_log_enabled,
@@ -2340,6 +2377,17 @@ def create_personal_plus_checkout_job(
     account = session.get(UserAccountModel, space.owner_user_account_id)
     if account is None or account.account_status != "active":
         raise HTTPException(status_code=409, detail="plus checkout owner account is not active")
+    if has_personal_plus_checkout_consume_stop(
+        session, space_id=space.id
+    ) and not has_personal_plus_checkout_sync_failure(session, space_id=space.id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "plus checkout has a non-replayable prior submission",
+                "error_code": "personal_plus_checkout_consume_stop_exists",
+                "attempt_disposition": "consume_stop",
+            },
+        )
     active_job = _active_work_job_for_type(
         session=session,
         job_type="space.personal_plus_checkout.tick",
@@ -2362,9 +2410,11 @@ def create_personal_plus_checkout_job(
             "space_id": space.id,
             "limit": 1,
             "work_count": 1,
+            "checkout_attempt_mode": "new",
             "create_proxy_country": req.create_proxy_country.strip().upper(),
             "promo_proxy_country": req.promo_proxy_country.strip().upper(),
             "promo_campaign_id": req.promo_campaign_id.strip(),
+            "checkout_ui_mode": req.checkout_ui_mode,
             "browser_headless": req.browser_headless,
             "browser_log_enabled": req.browser_log_enabled,
             "browser_log_capture_bodies": req.browser_log_capture_bodies,
@@ -2380,9 +2430,11 @@ def create_personal_plus_checkout_job(
         execution_key=f"personal-plus-checkout:{space.id}",
         input_json={
             "space_id": space.id,
+            "checkout_attempt_mode": "new",
             "create_proxy_country": req.create_proxy_country.strip().upper(),
             "promo_proxy_country": req.promo_proxy_country.strip().upper(),
             "promo_campaign_id": req.promo_campaign_id.strip(),
+            "checkout_ui_mode": req.checkout_ui_mode,
             "browser_headless": req.browser_headless,
             "browser_log_enabled": req.browser_log_enabled,
             "browser_log_capture_bodies": req.browser_log_capture_bodies,
@@ -5843,6 +5895,8 @@ def _select_personal_payment_method_bind_spaces(
             reason = "payment_method_promotion_required"
         elif space.has_payment_method or space.payment_method_status == "bound":
             reason = "payment_method_already_bound"
+        elif space.payment_method_status == "binding":
+            reason = "payment_method_binding_in_progress"
         elif (
             space.payment_method_attempt_count >= PAYMENT_METHOD_MAX_ATTEMPTS
             and (
@@ -6661,6 +6715,7 @@ def _validated_space_schedule_config_values(
             "limit": ("int", 1, 100),
             "work_count": ("int", 1, 10),
             "auto_start_plus_checkout": ("bool", None, None),
+            "checkout_ui_mode": ("str", None, None),
         },
         "automation.personal_codex_credential_heartbeat": {
             "space_id": ("str", None, None),
@@ -6686,6 +6741,11 @@ def _validated_space_schedule_config_values(
             parsed: Any = str(value or "").strip()
             if key == "credential_name_prefix" and not parsed:
                 raise HTTPException(status_code=400, detail=f"{key} is required")
+            if key == "checkout_ui_mode" and parsed not in {"", "hosted", "custom"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} must be hosted, custom, or empty",
+                )
         elif value_type == "bool":
             if isinstance(value, bool):
                 parsed = value
@@ -6948,6 +7008,11 @@ def _execute_space_automation_schedule(
                     "work_count": int(effective_config["work_count"]),
                     "auto_start_plus_checkout": bool(
                         effective_config["auto_start_plus_checkout"]
+                    ),
+                    **(
+                        {"checkout_ui_mode": str(effective_config["checkout_ui_mode"])}
+                        if str(effective_config.get("checkout_ui_mode") or "").strip()
+                        else {}
                     ),
                 },
                 created_by=actor,

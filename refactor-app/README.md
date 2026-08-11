@@ -33,6 +33,7 @@
 Cliproxy 账号静态代理：
 
 ```dotenv
+CLIPROXY_MODE=remote
 CLIPROXY_GATEWAY_MODE=auto
 CLIPROXY_HOST=us.arxlabs.io
 CLIPROXY_US_HOST=us.arxlabs.io
@@ -53,6 +54,22 @@ CLIPROXY_MAX_SID_ATTEMPTS=4
 邮箱的 SHA-256 生成稳定 `sid`；使用前访问 ChatGPT CSRF 接口探测，失败后改用随机
 UUID `sid`，直到达到 `CLIPROXY_MAX_SID_ATTEMPTS`。该链路不读取
 `proxy_inventory`，也不回退旧 Webshare Backbone。
+
+本地 Trojan 池模式复用同一个解析入口，不再访问 Cliproxy 网关：
+
+```dotenv
+CLIPROXY_MODE=trojan_pool
+CLIPROXY_TROJAN_POOL_FILE=runtime/proxy/trojan-pool.yaml
+CLIPROXY_TROJAN_HTTP_START_PORT=18081
+CLIPROXY_TROJAN_WORK_DIR=runtime/proxy/trojan-bridge
+CLIPROXY_TROJAN_EXECUTABLE=sing-box
+```
+
+池文件支持老项目的 `COUNTRY trojan://...` 文本/JSON 格式，以及 Clash YAML 的
+`proxies` 列表；Clash YAML 中暂时只加载 Trojan 与 Hysteria2，忽略其他协议。每个节点
+由 `sing-box` 暴露为独立的本地 HTTP 端口，调用方按规范化邮箱和目标国家的 SHA-256
+稳定选择节点，探测失败后按同一确定性顺序切换同国家节点。`trojan_pool` 模式不会读取
+也不会回退远端 Cliproxy 的用户名、密码或网关。
 
 边界：
 

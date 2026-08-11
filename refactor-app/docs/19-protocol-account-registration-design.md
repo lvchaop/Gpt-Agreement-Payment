@@ -721,6 +721,12 @@ activationId、phoneNumber、countryPhoneCode 等只保存在当前 work output_
 该链路不读取 proxy_inventory，也不回退 Webshare Backbone；
 其他登录、补 Session、授权仍使用各自既有代理逻辑。
 不把全局 protocol_register_proxy_url 作为默认代理覆盖账号绑定。
+
+运行时可通过 `CLIPROXY_MODE=trojan_pool` 将同一解析入口切换为本地 Trojan 池。
+该模式读取 `CLIPROXY_TROJAN_POOL_FILE`，支持老项目文本/JSON 池和 Clash YAML，使用
+`sing-box` 为每个 Trojan/Hysteria2 节点建立独立本地 HTTP 入口。节点按规范化邮箱与
+目标国家共同计算 SHA-256 后稳定选择；探活失败仅在同国家节点内确定性切换，且不会
+回退远端 Cliproxy。远端模式仍由 `CLIPROXY_MODE=remote` 启用。
 不使用 team admin 静态住宅代理。
 team admin 静态住宅代理只属于空间管理员操作。
 ```

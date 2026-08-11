@@ -303,6 +303,7 @@ def test_personal_payment_method_schedule_propagates_plus_checkout_setting(
             "limit": 5,
             "work_count": 2,
             "auto_start_plus_checkout": False,
+            "checkout_ui_mode": "custom",
         },
         advance_next_run=False,
         created_by="ops:test",
@@ -316,9 +317,20 @@ def test_personal_payment_method_schedule_propagates_plus_checkout_setting(
             "limit": 5,
             "work_count": 2,
             "auto_start_plus_checkout": False,
+            "checkout_ui_mode": "custom",
         },
         "created_by": "ops:test",
     }
+
+
+def test_personal_payment_method_schedule_rejects_unknown_checkout_ui_mode() -> None:
+    with pytest.raises(HTTPException) as error:
+        resources._effective_space_schedule_config(
+            schedule_type="automation.personal_payment_method_bind",
+            saved_config={"checkout_ui_mode": "automatic"},
+        )
+
+    assert error.value.status_code == 400
 
 
 def test_personal_codex_credential_heartbeat_schedule_defaults_and_mapping() -> None:

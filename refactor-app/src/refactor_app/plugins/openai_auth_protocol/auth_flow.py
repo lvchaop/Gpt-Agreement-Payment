@@ -30,6 +30,7 @@ from refactor_app.config.browser_fingerprint import (
     BROWSER_SEC_CH_UA,
     BROWSER_SEC_CH_UA_PLATFORM,
 )
+from refactor_app.plugins.browser_runtime import managed_camoufox_context
 
 from .config import Config
 from .mail_provider import MailProvider
@@ -2623,7 +2624,9 @@ class AuthFlow:
                 "[phone-protocol] auth_oauth_init 遇到 Cloudflare，启动 Camoufox warmup headless=%s",
                 headless,
             )
-            with Camoufox(
+            with managed_camoufox_context(
+                Camoufox,
+                flow="protocol-auth-warmup",
                 headless=headless,
                 humanize=True,
                 persistent_context=True,

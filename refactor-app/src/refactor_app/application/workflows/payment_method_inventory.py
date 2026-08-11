@@ -122,6 +122,7 @@ def payment_method_inventory_summary(session: Session) -> dict[str, Any]:
                 SpaceModel.has_promotion.is_(True),
                 SpaceModel.promotion_id != "",
                 SpaceModel.has_payment_method.is_(False),
+                SpaceModel.payment_method_status != "binding",
                 or_(
                     SpaceModel.payment_method_attempt_count < PAYMENT_METHOD_MAX_ATTEMPTS,
                     (

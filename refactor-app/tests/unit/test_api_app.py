@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -350,6 +351,11 @@ def test_payment_method_pool_import_and_personal_job_api(
     monkeypatch: MonkeyPatch,
 ) -> None:
     _disable_web_login(monkeypatch)
+    route_settings = Settings(_env_file=None)
+    captcha_client_key = uuid4().hex
+    route_settings.personal_plus_checkout_captcha_api_url = "https://captcha.test"
+    route_settings.personal_plus_checkout_captcha_client_key = captcha_client_key
+    monkeypatch.setattr(resource_routes, "get_settings", lambda: route_settings)
     client = TestClient(create_app())
     prefix = f"test-payment-method-{uuid4()}"
     account_id = f"{prefix}-account"
@@ -433,6 +439,23 @@ def test_payment_method_pool_import_and_personal_job_api(
         assert job_response.status_code == 200
         job_id = job_response.json()["job_id"]
         assert job_response.json()["job_status"] in {"queued", "running"}
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            work = session.scalars(
+                select(WorkItemModel).where(WorkItemModel.job_id == job_id)
+            ).one()
+        assert job is not None
+        assert job.input_json["checkout_ui_mode"] == "custom"
+        assert work.input_json["checkout_ui_mode"] == "custom"
+        assert job.input_json["captcha_api_url"] == "https://captcha.test"
+        assert work.input_json["captcha_api_url"] == "https://captcha.test"
+        assert hashlib.sha256(job.input_json["captcha_client_key"].encode()).digest() == (
+            hashlib.sha256(captcha_client_key.encode()).digest()
+        )
+        assert hashlib.sha256(work.input_json["captcha_client_key"].encode()).digest() == (
+            hashlib.sha256(captcha_client_key.encode()).digest()
+        )
+        assert "captcha_client_key" not in job_response.text
 
         duplicate_response = client.post(
             f"/spaces/{space_id}/payment-method-bind-job",
@@ -469,6 +492,11 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
     monkeypatch: MonkeyPatch,
 ) -> None:
     _disable_web_login(monkeypatch)
+    route_settings = Settings(_env_file=None)
+    captcha_client_key = uuid4().hex
+    route_settings.personal_plus_checkout_captcha_api_url = "https://captcha.test"
+    route_settings.personal_plus_checkout_captcha_client_key = captcha_client_key
+    monkeypatch.setattr(resource_routes, "get_settings", lambda: route_settings)
     monkeypatch.setattr(
         resource_routes,
         "payment_method_inventory_summary",
@@ -612,11 +640,24 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
         }
 
         with session_factory() as session:
+            job = session.get(JobModel, job_id)
             works = session.scalars(
                 select(WorkItemModel).where(WorkItemModel.job_id == job_id)
             ).all()
+        assert job is not None
         assert len(works) == 1
         assert works[0].input_json["space_id"] == space_ids["eligible"]
+        assert job.input_json["checkout_ui_mode"] == "custom"
+        assert works[0].input_json["checkout_ui_mode"] == "custom"
+        assert job.input_json["captcha_api_url"] == "https://captcha.test"
+        assert works[0].input_json["captcha_api_url"] == "https://captcha.test"
+        assert hashlib.sha256(job.input_json["captcha_client_key"].encode()).digest() == (
+            hashlib.sha256(captcha_client_key.encode()).digest()
+        )
+        assert hashlib.sha256(works[0].input_json["captcha_client_key"].encode()).digest() == (
+            hashlib.sha256(captcha_client_key.encode()).digest()
+        )
+        assert "captcha_client_key" not in selected_response.text
 
         duplicate_response = client.post(
             "/spaces/payment-method-bind-selected-job",
@@ -1062,10 +1103,12 @@ def test_personal_payment_method_tick_only_enqueues_eligible_spaces() -> None:
         "inactive-space",
         "inactive-owner",
         "attempt-limit",
+        "binding",
     )
     job_ids = {suffix: f"{prefix}-job-{suffix}" for suffix in space_suffixes}
     now = datetime.now(UTC)
-    session_factory = make_session_factory(make_engine(Settings()))
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
 
     def make_space(
         suffix: str,
@@ -1128,6 +1171,11 @@ def test_personal_payment_method_tick_only_enqueues_eligible_spaces() -> None:
                     payment_method_status="failed",
                     payment_method_attempt_count=3,
                 ),
+                make_space(
+                    "binding",
+                    payment_method_status="binding",
+                    payment_method_attempt_count=1,
+                ),
                 *[
                     JobModel(
                         id=job_id,
@@ -1150,9 +1198,10 @@ def test_personal_payment_method_tick_only_enqueues_eligible_spaces() -> None:
 
     try:
         results = {
-            suffix: handlers._run_personal_payment_method_bind_tick_job(
-                session_factory=session_factory,
-                input_json={
+                suffix: handlers._run_personal_payment_method_bind_tick_job(
+                    session_factory=session_factory,
+                    settings=settings,
+                    input_json={
                     "space_id": f"{prefix}-{suffix}",
                     "limit": 10,
                     "work_count": 3,
@@ -1164,6 +1213,7 @@ def test_personal_payment_method_tick_only_enqueues_eligible_spaces() -> None:
         }
         second = handlers._run_personal_payment_method_bind_tick_job(
             session_factory=session_factory,
+            settings=settings,
             input_json={
                 "space_id": eligible_space_id,
                 "limit": 10,

@@ -1,33 +1,46 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from uuid import uuid4
+
+from refactor_app.plugins.browser_static_asset_store import (
+    CACHE_SCHEMA_VERSION,
+    CorruptStaticAssetError,
+    DiskStaticAssetStore,
+)
 
 logger = logging.getLogger(__name__)
 APP_ROOT = Path(__file__).resolve().parents[3]
 
-CACHE_VERSION = 2
-CACHEABLE_RESOURCE_TYPES = frozenset({"script", "stylesheet", "image"})
+CACHE_VERSION = CACHE_SCHEMA_VERSION
+CACHEABLE_RESOURCE_TYPES = frozenset({"script", "stylesheet", "image", "font"})
 DEFAULT_TTL_S = 7 * 24 * 60 * 60
 MAX_TTL_S = 30 * 24 * 60 * 60
-MAX_SCRIPT_STYLE_TTL_S = 60 * 60
-_CACHEABLE_HOSTS = frozenset(
-    {
-        "auth.openai.com",
-        "chatgpt.com",
-        "cdn.openai.com",
-    }
+DEFAULT_MAX_OBJECT_BYTES = 20 * 1024 * 1024
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
+_BASE_VARIANT_HEADERS = ("accept",)
+_SENSITIVE_VARY_HEADERS = frozenset(
+    {"authorization", "cookie", "proxy-authorization"}
 )
-_CACHEABLE_PATH_PREFIXES = ("/cdn/assets/", "/assets/", "/common/fonts/")
+_CACHEABLE_HOST_PATHS: dict[str, tuple[str, ...]] = {
+    "auth.openai.com": ("/assets/", "/cdn/assets/", "/common/fonts/"),
+    "chatgpt.com": ("/assets/", "/cdn/assets/", "/common/fonts/"),
+    "cdn.openai.com": ("/",),
+    "auth-cdn.oaistatic.com": ("/",),
+    "persistent.oaistatic.com": ("/",),
+    "js.stripe.com": ("/",),
+    "b.stripecdn.com": ("/",),
+    "applepay.cdn-apple.com": ("/",),
+    "fonts.gstatic.com": ("/",),
+    "www.gstatic.com": ("/",),
+}
 _MAX_AGE_PATTERN = re.compile(r"(?:^|,)\s*(?:s-maxage|max-age)\s*=\s*(\d+)", re.I)
 _DROP_RESPONSE_HEADERS = frozenset(
     {
@@ -56,28 +69,47 @@ class StaticAssetCacheStats:
     bytes_served: int
     bytes_stored: int
     upstream_failures: int = 0
+    corrupt_entries: int = 0
+
+
+@dataclass(frozen=True)
+class _PendingRequest:
+    request_id: str
+    request_url: str
+    resource_type: str
+    request_headers: dict[str, str]
 
 
 class BrowserStaticAssetCache:
-    """Persistent disk cache for browser JavaScript, CSS, and image responses."""
+    """Global browser interceptor backed by a content-versioned disk store."""
 
-    def __init__(self, root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        *,
+        max_object_bytes: int | None = None,
+    ) -> None:
         self.root = Path(root) if root else default_browser_static_cache_dir()
-        self.objects_dir = self.root / "objects"
-        self.requests_dir = self.root / "requests"
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
-        self.requests_dir.mkdir(parents=True, exist_ok=True)
+        self.store = DiskStaticAssetStore(self.root)
+        self.schema_root = self.store.schema_root
+        self.objects_dir = self.store.objects_dir
+        self.requests_dir = self.store.requests_dir
+        self.max_object_bytes = (
+            max(1, int(max_object_bytes))
+            if max_object_bytes is not None
+            else browser_static_cache_max_object_bytes()
+        )
         self._hits = 0
         self._misses = 0
         self._stored = 0
         self._bytes_served = 0
         self._bytes_stored = 0
         self._upstream_failures = 0
+        self._corrupt_entries = 0
         self._bypass = False
-        self._pending_requests: dict[int, tuple[str, str, str]] = {}
+        self._pending_requests: dict[int, _PendingRequest] = {}
 
     def bypass(self) -> None:
-        """Disable replay for the remainder of the browser context."""
         self._bypass = True
 
     def install(self, context: Any) -> BrowserStaticAssetCache:
@@ -94,68 +126,80 @@ class BrowserStaticAssetCache:
             bytes_served=self._bytes_served,
             bytes_stored=self._bytes_stored,
             upstream_failures=self._upstream_failures,
+            corrupt_entries=self._corrupt_entries,
         )
 
     def log_summary(self, *, flow: str) -> None:
         stats = self.stats()
         logger.info(
             "browser static cache: flow=%s root=%s hits=%s misses=%s stored=%s "
-            "bytes_served=%s bytes_stored=%s upstream_failures=%s",
+            "bytes_served=%s bytes_stored=%s upstream_failures=%s corrupt_entries=%s",
             flow,
-            self.root,
+            self.schema_root,
             stats.hits,
             stats.misses,
             stats.stored,
             stats.bytes_served,
             stats.bytes_stored,
             stats.upstream_failures,
+            stats.corrupt_entries,
         )
 
     def _handle_route(self, route: Any, request: Any) -> None:
         resource_type = str(getattr(request, "resource_type", "") or "").lower()
         method = str(getattr(request, "method", "") or "").upper()
+        request_url = str(getattr(request, "url", "") or "")
         headers = _request_headers(request)
         if (
-            resource_type not in CACHEABLE_RESOURCE_TYPES
+            self._bypass
+            or resource_type not in CACHEABLE_RESOURCE_TYPES
             or method != "GET"
             or "range" in headers
-            or not is_browser_static_asset_url(str(getattr(request, "url", "") or ""))
-            or self._bypass
+            or not is_browser_static_asset_url(request_url)
         ):
-            route.continue_()
+            _route_fallback(route)
             return
 
-        key = _request_cache_key(request, resource_type=resource_type, headers=headers)
-        cached = self._read_entry(key, request_url=str(getattr(request, "url", "") or ""))
+        request_id = _request_cache_key(
+            request,
+            resource_type=resource_type,
+            headers=headers,
+        )
+        try:
+            cached = self.store.read(
+                request_id,
+                request_url=request_url,
+                resource_type=resource_type,
+                request_headers=headers,
+            )
+        except CorruptStaticAssetError:
+            self._corrupt_entries += 1
+            cached = None
         if cached is not None:
-            status, response_headers, body = cached
             self._hits += 1
-            self._bytes_served += len(body)
-            route.fulfill(status=status, headers=response_headers, body=body)
+            self._bytes_served += len(cached.body)
+            route.fulfill(status=cached.status, headers=cached.headers, body=cached.body)
             return
 
         self._misses += 1
-        self._pending_requests[id(request)] = (
-            key,
-            str(getattr(request, "url", "") or ""),
-            resource_type,
+        self._pending_requests[id(request)] = _PendingRequest(
+            request_id=request_id,
+            request_url=request_url,
+            resource_type=resource_type,
+            request_headers=headers,
         )
         try:
-            # A route.fetch() miss is issued by Playwright's request client,
-            # not the browser network stack. Protected static assets can reject
-            # that different request fingerprint and leave the rendered button
-            # without its React click handler. Let Camoufox perform the original
-            # request, then persist the completed browser response below.
-            route.continue_()
+            # Keep misses in the browser network stack. route.fetch() changes
+            # the request client and can break protected JavaScript responses.
+            _route_fallback(route)
         except Exception:
             self._pending_requests.pop(id(request), None)
             raise
 
     def _handle_request_finished(self, request: Any) -> None:
         pending = self._pending_requests.pop(id(request), None)
-        if pending is None:
+        if pending is None or self._bypass:
             return
-        key, request_url, resource_type = pending
         try:
             response_getter = getattr(request, "response", None)
             response = response_getter() if callable(response_getter) else response_getter
@@ -166,99 +210,44 @@ class BrowserStaticAssetCache:
             if status >= 400:
                 self._upstream_failures += 1
                 return
+            if status != 200 or not _response_is_cacheable(
+                response_headers,
+                resource_type=pending.resource_type,
+            ):
+                return
+            content_length = _positive_int(response_headers.get("content-length"))
+            if content_length and content_length > self.max_object_bytes:
+                return
             body = bytes(response.body())
-            ttl_s = _response_ttl_s(response_headers, resource_type=resource_type)
-            if status == 200 and body and ttl_s > 0:
-                self._write_entry(
-                    key,
-                    request_url=request_url,
-                    resource_type=resource_type,
-                    status=status,
-                    headers=response_headers,
-                    body=body,
-                    ttl_s=ttl_s,
-                )
+            if not body or len(body) > self.max_object_bytes:
+                return
+            ttl_s = _response_ttl_s(response_headers, resource_type=pending.resource_type)
+            vary_headers = _response_vary_headers(response_headers)
+            if ttl_s <= 0 or vary_headers is None:
+                return
+            self.store.write(
+                pending.request_id,
+                request_url=pending.request_url,
+                resource_type=pending.resource_type,
+                request_headers=pending.request_headers,
+                vary_headers=vary_headers,
+                status=status,
+                replay_headers=_replay_headers(response_headers),
+                validators={
+                    "etag": str(response_headers.get("etag") or ""),
+                    "content_md5": str(response_headers.get("content-md5") or ""),
+                    "last_modified": str(response_headers.get("last-modified") or ""),
+                },
+                body=body,
+                ttl_s=ttl_s,
+            )
+            self._stored += 1
+            self._bytes_stored += len(body)
         except Exception:
             logger.debug("browser static cache write failed", exc_info=True)
 
     def _handle_request_failed(self, request: Any) -> None:
         self._pending_requests.pop(id(request), None)
-
-    def _read_entry(
-        self,
-        key: str,
-        *,
-        request_url: str = "",
-    ) -> tuple[int, dict[str, str], bytes] | None:
-        metadata_path = self._request_path(key)
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if int(metadata.get("version") or 0) != CACHE_VERSION:
-                return None
-            if request_url and str(metadata.get("url") or "") != request_url:
-                return None
-            if float(metadata.get("expires_at") or 0) <= time.time():
-                return None
-            object_digest = str(metadata.get("object_sha256") or "")
-            if not re.fullmatch(r"[0-9a-f]{64}", object_digest):
-                return None
-            body = self._object_path(object_digest).read_bytes()
-            if hashlib.sha256(body).hexdigest() != object_digest:
-                return None
-            headers = metadata.get("headers")
-            if not isinstance(headers, dict):
-                return None
-            return (
-                int(metadata.get("status") or 200),
-                {str(name): str(value) for name, value in headers.items()},
-                body,
-            )
-        except (OSError, ValueError, TypeError):
-            return None
-
-    def _write_entry(
-        self,
-        key: str,
-        *,
-        request_url: str,
-        resource_type: str,
-        status: int,
-        headers: dict[str, str],
-        body: bytes,
-        ttl_s: int,
-    ) -> None:
-        object_digest = hashlib.sha256(body).hexdigest()
-        object_path = self._object_path(object_digest)
-        object_path.parent.mkdir(parents=True, exist_ok=True)
-        if not object_path.exists():
-            _atomic_write_bytes(object_path, body)
-
-        now = time.time()
-        metadata = {
-            "version": CACHE_VERSION,
-            "url": request_url,
-            "resource_type": resource_type,
-            "status": int(status),
-            "headers": _replay_headers(headers),
-            "object_sha256": object_digest,
-            "body_size": len(body),
-            "stored_at": now,
-            "expires_at": now + max(1, int(ttl_s)),
-        }
-        metadata_path = self._request_path(key)
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_bytes(
-            metadata_path,
-            json.dumps(metadata, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
-        )
-        self._stored += 1
-        self._bytes_stored += len(body)
-
-    def _object_path(self, digest: str) -> Path:
-        return self.objects_dir / digest[:2] / digest
-
-    def _request_path(self, key: str) -> Path:
-        return self.requests_dir / key[:2] / f"{key}.json"
 
 
 def install_browser_static_asset_cache(
@@ -268,6 +257,10 @@ def install_browser_static_asset_cache(
 ) -> BrowserStaticAssetCache | None:
     if not browser_static_asset_cache_enabled():
         return None
+    if not callable(getattr(context, "route", None)) or not callable(
+        getattr(context, "on", None)
+    ):
+        return None
     try:
         return BrowserStaticAssetCache(cache_dir).install(context)
     except Exception:
@@ -276,11 +269,21 @@ def install_browser_static_asset_cache(
 
 
 def browser_static_asset_cache_enabled() -> bool:
-    """Use the local static-asset cache only when it is explicitly enabled."""
     value = str(os.environ.get("REFACTOR_APP_BROWSER_STATIC_ASSET_CACHE_ENABLED") or "")
-    if not value.strip():
+    normalized = value.strip().lower()
+    if not normalized:
+        return True
+    if normalized in _FALSE_VALUES:
         return False
-    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return normalized in _TRUE_VALUES
+
+
+def browser_static_cache_max_object_bytes() -> int:
+    value = str(os.environ.get("REFACTOR_APP_BROWSER_STATIC_CACHE_MAX_OBJECT_BYTES") or "")
+    try:
+        return max(1, int(value)) if value.strip() else DEFAULT_MAX_OBJECT_BYTES
+    except ValueError:
+        return DEFAULT_MAX_OBJECT_BYTES
 
 
 def default_browser_static_cache_dir() -> Path:
@@ -296,10 +299,11 @@ def default_browser_static_cache_dir() -> Path:
 def is_browser_static_asset_url(url: str) -> bool:
     parsed = urlparse(str(url or ""))
     host = str(parsed.hostname or "").lower().rstrip(".")
-    return (
+    prefixes = _CACHEABLE_HOST_PATHS.get(host)
+    return bool(
         parsed.scheme == "https"
-        and host in _CACHEABLE_HOSTS
-        and parsed.path.startswith(_CACHEABLE_PATH_PREFIXES)
+        and prefixes
+        and any(parsed.path.startswith(prefix) for prefix in prefixes)
     )
 
 
@@ -329,33 +333,72 @@ def _request_cache_key(
     resource_type: str,
     headers: dict[str, str],
 ) -> str:
+    del headers
     material = "\0".join(
         (
-            str(CACHE_VERSION),
+            str(CACHE_SCHEMA_VERSION),
+            "GET",
             str(getattr(request, "url", "") or ""),
             resource_type,
-            headers.get("accept", ""),
-            headers.get("accept-language", ""),
         )
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _response_vary_headers(headers: dict[str, str]) -> tuple[str, ...] | None:
+    values = {
+        part.strip().lower()
+        for part in str(headers.get("vary") or "").split(",")
+        if part.strip()
+    }
+    if "*" in values or values.intersection(_SENSITIVE_VARY_HEADERS):
+        return None
+    values.update(_BASE_VARIANT_HEADERS)
+    return tuple(sorted(values))
+
+
 def _response_ttl_s(headers: dict[str, str], *, resource_type: str = "") -> int:
+    del resource_type
     cache_control = str(headers.get("cache-control") or "").lower()
     directives = {part.strip() for part in cache_control.split(",") if part.strip()}
-    if "no-store" in directives or "private" in directives:
+    if any(
+        directive == blocked or directive.startswith(f"{blocked}=")
+        for directive in directives
+        for blocked in ("no-store", "private", "no-cache")
+    ):
         return 0
     max_age = _MAX_AGE_PATTERN.search(cache_control)
     if max_age:
-        ttl_s = min(MAX_TTL_S, max(0, int(max_age.group(1))))
-    else:
-        ttl_s = DEFAULT_TTL_S
-    if "no-cache" in directives:
-        return 0
-    if resource_type in {"script", "stylesheet"}:
-        return min(MAX_SCRIPT_STYLE_TTL_S, ttl_s)
-    return ttl_s
+        return min(MAX_TTL_S, max(0, int(max_age.group(1))))
+    return DEFAULT_TTL_S
+
+
+def _response_is_cacheable(headers: dict[str, str], *, resource_type: str) -> bool:
+    if "set-cookie" in headers:
+        return False
+    content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if resource_type == "script":
+        return content_type in {
+            "application/ecmascript",
+            "application/javascript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "text/javascript",
+        }
+    if resource_type == "stylesheet":
+        return content_type == "text/css"
+    if resource_type == "image":
+        return content_type.startswith("image/")
+    if resource_type == "font":
+        return content_type.startswith("font/") or content_type in {
+            "application/font-sfnt",
+            "application/font-woff",
+            "application/octet-stream",
+            "application/vnd.ms-fontobject",
+            "application/x-font-ttf",
+            "application/x-font-woff",
+        }
+    return False
 
 
 def _replay_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -366,13 +409,28 @@ def _replay_headers(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+def _route_fallback(route: Any) -> None:
+    fallback = getattr(route, "fallback", None)
+    if callable(fallback):
+        fallback()
+        return
+    route.continue_()
+
+
+def _positive_int(value: object) -> int:
     try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+        return max(0, int(str(value or "0")))
+    except ValueError:
+        return 0
+
+
+__all__ = [
+    "BrowserStaticAssetCache",
+    "CACHE_SCHEMA_VERSION",
+    "CACHE_VERSION",
+    "StaticAssetCacheStats",
+    "browser_static_asset_cache_enabled",
+    "default_browser_static_cache_dir",
+    "install_browser_static_asset_cache",
+    "is_browser_static_asset_url",
+]

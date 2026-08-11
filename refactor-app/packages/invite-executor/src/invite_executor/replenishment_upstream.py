@@ -13,6 +13,7 @@ from typing import Any
 from refactor_app.application.workflows.protocol_registration import (
     HeroSmsPhoneProviderAdapter,
 )
+from refactor_app.plugins.browser_runtime import managed_camoufox_context
 from refactor_app.plugins.mail_external_api.client import ExternalMailApiClient
 from refactor_app.plugins.openai_auth_browser import (
     BrowserAccountDeactivatedError,
@@ -383,7 +384,9 @@ class BrowserCodexCredentialProvisioner:
         install_dir = camoufox_path(download_if_missing=True)
         executable = launch_path()
         with TemporaryDirectory(prefix="invite_executor_camoufox_") as profile_dir:
-            with Camoufox(
+            with managed_camoufox_context(
+                Camoufox,
+                flow="invite-executor-runtime-prepare",
                 headless=True,
                 persistent_context=True,
                 user_data_dir=profile_dir,

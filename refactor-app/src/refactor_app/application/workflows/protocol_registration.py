@@ -208,8 +208,8 @@ class ProtocolRegistrationWorkflow:
                     "user_account_id": user_account_id,
                     "has_proxy": True,
                     "proxy_type": "static_proxy",
-                    "proxy_mode": "cliproxy_sticky",
-                    "proxy_source": "target_email_hash",
+                    "proxy_mode": proxy.proxy_mode,
+                    "proxy_source": proxy.proxy_source,
                     "proxy_provider": proxy.provider,
                     "proxy_country": proxy.country_code,
                     "proxy_sid_source": proxy.sid_source,
@@ -222,6 +222,7 @@ class ProtocolRegistrationWorkflow:
                 user_account_id=user_account_id,
                 work_id=work_id,
                 proxy_url=proxy.proxy_url,
+                proxy_mode=proxy.proxy_mode,
                 emit=emit,
             )
             result = attempt.result
@@ -371,6 +372,7 @@ class ProtocolRegistrationWorkflow:
         user_account_id: str,
         work_id: str,
         proxy_url: str,
+        proxy_mode: str = "cliproxy_sticky",
         emit: TraceEmitter,
     ) -> _RegistrationAttempt:
         del user_account_id, work_id
@@ -380,7 +382,7 @@ class ProtocolRegistrationWorkflow:
             "register": {
                 "region": input_.proxy_country.upper(),
                 "country_code": input_.proxy_country.upper(),
-                "mode": "cliproxy_sticky",
+                "mode": proxy_mode,
             }
         }
         flow = AuthFlow(cfg, trace_callback=self._make_http_trace_callback(emit))
@@ -399,8 +401,10 @@ class ProtocolRegistrationWorkflow:
         user_account_id: str,
         work_id: str,
         proxy_url: str,
+        proxy_mode: str = "cliproxy_sticky",
         emit: TraceEmitter,
     ) -> _RegistrationAttempt:
+        del proxy_mode
         del user_account_id
         browser = CamoufoxEmailRegistration(
             BrowserEmailRegistrationConfig(
@@ -432,6 +436,7 @@ class ProtocolRegistrationWorkflow:
         user_account_id: str,
         work_id: str,
         proxy_url: str,
+        proxy_mode: str = "cliproxy_sticky",
         emit: TraceEmitter,
     ) -> _RegistrationAttempt:
         del user_account_id, work_id
@@ -441,7 +446,7 @@ class ProtocolRegistrationWorkflow:
             "register": {
                 "region": input_.proxy_country.upper(),
                 "country_code": input_.proxy_country.upper(),
-                "mode": "cliproxy_sticky",
+                "mode": proxy_mode,
             }
         }
         cfg.phone = _phone_config(input_)
@@ -801,7 +806,7 @@ class ProtocolRegistrationWorkflow:
                     "user_account_id": user_account_id,
                     "proxy_provider": proxy.provider,
                     "proxy_country": proxy.country_code,
-                    "proxy_source": "target_email_hash",
+                    "proxy_source": proxy.proxy_source,
                     "proxy_sid_source": proxy.sid_source,
                     "proxy_probe_attempts": proxy.probe_attempts,
                 },

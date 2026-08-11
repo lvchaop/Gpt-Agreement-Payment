@@ -47,6 +47,12 @@ SENTINEL_SDK_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
 
 DEFAULT_UA = BROWSER_USER_AGENT
 DEFAULT_SEC_CH_UA = BROWSER_SEC_CH_UA
+_CHECKOUT_FLOW = "checkout_session_approval"
+
+
+def _require_checkout_page_url(flow: str, page_url: str | None) -> None:
+    if flow == _CHECKOUT_FLOW and not str(page_url or "").strip():
+        raise ValueError("page_url is required for checkout_session_approval")
 
 
 class SentinelTokenGenerator:
@@ -332,8 +338,10 @@ def get_sentinel_token(
     device_id: str,
     flow: str = "authorize_continue",
     user_agent: str = DEFAULT_UA,
+    page_url: str | None = None,
 ) -> str:
     """Generate a real-SDK token; synthetic fallback is explicit and off by default."""
+    _require_checkout_page_url(flow, page_url)
     disabled = _env_enabled("OPENAI_SENTINEL_DISABLE_QUICKJS")
     allow_synthetic = _env_enabled("OPENAI_SENTINEL_ALLOW_SYNTHETIC_FALLBACK")
     if not disabled:
@@ -344,6 +352,7 @@ def get_sentinel_token(
                 session,
                 device_id=device_id,
                 flow=flow,
+                page_url=page_url,
                 log=lambda m: logger.info(m),
             )
             if qtoken:
@@ -390,8 +399,10 @@ def get_sentinel_tokens(
     flow: str = "authorize_continue",
     user_agent: str = DEFAULT_UA,
     initialize_first: bool = False,
+    page_url: str | None = None,
 ) -> tuple[str, str]:
     """Return real-SDK Sentinel headers; synthetic fallback is opt-in only."""
+    _require_checkout_page_url(flow, page_url)
     disabled = _env_enabled("OPENAI_SENTINEL_DISABLE_QUICKJS")
     allow_synthetic = _env_enabled("OPENAI_SENTINEL_ALLOW_SYNTHETIC_FALLBACK")
     if not disabled:
@@ -403,6 +414,7 @@ def get_sentinel_tokens(
                 device_id=device_id,
                 flow=flow,
                 initialize_first=initialize_first,
+                page_url=page_url,
                 log=lambda m: logger.info(m),
             )
             if qtokens:

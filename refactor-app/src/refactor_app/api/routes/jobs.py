@@ -511,12 +511,12 @@ def _job_progress(session: Session, job_ids: list[str]) -> dict[str, dict[str, i
 _SENSITIVE_KEY_RE = re.compile(
     r"(^|_)(access_token|refresh_token|session_token|cookie|cookie_header|auth_cookie_header|"
     r"authorization|admin_key|custom_auth_header_value|password|csrf_token|code_verifier|otp_code|"
-    r"claim_token|api_key|pt)($|_)",
+    r"claim_token|api_key|client_key|pt)($|_)",
     re.IGNORECASE,
 )
 _SENSITIVE_TEXT_RE = re.compile(
     r"(?i)(access_token|refresh_token|session_token|authorization|cookie|password|csrf_token|"
-    r"code_verifier|otp_code)=([^&\s]+)"
+    r"code_verifier|otp_code|client_key)=([^&\s]+)"
 )
 
 

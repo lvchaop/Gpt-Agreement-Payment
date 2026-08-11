@@ -21,16 +21,16 @@ class Settings(BaseSettings):
     openai_chatgpt_base_url: str = "https://chatgpt.com"
     openai_probe_path_template: str = ""
     browser_impersonate: str = Field(default="chrome142", pattern=r"^chrome\d+[a-z]*$")
-    browser_static_asset_cache_enabled: bool = False
+    browser_static_asset_cache_enabled: bool = True
     browser_log_enabled: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices(
             "BROWSER_LOG_ENABLED",
             "REFACTOR_APP_BROWSER_LOG_ENABLED",
         ),
     )
     browser_log_capture_bodies: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices(
             "BROWSER_LOG_CAPTURE_BODIES",
             "REFACTOR_APP_BROWSER_LOG_CAPTURE_BODIES",
@@ -98,6 +98,54 @@ class Settings(BaseSettings):
     )
     protocol_register_proxy_url: str = ""
     protocol_register_proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    cliproxy_mode: str = Field(
+        default="remote",
+        pattern=r"^(?:remote|trojan_pool)$",
+        validation_alias=AliasChoices(
+            "CLIPROXY_MODE",
+            "REFACTOR_APP_CLIPROXY_MODE",
+        ),
+    )
+    cliproxy_trojan_pool_file: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_POOL_FILE",
+            "REFACTOR_APP_CLIPROXY_TROJAN_POOL_FILE",
+        ),
+    )
+    cliproxy_trojan_http_start_port: int = Field(
+        default=18081,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_HTTP_START_PORT",
+            "REFACTOR_APP_CLIPROXY_TROJAN_HTTP_START_PORT",
+        ),
+    )
+    cliproxy_trojan_work_dir: str = Field(
+        default="runtime/proxy/trojan-bridge",
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_WORK_DIR",
+            "REFACTOR_APP_CLIPROXY_TROJAN_WORK_DIR",
+        ),
+    )
+    cliproxy_trojan_executable: str = Field(
+        default="sing-box",
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_EXECUTABLE",
+            "REFACTOR_APP_CLIPROXY_TROJAN_EXECUTABLE",
+        ),
+    )
+    cliproxy_trojan_start_timeout_s: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=60.0,
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_START_TIMEOUT_S",
+            "REFACTOR_APP_CLIPROXY_TROJAN_START_TIMEOUT_S",
+        ),
+    )
     cliproxy_gateway_mode: str = Field(
         default="auto",
         pattern=r"^(?:auto|fixed)$",
@@ -182,6 +230,13 @@ class Settings(BaseSettings):
             "REFACTOR_APP_CLIPROXY_STATE",
         ),
     )
+    cliproxy_jp_state: str = Field(
+        default="Tokyo",
+        validation_alias=AliasChoices(
+            "CLIPROXY_JP_STATE",
+            "REFACTOR_APP_CLIPROXY_JP_STATE",
+        ),
+    )
     cliproxy_session_duration_minutes: int = Field(
         default=15,
         ge=1,
@@ -236,6 +291,16 @@ class Settings(BaseSettings):
     personal_plus_checkout_promo_campaign_id: str = Field(
         default="plus-1-month-free",
         validation_alias="PERSONAL_PLUS_CHECKOUT_PROMO_CAMPAIGN_ID",
+    )
+    personal_plus_checkout_ui_mode: str = Field(
+        default="hosted",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_UI_MODE",
+        pattern=r"^(?:hosted|custom)$",
+    )
+    personal_payment_method_checkout_ui_mode: str = Field(
+        default="custom",
+        validation_alias="PERSONAL_PAYMENT_METHOD_CHECKOUT_UI_MODE",
+        pattern=r"^(?:hosted|custom)$",
     )
     personal_plus_checkout_captcha_api_url: str = Field(
         default="",

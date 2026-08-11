@@ -20,6 +20,7 @@ class StablePlusCheckoutSubmitter:
         result_poll_interval_s: float,
         challenge_callback: Callable[[dict[str, Any]], None] | None,
         captcha_solver: Callable[[dict[str, Any]], dict[str, Any]] | None,
+        trace_emitter: Callable[[str, dict[str, Any], str], None] | None,
         runtime: Any,
     ) -> None:
         self.page = page
@@ -28,12 +29,14 @@ class StablePlusCheckoutSubmitter:
         self.result_poll_interval_s = max(0.0, float(result_poll_interval_s))
         self.challenge_callback = challenge_callback
         self.captcha_solver = captcha_solver
+        self.trace_emitter = trace_emitter
         self.runtime = runtime
 
         self.capture = runtime._CheckoutChallengeCapture(page)
         self.challenge_notified = False
         self.challenge_attempts = 0
         self.solved_challenges: set[str] = set()
+        self.classified_visuals: set[str] = set()
         self.last_solver_error = ""
         self.last_solver_task_id = ""
         self.last_verification: dict[str, Any] | None = None
@@ -175,6 +178,8 @@ class StablePlusCheckoutSubmitter:
                 challenge_capture=self.capture,
                 captcha_solver=self.captcha_solver,
                 solved_challenges=self.solved_challenges,
+                classified_visuals=self.classified_visuals,
+                trace_emitter=self.trace_emitter,
             )
         except self.runtime.PlusCheckoutPluginError as error:
             detail = str(error)
@@ -241,6 +246,16 @@ class StablePlusCheckoutSubmitter:
     def _finish_from_terminal_poll(self, state: dict[str, Any]) -> dict[str, Any]:
         return self._completed(state, payment_result=self._poll_terminal(state))
 
+    def _finish_at_submit_deadline(self, state: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._finish_from_terminal_poll(state)
+        except self.runtime.PlusCheckoutPluginError as poll_error:
+            raise self.runtime.PlusCheckoutPluginError(
+                "plus_checkout_plugin_submit_timeout: "
+                + self.runtime._compact_json(state)
+                + f"; terminal_poll={poll_error}"
+            ) from poll_error
+
     def _wait_terminal(self, ready_state: dict[str, Any]) -> dict[str, Any]:
         start_returned = self._start_once(ready_state)
         if not start_returned:
@@ -261,10 +276,18 @@ class StablePlusCheckoutSubmitter:
             if outcome:
                 verification = outcome.get("verification")
                 injection = outcome.get("injection")
+                browser_interaction = outcome.get("browser_interaction")
                 if isinstance(verification, dict):
                     return self._finish_from_terminal_poll(last_state)
                 if isinstance(injection, dict) and injection.get("navigation_interrupted"):
                     return self._finish_from_terminal_poll(last_state)
+                if isinstance(browser_interaction, dict):
+                    # The current browser has continued the original confirmation.
+                    # Re-read its state; never start a second Checkout submit.
+                    if time.monotonic() >= deadline:
+                        return self._finish_at_submit_deadline(last_state)
+                    time.sleep(0.1)
+                    continue
                 # Token injection continues the original Checkout confirmation.
                 # It never starts a second confirmation.
                 time.sleep(0.1)
@@ -288,14 +311,7 @@ class StablePlusCheckoutSubmitter:
                 )
 
             if time.monotonic() >= deadline:
-                try:
-                    return self._finish_from_terminal_poll(last_state)
-                except self.runtime.PlusCheckoutPluginError as poll_error:
-                    raise self.runtime.PlusCheckoutPluginError(
-                        "plus_checkout_plugin_submit_timeout: "
-                        + self.runtime._compact_json(last_state)
-                        + f"; terminal_poll={poll_error}"
-                    ) from poll_error
+                return self._finish_at_submit_deadline(last_state)
             time.sleep(0.1)
 
     def run(self) -> dict[str, Any]:
@@ -332,6 +348,7 @@ def submit_plus_checkout_stably(
     result_poll_interval_s: float,
     challenge_callback: Callable[[dict[str, Any]], None] | None,
     captcha_solver: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    trace_emitter: Callable[[str, dict[str, Any], str], None] | None,
     runtime: Any,
 ) -> dict[str, Any]:
     return StablePlusCheckoutSubmitter(
@@ -341,6 +358,7 @@ def submit_plus_checkout_stably(
         result_poll_interval_s=result_poll_interval_s,
         challenge_callback=challenge_callback,
         captcha_solver=captcha_solver,
+        trace_emitter=trace_emitter,
         runtime=runtime,
     ).run()
 

@@ -251,3 +251,21 @@ def test_job_redaction_exposes_cookie_names_but_not_cookie_values() -> None:
 
     assert redacted["request_cookie_names"] == ["oai-did", "auth-session"]
     assert redacted["cookie_header"] == "<redacted>"
+
+
+def test_job_redaction_hides_captcha_client_keys() -> None:
+    redacted = _redact_value(
+        {
+            "captcha_client_key": "secret-captcha-key",
+            "nested": {"client_key": "secret-client-key"},
+            "message": "client_key=secret-in-text",
+            "request_url": "https://captcha.example/create?client_key=secret-in-url",
+        }
+    )
+
+    assert redacted == {
+        "captcha_client_key": "<redacted>",
+        "nested": {"client_key": "<redacted>"},
+        "message": "client_key=<redacted>",
+        "request_url": "https://captcha.example/create?client_key=%3Credacted%3E",
+    }

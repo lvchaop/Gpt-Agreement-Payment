@@ -199,6 +199,91 @@ def test_real_sdk_flow_passes_page_cookie_and_context_to_runner(
     assert session.cookies.get("oai-did", domain="sentinel.openai.com") == "device-id"
 
 
+def test_checkout_flow_passes_explicit_page_url_and_chatgpt_cookies_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = SimpleNamespace(cookies=RequestsCookieJar())
+    session.cookies.set("auth-session", "auth-value", domain="auth.openai.com", path="/")
+    session.cookies.set("chat-session", "chat-value", domain="chatgpt.com", path="/")
+    sdk_file = tmp_path / "sdk.js"
+    sdk_file.write_bytes(FULL_SDK)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(sentinel_quickjs, "_ensure_sdk_file", lambda *_: sdk_file)
+    monkeypatch.setattr(
+        sentinel_quickjs,
+        "_fetch_sentinel_challenge",
+        lambda *_args, **_kwargs: {
+            "token": "challenge-token",
+            "proofofwork": {"required": False},
+        },
+    )
+
+    def fake_runner(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return json.dumps(
+            {
+                "p": "real-sdk-proof",
+                "t": "",
+                "c": "challenge-token",
+                "id": "device-id",
+                "flow": "checkout_session_approval",
+            }
+        )
+
+    monkeypatch.setattr(sentinel_quickjs, "_run_sentinel_runner", fake_runner)
+    checkout_url = "https://chatgpt.com/checkout/openai/cs_live_example"
+
+    sentinel_quickjs.get_sentinel_tokens_via_quickjs(
+        session,
+        device_id="device-id",
+        flow="checkout_session_approval",
+        page_url=checkout_url,
+    )
+
+    assert captured["page_url"] == checkout_url
+    assert "chat-session=chat-value" in str(captured["cookie"])
+    assert "auth-session=auth-value" not in str(captured["cookie"])
+    assert "oai-did=device-id" in str(captured["cookie"])
+
+
+def test_checkout_flow_requires_explicit_page_url() -> None:
+    with pytest.raises(ValueError, match="page_url is required"):
+        sentinel_quickjs.get_sentinel_tokens_via_quickjs(
+            SimpleNamespace(cookies=RequestsCookieJar()),
+            device_id="device-id",
+            flow="checkout_session_approval",
+        )
+    with pytest.raises(ValueError, match="page_url is required"):
+        sentinel.get_sentinel_tokens(
+            SimpleNamespace(),
+            "device-id",
+            flow="checkout_session_approval",
+        )
+
+
+def test_public_sentinel_api_forwards_checkout_page_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_quickjs(*_args: object, **kwargs: object) -> tuple[str, str]:
+        captured.update(kwargs)
+        return "sentinel-token", ""
+
+    monkeypatch.setattr(sentinel_quickjs, "get_sentinel_tokens_via_quickjs", fake_quickjs)
+    checkout_url = "https://chatgpt.com/checkout/openai/cs_live_example"
+
+    assert sentinel.get_sentinel_tokens(
+        SimpleNamespace(),
+        "device-id",
+        flow="checkout_session_approval",
+        page_url=checkout_url,
+    ) == ("sentinel-token", "")
+    assert captured["page_url"] == checkout_url
+
+
 def test_lifecycle_runner_executes_init_before_token_in_one_sdk_context(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

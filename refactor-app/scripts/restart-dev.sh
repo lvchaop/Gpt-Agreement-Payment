@@ -19,6 +19,37 @@ WORKER_LOG="$LOG_DIR/worker.log"
 
 mkdir -p "$LOG_DIR" "$APP_DIR/runtime"
 
+resolve_trojan_executable() {
+  local configured="${CLIPROXY_TROJAN_EXECUTABLE:-sing-box}"
+  local candidate
+
+  if [[ "$configured" == */* ]] && [ -x "$configured" ]; then
+    printf '%s\n' "$configured"
+    return
+  fi
+
+  if [[ "$configured" != */* ]]; then
+    candidate="$(command -v "$configured" 2>/dev/null || true)"
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  fi
+
+  for candidate in /opt/homebrew/bin/sing-box /usr/local/bin/sing-box; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  echo "Trojan bridge executable not found: $configured" >&2
+  return 1
+}
+
+CLIPROXY_TROJAN_EXECUTABLE="$(resolve_trojan_executable)"
+LAUNCHD_PATH="$(dirname "$CLIPROXY_TROJAN_EXECUTABLE"):${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+
 process_cwd() {
   local pid="$1"
   lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ { sub(/^n/, ""); print; exit }'
@@ -100,6 +131,7 @@ wait_for_url() {
 }
 
 echo "restart refactor-app..."
+echo "trojan bridge executable: $CLIPROXY_TROJAN_EXECUTABLE"
 
 if ! launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
   echo "current user launchd domain is unavailable: gui/$(id -u)" >&2
@@ -133,7 +165,7 @@ launchctl submit \
   -- \
   /bin/zsh \
   -lc \
-  "cd '$APP_DIR' && ulimit -n '$WORKER_MAX_OPEN_FILES' && echo \"worker max open files: \$(ulimit -n)\" && exec env PYTHONPATH=\"\$PWD/src\" '$PYTHON_BIN' -m refactor_app.cli.main worker run --no-once --capacity '$WORKER_CAPACITY'"
+  "cd '$APP_DIR' && ulimit -n '$WORKER_MAX_OPEN_FILES' && echo \"worker max open files: \$(ulimit -n)\" && exec env PATH='$LAUNCHD_PATH' CLIPROXY_TROJAN_EXECUTABLE='$CLIPROXY_TROJAN_EXECUTABLE' PYTHONPATH=\"\$PWD/src\" '$PYTHON_BIN' -m refactor_app.cli.main worker run --no-once --capacity '$WORKER_CAPACITY'"
 
 echo "start backend via launchd (START_WORKER=0)"
 launchctl submit \
@@ -142,7 +174,8 @@ launchctl submit \
   -e "$START_LOG" \
   -- \
   /usr/bin/env \
-  PATH="$PATH" \
+  PATH="$LAUNCHD_PATH" \
+  CLIPROXY_TROJAN_EXECUTABLE="$CLIPROXY_TROJAN_EXECUTABLE" \
   BACKEND_HOST="$BACKEND_HOST" \
   BACKEND_PORT="$BACKEND_PORT" \
   START_FRONTEND=0 \

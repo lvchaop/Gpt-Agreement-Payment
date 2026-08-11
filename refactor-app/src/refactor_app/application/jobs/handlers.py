@@ -4,10 +4,21 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from refactor_app.application.jobs.attempt_disposition import (
+    PERSONAL_PLUS_CHECKOUT_FAILURE_SCOPE,
+    checkpoint_personal_plus_checkout_failure,
+    has_personal_plus_checkout_consume_stop,
+    has_personal_plus_checkout_sync_failure,
+    personal_plus_checkout_consume_stop_exists_for,
+    personal_plus_checkout_sync_failure_exists_for,
+    resolve_personal_plus_checkout_sync_failures,
+    try_acquire_personal_plus_checkout_lock,
+)
 from refactor_app.application.jobs.queue import WorkQueue
 from refactor_app.application.jobs.runner import JobRunner
 from refactor_app.application.workflows.account_auth import (
@@ -530,73 +541,79 @@ def register_core_handlers(
     )
 
     def personal_payment_method_workflow(input_json: dict) -> PersonalPaymentMethodBindWorkflow:
-        after_bind_success = None
-        browser_headless = bool(input_json.get("browser_headless", True))
-        if bool(input_json.get("auto_start_plus_checkout", True)):
-            plus_workflow = PersonalPlusCheckoutWorkflow(
-                session_factory=session_factory,
-                mail_provider=_mail_plugin(settings),
-                openai_provider=_openai_plugin(settings),
-                us_proxy_country=settings.personal_plus_checkout_create_proxy_country,
-                jp_proxy_country=settings.personal_plus_checkout_promo_proxy_country,
-                promo_campaign_id=settings.personal_plus_checkout_promo_campaign_id,
-                browser_headless=browser_headless,
-                browser_log_enabled=bool(getattr(settings, "browser_log_enabled", False)),
-                browser_log_capture_bodies=bool(
-                    getattr(settings, "browser_log_capture_bodies", False)
-                ),
-                browser_log_max_body_chars=int(
-                    getattr(settings, "browser_log_max_body_chars", 20_000)
-                ),
-                totp_code_resolver=totp_code_resolver,
-                captcha_api_url=str(
-                    input_json.get("captcha_api_url")
-                    or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
-                    or ""
-                ),
-                captcha_client_key=str(
-                    input_json.get("captcha_client_key")
-                    or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
-                    or ""
-                ),
-            )
-            def after_bind_success(space_id, page, _result):
-                return plus_workflow.run_on_existing_page(
-                    space_id=space_id,
-                    page=page,
-                    work_id=str(input_json.get("_work_id") or "") + "-plus",
-                    run_id=str(input_json.get("_run_id") or ""),
-                )
         return PersonalPaymentMethodBindWorkflow(
             session_factory=session_factory,
-            mail_provider=_mail_plugin(settings),
-                registration_proxy_country=settings.personal_plus_checkout_create_proxy_country,
-            browser_headless=browser_headless,
-            browser_log_enabled=bool(getattr(settings, "browser_log_enabled", False)),
-            browser_log_capture_bodies=bool(
-                getattr(settings, "browser_log_capture_bodies", False)
+            registration_proxy_country=settings.personal_plus_checkout_create_proxy_country,
+            promo_campaign_id=settings.personal_plus_checkout_promo_campaign_id,
+            checkout_ui_mode=str(
+                input_json.get("checkout_ui_mode")
+                or getattr(settings, "personal_payment_method_checkout_ui_mode", "custom")
+                or "custom"
             ),
-            browser_log_max_body_chars=int(
-                getattr(settings, "browser_log_max_body_chars", 20_000)
-            ),
-            totp_code_resolver=totp_code_resolver,
-            after_bind_success=after_bind_success,
         )
 
-    runner.register_work(
-        "space.personal_payment_method_bind.space",
-            lambda _session, input_json: personal_payment_method_workflow(input_json).run(
-                space_id=str(input_json["space_id"]),
-                run_id=str(input_json.get("_run_id") or ""),
-                work_id=str(input_json.get("_work_id") or ""),
-                payment_card_id=str(input_json.get("payment_card_id") or ""),
-            ),
-    )
-    runner.register_work(
-        "space.personal_plus_checkout.space",
-        lambda _session, input_json: PersonalPlusCheckoutWorkflow(
+    def terminal_plus_checkout_output(space_id: str) -> dict[str, Any]:
+        return {
+            "_work_outcome": "skipped",
+            "space_id": space_id,
+            "skip_reason": "personal_plus_checkout_consume_stop_exists",
+            "failure_scope": PERSONAL_PLUS_CHECKOUT_FAILURE_SCOPE,
+            "attempt_disposition": "consume_stop",
+            "terminal": True,
+        }
+
+    def concurrent_plus_checkout_output(space_id: str) -> dict[str, Any]:
+        return {
+            "_work_outcome": "skipped",
+            "space_id": space_id,
+            "skip_reason": "personal_plus_checkout_in_progress",
+            "failure_scope": PERSONAL_PLUS_CHECKOUT_FAILURE_SCOPE,
+            "attempt_disposition": "release",
+            "terminal": False,
+        }
+
+    def acquire_plus_checkout_guard(
+        work_session: Session | None,
+        *,
+        space_id: str,
+        start_new_checkout: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        if work_session is None:
+            return None, False
+
+        def prior_attempt_state() -> tuple[dict[str, Any] | None, bool]:
+            terminal = has_personal_plus_checkout_consume_stop(
+                work_session,
+                space_id=space_id,
+            )
+            recoverable_sync = bool(
+                terminal
+                and has_personal_plus_checkout_sync_failure(
+                    work_session,
+                    space_id=space_id,
+                )
+            )
+            if terminal and not recoverable_sync:
+                return terminal_plus_checkout_output(space_id), False
+            return None, bool(recoverable_sync and not start_new_checkout)
+
+        guard_output, sync_only = prior_attempt_state()
+        if guard_output is not None:
+            return guard_output, sync_only
+        if not try_acquire_personal_plus_checkout_lock(
+            work_session,
+            space_id=space_id,
+        ):
+            return concurrent_plus_checkout_output(space_id), False
+        # Close the check/lock race: a prior worker may have committed its
+        # terminal marker immediately before this transaction acquired the lock.
+        return prior_attempt_state()
+
+    def personal_plus_checkout_workflow(
+        input_json: dict,
+    ) -> PersonalPlusCheckoutWorkflow:
+        return PersonalPlusCheckoutWorkflow(
             session_factory=session_factory,
-            mail_provider=_mail_plugin(settings),
             openai_provider=_openai_plugin(settings),
             us_proxy_country=str(
                 input_json.get("create_proxy_country")
@@ -609,6 +626,11 @@ def register_core_handlers(
             promo_campaign_id=str(
                 input_json.get("promo_campaign_id")
                 or settings.personal_plus_checkout_promo_campaign_id
+            ),
+            checkout_ui_mode=str(
+                input_json.get("checkout_ui_mode")
+                or getattr(settings, "personal_plus_checkout_ui_mode", "hosted")
+                or "hosted"
             ),
             browser_headless=bool(input_json.get("browser_headless", True)),
             browser_log_enabled=bool(
@@ -640,10 +662,161 @@ def register_core_handlers(
                 or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
                 or ""
             ),
-        ).run(
-            space_id=str(input_json["space_id"]),
-            work_id=str(input_json.get("_work_id") or ""),
-            run_id=str(input_json.get("_run_id") or ""),
+        )
+
+    def reconcile_plus_subscription(
+        work_session: Session | None,
+        *,
+        workflow: PersonalPlusCheckoutWorkflow,
+        space_id: str,
+        work_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        output = workflow.reconcile_subscription(
+            space_id=space_id,
+            work_id=work_id,
+            run_id=run_id,
+        )
+        if work_session is not None:
+            output["resolved_markers"] = resolve_personal_plus_checkout_sync_failures(
+                work_session,
+                space_id=space_id,
+                work_id=work_id,
+            )
+        return output
+
+    def checkpoint_plus_checkout_failure(
+        work_session: Session | None,
+        *,
+        work_id: str,
+        exc: BaseException,
+    ) -> None:
+        if work_session is None:
+            return
+        try:
+            checkpoint_personal_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+        except Exception:
+            # Preserve the checkout exception so the runner can make its own
+            # failure-record attempt with a clean transaction.
+            try:
+                work_session.rollback()
+            except Exception:
+                pass
+
+    def run_personal_payment_method_work(
+        work_session: Session | None,
+        input_json: dict,
+    ) -> dict[str, Any]:
+        space_id = str(input_json["space_id"])
+        run_id = str(input_json.get("_run_id") or "")
+        work_id = str(input_json.get("_work_id") or "")
+        guard_output, sync_only = acquire_plus_checkout_guard(
+            work_session,
+            space_id=space_id,
+        )
+        if guard_output is not None:
+            return guard_output
+        if sync_only:
+            plus_workflow = personal_plus_checkout_workflow(input_json)
+            return reconcile_plus_subscription(
+                work_session,
+                workflow=plus_workflow,
+                space_id=space_id,
+                work_id=work_id,
+                run_id=run_id,
+            )
+        output = personal_payment_method_workflow(input_json).run(
+            space_id=space_id,
+            run_id=run_id,
+            work_id=work_id,
+            payment_card_id=str(input_json.get("payment_card_id") or ""),
+        )
+        if not bool(input_json.get("auto_start_plus_checkout", True)):
+            return output
+
+        plus_workflow = personal_plus_checkout_workflow(input_json)
+        try:
+            output["after_bind_success"] = plus_workflow.run(
+                space_id=space_id,
+                work_id=f"{work_id}-plus",
+                run_id=run_id,
+            )
+        except Exception as exc:
+            checkpoint_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+            raise
+        return output
+
+    runner.register_work(
+        "space.personal_payment_method_bind.space",
+        lambda work_session, input_json: run_personal_payment_method_work(
+            work_session,
+            input_json,
+        ),
+    )
+
+    def run_personal_plus_checkout_work(
+        work_session: Session | None,
+        input_json: dict,
+    ) -> dict[str, Any]:
+        space_id = str(input_json["space_id"])
+        work_id = str(input_json.get("_work_id") or "")
+        start_new_checkout = (
+            str(input_json.get("checkout_attempt_mode") or "").strip().lower() == "new"
+        )
+        guard_output, sync_only = acquire_plus_checkout_guard(
+            work_session,
+            space_id=space_id,
+            start_new_checkout=start_new_checkout,
+        )
+        if guard_output is not None:
+            return guard_output
+        workflow = personal_plus_checkout_workflow(input_json)
+        try:
+            if sync_only:
+                return reconcile_plus_subscription(
+                    work_session,
+                    workflow=workflow,
+                    space_id=space_id,
+                    work_id=work_id,
+                    run_id=str(input_json.get("_run_id") or ""),
+                )
+            output = workflow.run(
+                space_id=space_id,
+                work_id=work_id,
+                run_id=str(input_json.get("_run_id") or ""),
+            )
+            if start_new_checkout:
+                output = {**output, "checkout_attempt_mode": "new"}
+                if work_session is not None:
+                    output["resolved_markers"] = (
+                        resolve_personal_plus_checkout_sync_failures(
+                            work_session,
+                            space_id=space_id,
+                            work_id=work_id,
+                        )
+                    )
+            return output
+        except Exception as exc:
+            checkpoint_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+            raise
+
+    runner.register_work(
+        "space.personal_plus_checkout.space",
+        lambda work_session, input_json: run_personal_plus_checkout_work(
+            work_session,
+            input_json,
         ),
     )
     runner.register_work(
@@ -1348,6 +1521,11 @@ def _run_personal_payment_method_bind_tick_job(
     limit = max(1, int(input_json.get("limit") or 10))
     work_count = max(1, int(input_json.get("work_count") or 1))
     auto_start_plus_checkout = bool(input_json.get("auto_start_plus_checkout", True))
+    checkout_ui_mode = str(
+        input_json.get("checkout_ui_mode")
+        or getattr(settings, "personal_payment_method_checkout_ui_mode", "custom")
+        or "custom"
+    ).strip().lower()
     browser_headless = bool(input_json.get("browser_headless", True))
     captcha_api_url = str(
         input_json.get("captcha_api_url")
@@ -1389,6 +1567,7 @@ def _run_personal_payment_method_bind_tick_job(
                     SpaceModel.promotion_id != "",
                     SpaceModel.has_payment_method.is_(False),
                     SpaceModel.payment_method_status != "bound",
+                    SpaceModel.payment_method_status != "binding",
                     or_(
                         SpaceModel.payment_method_attempt_count < 3,
                         (
@@ -1417,6 +1596,8 @@ def _run_personal_payment_method_bind_tick_job(
                     "captcha_client_key": captcha_client_key,
                     "_run_id": run_id,
                 }
+                if checkout_ui_mode:
+                    work_input["checkout_ui_mode"] = checkout_ui_mode
                 if payment_card_id:
                     work_input["payment_card_id"] = payment_card_id
                 queue.enqueue(
@@ -1427,7 +1608,7 @@ def _run_personal_payment_method_bind_tick_job(
                 )
             session.commit()
     summary = _work_summary(session_factory=session_factory, job_id=job_id)
-    return {
+    result = {
         "space_id": requested_space_id,
         "selected_count": existing_count or len(selected),
         "limit": limit,
@@ -1436,6 +1617,9 @@ def _run_personal_payment_method_bind_tick_job(
         "browser_headless": browser_headless,
         **summary,
     }
+    if checkout_ui_mode:
+        result["checkout_ui_mode"] = checkout_ui_mode
+    return result
 
 
 def _run_personal_plus_checkout_tick_job(
@@ -1466,7 +1650,13 @@ def _run_personal_plus_checkout_tick_job(
         input_json.get("promo_campaign_id")
         or settings.personal_plus_checkout_promo_campaign_id
     ).strip()
+    checkout_ui_mode = str(
+        input_json.get("checkout_ui_mode")
+        or getattr(settings, "personal_plus_checkout_ui_mode", "hosted")
+        or "hosted"
+    ).strip().lower()
     browser_headless = bool(input_json.get("browser_headless", True))
+    checkout_attempt_mode = str(input_json.get("checkout_attempt_mode") or "").strip().lower()
     captcha_api_url = str(
         input_json.get("captcha_api_url")
         or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
@@ -1503,8 +1693,23 @@ def _run_personal_plus_checkout_tick_job(
                     SpaceModel.has_payment_method.is_(True),
                     SpaceModel.payment_method_status == "bound",
                     UserAccountModel.account_status == "active",
-                    UserAccountModel.cookie_header != "",
-                    UserAccountModel.auth_cookie_header != "",
+                    or_(
+                        UserAccountModel.access_token != "",
+                        (
+                            (UserAccountModel.cookie_header != "")
+                            & (UserAccountModel.auth_cookie_header != "")
+                        ),
+                    ),
+                    or_(
+                        func.lower(func.coalesce(SpaceModel.plan_type, "")).notin_(
+                            ("plus", "chatgptplusplan")
+                        ),
+                        personal_plus_checkout_sync_failure_exists_for(SpaceModel.id),
+                    ),
+                    or_(
+                        ~personal_plus_checkout_consume_stop_exists_for(SpaceModel.id),
+                        personal_plus_checkout_sync_failure_exists_for(SpaceModel.id),
+                    ),
                 )
                 .order_by(SpaceModel.updated_at.asc(), SpaceModel.id.asc())
             )
@@ -1521,6 +1726,7 @@ def _run_personal_plus_checkout_tick_job(
                     execution_key=f"personal-plus-checkout:{space.id}",
                     input_json={
                         "space_id": space.id,
+                        "checkout_attempt_mode": checkout_attempt_mode,
                         "create_proxy_country": create_country,
                         "promo_proxy_country": promo_country,
                         "promo_campaign_id": promo_campaign_id,
@@ -1528,20 +1734,29 @@ def _run_personal_plus_checkout_tick_job(
                         "captcha_api_url": captcha_api_url,
                         "captcha_client_key": captcha_client_key,
                         "_run_id": run_id,
+                        **(
+                            {"checkout_ui_mode": checkout_ui_mode}
+                            if checkout_ui_mode
+                            else {}
+                        ),
                     },
                 )
             session.commit()
     summary = _work_summary(session_factory=session_factory, job_id=job_id)
-    return {
+    result = {
         "space_id": requested_space_id,
         "selected_count": existing_count or len(selected),
         "limit": limit,
         "work_count": work_count,
+        "checkout_attempt_mode": checkout_attempt_mode,
         "create_proxy_country": create_country,
         "promo_proxy_country": promo_country,
         "promo_campaign_id": promo_campaign_id,
         **summary,
     }
+    if checkout_ui_mode:
+        result["checkout_ui_mode"] = checkout_ui_mode
+    return result
 
 
 def _space_auto_replenish_workflow(

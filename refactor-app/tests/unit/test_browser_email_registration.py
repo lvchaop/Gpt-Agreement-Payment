@@ -677,15 +677,15 @@ def test_submit_email_falls_back_to_enter_when_click_has_no_effect(
     )
     page = _FakePage()
     field = _FakeInput()
-    waits = iter((False, False, True))
-
     monkeypatch.setattr(browser_registration, "_visible", lambda *_args: field)
     monkeypatch.setattr(browser_registration, "_click_first", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        runner,
-        "_wait_for_page_state",
-        lambda *_args, **_kwargs: next(waits),
-    )
+
+    def wait_for_page_state(_page, predicate, *, stage, **_kwargs):
+        if stage in {"wait-email-submit", "wait-email-retry-submit"}:
+            return False
+        return bool(predicate())
+
+    monkeypatch.setattr(runner, "_wait_for_page_state", wait_for_page_state)
     monkeypatch.setattr(browser_registration.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(browser_registration.random, "uniform", lambda _start, _end: 0)
 
@@ -720,6 +720,75 @@ def test_submit_email_accepts_navigation_when_button_handle_detaches(
     assert page.url == "https://auth.openai.com/email-verification"
 
 
+def test_submit_email_does_not_refill_while_password_page_is_arriving(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    page.url = "https://chatgpt.com/auth/login"
+    state = {"pending": False, "password_ready": False, "submit_clicks": 0}
+
+    class EmailInput(_FakeInput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fill_calls = 0
+
+        def fill(self, value: str, **_kwargs) -> None:
+            self.fill_calls += 1
+            if self.fill_calls > 1:
+                raise RuntimeError("element is not editable")
+            super().fill(value)
+
+        def is_editable(self) -> bool:
+            return not state["pending"] and not state["password_ready"]
+
+    email_field = EmailInput()
+    password_field = _FakeInput()
+
+    def visible(_page, selectors):
+        if selectors is browser_registration.EMAIL_INPUT_SELECTORS:
+            # The password page keeps the submitted email visible as a
+            # read-only input, matching the real auth page.
+            return email_field
+        if selectors is browser_registration.PASSWORD_INPUT_SELECTORS:
+            return password_field if state["password_ready"] else None
+        if selectors is browser_registration.EMAIL_CONTINUE_SELECTORS:
+            return email_field if not state["password_ready"] else None
+        return None
+
+    def click_and_eventually_navigate(_page, _selectors, **_kwargs):
+        state["submit_clicks"] += 1
+        if state["submit_clicks"] == 1:
+            state["pending"] = True
+        else:
+            raise AssertionError("pending email submit must not be clicked twice")
+        return True
+
+    def wait_for_page_state(_page, predicate, *, stage, **_kwargs):
+        if stage == "wait-email-submit":
+            return False
+        if stage == "wait-email-retry-ready":
+            state["password_ready"] = True
+            state["pending"] = False
+            page.url = "https://auth.openai.com/log-in/password"
+        return bool(predicate())
+
+    monkeypatch.setattr(browser_registration, "_visible", visible)
+    monkeypatch.setattr(browser_registration, "_click_first", click_and_eventually_navigate)
+    monkeypatch.setattr(runner, "_wait_for_page_state", wait_for_page_state)
+    monkeypatch.setattr(browser_registration.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(browser_registration.random, "uniform", lambda _start, _end: 0)
+
+    runner._submit_email(page, "member@example.com")
+
+    assert email_field.fill_calls == 1
+    assert state == {"pending": False, "password_ready": True, "submit_clicks": 1}
+    assert page.keyboard.pressed == []
+
+
 def test_submit_email_waits_for_document_load_before_next_stage_poll(
     monkeypatch,
     tmp_path,
@@ -730,10 +799,17 @@ def test_submit_email_waits_for_document_load_before_next_stage_poll(
     page = _FakePage()
     field = _FakeInput()
     load_states: list[str] = []
-    wait_calls: list[tuple[str, float]] = []
+    wait_calls: list[tuple[str, float, float]] = []
 
-    def wait_for_page_state(_page, predicate, *, stage, timeout_s):
-        wait_calls.append((stage, timeout_s))
+    def wait_for_page_state(
+        _page,
+        predicate,
+        *,
+        stage,
+        timeout_s,
+        transient_challenge_timeout_s,
+    ):
+        wait_calls.append((stage, timeout_s, transient_challenge_timeout_s))
         return bool(predicate())
 
     monkeypatch.setattr(browser_registration, "_visible", lambda *_args: field)
@@ -750,7 +826,202 @@ def test_submit_email_waits_for_document_load_before_next_stage_poll(
     runner._submit_email(page, "member@example.com")
 
     assert load_states == ["domcontentloaded", "load"]
-    assert wait_calls == [("wait-email-submit", 16.0)]
+    assert wait_calls == [("wait-email-submit", 16.0, 60.0)]
+
+
+def test_page_state_wait_resumes_after_transient_challenge(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object], str]] = []
+    clock = {"now": 0.0}
+    challenge_states = iter(
+        (
+            "Cloudflare challenge",
+            "Cloudflare challenge",
+            "",
+            "",
+        )
+    )
+    predicate_calls = {"count": 0}
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(capture_artifacts=False),
+        event_callback=lambda stage, data, level: events.append((stage, data, level)),
+    )
+    page = _FakePage()
+
+    def predicate() -> bool:
+        predicate_calls["count"] += 1
+        return predicate_calls["count"] >= 2
+
+    monkeypatch.setattr(
+        browser_registration.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        browser_registration.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "_challenge_reason",
+        lambda _page: next(challenge_states),
+    )
+
+    assert runner._wait_for_page_state(
+        page,
+        predicate,
+        stage="wait-email-submit",
+        timeout_s=1.0,
+        transient_challenge_timeout_s=2.0,
+    )
+    assert predicate_calls["count"] == 2
+    assert [event[0] for event in events] == [
+        "browser.challenge.waiting",
+        "browser.challenge.cleared",
+    ]
+
+
+def test_page_state_wait_fails_after_transient_challenge_timeout(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    events: list[tuple[str, dict[str, object], str]] = []
+    screenshots: list[str] = []
+    clock = {"now": 0.0}
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path)),
+        event_callback=lambda stage, data, level: events.append((stage, data, level)),
+    )
+    page = _FakePage()
+
+    monkeypatch.setattr(
+        browser_registration.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        browser_registration.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "_challenge_reason",
+        lambda _page: "Cloudflare challenge",
+    )
+    monkeypatch.setattr(runner, "_screenshot", lambda _page, name: screenshots.append(name))
+
+    with pytest.raises(
+        BrowserEmailRegistrationError,
+        match=(
+            r"Cloudflare challenge timed out after 1\.0s "
+            r"during wait-email-submit"
+        ),
+    ):
+        runner._wait_for_page_state(
+            page,
+            lambda: False,
+            stage="wait-email-submit",
+            timeout_s=1.0,
+            transient_challenge_timeout_s=1.0,
+        )
+
+    assert screenshots == ["challenge-wait-email-submit.png"]
+    assert [event[0] for event in events] == [
+        "browser.challenge.waiting",
+        "browser.challenge.timeout",
+    ]
+
+
+def test_page_state_wait_keeps_immediate_challenge_failure_by_default(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    clock = {"now": 0.0}
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    screenshots: list[str] = []
+
+    monkeypatch.setattr(
+        browser_registration.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "_challenge_reason",
+        lambda _page: "Cloudflare challenge",
+    )
+    monkeypatch.setattr(runner, "_screenshot", lambda _page, name: screenshots.append(name))
+
+    with pytest.raises(
+        BrowserEmailRegistrationError,
+        match=r"Cloudflare challenge during wait-email-otp",
+    ):
+        runner._wait_for_page_state(
+            page,
+            lambda: False,
+            stage="wait-email-otp",
+            timeout_s=1.0,
+        )
+
+    assert screenshots == ["challenge-wait-email-otp.png"]
+
+
+def test_page_state_wait_does_not_tolerate_interactive_challenge(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    screenshots: list[str] = []
+
+    monkeypatch.setattr(
+        browser_registration,
+        "_challenge_reason",
+        lambda _page: "Turnstile challenge",
+    )
+    monkeypatch.setattr(runner, "_screenshot", lambda _page, name: screenshots.append(name))
+
+    with pytest.raises(
+        BrowserEmailRegistrationError,
+        match=r"Turnstile challenge during wait-email-submit",
+    ):
+        runner._wait_for_page_state(
+            page,
+            lambda: False,
+            stage="wait-email-submit",
+            timeout_s=1.0,
+            transient_challenge_timeout_s=60.0,
+        )
+
+    assert screenshots == ["challenge-wait-email-submit.png"]
+
+
+def test_page_state_wait_returns_immediately_on_normal_ready_page(monkeypatch) -> None:
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(capture_artifacts=False)
+    )
+    page = _FakePage()
+    challenge_checks: list[bool] = []
+    monkeypatch.setattr(
+        browser_registration,
+        "_challenge_reason",
+        lambda _page: challenge_checks.append(True) or "",
+    )
+
+    assert runner._wait_for_page_state(
+        page,
+        lambda: True,
+        stage="wait-email-submit",
+        timeout_s=1.0,
+        transient_challenge_timeout_s=2.0,
+    )
+    assert challenge_checks == []
 
 
 def test_email_submit_does_not_treat_a_closed_email_modal_as_advance(monkeypatch) -> None:
@@ -1243,6 +1514,51 @@ def test_complete_email_otp_surfaces_account_deactivated_page(
         )
 
 
+def test_complete_email_otp_surfaces_account_deactivated_before_otp_form(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    page = _FakePage()
+    page.url = "https://auth.openai.com/log-in/password"
+    wait_stages: list[str] = []
+
+    class Mailbox:
+        @staticmethod
+        def wait_for_otp(*_args, **_kwargs) -> str:
+            raise AssertionError("mailbox must not be polled for a deactivated account")
+
+    def visible(_page, selectors):
+        if selectors is browser_registration.ACCOUNT_DEACTIVATED_SELECTORS:
+            return object()
+        return None
+
+    def wait_for_page_state(_page, predicate, *, stage, timeout_s):
+        del timeout_s
+        wait_stages.append(stage)
+        assert predicate() is True
+        return True
+
+    monkeypatch.setattr(browser_registration, "_otp_inputs", lambda _page: [])
+    monkeypatch.setattr(browser_registration, "_visible", visible)
+    monkeypatch.setattr(runner, "_wait_for_page_state", wait_for_page_state)
+
+    with pytest.raises(
+        browser_registration.BrowserAccountDeactivatedError,
+        match="account_deactivated",
+    ):
+        runner._complete_email_otp(
+            page,
+            Mailbox(),
+            email="user@example.com",
+            issued_after=0,
+        )
+
+    assert wait_stages == ["wait-email-otp"]
+
+
 def test_email_otp_browser_validation_navigates_existing_account_continue_url() -> None:
     page = _FakeOtpValidationPage(
         {
@@ -1680,7 +1996,7 @@ class _FakeInput:
     def focus(self) -> None:
         return None
 
-    def fill(self, value: str) -> None:
+    def fill(self, value: str, **_kwargs) -> None:
         if self.fill_error is not None:
             raise self.fill_error
         self.filled = value

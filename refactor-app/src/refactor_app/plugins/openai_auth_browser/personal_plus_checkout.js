@@ -452,8 +452,8 @@
     host.id = HostId;
     host.style.cssText = [
       "position:fixed",
-      "right:18px",
-      "bottom:18px",
+      "left:18px",
+      "top:18px",
       "z-index:2147483647",
       "width:min(520px,calc(100vw - 36px))",
       "max-height:calc(100vh - 36px)",

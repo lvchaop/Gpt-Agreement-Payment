@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 import refactor_app.application.workflows.personal_payment_method as payment_workflow
 from refactor_app.api.routes.resources import PersonalPaymentMethodBindJobRequest
@@ -16,9 +17,15 @@ from refactor_app.application.workflows.registration_proxy import (
     CliproxyProxy,
 )
 from refactor_app.plugins.openai_auth_browser import (
+    BrowserAccountDeactivatedError,
     BrowserPaymentMethodConfirmError,
     BrowserPaymentMethodResult,
     BrowserPersonalPaymentMethodError,
+)
+from refactor_app.plugins.openai_auth_protocol.card_payment import (
+    CardPaymentConfirmError,
+    CardPaymentResult,
+    CardPaymentUnknownResultError,
 )
 
 
@@ -61,50 +68,100 @@ def test_payment_method_bind_job_defaults_to_continue_into_plus_checkout() -> No
     assert PersonalPaymentMethodBindJobRequest().auto_start_plus_checkout is True
 
 
-def test_payment_method_workflow_reuses_one_browser_for_three_card_window(
+def test_payment_card_selection_randomizes_within_preferred_bin8_pool() -> None:
+    preferred_card = object()
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def scalar(self, statement):
+            self.statements.append(statement)
+            return preferred_card
+
+    session = Session()
+
+    selected = payment_workflow._select_available_payment_card(session)
+
+    assert selected is preferred_card
+    assert len(session.statements) == 1
+    sql = _postgresql_sql(session.statements[0])
+    assert "substr(payment_card_pool.card_number, 1, 8)" in sql
+    for prefix in payment_workflow.PREFERRED_PAYMENT_CARD_BIN8_PREFIXES:
+        assert f"'{prefix}'" in sql
+    assert "ORDER BY random()" in sql
+
+
+def test_payment_card_selection_falls_back_to_full_pool() -> None:
+    fallback_card = object()
+
+    class Session:
+        def __init__(self):
+            self.responses = [None, fallback_card]
+            self.statements = []
+
+        def scalar(self, statement):
+            self.statements.append(statement)
+            return self.responses.pop(0)
+
+    session = Session()
+
+    selected = payment_workflow._select_available_payment_card(session)
+
+    assert selected is fallback_card
+    assert len(session.statements) == 2
+    preferred_sql = _postgresql_sql(session.statements[0])
+    fallback_sql = _postgresql_sql(session.statements[1])
+    assert "substr(payment_card_pool.card_number, 1, 8)" in preferred_sql
+    assert "substr(payment_card_pool.card_number, 1, 8)" not in fallback_sql
+    assert "ORDER BY random()" in fallback_sql
+
+
+def test_payment_card_selection_honors_explicit_card_id() -> None:
+    explicit_card = object()
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def scalar(self, statement):
+            self.statements.append(statement)
+            return explicit_card
+
+    session = Session()
+
+    selected = payment_workflow._select_available_payment_card(
+        session,
+        payment_card_id=" card-1 ",
+    )
+
+    assert selected is explicit_card
+    assert len(session.statements) == 1
+    sql = _postgresql_sql(session.statements[0])
+    assert "payment_card_pool.id = 'card-1'" in sql
+    assert "substr(payment_card_pool.card_number, 1, 8)" not in sql
+    assert "ORDER BY random()" not in sql
+
+
+def test_payment_method_workflow_uses_protocol_for_three_card_window(
     monkeypatch,
 ) -> None:
     attempts = [_attempt(1), _attempt(2), _attempt(3)]
     first_attempt = attempts[0]
-    browser_instances: list[object] = []
     billing_templates: list[_ReservedPaymentAttempt | None] = []
     failed: list[str] = []
-    browser_auth: dict = {}
+    protocol_calls: list[tuple[object, str]] = []
 
-    class Browser:
-        def __init__(self, _config, *, event_callback=None):
-            browser_instances.append(self)
-
-        def bind_personal_payment_cards(
-            self,
-            _mail,
-            *,
-            card_provider,
-            max_attempts,
-            on_success,
-            on_failure,
-            **kwargs,
-        ):
-            browser_auth.update(kwargs)
-            assert max_attempts == 3
-            for index in range(1, 4):
-                card, _billing = card_provider(index)
-                if index < 3:
-                    on_failure(
-                        object(),
-                        index,
-                        BrowserPaymentMethodConfirmError("card_declined"),
-                    )
-                    continue
-                result = BrowserPaymentMethodResult(
-                    personal_account_id="personal-1",
-                    payment_method_id="pm_test_3",
-                    last4=card.number[-4:],
-                    brand="visa",
-                )
-                on_success(object(), index, result)
-                return [result]
-            return []
+    def run_protocol(config, *, proxy_url, **_kwargs):
+        protocol_calls.append((config, proxy_url))
+        if len(protocol_calls) < 3:
+            raise CardPaymentConfirmError("card_declined", "issuer declined")
+        return CardPaymentResult(
+            personal_account_id="personal-1",
+            payment_method_id="pm_test_3",
+            last4="4242",
+            brand="visa",
+        )
 
     class Workflow(PersonalPaymentMethodBindWorkflow):
         def _load_context(self, _space_id):
@@ -128,7 +185,7 @@ def test_payment_method_workflow_reuses_one_browser_for_three_card_window(
         def _event(self, **_kwargs):
             return None
 
-    monkeypatch.setattr(payment_workflow, "CamoufoxEmailRegistration", Browser)
+    monkeypatch.setattr(payment_workflow, "run_card_payment", run_protocol)
     monkeypatch.setattr(
         payment_workflow,
         "resolve_cliproxy_proxy",
@@ -137,32 +194,30 @@ def test_payment_method_workflow_reuses_one_browser_for_three_card_window(
             country_code="US",
         ),
     )
+    monkeypatch.setattr(
+        payment_workflow,
+        "detect_proxy_egress_country",
+        lambda _proxy_url: "US",
+    )
     workflow = Workflow(session_factory=lambda: None, mail_provider=object())
 
     result = workflow.run(space_id="space-1")
 
     assert result["payment_method_id"] == "pm_test_3"
-    assert len(browser_instances) == 1
+    assert len(protocol_calls) == 3
     assert failed == ["card-1", "card-2"]
     assert billing_templates == [None, first_attempt, first_attempt]
-    assert browser_auth["login_password"] == "test-password"
-    assert "cookie_header" not in browser_auth
-    assert "auth_cookie_header" not in browser_auth
+    assert [call[1] for call in protocol_calls] == ["http://proxy.example:8080"] * 3
+    assert protocol_calls[0][0].access_token == "access-token"
+    assert protocol_calls[0][0].cookie_header == "session=cookie"
+    assert protocol_calls[0][0].auth_cookie_header == "auth=cookie"
 
 
-def test_payment_method_workflow_releases_reserved_card_when_browser_aborts(
+def test_payment_method_workflow_releases_reserved_card_when_protocol_aborts(
     monkeypatch,
 ) -> None:
     attempt = _attempt(1)
     released: list[str] = []
-
-    class Browser:
-        def __init__(self, _config, *, event_callback=None):
-            pass
-
-        def bind_personal_payment_cards(self, _mail, *, card_provider, **_kwargs):
-            card_provider(1)
-            raise RuntimeError("browser aborted before result callback")
 
     class Workflow(PersonalPaymentMethodBindWorkflow):
         def _load_context(self, _space_id):
@@ -177,7 +232,13 @@ def test_payment_method_workflow_releases_reserved_card_when_browser_aborts(
         def _event(self, **_kwargs):
             return None
 
-    monkeypatch.setattr(payment_workflow, "CamoufoxEmailRegistration", Browser)
+    monkeypatch.setattr(
+        payment_workflow,
+        "run_card_payment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("protocol aborted before confirm")
+        ),
+    )
     monkeypatch.setattr(
         payment_workflow,
         "resolve_cliproxy_proxy",
@@ -186,11 +247,16 @@ def test_payment_method_workflow_releases_reserved_card_when_browser_aborts(
             country_code="US",
         ),
     )
+    monkeypatch.setattr(
+        payment_workflow,
+        "detect_proxy_egress_country",
+        lambda _proxy_url: "US",
+    )
 
     workflow = Workflow(session_factory=lambda: None, mail_provider=object())
     with pytest.raises(
         PersonalPaymentMethodBindError,
-        match="browser aborted before result callback",
+        match="protocol aborted before confirm",
     ):
         workflow.run(space_id="space-1")
 
@@ -209,6 +275,44 @@ def test_payment_method_workflow_stops_before_reserving_card_without_promotion()
 
     with pytest.raises(PersonalPaymentMethodBindError, match="payment_method_promotion_required"):
         workflow.run(space_id="space-1")
+
+
+def test_payment_method_reservation_rejects_existing_binding_under_lock() -> None:
+    class Space:
+        id = "space-1"
+        has_promotion = True
+        promotion_id = "plus-1-month-free"
+        has_payment_method = False
+        payment_method_status = "binding"
+        payment_method_attempt_count = 1
+        payment_method_cooldown_until = None
+
+    class Session:
+        def __init__(self):
+            self.space = Space()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, row_id, *, with_for_update=False):
+            assert model is payment_workflow.SpaceModel
+            assert row_id == "space-1"
+            assert with_for_update is True
+            return self.space
+
+        def scalar(self, _statement):
+            raise AssertionError("inventory must not be touched while binding is active")
+
+    workflow = PersonalPaymentMethodBindWorkflow(session_factory=Session)
+
+    with pytest.raises(
+        PersonalPaymentMethodBindError,
+        match="payment_method_binding_in_progress",
+    ):
+        workflow._reserve_attempt("space-1")
 
 
 def test_payment_method_workflow_returns_after_later_card_succeeds() -> None:
@@ -258,6 +362,38 @@ def test_payment_method_workflow_returns_after_later_card_succeeds() -> None:
     assert attempts == []
 
 
+def test_payment_method_workflow_does_not_fallback_after_explicit_card_decline() -> None:
+    attempts = [_attempt(1), _attempt(2)]
+    reserve_card_ids: list[str] = []
+    failures: list[str] = []
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id, *, payment_card_id=""):
+            reserve_card_ids.append(payment_card_id)
+            return attempts.pop(0)
+
+        def _bind_attempt(self, **_kwargs):
+            raise BrowserPaymentMethodConfirmError("card_declined")
+
+        def _record_failure(self, *, attempt, **_kwargs):
+            failures.append(attempt.card_id)
+
+        def _event(self, **_kwargs):
+            return None
+
+    workflow = Workflow(session_factory=lambda: None, mail_provider=object())
+
+    with pytest.raises(PersonalPaymentMethodBindError, match="card_declined"):
+        workflow.run(space_id="space-1", payment_card_id="card-explicit")
+
+    assert reserve_card_ids == ["card-explicit"]
+    assert failures == ["card-1"]
+    assert [attempt.card_id for attempt in attempts] == ["card-2"]
+
+
 def test_payment_method_workflow_writes_structured_stripe_diagnostics() -> None:
     events: list[dict] = []
 
@@ -300,7 +436,7 @@ def test_payment_method_workflow_writes_structured_stripe_diagnostics() -> None:
     }
 
 
-def test_bind_attempt_uses_cliproxy_and_plaintext_card(monkeypatch) -> None:
+def test_bind_attempt_uses_cliproxy_and_protocol_credentials(monkeypatch) -> None:
     captured: dict = {}
 
     def resolve_proxy(*, email, country_code):
@@ -311,44 +447,32 @@ def test_bind_attempt_uses_cliproxy_and_plaintext_card(monkeypatch) -> None:
             country_code=country_code,
         )
 
-    class Browser:
-        def __init__(self, config, *, event_callback=None):
-            captured["browser_proxy"] = config.proxy_url
-            captured["browser_headless"] = config.headless
-            captured["event_callback"] = event_callback
-
-        def bind_personal_payment_method(
-            self,
-            mail,
-            *,
-            expected_personal_account_id,
-            card,
-            billing,
-            **kwargs,
-        ):
-            captured["mail"] = mail
-            captured["expected_personal_account_id"] = expected_personal_account_id
-            captured["card"] = card
-            captured["billing"] = billing
-            captured["browser_auth"] = kwargs
-            return BrowserPaymentMethodResult(
-                personal_account_id=expected_personal_account_id,
-                payment_method_id="pm_test_1",
-                last4="4242",
-                brand="visa",
-            )
+    def run_protocol(config, *, proxy_url, event_callback, **_kwargs):
+        captured["config"] = config
+        captured["proxy_url"] = proxy_url
+        captured["event_callback"] = event_callback
+        return CardPaymentResult(
+            personal_account_id=config.account_id,
+            payment_method_id="pm_test_1",
+            last4="4242",
+            brand="visa",
+        )
 
     monkeypatch.setattr(
         payment_workflow,
         "resolve_cliproxy_proxy",
         resolve_proxy,
     )
-    monkeypatch.setattr(payment_workflow, "CamoufoxEmailRegistration", Browser)
+    monkeypatch.setattr(
+        payment_workflow,
+        "detect_proxy_egress_country",
+        lambda proxy_url: captured.__setitem__("egress_proxy_url", proxy_url) or "US",
+    )
+    monkeypatch.setattr(payment_workflow, "run_card_payment", run_protocol)
     workflow = PersonalPaymentMethodBindWorkflow(
         session_factory=lambda: None,
         mail_provider=object(),
         registration_proxy_country="JP",
-        browser_headless=False,
     )
     attempt = _attempt(1)
 
@@ -361,15 +485,30 @@ def test_bind_attempt_uses_cliproxy_and_plaintext_card(monkeypatch) -> None:
     assert result.payment_method_id == "pm_test_1"
     assert captured["proxy_email"] == "member@outlook.com"
     assert captured["proxy_country"] == "JP"
-    assert captured["browser_proxy"] == "http://backbone-proxy.example:8080"
-    assert captured["browser_headless"] is False
+    assert captured["proxy_url"] == "http://backbone-proxy.example:8080"
+    assert captured["egress_proxy_url"] == "http://backbone-proxy.example:8080"
     assert callable(captured["event_callback"])
-    assert captured["card"].number == "4242424242424242"
-    assert captured["card"].cvc == "123"
-    assert captured["billing"].email == "member@outlook.com"
-    assert captured["browser_auth"]["login_password"] == "test-password"
-    assert "cookie_header" not in captured["browser_auth"]
-    assert "auth_cookie_header" not in captured["browser_auth"]
+    assert captured["config"].access_token == "access-token"
+    assert captured["config"].session_token == "session-token"
+    assert captured["config"].device_id == "device-1"
+    assert captured["config"].card["number"] == "4242424242424242"
+    assert captured["config"].card["cvc"] == "123"
+    assert captured["config"].billing["email"] == "member@outlook.com"
+    assert captured["config"].captcha_api_url == ""
+    assert captured["config"].captcha_client_key == ""
+    assert captured["config"].locale == "en-US"
+    assert captured["config"].browser_timezone == "America/Los_Angeles"
+
+
+def test_payment_protocol_locale_tracks_proxy_egress_country() -> None:
+    assert payment_workflow._payment_locale_for_proxy_country("US") == "en-US"
+    assert payment_workflow._payment_locale_for_proxy_country("jp") == "ja-JP"
+    assert payment_workflow._payment_locale_for_proxy_country("unknown") == "en-US"
+    assert payment_workflow._payment_timezone_for_proxy_country("US") == (
+        "America/Los_Angeles"
+    )
+    assert payment_workflow._payment_timezone_for_proxy_country("jp") == "Asia/Tokyo"
+    assert payment_workflow._payment_timezone_for_proxy_country("unknown") == "UTC"
 
 
 def test_payment_mail_provider_mapping_matches_supported_mail_sources() -> None:
@@ -441,6 +580,349 @@ def test_payment_method_workflow_releases_non_consuming_failure_without_retry(
     assert [attempt.card_id for attempt in attempts] == ["card-2"]
 
 
+def test_payment_method_workflow_stops_after_unknown_confirm_result() -> None:
+    attempts = [_attempt(1), _attempt(2)]
+    released: list[str] = []
+    consumed: list[tuple[str, bool]] = []
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id):
+            return attempts.pop(0)
+
+        def _bind_attempt(self, **_kwargs):
+            raise CardPaymentUnknownResultError(
+                "payment_method_confirm_result_unknown",
+                "connection reset after submit",
+            )
+
+        def _release_pre_payment_failure(self, *, attempt, **_kwargs):
+            released.append(attempt.card_id)
+
+        def _record_failure(self, *, attempt, stop_replay=False, **_kwargs):
+            consumed.append((attempt.card_id, stop_replay))
+
+        def _event(self, **_kwargs):
+            return None
+
+    workflow = Workflow(session_factory=lambda: None, mail_provider=object())
+
+    with pytest.raises(PersonalPaymentMethodBindError, match="result_unknown"):
+        workflow.run(space_id="space-1")
+
+    assert released == []
+    assert consumed == [("card-1", True)]
+    assert [attempt.card_id for attempt in attempts] == ["card-2"]
+
+
+def test_unknown_confirm_failure_persists_manual_review_block() -> None:
+    class Space:
+        id = "space-1"
+        has_payment_method = False
+        payment_method_attempt_count = 1
+        payment_method_status = "binding"
+        payment_method_cooldown_until = None
+        payment_method_last_error_code = ""
+        payment_method_last_error_message = ""
+        updated_at = None
+
+    class Card:
+        id = "card-1"
+        card_status = "in_use"
+        reserved_by_space_id = "space-1"
+        reserved_at = object()
+        last_error_code = ""
+        last_error_message = ""
+        updated_at = None
+
+    class Session:
+        def __init__(self):
+            self.space = Space()
+            self.card = Card()
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, row_id, *, with_for_update=False):
+            assert with_for_update is True
+            if model is payment_workflow.SpaceModel:
+                assert row_id == "space-1"
+                return self.space
+            assert model is payment_workflow.PaymentCardPoolModel
+            assert row_id == "card-1"
+            return self.card
+
+        def commit(self):
+            self.committed = True
+
+    session = Session()
+    workflow = PersonalPaymentMethodBindWorkflow(
+        session_factory=lambda: session,
+        mail_provider=object(),
+    )
+
+    workflow._record_failure(
+        context=_context(),
+        attempt=_attempt(1),
+        error=PersonalPaymentMethodBindError(
+            "payment_method_confirm_result_unknown",
+            "remote result is unknown",
+        ),
+        stop_replay=True,
+    )
+
+    assert session.space.payment_method_attempt_count == (
+        payment_workflow.MAX_PAYMENT_METHOD_CARD_ATTEMPTS
+    )
+    assert session.space.payment_method_status == "failed"
+    assert session.space.payment_method_cooldown_until is None
+    assert payment_workflow._payment_method_cooldown_active(
+        session.space,
+        now=payment_workflow.datetime.now(payment_workflow.UTC),
+    )
+    assert session.card.card_status == "failed"
+    assert session.card.reserved_by_space_id is None
+    assert session.card.reserved_at is None
+    assert session.committed is True
+
+
+def test_remote_success_transient_persistence_failure_retries_local_write_only() -> None:
+    attempt = _attempt(1)
+    result = CardPaymentResult(
+        personal_account_id="personal-1",
+        payment_method_id="pm_remote_success",
+        last4="4242",
+        brand="visa",
+    )
+
+    class Space:
+        id = "space-1"
+        external_space_id = "personal-1"
+        has_payment_method = False
+        payment_method_attempt_count = 1
+        payment_method_status = "binding"
+        payment_method_cooldown_until = None
+        payment_method_last_error_code = ""
+        payment_method_last_error_message = ""
+        updated_at = None
+
+    class Card:
+        id = "card-1"
+        card_status = "in_use"
+        reserved_by_space_id = "space-1"
+        reserved_at = object()
+        last_error_code = ""
+        last_error_message = ""
+        updated_at = None
+
+    class Session:
+        def __init__(self):
+            self.space = Space()
+            self.card = Card()
+            self.commit_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, row_id, *, with_for_update=False):
+            assert with_for_update is True
+            if model is payment_workflow.SpaceModel:
+                assert row_id == "space-1"
+                return self.space
+            assert model is payment_workflow.PaymentCardPoolModel
+            assert row_id == "card-1"
+            return self.card
+
+        def commit(self):
+            self.commit_calls += 1
+            if self.commit_calls == 1:
+                raise RuntimeError("database write failed")
+
+    session = Session()
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id):
+            return attempt
+
+        def _bind_attempt(self, **_kwargs):
+            return result
+
+        def _release_pre_payment_failure(self, **_kwargs):
+            raise AssertionError("remote success must not release the card as available")
+
+        def _event(self, **_kwargs):
+            return None
+
+    workflow = Workflow(session_factory=lambda: session, mail_provider=object())
+
+    output = workflow.run(space_id="space-1")
+
+    assert output["payment_method_id"] == "pm_remote_success"
+    assert output["payment_method_status"] == "bound"
+    assert session.space.has_payment_method is True
+    assert session.space.payment_method_status == "bound"
+    assert session.space.payment_method_id == "pm_remote_success"
+    assert session.space.payment_method_last_error_code == ""
+    assert session.card.card_status == "used"
+    assert session.card.reserved_by_space_id is None
+    assert session.card.reserved_at is None
+    assert session.card.last_error_code == ""
+    assert session.commit_calls == 2
+
+
+def test_payment_method_workflow_preserves_account_deactivated_error_code() -> None:
+    attempt = _attempt(1)
+    released: list[PersonalPaymentMethodBindError] = []
+    deactivated: list[PersonalPaymentMethodBindError] = []
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id):
+            return attempt
+
+        def _bind_attempt(self, **_kwargs):
+            raise BrowserAccountDeactivatedError(
+                "OpenAI browser flow failed: code=account_deactivated"
+            )
+
+        def _release_pre_payment_failure(self, *, error, **_kwargs):
+            released.append(error)
+
+        def _mark_account_deactivated(self, *, error, **_kwargs):
+            deactivated.append(error)
+
+        def _event(self, **_kwargs):
+            return None
+
+    workflow = Workflow(session_factory=lambda: None, mail_provider=object())
+
+    with pytest.raises(PersonalPaymentMethodBindError) as raised:
+        workflow.run(space_id="space-1")
+
+    assert raised.value.error_code == "account_deactivated"
+    assert "account_deactivated" in raised.value.error_message
+    assert [error.error_code for error in released] == ["account_deactivated"]
+    assert [error.error_code for error in deactivated] == ["account_deactivated"]
+
+
+def test_payment_method_protocol_marks_wrapped_account_deactivated(monkeypatch) -> None:
+    attempt = _attempt(1)
+    deactivated: list[PersonalPaymentMethodBindError] = []
+    released: list[str] = []
+
+    class Workflow(PersonalPaymentMethodBindWorkflow):
+        def _load_context(self, _space_id):
+            return _context(), None
+
+        def _reserve_attempt(self, _space_id, **_kwargs):
+            return attempt
+
+        def _mark_account_deactivated(self, *, error, **_kwargs):
+            deactivated.append(error)
+
+        def _release_pre_payment_failure(self, *, attempt, **_kwargs):
+            released.append(attempt.card_id)
+
+        def _record_failure(self, **_kwargs):
+            raise AssertionError("deactivated account must not consume a card")
+
+        def _event(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        payment_workflow,
+        "resolve_cliproxy_proxy",
+        lambda *_args, **_kwargs: CliproxyProxy(
+            proxy_url="http://proxy.example:8080",
+            country_code="US",
+        ),
+    )
+    monkeypatch.setattr(
+        payment_workflow,
+        "detect_proxy_egress_country",
+        lambda _proxy_url: "US",
+    )
+    monkeypatch.setattr(
+        payment_workflow,
+        "run_card_payment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("CardPaymentError: account_deactivated")
+        ),
+    )
+    workflow = Workflow(session_factory=lambda: None, mail_provider=object())
+
+    with pytest.raises(PersonalPaymentMethodBindError) as raised:
+        workflow.run(space_id="space-1")
+
+    assert raised.value.error_code == "account_deactivated"
+    assert [error.error_code for error in deactivated] == ["account_deactivated"]
+    assert released == ["card-1"]
+
+
+def test_mark_account_deactivated_updates_account_state() -> None:
+    class Account:
+        account_status = "active"
+        session_status = "active"
+        last_login_error_code = ""
+        last_login_error_message = ""
+        updated_at = None
+
+    class Session:
+        def __init__(self):
+            self.account = Account()
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, account_id, *, with_for_update=False):
+            assert model is payment_workflow.UserAccountModel
+            assert account_id == "account-1"
+            assert with_for_update is True
+            return self.account
+
+        def commit(self):
+            self.committed = True
+
+    session = Session()
+    workflow = PersonalPaymentMethodBindWorkflow(
+        session_factory=lambda: session,
+        mail_provider=object(),
+    )
+
+    workflow._mark_account_deactivated(
+        context=_context(),
+        error=PersonalPaymentMethodBindError(
+            "account_deactivated",
+            "OpenAI browser flow failed: code=account_deactivated",
+        ),
+    )
+
+    assert session.account.account_status == "invalid"
+    assert session.account.session_status == "dead"
+    assert session.account.last_login_error_code == "account_deactivated"
+    assert "account_deactivated" in session.account.last_login_error_message
+    assert session.account.updated_at is not None
+    assert session.committed is True
+
+
 def _context() -> _BindingContext:
     return _BindingContext(
         space_id="space-1",
@@ -452,6 +934,19 @@ def _context() -> _BindingContext:
         auth_cookie_header="auth=cookie",
         mfa_status="not_configured",
         twofauth_account_id="",
+        access_token="access-token",
+        session_token="session-token",
+        device_id="device-1",
+        promotion_id="plus-1-month-free",
+    )
+
+
+def _postgresql_sql(statement) -> str:
+    return str(
+        statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
     )
 
 

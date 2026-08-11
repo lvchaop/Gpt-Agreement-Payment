@@ -223,6 +223,21 @@ def test_browser_log_body_capture_is_explicit() -> None:
     assert BrowserEmailRegistrationConfig().browser_log_capture_bodies is False
 
 
+def test_browser_log_settings_default_to_disabled(monkeypatch) -> None:
+    for name in (
+        "BROWSER_LOG_ENABLED",
+        "REFACTOR_APP_BROWSER_LOG_ENABLED",
+        "BROWSER_LOG_CAPTURE_BODIES",
+        "REFACTOR_APP_BROWSER_LOG_CAPTURE_BODIES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.browser_log_enabled is False
+    assert settings.browser_log_capture_bodies is False
+
+
 def test_browser_log_settings_can_be_enabled_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("REFACTOR_APP_BROWSER_LOG_ENABLED", "true")
     monkeypatch.setenv("REFACTOR_APP_BROWSER_LOG_CAPTURE_BODIES", "1")

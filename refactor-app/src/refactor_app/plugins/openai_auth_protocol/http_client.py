@@ -58,7 +58,10 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str | None = N
             total=3,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST"],
+            # Payment and checkout POSTs are one-shot mutations.  Retrying
+            # them below the protocol state machine can duplicate a charge or
+            # hide an ambiguous result from its read-after-write recovery.
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)

@@ -13,6 +13,7 @@ from typing import Callable, Protocol
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from refactor_app.config.browser_fingerprint import BROWSER_IMPERSONATE
+from refactor_app.plugins.browser_runtime import managed_camoufox_context
 from refactor_app.plugins.mail_external_api.plugin import prepare_domain_mailbox
 
 
@@ -203,7 +204,9 @@ def acquire_codex_rt_with_existing_browser_session(
         return True
 
     try:
-        with Camoufox(
+        with managed_camoufox_context(
+            Camoufox,
+            flow="codex-existing-session",
             headless=(
                 bool(headless)
                 if headless is not None
@@ -450,7 +453,9 @@ def acquire_codex_rt_with_browser_login(
 
     try:
         prepare_domain_mailbox(mail_provider, email=email)
-        with Camoufox(
+        with managed_camoufox_context(
+            Camoufox,
+            flow="codex-browser-login",
             headless=(
                 bool(headless)
                 if headless is not None

@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import random
 import shutil
-import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from uuid import uuid4
 
+from refactor_app.plugins.browser_runtime import (
+    managed_camoufox_context as _managed_camoufox,
+)
 from refactor_app.plugins.mail_external_api.plugin import prepare_domain_mailbox
 from refactor_app.plugins.openai_auth_browser.browser_logging import (
     BrowserLogRecorder,
@@ -182,6 +183,7 @@ class CamoufoxEmailRegistration:
         try:
             with _managed_camoufox(
                 Camoufox,
+                flow="authenticated-page",
                 headless=self.config.headless,
                 humanize=True,
                 persistent_context=True,
@@ -404,6 +406,7 @@ class CamoufoxEmailRegistration:
         try:
             with _managed_camoufox(
                 Camoufox,
+                flow=f"browser-{entry_mode}",
                 headless=self.config.headless,
                 humanize=True,
                 persistent_context=True,
@@ -808,7 +811,7 @@ class CamoufoxEmailRegistration:
                 _click_registration_input(field, timeout_ms=5_000)
                 time.sleep(0.3)
                 current = _visible_email_input(page) or field
-                current.fill(email)
+                current.fill(email, timeout=5_000)
                 if _input_value(current) != email:
                     # React can replace the input during fill. Re-query the new
                     # element, then use the browser event path once.
@@ -855,32 +858,52 @@ class CamoufoxEmailRegistration:
             stage="wait-email-submit",
         )
         if not advanced:
-            # Match the reference registration flow: re-query the live React
-            # form, refill the controlled input, and click the submit control
-            # again before falling back to Enter.
-            current = _visible_email_input(page) or submitted_field
-            if current is None:
-                raise BrowserEmailRegistrationError("email continue button not found")
+            advanced, current = self._wait_for_email_retry_target(
+                page,
+                initial_url=initial_url,
+                stage="wait-email-retry-ready",
+            )
+        if not advanced:
+            # Retry only after the live email form becomes editable again. A
+            # disabled email field means the first submit is still navigating.
             try:
-                current.fill(email)
+                if _input_value(current) != email:
+                    current.fill(email, timeout=5_000)
                 clicked = _click_first_native(
                     page,
                     EMAIL_CONTINUE_SELECTORS,
                     timeout_ms=5_000,
                 )
             except Exception as exc:
-                raise BrowserEmailRegistrationError(f"email form retry failed: {exc}") from exc
-            advanced = self._wait_for_email_submit_transition(
+                # The auth SPA can replace the read/write email input with the
+                # read-only password-page copy during fill. Accept that real
+                # transition instead of reporting a stale ElementHandle error.
+                advanced = self._wait_for_email_submit_transition(
+                    page,
+                    initial_url=initial_url,
+                    stage="wait-email-retry-race",
+                    timeout_s=8.0,
+                )
+                if not advanced:
+                    raise BrowserEmailRegistrationError(
+                        f"email form retry failed: {exc}"
+                    ) from exc
+            if not advanced:
+                advanced = self._wait_for_email_submit_transition(
+                    page,
+                    initial_url=initial_url,
+                    stage="wait-email-retry-submit",
+                )
+        if not advanced:
+            advanced, current = self._wait_for_email_retry_target(
                 page,
                 initial_url=initial_url,
-                stage="wait-email-retry-submit",
+                stage="wait-email-enter-ready",
             )
         if not advanced:
             submit_method = "enter"
-            current = _visible_email_input(page) or submitted_field
-            if current is None:
-                raise BrowserEmailRegistrationError("email continue button not found")
             try:
+                _click_registration_input(current, timeout_ms=5_000)
                 page.keyboard.press("Enter")
             except Exception as exc:
                 raise BrowserEmailRegistrationError(f"email form submit failed: {exc}") from exc
@@ -909,13 +932,11 @@ class CamoufoxEmailRegistration:
         *,
         initial_url: str,
         stage: str,
+        timeout_s: float | None = None,
     ) -> bool:
         """Wait for the post-email page to load before touching its controls."""
-        configured_timeout = float(
-            self.config.email_submit_timeout_s
-            or min(16.0, float(self.config.navigation_timeout_ms or 60_000) / 1_000)
-        )
-        timeout_s = max(
+        configured_timeout = float(timeout_s or self.config.email_submit_timeout_s or 16.0)
+        effective_timeout_s = max(
             8.0,
             min(
                 30.0,
@@ -925,9 +946,16 @@ class CamoufoxEmailRegistration:
         )
         self._emit(
             "browser.email.submit.waiting",
-            {"stage": stage, "timeout_s": int(timeout_s), "initial_url": initial_url},
+            {
+                "stage": stage,
+                "timeout_s": int(effective_timeout_s),
+                "initial_url": initial_url,
+            },
         )
-        _wait_for_document_load(page, timeout_ms=min(15_000, int(timeout_s * 1_000)))
+        _wait_for_document_load(
+            page,
+            timeout_ms=min(15_000, int(effective_timeout_s * 1_000)),
+        )
         # The Google One Tap overlay can be injected again during the slow
         # post-submit navigation. Remove it only after the document had a chance
         # to load, then let the stage poll decide whether the real form exists.
@@ -937,7 +965,10 @@ class CamoufoxEmailRegistration:
             page,
             lambda: _email_submit_advanced(page, initial_url=initial_url),
             stage=stage,
-            timeout_s=timeout_s,
+            timeout_s=effective_timeout_s,
+            transient_challenge_timeout_s=(
+                float(self.config.navigation_timeout_ms or 60_000) / 1_000
+            ),
         )
         if advanced:
             self._emit(
@@ -949,6 +980,59 @@ class CamoufoxEmailRegistration:
                 },
             )
         return advanced
+
+    def _wait_for_email_retry_target(
+        self,
+        page,
+        *,
+        initial_url: str,
+        stage: str,
+    ) -> tuple[bool, Any | None]:
+        """Wait until navigation wins or the original email form is actionable again."""
+        navigation_timeout_s = max(
+            8.0,
+            min(60.0, float(self.config.navigation_timeout_ms or 60_000) / 1_000),
+        )
+
+        def resolved() -> bool:
+            if _email_submit_advanced(page, initial_url=initial_url):
+                return True
+            return _email_input_is_editable(_visible_email_input(page))
+
+        self._emit(
+            "browser.email.submit.settling",
+            {
+                "stage": stage,
+                "timeout_s": int(navigation_timeout_s),
+                "initial_url": initial_url,
+            },
+        )
+        settled = self._wait_for_page_state(
+            page,
+            resolved,
+            stage=stage,
+            timeout_s=navigation_timeout_s,
+            transient_challenge_timeout_s=navigation_timeout_s,
+        )
+        if _email_submit_advanced(page, initial_url=initial_url):
+            self._emit(
+                "browser.email.submit.settled",
+                {"stage": stage, "state": "advanced", "url": page.url},
+            )
+            return True, None
+
+        current = _visible_email_input(page)
+        if settled and _email_input_is_editable(current):
+            self._emit(
+                "browser.email.submit.settled",
+                {"stage": stage, "state": "retryable", "url": page.url},
+            )
+            return False, current
+
+        self._screenshot(page, f"email-submit-pending-{stage}.png")
+        raise BrowserEmailRegistrationError(
+            f"email submit remained pending url={page.url} stage={stage}"
+        )
 
     def _submit_password_if_requested(
         self,
@@ -1171,10 +1255,13 @@ class CamoufoxEmailRegistration:
                     or _is_mfa_challenge_url(str(page.url or ""))
                     or _about_you_visible(page)
                     or _has_authenticated_session(page)
+                    or _visible(page, ACCOUNT_MISSING_SELECTORS) is not None
+                    or _visible(page, ACCOUNT_DEACTIVATED_SELECTORS) is not None
                 ),
                 stage="wait-email-otp",
                 timeout_s=45,
             )
+            self._raise_for_terminal_account_error(page, "email-otp")
             if _is_mfa_challenge_url(str(page.url or "")):
                 self._complete_totp_challenge(
                     page,
@@ -1593,10 +1680,12 @@ class CamoufoxEmailRegistration:
         *,
         stage: str,
         timeout_s: float,
+        transient_challenge_timeout_s: float = 0.0,
     ) -> bool:
         deadline = time.monotonic() + max(0.1, timeout_s)
         screenshot_at = time.monotonic() + min(15, max(1, timeout_s / 2))
         screenshot_taken = False
+        challenge_budget_s = max(0.0, transient_challenge_timeout_s)
         while time.monotonic() < deadline:
             try:
                 if predicate():
@@ -1614,12 +1703,80 @@ class CamoufoxEmailRegistration:
                     },
                     "WARN",
                 )
-            self._raise_for_challenge(page, stage)
+            challenge_reason = _challenge_reason(page)
+            if challenge_reason == "Cloudflare challenge" and challenge_budget_s > 0:
+                challenge_started_at = time.monotonic()
+                challenge_elapsed_s = self._wait_for_transient_challenge(
+                    page,
+                    stage=stage,
+                    reason=challenge_reason,
+                    timeout_s=challenge_budget_s,
+                )
+                challenge_budget_s = max(0.0, challenge_budget_s - challenge_elapsed_s)
+                # A security-verification page is part of the navigation, not a
+                # failed form transition. Preserve the original state-wait budget.
+                deadline += max(0.0, time.monotonic() - challenge_started_at)
+                continue
+            if challenge_reason:
+                self._raise_for_challenge(page, stage)
             if not screenshot_taken and time.monotonic() >= screenshot_at:
                 self._screenshot(page, f"waiting-{stage}.png")
                 screenshot_taken = True
             time.sleep(0.5)
         return False
+
+    def _wait_for_transient_challenge(
+        self,
+        page,
+        *,
+        stage: str,
+        reason: str,
+        timeout_s: float,
+    ) -> float:
+        started_at = time.monotonic()
+        deadline = started_at + max(0.1, timeout_s)
+        self._emit(
+            "browser.challenge.waiting",
+            {
+                "stage": stage,
+                "reason": reason,
+                "timeout_s": round(max(0.1, timeout_s), 1),
+                "url": page.url,
+            },
+            "WARN",
+        )
+        while time.monotonic() < deadline:
+            current_reason = _challenge_reason(page)
+            if not current_reason:
+                elapsed_s = max(0.0, time.monotonic() - started_at)
+                self._emit(
+                    "browser.challenge.cleared",
+                    {
+                        "stage": stage,
+                        "reason": reason,
+                        "elapsed_ms": int(elapsed_s * 1_000),
+                        "url": page.url,
+                    },
+                )
+                return elapsed_s
+            reason = current_reason
+            time.sleep(0.5)
+
+        elapsed_s = max(0.0, time.monotonic() - started_at)
+        self._screenshot(page, f"challenge-{stage}.png")
+        self._emit(
+            "browser.challenge.timeout",
+            {
+                "stage": stage,
+                "reason": reason,
+                "elapsed_ms": int(elapsed_s * 1_000),
+                "url": page.url,
+            },
+            "WARN",
+        )
+        raise BrowserEmailRegistrationError(
+            f"{reason} timed out after {elapsed_s:.1f}s during {stage}"
+        )
 
     def _raise_for_challenge(self, page, stage: str) -> None:
         reason = _challenge_reason(page)
@@ -1853,6 +2010,27 @@ def _visible(page, selectors: tuple[str, ...]):
 
 def _visible_email_input(page):
     return _visible(page, EMAIL_INPUT_SELECTORS)
+
+
+def _email_input_is_editable(element: Any) -> bool:
+    if element is None:
+        return False
+    checker = getattr(element, "is_editable", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    getter = getattr(element, "get_attribute", None)
+    if callable(getter):
+        try:
+            if getter("disabled") is not None or getter("readonly") is not None:
+                return False
+            if str(getter("aria-disabled") or "").strip().lower() == "true":
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _click_registration_input(element, *, timeout_ms: int) -> None:
@@ -2369,49 +2547,6 @@ def _metadata_int(value: object) -> int:
         return int(str(value or "0"))
     except ValueError:
         return 0
-
-
-@contextmanager
-def _managed_camoufox(
-    manager_factory: Callable[..., Any],
-    **launch_options: Any,
-) -> Iterator[Any]:
-    manager = manager_factory(**launch_options)
-    active_error: tuple[Any, Any, Any] | None = None
-    try:
-        context = manager.__enter__()
-    except BaseException:
-        error = sys.exc_info()
-        try:
-            manager.__exit__(*error)
-        except Exception:
-            pass
-        raise
-    try:
-        yield context
-    except BaseException:
-        active_error = sys.exc_info()
-        raise
-    finally:
-        if not _camoufox_driver_disconnected(manager):
-            try:
-                manager.__exit__(None, None, None)
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException:
-                # Cleanup must not replace the original browser/workflow
-                # exception. If cleanup is the first failure, preserve it.
-                if active_error is None:
-                    raise
-
-
-def _camoufox_driver_disconnected(manager: Any) -> bool:
-    try:
-        browser = manager.browser
-        connection = browser._impl_obj._connection
-        return bool(connection._transport.on_error_future.done())
-    except (AttributeError, TypeError):
-        return False
 
 
 def _input_text(item: dict[str, Any]) -> str:

@@ -14,6 +14,7 @@ from refactor_app.application.workflows.registration_proxy import (
     cliproxy_stable_sid,
     cliproxy_username_for_email,
     detect_machine_egress_country,
+    detect_proxy_egress_country,
     probe_cliproxy_proxy,
     resolve_cliproxy_proxy,
     select_cliproxy_gateway_host,
@@ -128,6 +129,148 @@ def test_registration_proxy_returns_stable_sid_when_probe_succeeds() -> None:
     assert proxy.probe_attempts == 1
 
 
+def test_registration_proxy_default_probe_rotates_country_mismatch(monkeypatch) -> None:
+    seen_urls: list[str] = []
+    observed_countries = iter(("ID", "US"))
+
+    monkeypatch.setattr(
+        registration_proxy,
+        "probe_cliproxy_proxy",
+        lambda proxy_url, **_kwargs: seen_urls.append(proxy_url) or True,
+    )
+    monkeypatch.setattr(
+        registration_proxy,
+        "detect_proxy_egress_country",
+        lambda _proxy_url, **_kwargs: next(observed_countries),
+    )
+
+    proxy = resolve_cliproxy_proxy(
+        email="target@example.com",
+        country_code="US",
+        config=_config(max_sid_attempts=3),
+    )
+
+    assert len(seen_urls) == 2
+    assert cliproxy_stable_sid("target@example.com", "US") in seen_urls[0]
+    assert proxy.country_code == "US"
+    assert proxy.sid_source == "random_uuid"
+    assert proxy.probe_attempts == 2
+
+
+def test_registration_proxy_applies_country_specific_state() -> None:
+    seen_urls: list[str] = []
+
+    proxy = resolve_cliproxy_proxy(
+        email="target@example.com",
+        country_code="JP",
+        config=_config(state="California", jp_state="Tokyo"),
+        probe=lambda proxy_url: seen_urls.append(proxy_url) or True,
+    )
+
+    username = unquote(urlparse(seen_urls[0]).username or "")
+    assert "-region-JP-" in username
+    assert "-st-California-" not in username
+    assert "-st-Tokyo-" in username
+    assert proxy.country_code == "JP"
+
+
+def test_registration_proxy_uses_local_trojan_pool_without_remote_credentials(
+    monkeypatch,
+) -> None:
+    seen: dict[str, object] = {"probes": []}
+
+    class Node:
+        def __init__(self, port: int) -> None:
+            self.local_http_url = f"http://127.0.0.1:{port}"
+            self.country_code = "US"
+
+    class Manager:
+        @staticmethod
+        def ensure_started() -> None:
+            seen["started"] = True
+
+        @staticmethod
+        def candidate_nodes(*, email: str, country_code: str):
+            seen["selection"] = (email, country_code)
+            return [Node(18081), Node(18082)]
+
+    monkeypatch.setattr(
+        registration_proxy,
+        "get_trojan_proxy_pool_manager",
+        lambda *_args: Manager(),
+    )
+
+    def probe(proxy_url: str) -> bool:
+        seen["probes"].append(proxy_url)
+        return proxy_url.endswith(":18082")
+
+    proxy = resolve_cliproxy_proxy(
+        email=" Target@example.com ",
+        country_code="us",
+        config=CliproxyProxyConfig(
+            host="",
+            port=0,
+            mode="trojan_pool",
+            trojan_pool_file="runtime/proxy/trojan-pool.yaml",
+            max_sid_attempts=4,
+        ),
+        probe=probe,
+    )
+
+    assert seen == {
+        "started": True,
+        "selection": ("target@example.com", "US"),
+        "probes": ["http://127.0.0.1:18081", "http://127.0.0.1:18082"],
+    }
+    assert proxy.proxy_url == "http://127.0.0.1:18082"
+    assert proxy.country_code == "US"
+    assert proxy.provider == "local_trojan_pool"
+    assert proxy.proxy_mode == "trojan_pool_sticky"
+    assert proxy.proxy_source == "target_email_country_hash"
+    assert proxy.sid_source == "email_sha256_failover"
+    assert proxy.probe_attempts == 2
+
+
+def test_registration_proxy_trojan_pool_does_not_fall_back_to_remote(monkeypatch) -> None:
+    class Manager:
+        @staticmethod
+        def ensure_started() -> None:
+            return None
+
+        @staticmethod
+        def candidate_nodes(**_kwargs):
+            return [
+                type(
+                    "Node",
+                    (),
+                    {"local_http_url": "http://127.0.0.1:18081", "country_code": "JP"},
+                )()
+            ]
+
+    monkeypatch.setattr(
+        registration_proxy,
+        "get_trojan_proxy_pool_manager",
+        lambda *_args: Manager(),
+    )
+    with pytest.raises(CliproxyProxyError, match="Trojan pool probe failed") as exc_info:
+        resolve_cliproxy_proxy(
+            email="target@example.com",
+            country_code="JP",
+            config=CliproxyProxyConfig(
+                host="remote.example.test",
+                port=443,
+                username="remote-user",
+                password="remote-password",
+                mode="trojan_pool",
+                trojan_pool_file="runtime/proxy/trojan-pool.yaml",
+            ),
+            probe=lambda _proxy_url: False,
+        )
+
+    assert "remote.example.test" not in str(exc_info.value)
+    assert "remote-password" not in str(exc_info.value)
+
+
 @pytest.mark.parametrize("country_code", ["JP", "SG", "AU"])
 def test_cliproxy_auto_gateway_uses_sg_for_asia_pacific(
     monkeypatch,
@@ -229,6 +372,96 @@ def test_machine_egress_probe_bypasses_environment_proxy_and_is_cached(monkeypat
     detect_machine_egress_country.cache_clear()
 
 
+def test_proxy_egress_probe_uses_selected_proxy_and_reads_country(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+        text = "ip=198.51.100.9\nloc=US\ncolo=FAT\n"
+
+    class Client:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, url, **kwargs):
+            captured["trust_env"] = self.trust_env
+            captured["url"] = url
+            captured["get_kwargs"] = kwargs
+            return Response()
+
+    def session_factory(**kwargs):
+        captured["session_kwargs"] = kwargs
+        return Client()
+
+    monkeypatch.setattr(registration_proxy.curl_requests, "Session", session_factory)
+
+    proxy_url = "http://proxy-user:proxy-password@us.example.test:443"
+    assert (
+        detect_proxy_egress_country(
+            proxy_url,
+            trace_url="https://trace.example.test",
+            timeout_s=4.0,
+        )
+        == "US"
+    )
+    assert captured["session_kwargs"] == {
+        "impersonate": registration_proxy.BROWSER_IMPERSONATE,
+        "proxies": {"http": proxy_url, "https": proxy_url},
+    }
+    assert captured["trust_env"] is False
+    assert captured["url"] == "https://trace.example.test"
+    assert captured["get_kwargs"]["timeout"] == 4.0
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [
+        (502, "ip=198.51.100.9\nloc=US\n"),
+        (200, "loc=US\n"),
+        (200, "ip=198.51.100.9\nloc=XX\n"),
+        (200, "ip=198.51.100.9\nloc=USA\n"),
+    ],
+)
+def test_proxy_egress_probe_rejects_unusable_trace(
+    monkeypatch,
+    status_code: int,
+    payload: str,
+) -> None:
+    class Response:
+        pass
+
+    response = Response()
+    response.status_code = status_code
+    response.text = payload
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return response
+
+    monkeypatch.setattr(
+        registration_proxy.curl_requests,
+        "Session",
+        lambda **_kwargs: Client(),
+    )
+
+    with pytest.raises(CliproxyProxyError):
+        detect_proxy_egress_country(
+            "http://secret-user:secret-password@proxy.example.test:443",
+            trace_url="https://trace.example.test",
+        )
+
+
 def test_cliproxy_auto_gateway_is_used_to_build_proxy(monkeypatch) -> None:
     seen_urls: list[str] = []
     monkeypatch.setattr(
@@ -328,6 +561,8 @@ def test_cliproxy_probe_uses_proxy_and_requires_chatgpt_csrf_token(monkeypatch) 
 
 def test_cliproxy_settings_accept_prefixed_environment(monkeypatch) -> None:
     names = (
+        "REFACTOR_APP_CLIPROXY_MODE",
+        "REFACTOR_APP_CLIPROXY_TROJAN_POOL_FILE",
         "REFACTOR_APP_CLIPROXY_HOST",
         "REFACTOR_APP_CLIPROXY_PORT",
         "REFACTOR_APP_CLIPROXY_USERNAME",
@@ -338,6 +573,11 @@ def test_cliproxy_settings_accept_prefixed_environment(monkeypatch) -> None:
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REFACTOR_APP_CLIPROXY_MODE", "trojan_pool")
+    monkeypatch.setenv(
+        "REFACTOR_APP_CLIPROXY_TROJAN_POOL_FILE",
+        "runtime/proxy/trojan-pool.yaml",
+    )
     monkeypatch.setenv("REFACTOR_APP_CLIPROXY_HOST", "sg.cliproxy.io")
     monkeypatch.setenv("REFACTOR_APP_CLIPROXY_PORT", "2345")
     monkeypatch.setenv("REFACTOR_APP_CLIPROXY_USERNAME", "clip-user")
@@ -347,6 +587,8 @@ def test_cliproxy_settings_accept_prefixed_environment(monkeypatch) -> None:
     monkeypatch.setenv("REFACTOR_APP_CLIPROXY_SG_HOST", "sg.arxlabs.io")
 
     settings = Settings(_env_file=None)
+    assert settings.cliproxy_mode == "trojan_pool"
+    assert settings.cliproxy_trojan_pool_file == "runtime/proxy/trojan-pool.yaml"
     assert settings.cliproxy_host == "sg.cliproxy.io"
     assert settings.cliproxy_port == 2345
     assert settings.cliproxy_username == "clip-user"

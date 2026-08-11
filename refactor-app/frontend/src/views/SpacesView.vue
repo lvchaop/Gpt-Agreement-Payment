@@ -59,7 +59,6 @@ const plusCheckoutSpaceId = ref("");
 const plusCheckoutCreateCountry = ref("US");
 const plusCheckoutPromoCountry = ref("JP");
 const plusCheckoutCampaign = ref("plus-1-month-free");
-const browserHeadless = ref(true);
 const autoStartPlusCheckout = ref(true);
 const bindingSelectedPaymentSpaces = ref(false);
 const showPaymentPoolPanel = ref(false);
@@ -536,7 +535,7 @@ async function bindPersonalPaymentMethod() {
     const name = String(paymentBindTarget.value?.name || paymentBindTarget.value?.external_space_id || id);
     const result = await resourcesApi.bindPersonalPaymentMethod(id, {
       auto_start_plus_checkout: autoStartPlusCheckout.value,
-      browser_headless: browserHeadless.value,
+      checkout_ui_mode: "custom",
       created_by: "ops:personal-payment-method-bind",
     });
     paymentBindTarget.value = null;
@@ -569,7 +568,6 @@ async function createPersonalPlusCheckout() {
       create_proxy_country: createCountry,
       promo_proxy_country: promoCountry,
       promo_campaign_id: campaign,
-      browser_headless: browserHeadless.value,
       created_by: "ops:personal-plus-checkout",
     });
     plusCheckoutTarget.value = null;
@@ -604,7 +602,7 @@ async function bindSelectedPersonalPaymentMethods() {
     const result = await resourcesApi.bindSelectedPersonalPaymentMethods({
       space_ids: spaceIds,
       auto_start_plus_checkout: autoStartPlusCheckout.value,
-      browser_headless: browserHeadless.value,
+      checkout_ui_mode: "custom",
       created_by: "ops:personal-payment-method-bind-selected",
     });
     if (!result.job_id) {
@@ -895,10 +893,6 @@ onMounted(() => {
       <input v-model="autoStartPlusCheckout" type="checkbox" />
       <span>绑卡成功后继续 Plus 支付</span>
     </label>
-    <label class="auto-replenish-toggle">
-      <input v-model="browserHeadless" type="checkbox" />
-      <span>使用无头浏览器</span>
-    </label>
   </ConfirmModal>
   <ConfirmModal
     :open="Boolean(plusCheckoutTarget)"
@@ -914,13 +908,6 @@ onMounted(() => {
       <label class="field"><span>创建 Checkout 代理国家</span><input v-model="plusCheckoutCreateCountry" class="input" maxlength="2" autocomplete="off" /></label>
       <label class="field"><span>更新优惠代理国家</span><input v-model="plusCheckoutPromoCountry" class="input" maxlength="2" autocomplete="off" /></label>
       <label class="field"><span>优惠 campaign</span><input v-model="plusCheckoutCampaign" class="input" autocomplete="off" /></label>
-      <label class="field">
-        <span>浏览器模式</span>
-        <span class="browser-mode-checkbox">
-          <input v-model="browserHeadless" type="checkbox" />
-          <span>使用无头浏览器</span>
-        </span>
-      </label>
     </div>
   </ConfirmModal>
   <ConfirmModal
@@ -936,10 +923,6 @@ onMounted(() => {
     <label class="auto-replenish-toggle">
       <input v-model="autoStartPlusCheckout" type="checkbox" />
       <span>绑卡成功后继续 Plus 支付</span>
-    </label>
-    <label class="auto-replenish-toggle">
-      <input v-model="browserHeadless" type="checkbox" />
-      <span>使用无头浏览器</span>
     </label>
   </ConfirmModal>
   <ConfirmModal

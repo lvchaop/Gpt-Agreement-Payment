@@ -54,6 +54,7 @@ def test_email_protocol_passes_proxy_country_to_sentinel_context(monkeypatch) ->
         user_account_id="account-1",
         work_id="work-1",
         proxy_url="http://proxy.example",
+        proxy_mode="trojan_pool_sticky",
         emit=lambda *_args, **_kwargs: None,
     )
 
@@ -62,6 +63,7 @@ def test_email_protocol_passes_proxy_country_to_sentinel_context(monkeypatch) ->
     assert config.proxy == "http://proxy.example"
     assert config.proxy_meta["register"]["country_code"] == "JP"
     assert config.proxy_meta["register"]["region"] == "JP"
+    assert config.proxy_meta["register"]["mode"] == "trojan_pool_sticky"
     assert captured["mail"] is mail
 
 
