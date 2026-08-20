@@ -17,7 +17,6 @@ from refactor_app.application.workflows.account_auth import (
 from refactor_app.config.settings import Settings
 from refactor_app.infrastructure.db.engine import make_engine, make_session_factory
 from refactor_app.infrastructure.db.models import (
-    ProxyInventoryModel,
     SpaceModel,
     UserAccountModel,
     UserAccountProxyBindingModel,
@@ -258,7 +257,7 @@ def test_codex_proxy_override_bypasses_account_proxy_selection(
         proxy_url_override="http://registration-proxy.example:8080",
     )
 
-    assert loaded == (account, auth, "http://registration-proxy.example:8080")
+    assert loaded == (account, auth, "http://registration-proxy.example:8080", "US")
     assert events == [
         (
             "account_auth.proxy_override_used",
@@ -271,17 +270,14 @@ def test_codex_proxy_override_bypasses_account_proxy_selection(
     ]
 
 
-def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
+def test_backfill_session_uses_cliproxy_instead_of_account_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings()
     engine = make_engine(settings)
     _skip_if_schema_is_not_current(engine)
     session_factory = make_session_factory(engine)
-    account_id = "test-cloudflare-403-reassign-account"
-    proxy_1_id = "test-cloudflare-403-proxy-1"
-    proxy_2_id = "test-cloudflare-403-proxy-2"
-    binding_id = "test-cloudflare-403-binding"
+    account_id = "test-cliproxy-backfill-account"
     now = datetime.now(UTC)
 
     with session_factory() as session:
@@ -291,74 +287,39 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
             )
         )
         session.execute(delete(SpaceModel).where(SpaceModel.owner_user_account_id == account_id))
-        session.execute(
-            delete(ProxyInventoryModel).where(ProxyInventoryModel.id.in_([proxy_1_id, proxy_2_id]))
-        )
         session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
         session.add(
             UserAccountModel(
                 id=account_id,
-                email="cloudflare-reassign@example.test",
+                email="cliproxy-backfill@example.test",
                 password="test-password",
                 account_status="active",
                 created_at=now,
                 updated_at=now,
             )
         )
-        for proxy_id, port, status in (
-            (proxy_1_id, 18081, "bound"),
-            (proxy_2_id, 18082, "available"),
-        ):
-            session.add(
-                ProxyInventoryModel(
-                    id=proxy_id,
-                    provider="webshare",
-                    proxy_type="proxyserver",
-                    external_proxy_id=proxy_id,
-                    connection_mode="direct",
-                    proxy_host="127.0.0.1",
-                    proxy_port=port,
-                    proxy_scheme="http",
-                    proxy_username="",
-                    proxy_password="",
-                    country_code="",
-                    city_name="",
-                    asn_name="",
-                    proxy_status=status,
-                    provider_valid=True,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-        session.add(
-            UserAccountProxyBindingModel(
-                id=binding_id,
-                user_account_id=account_id,
-                proxy_id=proxy_1_id,
-                bind_status="active",
-                bind_reason="test",
-                bound_by_job_id="",
-                bound_at=now,
-                created_at=now,
-                updated_at=now,
-            )
-        )
         session.commit()
 
-    monkeypatch.setattr(account_auth, "_probe_proxy_alive", lambda proxy_url: True)
-    monkeypatch.setattr(
-        account_auth,
-        "_least_bound_proxy_for_update",
-        lambda session: session.get(ProxyInventoryModel, proxy_2_id),
-    )
     calls: list[str] = []
-    personal_space_id = "test-personal-space-after-proxy-reassign"
+    proxy_calls: list[dict] = []
+    personal_space_id = "test-personal-space-after-cliproxy-backfill"
     personal_access_token = _workspace_access_token(personal_space_id)
+
+    def resolve_proxy(**kwargs):
+        proxy_calls.append(kwargs)
+        return SimpleNamespace(
+            proxy_url="http://cliproxy.example:443",
+            provider="cliproxy",
+            country_code="US",
+            egress_ip="203.0.113.11",
+            sid_source="email_sha256",
+            proxy_mode="cliproxy_sticky",
+        )
+
+    monkeypatch.setattr(account_auth, "resolve_cliproxy_proxy", resolve_proxy)
 
     def fake_acquire_chatgpt_session(**kwargs):
         calls.append(str(kwargs["proxy"]))
-        if len(calls) == 1:
-            raise RuntimeError("cloudflare_csrf_403_after_3_retries")
         auth_result = SimpleNamespace(
             session_token="session-token",
             access_token=personal_access_token,
@@ -384,25 +345,18 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
     assert workflow.run(user_account_id=account_id) == account_id
 
     with session_factory() as session:
-        binding = session.get(UserAccountProxyBindingModel, binding_id)
-        proxy_1 = session.get(ProxyInventoryModel, proxy_1_id)
-        proxy_2 = session.get(ProxyInventoryModel, proxy_2_id)
         account = session.get(UserAccountModel, account_id)
-        assert binding is not None
-        assert binding.proxy_id == proxy_2_id
-        assert binding.bind_status == "active"
-        assert proxy_1 is not None
-        assert proxy_1.proxy_status == "error"
-        assert proxy_1.provider_valid is False
-        assert proxy_2 is not None
-        assert proxy_2.proxy_status == "bound"
         assert account is not None
         assert account.session_status == "active"
         assert account.access_token == personal_access_token
         assert account.last_login_error_code == ""
-        assert len(calls) == 2
-        assert ":18081" in calls[0]
-        assert ":18082" in calls[1]
+        assert calls == ["http://cliproxy.example:443"]
+        assert proxy_calls == [
+            {
+                "email": "cliproxy-backfill@example.test",
+                "country_code": "US",
+            }
+        ]
 
         session.execute(
             delete(UserAccountProxyBindingModel).where(
@@ -410,9 +364,6 @@ def test_backfill_session_reassigns_proxy_after_cloudflare_csrf_403(
             )
         )
         session.execute(delete(SpaceModel).where(SpaceModel.owner_user_account_id == account_id))
-        session.execute(
-            delete(ProxyInventoryModel).where(ProxyInventoryModel.id.in_([proxy_1_id, proxy_2_id]))
-        )
         session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
         session.commit()
 

@@ -44,6 +44,26 @@ const completion = computed(() => {
   return total ? Math.round((done / total) * 100) : 0;
 });
 
+function classifyError(row: Row): string {
+  const raw = [
+    row.error_code,
+    row.error_message,
+    row.error,
+    row.output_json,
+  ]
+    .map((value) => (typeof value === "string" ? value : JSON.stringify(value ?? "")))
+    .join(" ")
+    .toLowerCase();
+  if (!raw.trim()) return "";
+  return raw.includes("payment_method_types_mismatch")
+    ? "payment_method_types_mismatch"
+    : "";
+}
+
+const classifiedWorkRows = computed<Row[]>(() =>
+  workResult.value.items.map((row) => ({ ...row, error_type: classifyError(row as Row) })),
+);
+
 const workColumns: Column[] = [
   { key: "id", label: "Work ID", mono: true, summary: 24, copyable: true },
   { key: "work_type", label: "类型" },
@@ -52,6 +72,7 @@ const workColumns: Column[] = [
   { key: "started_at", label: "开始时间", type: "datetime", relativeTime: true, sortable: true },
   { key: "finished_at", label: "结束时间", type: "datetime", sortable: true },
   { key: "error_code", label: "错误码", badge: true },
+  { key: "error_type", label: "错误类型", summary: 28 },
   { key: "error_message", label: "错误信息", summary: 40 },
 ];
 const workFilters: TableFilter[] = [{ key: "status", label: "Work 状态", options: [
@@ -176,7 +197,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
   </nav>
 
   <DataTable
-    v-if="activeTab === 'work'" :columns="workColumns" :filters="workFilters" :rows="workResult.items"
+    v-if="activeTab === 'work'" :columns="workColumns" :filters="workFilters" :rows="classifiedWorkRows"
     :total="workResult.total" :page="workResult.page" :page-size="workResult.page_size" :sort="workResult.sort" remote
     :all-rows-loader="loadAllWorkRows"
     empty-text="暂无 Work。" @query-change="loadWork" @refresh="loadWork()" @row-click="(row) => openDetail('Work 详情', row)"

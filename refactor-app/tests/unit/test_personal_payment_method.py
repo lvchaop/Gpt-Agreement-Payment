@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy.dialects import postgresql
 
@@ -315,6 +317,276 @@ def test_payment_method_reservation_rejects_existing_binding_under_lock() -> Non
         workflow._reserve_attempt("space-1")
 
 
+def test_payment_method_context_can_skip_local_promotion_for_plus_checkout() -> None:
+    class Space:
+        id = "space-1"
+        space_type = "personal"
+        space_status = "active"
+        has_promotion = False
+        promotion_id = ""
+        owner_user_account_id = "account-1"
+        external_space_id = "personal-1"
+        has_payment_method = False
+        payment_method_status = "missing"
+        payment_method_attempt_count = 0
+        payment_method_cooldown_until = None
+
+    class Account:
+        id = "account-1"
+        account_status = "active"
+        email = "member@outlook.com"
+        password = "test-password"
+        cookie_header = "session=cookie"
+        auth_cookie_header = "auth=cookie"
+        mfa_status = "not_configured"
+        twofauth_account_id = ""
+        access_token = "access-token"
+        session_token = "session-token"
+        device_id = "device-1"
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, row_id):
+            if model is payment_workflow.SpaceModel:
+                assert row_id == "space-1"
+                return Space()
+            assert model is payment_workflow.UserAccountModel
+            assert row_id == "account-1"
+            return Account()
+
+    workflow = PersonalPaymentMethodBindWorkflow(
+        session_factory=Session,
+        require_local_promotion=False,
+    )
+
+    context, existing = workflow._load_context("space-1")
+
+    assert existing is None
+    assert context.space_id == "space-1"
+    assert context.promotion_id == ""
+
+
+def test_payment_method_reservation_can_skip_local_promotion_for_plus_checkout() -> None:
+    class Space:
+        id = "space-1"
+        has_promotion = False
+        promotion_id = ""
+        has_payment_method = False
+        payment_method_status = "missing"
+        payment_method_attempt_count = 0
+        payment_method_cooldown_until = None
+        payment_method_last_attempt_at = None
+        payment_method_last_error_code = ""
+        payment_method_last_error_message = ""
+        updated_at = None
+
+    class Card:
+        id = "card-2"
+        card_number = "4242424242424242"
+        cvc = "123"
+        last4 = "4242"
+        exp_month = 12
+        exp_year = 2030
+        card_status = "available"
+        reserved_by_space_id = ""
+        reserved_at = None
+        use_count = 0
+        last_used_at = None
+        last_error_code = ""
+        last_error_message = ""
+        updated_at = None
+
+    class Session:
+        def __init__(self):
+            self.space = Space()
+            self.card = Card()
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, row_id, *, with_for_update=False):
+            assert model is payment_workflow.SpaceModel
+            assert row_id == "space-1"
+            assert with_for_update is True
+            return self.space
+
+        def scalar(self, _statement):
+            return self.card
+
+        def commit(self):
+            self.committed = True
+
+    session = Session()
+    workflow = PersonalPaymentMethodBindWorkflow(
+        session_factory=lambda: session,
+        require_local_promotion=False,
+    )
+
+    reserved = workflow._reserve_attempt(
+        "space-1",
+        billing_template=_attempt(1),
+        payment_card_id="card-2",
+    )
+
+    assert reserved.card_id == "card-2"
+    assert reserved.attempt_count == 1
+    assert session.space.payment_method_status == "binding"
+    assert session.committed is True
+
+
+def test_payment_method_reservation_filters_address_pool_by_selected_country() -> None:
+    space = SimpleNamespace(
+        id="space-1",
+        has_promotion=True,
+        promotion_id="plus-1-month-free",
+        has_payment_method=False,
+        payment_method_status="missing",
+        payment_method_attempt_count=0,
+        payment_method_cooldown_until=None,
+        payment_method_last_attempt_at=None,
+        payment_method_last_error_code="",
+        payment_method_last_error_message="",
+        updated_at=None,
+    )
+    name = SimpleNamespace(
+        full_name="Erika Mustermann",
+        use_count=0,
+        last_used_at=None,
+        updated_at=None,
+    )
+    address = SimpleNamespace(
+        line1="Musterstrasse 1",
+        line2="",
+        city="Berlin",
+        state="BE",
+        postal_code="10115",
+        country="DE",
+        phone="",
+        use_count=0,
+        last_used_at=None,
+        updated_at=None,
+    )
+    card = SimpleNamespace(
+        id="card-1",
+        card_number="4242424242424242",
+        cvc="123",
+        last4="4242",
+        exp_month=12,
+        exp_year=2030,
+        card_status="available",
+        reserved_by_space_id=None,
+        reserved_at=None,
+        use_count=0,
+        last_used_at=None,
+        last_error_code="",
+        last_error_message="",
+        updated_at=None,
+    )
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+            self.responses = iter((name, address, card))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, row_id, *, with_for_update=False):
+            assert model is payment_workflow.SpaceModel
+            assert row_id == "space-1"
+            assert with_for_update is True
+            return space
+
+        def scalar(self, statement):
+            self.statements.append(statement)
+            return next(self.responses)
+
+        def commit(self):
+            return None
+
+    session = Session()
+    workflow = PersonalPaymentMethodBindWorkflow(
+        session_factory=lambda: session,
+        registration_proxy_country="de",
+    )
+
+    reserved = workflow._reserve_attempt(
+        "space-1",
+        payment_card_id="card-1",
+    )
+
+    address_sql = _postgresql_sql(session.statements[1])
+    assert "payment_address_pool.country = 'DE'" in address_sql
+    assert reserved.country == "DE"
+    assert reserved.line1 == "Musterstrasse 1"
+
+
+def test_payment_method_reservation_reports_selected_country_without_address() -> None:
+    space = SimpleNamespace(
+        id="space-1",
+        has_promotion=True,
+        promotion_id="plus-1-month-free",
+        has_payment_method=False,
+        payment_method_status="missing",
+        payment_method_attempt_count=0,
+        payment_method_cooldown_until=None,
+        payment_method_last_error_code="",
+        payment_method_last_error_message="",
+        updated_at=None,
+    )
+    name = SimpleNamespace(full_name="Taro Yamada")
+    card = SimpleNamespace(id="card-1")
+
+    class Session:
+        def __init__(self):
+            self.responses = iter((name, None, card))
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _model, _row_id, *, with_for_update=False):
+            assert with_for_update is True
+            return space
+
+        def scalar(self, _statement):
+            return next(self.responses)
+
+        def commit(self):
+            self.committed = True
+
+    session = Session()
+    workflow = PersonalPaymentMethodBindWorkflow(
+        session_factory=lambda: session,
+        registration_proxy_country="jp",
+    )
+
+    with pytest.raises(PersonalPaymentMethodBindError) as raised:
+        workflow._reserve_attempt("space-1", payment_card_id="card-1")
+
+    assert raised.value.error_code == "payment_address_pool_country_empty"
+    assert raised.value.error_message == "no active payment address for JP"
+    assert raised.value.diagnostics == {"country": "JP"}
+    assert space.payment_method_status == "failed"
+    assert space.payment_method_last_error_code == "payment_address_pool_country_empty"
+    assert session.committed is True
+
+
 def test_payment_method_workflow_returns_after_later_card_succeeds() -> None:
     attempts = [_attempt(1), _attempt(2)]
     failures: list[str] = []
@@ -503,12 +775,15 @@ def test_bind_attempt_uses_cliproxy_and_protocol_credentials(monkeypatch) -> Non
 def test_payment_protocol_locale_tracks_proxy_egress_country() -> None:
     assert payment_workflow._payment_locale_for_proxy_country("US") == "en-US"
     assert payment_workflow._payment_locale_for_proxy_country("jp") == "ja-JP"
-    assert payment_workflow._payment_locale_for_proxy_country("unknown") == "en-US"
     assert payment_workflow._payment_timezone_for_proxy_country("US") == (
         "America/Los_Angeles"
     )
     assert payment_workflow._payment_timezone_for_proxy_country("jp") == "Asia/Tokyo"
-    assert payment_workflow._payment_timezone_for_proxy_country("unknown") == "UTC"
+    assert payment_workflow._payment_timezone_for_proxy_country("de") == "Europe/Berlin"
+    with pytest.raises(ValueError, match="ISO alpha-2"):
+        payment_workflow._payment_locale_for_proxy_country("unknown")
+    with pytest.raises(ValueError, match="ISO alpha-2"):
+        payment_workflow._payment_timezone_for_proxy_country("unknown")
 
 
 def test_payment_mail_provider_mapping_matches_supported_mail_sources() -> None:

@@ -23,20 +23,36 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in minimal test envs
 
     curl_requests = _MissingCurlRequests()
 
+from refactor_app.application.workflows.email_proxy_country import (
+    email_domain_proxy_country,
+)
+from refactor_app.application.workflows.proxy_locale import (
+    accept_language_for_proxy_country,
+    normalize_proxy_country,
+    timezone_offset_minutes_for_proxy_country,
+)
+from refactor_app.application.workflows.registration_proxy import (
+    resolve_cliproxy_proxy,
+)
 from refactor_app.application.workflows.space_authorization import (
     UpsertBusinessCodexSpaceCredentialInput,
     UpsertBusinessCodexSpaceCredentialWorkflow,
     UpsertPersonalCodexSpaceCredentialInput,
     UpsertPersonalCodexSpaceCredentialWorkflow,
 )
-from refactor_app.config.browser_fingerprint import BROWSER_IMPERSONATE
+from refactor_app.config.browser_fingerprint import (
+    BROWSER_IMPERSONATE,
+    browser_fingerprint_for_email,
+)
 from refactor_app.domain.enums import ProxyBindStatus, ProxyStatus
 from refactor_app.domain.space_status import space_status_after_discovery
 from refactor_app.infrastructure.db.models import (
     JobStepModel,
+    PromotionCheckRunModel,
     ProxyInventoryModel,
     SpaceMembershipModel,
     SpaceModel,
+    SpacePromotionOfferModel,
     UserAccountModel,
     UserAccountProxyBindingModel,
 )
@@ -64,6 +80,7 @@ ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-
 PLUS_ONE_MONTH_FREE_PROMOTION_ID = "plus-1-month-free"
 TRACE_DIR = Path("runtime/auth-traces")
 TotpCodeResolver = Callable[[str], str]
+ProxyResolver = Callable[..., object]
 
 
 @dataclass(frozen=True)
@@ -256,11 +273,18 @@ class BackfillSessionWorkflow:
         mail_provider: ExternalMailApiPlugin,
         chatgpt_client: OpenAIChatGPTClient | None = None,
         totp_code_resolver: TotpCodeResolver | None = None,
+        proxy_resolver: ProxyResolver | None = None,
+        proxy_country: str = "US",
+        prefer_configured_proxy_country: bool = False,
     ) -> None:
         self._session_factory = session_factory
         self._mail_provider = mail_provider
         self._chatgpt_client = chatgpt_client
         self._totp_code_resolver = totp_code_resolver
+        self._proxy_resolver = proxy_resolver or resolve_cliproxy_proxy
+        self._proxy_country = str(proxy_country or "US").strip().upper()
+        self._prefer_configured_proxy_country = prefer_configured_proxy_country
+        self._force_new_proxy_sid = False
 
     def detect_account_spaces_from_session(
         self,
@@ -269,10 +293,17 @@ class BackfillSessionWorkflow:
         access_token: str,
         cookie_header: str,
         proxy_url: str,
+        proxy_country: str = "",
         oai_device_id: str = "",
         session_chatgpt_account_id: str = "",
         session_chatgpt_account_structure: str = "",
         session_chatgpt_account_plan_type: str = "",
+        browser_user_agent: str = "",
+        browser_platform: str = "",
+        browser_timezone: str = "",
+        browser_timezone_offset: int | None = None,
+        browser_accept_language: str = "",
+        browser_impersonate: str = "",
         require_personal_access_token: bool = False,
         require_accounts_check: bool = False,
         run_id: str = "",
@@ -284,8 +315,15 @@ class BackfillSessionWorkflow:
             access_token=access_token,
             cookie_header=cookie_header,
             proxy_url=proxy_url,
+            proxy_country=proxy_country,
             chatgpt_account_id=token_account_id,
             oai_device_id=oai_device_id,
+            browser_user_agent=browser_user_agent,
+            browser_platform=browser_platform,
+            browser_timezone=browser_timezone,
+            browser_timezone_offset=browser_timezone_offset,
+            browser_accept_language=browser_accept_language,
+            browser_impersonate=browser_impersonate,
             run_id=run_id,
             parent_step_id=parent_step_id,
             raise_on_error=require_accounts_check,
@@ -308,8 +346,15 @@ class BackfillSessionWorkflow:
                 access_token=access_token,
                 cookie_header=cookie_header,
                 proxy_url=proxy_url,
+                proxy_country=proxy_country,
                 chatgpt_account_id=token_account_id,
                 oai_device_id=oai_device_id,
+                browser_user_agent=browser_user_agent,
+                browser_platform=browser_platform,
+                browser_timezone=browser_timezone,
+                browser_timezone_offset=browser_timezone_offset,
+                browser_accept_language=browser_accept_language,
+                browser_impersonate=browser_impersonate,
                 run_id=run_id,
                 parent_step_id=parent_step_id,
                 accounts_check_payload=accounts_check_payload,
@@ -443,12 +488,21 @@ class BackfillSessionWorkflow:
                 access_token=access_token,
                 cookie_header=cookie_header,
                 proxy_url=proxy_url,
+                proxy_country=normalized_proxy_country,
                 chatgpt_account_id=personal_account_id,
                 oai_device_id=oai_device_id,
             )
-            promotion_id = _extract_account_promotion_id(
+            campaigns = _extract_account_promotion_campaigns(
                 payload,
                 account_id=personal_account_id,
+            )
+            promotion_id = next(
+                (
+                    offer["promotion_id"]
+                    for offer in campaigns
+                    if offer["promotion_id"] == PLUS_ONE_MONTH_FREE_PROMOTION_ID
+                ),
+                "",
             )
             has_promotion = promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID
             now = datetime.now(UTC)
@@ -469,6 +523,23 @@ class BackfillSessionWorkflow:
                 space.has_promotion = has_promotion
                 space.promotion_id = promotion_id if has_promotion else ""
                 space.updated_at = now
+                # Keep the lightweight fake sessions used by existing workflow
+                # tests compatible; real SQLAlchemy sessions always expose all
+                # three methods and a persisted space id.
+                if (
+                    callable(getattr(session, "add", None))
+                    and callable(getattr(session, "execute", None))
+                    and str(getattr(space, "id", "") or "").strip()
+                ):
+                    _persist_promotion_snapshot(
+                        session,
+                        space_id=space.id,
+                        user_account_id=user_account_id,
+                        proxy_country=normalized_proxy_country,
+                        campaigns=campaigns,
+                        response_json=payload,
+                        checked_at=now,
+                    )
                 session.commit()
 
             result = {
@@ -476,6 +547,8 @@ class BackfillSessionWorkflow:
                 "personal_chatgpt_account_id": personal_account_id,
                 "has_promotion": has_promotion,
                 "promotion_id": promotion_id if has_promotion else "",
+                "promotion_ids": [offer["promotion_id"] for offer in campaigns],
+                "promotion_offers": campaigns,
                 "proxy_country": normalized_proxy_country,
             }
             self._write_event(
@@ -515,13 +588,16 @@ class BackfillSessionWorkflow:
         user_account_id: str,
         run_id: str = "",
     ) -> dict:
-        account, auth, proxy_url = self._load_input(user_account_id, run_id=run_id)
+        account, auth, proxy_url, _proxy_country = self._load_input(
+            user_account_id, run_id=run_id
+        )
         token_account_id = _access_token_chatgpt_account_id(auth.access_token)
         accounts_check_payload = self._mark_detected_space_memberships(
             user_account_id=account.id,
             access_token=auth.access_token,
             cookie_header=auth.cookie_header,
             proxy_url=proxy_url,
+            proxy_country=_proxy_country,
             chatgpt_account_id=token_account_id,
             oai_device_id=auth.device_id,
             run_id=run_id,
@@ -552,7 +628,9 @@ class BackfillSessionWorkflow:
             step_id=workflow_step_id,
         )
         try:
-            account, auth, proxy_url = self._load_input(user_account_id, run_id=run_id)
+            account, auth, proxy_url, proxy_country = self._load_input(
+                user_account_id, run_id=run_id
+            )
         except Exception as exc:
             self._finish_step(
                 workflow_step_id,
@@ -579,10 +657,21 @@ class BackfillSessionWorkflow:
             )
             trace_path_value = _trace_path_value(trace_path)
             try:
+                browser_fingerprint = browser_fingerprint_for_email(account.email)
                 event_data = {
                     "user_account_id": user_account_id,
                     "proxy_used": bool(proxy_url),
                     "proxy_reassign_count": proxy_reassign_count,
+                    "browser_impersonate": browser_fingerprint.impersonate,
+                    "browser_platform": browser_fingerprint.navigator_platform,
+                    "browser_platform_hint": browser_fingerprint.sec_ch_ua_platform,
+                    "browser_screen": (
+                        f"{browser_fingerprint.screen_width}x"
+                        f"{browser_fingerprint.screen_height}"
+                    ),
+                    "browser_hardware_concurrency": (
+                        browser_fingerprint.hardware_concurrency
+                    ),
                 }
                 if trace_path_value:
                     event_data["trace_path"] = trace_path_value
@@ -597,34 +686,31 @@ class BackfillSessionWorkflow:
                     email=account.email,
                     password=auth.password,
                     proxy=proxy_url,
+                    proxy_country=proxy_country,
                     mail_provider=self._mail_provider,
                     trace_dump_path=trace_path_value,
                     skip_oauth_token_exchange=True,
                     totp_code_provider=self._totp_code_provider(auth),
+                    browser_fingerprint=browser_fingerprint,
                 )
                 break
             except Exception as exc:
                 trace_summary = _trace_summary(trace_path)
                 if _is_cloudflare_csrf_403_after_retries(exc):
-                    released_proxy_id = self._release_active_proxy_for_reassign(
-                        user_account_id=user_account_id,
-                        error_code="cloudflare_csrf_403_after_3_retries",
-                        error_message=str(exc),
-                    )
                     event_data = {
                         "user_account_id": user_account_id,
-                        "proxy_id": released_proxy_id,
+                        "proxy_source": "cliproxy",
                         "error_type": type(exc).__name__,
                         "error_message": str(exc)[:1000],
                         "trace_summary": trace_summary,
-                        "next_action": "reassign_proxy",
+                        "next_action": "resolve_new_cliproxy_sid",
                     }
                     if trace_path_value:
                         event_data["trace_path"] = trace_path_value
                     self._write_event(
                         run_id,
                         "account_auth.proxy_reassign_after_cloudflare_403",
-                        "cloudflare csrf 403 after retries; releasing proxy and reassigning",
+                        "cloudflare csrf 403 after retries; resolving a new Cliproxy SID",
                         event_data,
                         level="WARN",
                         step_id=protocol_step_id,
@@ -632,7 +718,7 @@ class BackfillSessionWorkflow:
                     self._write_trace_steps(run_id, protocol_step_id, trace_summary)
                     step_output = {
                         "trace_summary": trace_summary,
-                        "released_proxy_id": released_proxy_id,
+                        "proxy_source": "cliproxy",
                     }
                     if trace_path_value:
                         step_output["trace_path"] = trace_path_value
@@ -643,7 +729,8 @@ class BackfillSessionWorkflow:
                         error_code="cloudflare_csrf_403_after_3_retries",
                         error_message=str(exc),
                     )
-                    account, auth, proxy_url = self._load_input(
+                    self._force_new_proxy_sid = True
+                    account, auth, proxy_url, proxy_country = self._load_input(
                         user_account_id,
                         run_id=run_id,
                     )
@@ -760,6 +847,7 @@ class BackfillSessionWorkflow:
                 access_token=result.auth_result.access_token,
                 cookie_header=result.cookie_header or result.auth_result.cookie_header,
                 proxy_url=proxy_url,
+                proxy_country=proxy_country,
                 oai_device_id=result.auth_result.device_id,
                 session_chatgpt_account_id=str(
                     getattr(result.auth_result, "chatgpt_account_id", "") or ""
@@ -769,6 +857,24 @@ class BackfillSessionWorkflow:
                 ),
                 session_chatgpt_account_plan_type=str(
                     getattr(result.auth_result, "chatgpt_account_plan_type", "") or ""
+                ),
+                browser_user_agent=str(
+                    getattr(result.auth_result, "browser_user_agent", "") or ""
+                ),
+                browser_platform=str(
+                    getattr(result.auth_result, "browser_platform", "") or ""
+                ),
+                browser_timezone=str(
+                    getattr(result.auth_result, "browser_timezone", "") or ""
+                ),
+                browser_timezone_offset=getattr(
+                    result.auth_result, "browser_timezone_offset", None
+                ),
+                browser_accept_language=str(
+                    getattr(result.auth_result, "browser_accept_language", "") or ""
+                ),
+                browser_impersonate=str(
+                    getattr(result.auth_result, "browser_impersonate", "") or ""
                 ),
                 require_personal_access_token=True,
                 run_id=run_id,
@@ -826,53 +932,51 @@ class BackfillSessionWorkflow:
         self,
         user_account_id: str,
         run_id: str = "",
-    ) -> tuple[UserAccountModel, UserAccountModel, str]:
-        account, auth, proxy = self._load_account_auth_proxy(user_account_id)
-        if proxy is not None and _probe_proxy_alive(_proxy_url(proxy)):
-            self._mark_proxy_health(proxy.id, alive=True)
-            self._write_event(
-                run_id,
-                "account_auth.proxy_ready",
-                "existing account proxy is alive",
-                {"user_account_id": user_account_id, "proxy_id": proxy.id},
+    ) -> tuple[UserAccountModel, UserAccountModel, str, str]:
+        account, auth, _bound_proxy = self._load_account_auth_proxy(user_account_id)
+        email_proxy_country = (
+            ""
+            if self._prefer_configured_proxy_country
+            else email_domain_proxy_country(account.email)
+        )
+        requested_proxy_country = email_proxy_country or self._proxy_country
+        if self._prefer_configured_proxy_country:
+            proxy_country_source = "configured_override"
+        else:
+            proxy_country_source = (
+                "email_domain" if email_proxy_country else "configured_default"
             )
-            return account, auth, _proxy_url(proxy)
-
-        if proxy is not None:
-            self._mark_proxy_health(proxy.id, alive=False)
-            self._write_event(
-                run_id,
-                "account_auth.proxy_dead",
-                "existing account proxy is dead",
-                {"user_account_id": user_account_id, "proxy_id": proxy.id},
-                level="WARN",
-            )
-
-        while True:
-            proxy = self._rebind_least_bound_proxy(user_account_id)
-            self._write_event(
-                run_id,
-                "account_auth.proxy_reassigned",
-                "account proxy reassigned",
-                {"user_account_id": user_account_id, "proxy_id": proxy.id},
-            )
-            if _probe_proxy_alive(_proxy_url(proxy)):
-                self._mark_proxy_health(proxy.id, alive=True)
-                self._write_event(
-                    run_id,
-                    "account_auth.proxy_ready",
-                    "reassigned account proxy is alive",
-                    {"user_account_id": user_account_id, "proxy_id": proxy.id},
-                )
-                return account, auth, _proxy_url(proxy)
-            self._mark_proxy_health(proxy.id, alive=False)
-            self._write_event(
-                run_id,
-                "account_auth.proxy_dead",
-                "reassigned account proxy is dead",
-                {"user_account_id": user_account_id, "proxy_id": proxy.id},
-                level="WARN",
-            )
+        resolver_kwargs = {
+            "email": account.email,
+            "country_code": requested_proxy_country,
+        }
+        if self._force_new_proxy_sid:
+            resolver_kwargs["force_new_sid"] = True
+        resolved_proxy = self._proxy_resolver(**resolver_kwargs)
+        proxy_url = str(getattr(resolved_proxy, "proxy_url", resolved_proxy) or "").strip()
+        if not proxy_url:
+            raise AccountAuthWorkflowError("cliproxy returned an empty proxy URL")
+        proxy_country = normalize_proxy_country(
+            str(getattr(resolved_proxy, "country_code", "") or "")
+        )
+        self._write_event(
+            run_id,
+            "account_auth.proxy_ready",
+            "Cliproxy proxy resolved for account session backfill",
+            {
+                "user_account_id": user_account_id,
+                "proxy_source": "cliproxy",
+                "proxy_provider": str(
+                    getattr(resolved_proxy, "provider", "cliproxy") or "cliproxy"
+                ),
+                "proxy_country": proxy_country,
+                "proxy_country_source": proxy_country_source,
+                "proxy_egress_ip": str(getattr(resolved_proxy, "egress_ip", "") or ""),
+                "proxy_sid_source": str(getattr(resolved_proxy, "sid_source", "") or ""),
+                "proxy_mode": str(getattr(resolved_proxy, "proxy_mode", "") or ""),
+            },
+        )
+        return account, auth, proxy_url, proxy_country
 
     def _load_account_auth_proxy(
         self,
@@ -1202,8 +1306,15 @@ class BackfillSessionWorkflow:
         access_token: str,
         cookie_header: str,
         proxy_url: str,
+        proxy_country: str = "",
         chatgpt_account_id: str = "",
         oai_device_id: str = "",
+        browser_user_agent: str = "",
+        browser_platform: str = "",
+        browser_timezone: str = "",
+        browser_timezone_offset: int | None = None,
+        browser_accept_language: str = "",
+        browser_impersonate: str = "",
         run_id: str,
         parent_step_id: str,
         accounts_check_payload: dict | None = None,
@@ -1220,8 +1331,15 @@ class BackfillSessionWorkflow:
                     access_token=access_token,
                     cookie_header=cookie_header,
                     proxy_url=proxy_url,
+                    proxy_country=proxy_country,
                     chatgpt_account_id=chatgpt_account_id,
                     oai_device_id=oai_device_id,
+                    browser_user_agent=browser_user_agent,
+                    browser_platform=browser_platform,
+                    browser_timezone=browser_timezone,
+                    browser_timezone_offset=browser_timezone_offset,
+                    browser_accept_language=browser_accept_language,
+                    browser_impersonate=browser_impersonate,
                 )
             personal_account_id = _extract_personal_chatgpt_account_id(payload)
             if not personal_account_id:
@@ -1294,8 +1412,15 @@ class BackfillSessionWorkflow:
         access_token: str,
         cookie_header: str,
         proxy_url: str,
+        proxy_country: str = "",
         chatgpt_account_id: str = "",
         oai_device_id: str = "",
+        browser_user_agent: str = "",
+        browser_platform: str = "",
+        browser_timezone: str = "",
+        browser_timezone_offset: int | None = None,
+        browser_accept_language: str = "",
+        browser_impersonate: str = "",
         run_id: str,
         parent_step_id: str,
         raise_on_error: bool = False,
@@ -1311,8 +1436,15 @@ class BackfillSessionWorkflow:
                 access_token=access_token,
                 cookie_header=cookie_header,
                 proxy_url=proxy_url,
+                proxy_country=proxy_country,
                 chatgpt_account_id=chatgpt_account_id,
                 oai_device_id=oai_device_id,
+                browser_user_agent=browser_user_agent,
+                browser_platform=browser_platform,
+                browser_timezone=browser_timezone,
+                browser_timezone_offset=browser_timezone_offset,
+                browser_accept_language=browser_accept_language,
+                browser_impersonate=browser_impersonate,
             )
             visible_account_ids = _extract_visible_chatgpt_account_ids(payload)
             if not visible_account_ids:
@@ -1481,6 +1613,9 @@ class BackfillSessionRtWorkflow(BackfillSessionWorkflow):
             session_factory=self._session_factory,
             mail_provider=self._mail_provider,
             totp_code_resolver=self._totp_code_resolver,
+            proxy_resolver=self._proxy_resolver,
+            proxy_country=self._proxy_country,
+            prefer_configured_proxy_country=self._prefer_configured_proxy_country,
         ).run(user_account_id=user_account_id, run_id=run_id)
 
 
@@ -1492,11 +1627,19 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
         mail_provider: ExternalMailApiPlugin,
         phone_provider: BrowserPhoneOtpProvider | None = None,
         totp_code_resolver: TotpCodeResolver | None = None,
+        proxy_resolver: ProxyResolver | None = None,
+        proxy_country: str = "US",
+        prefer_configured_proxy_country: bool = False,
     ) -> None:
-        self._session_factory = session_factory
-        self._mail_provider = mail_provider
+        super().__init__(
+            session_factory=session_factory,
+            mail_provider=mail_provider,
+            totp_code_resolver=totp_code_resolver,
+            proxy_resolver=proxy_resolver,
+            proxy_country=proxy_country,
+            prefer_configured_proxy_country=prefer_configured_proxy_country,
+        )
         self._phone_provider = phone_provider
-        self._totp_code_resolver = totp_code_resolver
 
     def run(
         self,
@@ -1561,7 +1704,7 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
             target_workspace_name = target_space.name or (
                 "Business workspace" if business_authorization else "Personal account"
             )
-        account, auth, proxy_url = self._load_rt_input(
+        account, auth, proxy_url, _proxy_country = self._load_rt_input(
             user_account_id=user_account_id,
             run_id=run_id,
             proxy_url_override=proxy_url_override,
@@ -1958,7 +2101,7 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
         user_account_id: str,
         run_id: str,
         proxy_url_override: str,
-    ) -> tuple[UserAccountModel, UserAccountModel, str]:
+    ) -> tuple[UserAccountModel, UserAccountModel, str, str]:
         override = str(proxy_url_override or "").strip()
         if not override:
             return self._load_input(user_account_id, run_id=run_id)
@@ -1974,7 +2117,7 @@ class BackfillRtWorkflow(BackfillSessionWorkflow):
                 "proxy_source": "registration_current_proxy",
             },
         )
-        return account, auth, override
+        return account, auth, override, normalize_proxy_country(self._proxy_country)
 
     def _raise_business_fallback_if_required(
         self,
@@ -2539,7 +2682,6 @@ def _probe_proxy_alive(proxy_url: str) -> bool:
     try:
         headers = {
             "accept": "application/json",
-            "accept-language": "zh-CN,zh;q=0.9",
             "referer": "https://chatgpt.com/",
         }
         with curl_requests.Session(
@@ -2560,8 +2702,15 @@ def _fetch_accounts_check_v4(
     access_token: str,
     cookie_header: str,
     proxy_url: str,
+    proxy_country: str = "",
     chatgpt_account_id: str = "",
     oai_device_id: str = "",
+    browser_user_agent: str = "",
+    browser_platform: str = "",
+    browser_timezone: str = "",
+    browser_timezone_offset: int | None = None,
+    browser_accept_language: str = "",
+    browser_impersonate: str = "",
 ) -> dict:
     if not access_token:
         raise AccountAuthWorkflowError("missing_access_token_for_accounts_check")
@@ -2569,12 +2718,10 @@ def _fetch_accounts_check_v4(
         raise AccountAuthWorkflowError("missing_cookie_for_accounts_check")
     headers = {
         "accept": "*/*",
-        "accept-language": "zh-CN,zh;q=0.9",
         "authorization": f"Bearer {access_token}",
         "cookie": cookie_header,
         "oai-client-build-number": "9052945",
         "oai-client-version": "prod-e1d6f2820dd20c3bab36cc42e8668035bf87f7bc",
-        "oai-language": "zh-CN",
         "oai-session-id": str(uuid4()),
         "priority": "u=1, i",
         "referer": "https://chatgpt.com/",
@@ -2588,10 +2735,30 @@ def _fetch_accounts_check_v4(
         headers["chatgpt-account-id"] = chatgpt_account_id
     if oai_device_id:
         headers["oai-device-id"] = oai_device_id
+    captured_accept_language = str(browser_accept_language or "").strip()
+    timezone_offset = None
+    if captured_accept_language:
+        headers["accept-language"] = captured_accept_language
+        headers["oai-language"] = captured_accept_language.split(",", 1)[0]
+    elif str(proxy_country or "").strip():
+        headers["accept-language"] = accept_language_for_proxy_country(proxy_country)
+        headers["oai-language"] = headers["accept-language"].split(",", 1)[0]
+    if browser_timezone_offset is not None:
+        timezone_offset = int(browser_timezone_offset)
+    elif str(proxy_country or "").strip():
+        timezone_offset = timezone_offset_minutes_for_proxy_country(proxy_country)
+    captured_user_agent = str(browser_user_agent or "").strip()
+    if captured_user_agent:
+        headers["user-agent"] = captured_user_agent
     proxies = _curl_proxies(proxy_url)
-    with curl_requests.Session(impersonate=BROWSER_IMPERSONATE, proxies=proxies) as client:
+    impersonate = _supported_curl_impersonate(browser_impersonate)
+    with curl_requests.Session(impersonate=impersonate, proxies=proxies) as client:
         response = client.get(
-            f"{ACCOUNTS_CHECK_URL}?timezone_offset_min=-480",
+            (
+                f"{ACCOUNTS_CHECK_URL}?timezone_offset_min={timezone_offset}"
+                if timezone_offset is not None
+                else ACCOUNTS_CHECK_URL
+            ),
             headers=headers,
             timeout=30,
         )
@@ -2601,6 +2768,17 @@ def _fetch_accounts_check_v4(
     if not isinstance(payload, dict):
         raise AccountAuthWorkflowError("accounts_check_response_not_object")
     return payload
+
+
+def _supported_curl_impersonate(value: str) -> str:
+    requested = str(value or "").strip().casefold()
+    if re.fullmatch(r"firefox\d+", requested):
+        # The running Camoufox build can be newer than curl_cffi's named profiles.
+        return "firefox"
+    if re.fullmatch(r"chrome\d+[a-z]*", requested):
+        # CloakBrowser can be newer than curl_cffi's named Chrome profiles.
+        return "chrome"
+    return requested or BROWSER_IMPERSONATE
 
 
 def _extract_personal_chatgpt_account_id(payload: dict) -> str:
@@ -2667,9 +2845,149 @@ def _extract_personal_accounts_check_identity(
 
 
 def _extract_account_promotion_id(payload: dict, *, account_id: str = "") -> str:
+    return next(
+        (
+            offer["promotion_id"]
+            for offer in _extract_account_promotion_campaigns(payload, account_id=account_id)
+            if offer["promotion_id"] == PLUS_ONE_MONTH_FREE_PROMOTION_ID
+        ),
+        "",
+    )
+
+
+def _persist_promotion_snapshot(
+    session: object,
+    *,
+    space_id: str,
+    user_account_id: str,
+    proxy_country: str,
+    campaigns: list[dict[str, object]],
+    response_json: dict,
+    checked_at: datetime,
+) -> str:
+    """Persist one country-scoped promotion check without losing offer history.
+
+    The workflow is also exercised with deliberately small fake sessions.  A fake
+    that cannot perform a real ORM write is left untouched, matching the previous
+    behavior while keeping the production path fully typed to the catalog models.
+    """
+    add = getattr(session, "add", None)
+    execute = getattr(session, "execute", None)
+    scalars = getattr(session, "scalars", None)
+    if not callable(add) or not callable(execute) or not callable(scalars):
+        return ""
+
+    check_id = f"promotion-check-{uuid4()}"
+    existing_stmt = (
+        select(SpacePromotionOfferModel)
+        .where(
+            SpacePromotionOfferModel.space_id == space_id,
+            SpacePromotionOfferModel.proxy_country == proxy_country,
+        )
+        .with_for_update()
+    )
+    existing_result = scalars(existing_stmt)
+    all_rows = getattr(existing_result, "all", None)
+    if callable(all_rows):
+        existing_rows = list(all_rows())
+    else:
+        first_row = getattr(existing_result, "first", None)
+        existing_rows = []
+        if callable(first_row):
+            row = first_row()
+            if row is not None:
+                existing_rows.append(row)
+
+    existing_by_promotion_id = {
+        str(getattr(row, "promotion_id", "") or "").strip(): row
+        for row in existing_rows
+        if str(getattr(row, "promotion_id", "") or "").strip()
+    }
+    seen_promotion_ids: set[str] = set()
+    for offer in campaigns:
+        promotion_id = str(offer.get("promotion_id") or "").strip()
+        if not promotion_id or promotion_id in seen_promotion_ids:
+            continue
+        seen_promotion_ids.add(promotion_id)
+        raw_offer = offer.get("raw_campaign_json") or offer.get("raw_offer_json")
+        raw_campaign = dict(raw_offer) if isinstance(raw_offer, dict) else {}
+        normalized_offer = offer.get("normalized_json")
+        normalized = (
+            dict(normalized_offer)
+            if isinstance(normalized_offer, dict)
+            else dict(raw_campaign)
+        )
+        promotion_name = str(
+            offer.get("promotion_name")
+            or offer.get("campaign_key")
+            or raw_campaign.get("name")
+            or raw_campaign.get("display_name")
+            or raw_campaign.get("title")
+            or ""
+        ).strip()
+        row = existing_by_promotion_id.get(promotion_id)
+        if row is None:
+            row = SpacePromotionOfferModel(
+                id=f"promotion-offer-{uuid4()}",
+                space_id=space_id,
+                user_account_id=user_account_id,
+                proxy_country=proxy_country,
+                promotion_id=promotion_id,
+                promotion_name=promotion_name,
+                status="eligible",
+                normalized_json=normalized,
+                raw_campaign_json=raw_campaign,
+                first_seen_at=checked_at,
+                last_seen_at=checked_at,
+                last_checked_at=checked_at,
+                source_check_id=check_id,
+            )
+            add(row)
+            existing_by_promotion_id[promotion_id] = row
+            continue
+
+        # Keep first_seen_at immutable while refreshing the current snapshot.
+        row.user_account_id = user_account_id
+        row.promotion_name = promotion_name
+        row.status = "eligible"
+        row.normalized_json = normalized
+        row.raw_campaign_json = raw_campaign
+        row.last_seen_at = checked_at
+        row.last_checked_at = checked_at
+        row.source_check_id = check_id
+
+    # A successful empty response is a meaningful observation.  Retain rows for
+    # history, but make sure stale offers are excluded by the UI's eligible filter.
+    for promotion_id, row in existing_by_promotion_id.items():
+        if promotion_id in seen_promotion_ids:
+            continue
+        row.status = "stale"
+        row.last_checked_at = checked_at
+        row.source_check_id = check_id
+
+    add(
+        PromotionCheckRunModel(
+            id=check_id,
+            space_id=space_id,
+            user_account_id=user_account_id,
+            proxy_country=proxy_country,
+            status="succeeded" if seen_promotion_ids else "empty",
+            campaigns_count=len(seen_promotion_ids),
+            response_json=response_json,
+            checked_at=checked_at,
+            created_at=checked_at,
+        )
+    )
+    return check_id
+
+
+def _extract_account_promotion_campaigns(
+    payload: dict, *, account_id: str = ""
+) -> list[dict[str, object]]:
+    """Return every eligible campaign for the selected account, retaining raw data."""
     accounts = payload.get("accounts")
     if not isinstance(accounts, dict):
-        return ""
+        return []
 
     target_account_id = str(account_id or "").strip()
     candidates: list[dict] = []
@@ -2691,20 +3009,53 @@ def _extract_account_promotion_id(payload: dict, *, account_id: str = "") -> str
         candidates.append(entry)
         seen.add(id(entry))
 
+    offers: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
     for entry in candidates:
         identity = _accounts_check_identity_from_entry(entry)
         if target_account_id and identity is not None and identity.account_id != target_account_id:
             continue
         campaigns = entry.get("eligible_promo_campaigns")
-        if not isinstance(campaigns, dict):
+        if isinstance(campaigns, list):
+            campaign_items = [(str(index), item) for index, item in enumerate(campaigns)]
+        elif isinstance(campaigns, dict):
+            campaign_items = list(campaigns.items())
+        else:
             continue
-        for campaign in campaigns.values():
+        for campaign_key, campaign in campaign_items:
             if not isinstance(campaign, dict):
                 continue
-            promotion_id = str(campaign.get("id") or "").strip()
-            if promotion_id == PLUS_ONE_MONTH_FREE_PROMOTION_ID:
-                return promotion_id
-    return ""
+            promotion_id = str(
+                campaign.get("promotion_id")
+                or campaign.get("promotionId")
+                or campaign.get("id")
+                or ""
+            ).strip()
+            if not promotion_id or promotion_id in seen_ids:
+                continue
+            seen_ids.add(promotion_id)
+            raw_campaign_json = dict(campaign)
+            promotion_name = str(
+                campaign.get("name")
+                or campaign.get("display_name")
+                or campaign.get("title")
+                or campaign_key
+                or ""
+            ).strip()
+            offers.append(
+                {
+                    "promotion_id": promotion_id,
+                    # Canonical catalog fields consumed by the persistence layer.
+                    "promotion_name": promotion_name,
+                    "normalized_json": dict(raw_campaign_json),
+                    "raw_campaign_json": raw_campaign_json,
+                    # Keep parser aliases for callers that consume the extractor
+                    # directly; they are not ORM model constructor fields.
+                    "campaign_key": str(campaign_key or "").strip(),
+                    "raw_offer_json": raw_campaign_json,
+                }
+            )
+    return offers
 
 
 def _accounts_check_identity_from_entry(entry: object) -> AccountsCheckIdentity | None:

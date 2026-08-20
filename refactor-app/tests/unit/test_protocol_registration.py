@@ -9,18 +9,23 @@ import pytest
 import refactor_app.application.workflows.protocol_registration as protocol_registration
 from refactor_app.application.jobs import handlers
 from refactor_app.application.workflows.protocol_registration import (
+    HERO_YANDEX_PROVIDER,
+    PHONE_BROWSER_BIND_EMAIL,
+    HeroSmsLongTermPhoneProviderAdapter,
     HeroSmsPhoneProviderAdapter,
     ProtocolRegistrationInput,
     ProtocolRegistrationWorkflow,
     RegistrationMailProviderAdapter,
     _extract_otp,
     _hero_phone_parts,
+    _validate_registration_email_domain,
 )
 from refactor_app.application.workflows.registration_proxy import CliproxyProxy
 from refactor_app.config.browser_fingerprint import (
     BROWSER_SEC_CH_UA,
     BROWSER_SEC_CH_UA_PLATFORM,
     BROWSER_USER_AGENT,
+    browser_fingerprint_for_email,
 )
 from refactor_app.config.settings import Settings
 from refactor_app.plugins.contracts import OtpMessage
@@ -30,6 +35,15 @@ from refactor_app.plugins.openai_auth_protocol.account_security import (
 )
 from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthFlow, AuthResult
 from refactor_app.plugins.openai_auth_protocol.config import Config, PhoneConfig
+from refactor_app.plugins.openai_auth_protocol.sentinel_quickjs import (
+    create_sentinel_runtime_context,
+)
+
+
+def _proxy_config(country_code: str = "US") -> Config:
+    config = Config()
+    config.proxy_meta = {"register": {"country_code": country_code}}
+    return config
 
 
 def test_email_protocol_passes_proxy_country_to_sentinel_context(monkeypatch) -> None:
@@ -46,7 +60,7 @@ def test_email_protocol_passes_proxy_country_to_sentinel_context(monkeypatch) ->
 
     monkeypatch.setattr(protocol_registration, "AuthFlow", Flow)
     workflow = ProtocolRegistrationWorkflow.__new__(ProtocolRegistrationWorkflow)
-    mail = object()
+    mail = SimpleNamespace(claim=SimpleNamespace(email="protocol@example.com"))
 
     workflow._execute_email_protocol(
         ProtocolRegistrationInput(mode="email_protocol_no_phone", proxy_country="JP"),
@@ -64,7 +78,322 @@ def test_email_protocol_passes_proxy_country_to_sentinel_context(monkeypatch) ->
     assert config.proxy_meta["register"]["country_code"] == "JP"
     assert config.proxy_meta["register"]["region"] == "JP"
     assert config.proxy_meta["register"]["mode"] == "trojan_pool_sticky"
+    assert config.browser_fingerprint == browser_fingerprint_for_email(
+        "protocol@example.com"
+    )
     assert captured["mail"] is mail
+
+
+def test_email_browser_runner_uses_claimed_mailbox_fingerprint(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeBrowser:
+        def __init__(self, config, *, event_callback):
+            captured["config"] = config
+            captured["event_callback"] = event_callback
+
+        def run(self, mail, *, totp_code_provider):
+            captured["mail"] = mail
+            captured["totp_code_provider"] = totp_code_provider
+            result = AuthResult()
+            result.email = "browser@example.com"
+            return result
+
+    mail = SimpleNamespace(claim=SimpleNamespace(email="browser@example.com"))
+    monkeypatch.setattr(protocol_registration, "CamoufoxEmailRegistration", FakeBrowser)
+    workflow = ProtocolRegistrationWorkflow.__new__(ProtocolRegistrationWorkflow)
+    workflow._cloakbrowser_license_key = "cloak-key"
+    workflow._totp_code_resolver = None
+
+    workflow._execute_email_browser(
+        ProtocolRegistrationInput(mode="email_browser_no_phone", proxy_country="US"),
+        mail=mail,
+        user_account_id="account-1",
+        work_id="work-1",
+        proxy_url="http://proxy.example",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    config = captured["config"]
+    assert config.browser_fingerprint == browser_fingerprint_for_email(
+        "browser@example.com"
+    )
+    assert captured["mail"] is mail
+
+
+def test_hero_gmail_rejects_fixed_email() -> None:
+    workflow = ProtocolRegistrationWorkflow(
+        session_factory=lambda: None,  # type: ignore[return-value]
+        mail_provider=object(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(
+        protocol_registration.ProtocolRegistrationWorkflowError,
+        match="fixed_email is not supported",
+    ):
+        workflow.run(
+            ProtocolRegistrationInput(
+                mode="email_protocol_no_phone",
+                mail_provider="hero_gmail",
+                fixed_email="existing@gmail.com",
+            )
+        )
+
+
+def test_hero_yandex_rejects_fixed_email() -> None:
+    workflow = ProtocolRegistrationWorkflow(
+        session_factory=lambda: None,  # type: ignore[return-value]
+        mail_provider=object(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(
+        protocol_registration.ProtocolRegistrationWorkflowError,
+        match="fixed_email is not supported",
+    ):
+        workflow.run(
+            ProtocolRegistrationInput(
+                mode="email_protocol_no_phone",
+                mail_provider=HERO_YANDEX_PROVIDER,
+                fixed_email="existing@yandex.ru",
+            )
+        )
+
+
+def test_yandex_dot_com_is_temporarily_disabled() -> None:
+    with pytest.raises(
+        protocol_registration.ProtocolRegistrationWorkflowError,
+        match="temporarily disabled: yandex.com",
+    ):
+        _validate_registration_email_domain("new.user@yandex.com")
+
+
+def test_non_yandex_email_domain_is_accepted() -> None:
+    assert _validate_registration_email_domain("new.user@example.com") is None
+
+
+def test_yandex_claim_uses_configured_proxy_route() -> None:
+    captured: dict[str, object] = {}
+
+    class MailProvider:
+        def claim_random(self, **_kwargs) -> ClaimedMailAccount:
+            return ClaimedMailAccount(
+                account_id="hero-email:tr",
+                email="new.user@yandex.com.tr",
+                claim_token="tr",
+                caller_id="caller",
+                task_id="work-yandex-tr",
+            )
+
+        def claim_complete(self, _claim, *, result: str, detail: str):
+            return {"success": True, "result": result, "detail": detail}
+
+        def claim_release(self, *_args, **_kwargs):
+            return {"success": True}
+
+    class Workflow(ProtocolRegistrationWorkflow):
+        def _make_event_emitter(self, **_kwargs):
+            return lambda stage, data, level="INFO": captured.setdefault(
+                stage, {"data": data, "level": level}
+            )
+
+        def _make_claim_persist_callback(self, _work_id: str):
+            return None
+
+        def _create_placeholder_account(self, *, email: str) -> str:
+            return "account-yandex-tr"
+
+        def _merge_work_output(self, _work_id: str, _patch: dict) -> None:
+            return None
+
+        def _resolve_registration_proxy(self, **kwargs) -> CliproxyProxy:
+            captured["proxy_request"] = kwargs
+            return CliproxyProxy(
+                proxy_url="http://proxy.example",
+                country_code=kwargs["country_code"],
+            )
+
+        def _detect_account_spaces_after_registration(self, **_kwargs):
+            return {"accounts_check_succeeded": True}
+
+        def _run_post_registration_security(self, *_args, **_kwargs):
+            return AccountSecuritySetupResult(
+                password_status="configured",
+                password_value_confirmed=True,
+                mfa_status="configured",
+                twofauth_account_id="twofauth-tr",
+            )
+
+        def _write_success_account(self, **_kwargs) -> None:
+            return None
+
+        def _run_post_registration_promotion_check(self, input_, **kwargs):
+            captured["promotion_input_country"] = input_.proxy_country
+            captured["promotion_proxy_country"] = kwargs["registration_proxy"].country_code
+            return None
+
+        def _run_post_registration_codex_authorization(self, *_args, **_kwargs):
+            return None
+
+        def _delete_placeholder_account(self, _user_account_id: str) -> None:
+            return None
+
+    def runner(input_, **kwargs):
+        captured["runner_input"] = input_
+        result = AuthResult()
+        result.email = "new.user@yandex.com.tr"
+        result.password_configured = True
+        result.session_token = "session-token"
+        result.access_token = "access-token"
+        return protocol_registration._RegistrationAttempt(
+            result=result,
+            flow=None,
+            proxy_url=kwargs["proxy_url"],
+            proxy_country=input_.proxy_country,
+        )
+
+    output = Workflow(
+        session_factory=lambda: None,
+        mail_provider=MailProvider(),
+    )._run_registration_lifecycle(
+        ProtocolRegistrationInput(
+            mode="email_protocol_no_phone",
+            mail_provider=HERO_YANDEX_PROVIDER,
+            proxy_country="US",
+            proxy_state="California",
+        ),
+        mode="email_protocol_no_phone",
+        work_id="work-yandex-tr",
+        run_id="run-yandex-tr",
+        runner=runner,
+    )
+
+    assert captured["proxy_request"] == {
+        "target_email": "new.user@yandex.com.tr",
+        "country_code": "US",
+        "state": "California",
+    }
+    assert captured["runner_input"].proxy_country == "US"
+    assert captured["runner_input"].proxy_state == "California"
+    assert captured["promotion_input_country"] == "US"
+    assert captured["promotion_proxy_country"] == "US"
+    assert "proxy.country_selected_from_email" not in captured
+    assert output["proxy_country"] == "US"
+
+
+def test_hero_gmail_resume_claim_is_scoped_to_the_same_run() -> None:
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, _model, work_id: str):
+            assert work_id == "work-1"
+            return SimpleNamespace(
+                output_json={
+                    "mail_claim_run_id": "run-1",
+                    "mail_claim": {
+                        "account_id": "hero-email:2770475",
+                        "email": "new.user@gmail.com",
+                        "email_domain": "gmail.com",
+                        "claim_token": "2770475",
+                        "caller_id": "caller",
+                        "task_id": "work-1",
+                    },
+                }
+            )
+
+    claim = handlers._registration_resume_mail_claim(
+        session_factory=Session,
+        input_json={
+            "mail_provider": "hero_gmail",
+            "_work_id": "work-1",
+            "_run_id": "run-1",
+        },
+    )
+    assert claim is not None
+    assert claim.email == "new.user@gmail.com"
+    assert claim.claim_token == "2770475"
+
+    assert (
+        handlers._registration_resume_mail_claim(
+            session_factory=Session,
+            input_json={
+                "mail_provider": "hero_gmail",
+                "_work_id": "work-1",
+                "_run_id": "retry-run",
+            },
+        )
+        is None
+    )
+
+
+def test_hero_yandex_resume_claim_preserves_provider_and_suffix() -> None:
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, _model, _work_id: str):
+            return SimpleNamespace(
+                output_json={
+                    "mail_claim_run_id": "run-yandex",
+                    "mail_claim": {
+                        "account_id": "hero-email:7001",
+                        "email": "new.user@yandex.com.tr",
+                        "email_domain": "yandex.com.tr",
+                        "claim_token": "7001",
+                    },
+                }
+            )
+
+    claim = handlers._registration_resume_mail_claim(
+        session_factory=Session,
+        input_json={
+            "mail_provider": HERO_YANDEX_PROVIDER,
+            "_work_id": "work-yandex",
+            "_run_id": "run-yandex",
+        },
+    )
+    assert claim is not None
+    assert claim.email_domain == "yandex.com.tr"
+    assert claim.raw["provider"] == HERO_YANDEX_PROVIDER
+
+
+def test_registration_proxy_resolver_receives_state_or_asn(monkeypatch) -> None:
+    calls: list[dict[str, str]] = []
+
+    def resolve_proxy(**kwargs):
+        calls.append(dict(kwargs))
+        return CliproxyProxy(proxy_url="http://proxy.example", country_code="US")
+
+    monkeypatch.setattr(protocol_registration, "resolve_cliproxy_proxy", resolve_proxy)
+    workflow = ProtocolRegistrationWorkflow.__new__(ProtocolRegistrationWorkflow)
+
+    workflow._resolve_registration_proxy(
+        target_email="state@example.test",
+        country_code="US",
+        state="California",
+    )
+    workflow._resolve_registration_proxy(
+        target_email="asn@example.test",
+        country_code="US",
+        asn="AS33363",
+    )
+
+    assert calls == [
+        {
+            "email": "state@example.test",
+            "country_code": "US",
+            "state": "California",
+        },
+        {
+            "email": "asn@example.test",
+            "country_code": "US",
+            "asn": "AS33363",
+        },
+    ]
 
 
 def test_auth_flow_csrf_retries_cloudflare_403_three_times(monkeypatch) -> None:
@@ -247,6 +576,347 @@ def test_hero_sms_phone_provider_adapter_lifecycle(monkeypatch) -> None:
     ]
 
 
+def _longterm_phone_config(**overrides) -> PhoneConfig:
+    values = {
+        "enabled": True,
+        "provider": "hero_sms",
+        "base_url": "https://hero-sms.com/stubs/handler_api.php",
+        "service": "ts",
+        "country": "187",
+        "otp_timeout_s": 2,
+        "otp_poll_interval_s": 1,
+    }
+    values.update(overrides)
+    return PhoneConfig(**values)
+
+
+def test_hero_sms_longterm_reuses_active_us_activation_without_lifecycle_mutation() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        params = dict(request.url.params)
+        assert params["api_key"] == "hero-key"
+        if params["action"] == "getActiveActivations":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": [
+                        {
+                            "activationId": "rent-1",
+                            "serviceCode": "ts",
+                            "countryCode": "187",
+                            "phoneNumber": "15717256466",
+                            "activationStatus": "2",
+                            "activationEndTime": "2099-08-16T13:35:25+00:00",
+                        }
+                    ],
+                },
+            )
+        if params["action"] == "getAllSms":
+            assert params["id"] == "rent-1"
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "old-1", "code": "123456", "text": "old"}]},
+            )
+        return httpx.Response(400, json={"error": "BAD_ACTION"})
+
+    adapter = HeroSmsLongTermPhoneProviderAdapter(
+        _longterm_phone_config(),
+        api_key="hero-key",
+    )
+    adapter._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        lease = adapter.allocate()
+        adapter.mark_verified(lease.lease_id)
+        adapter.mark_failed(lease.lease_id, "retry")
+    finally:
+        adapter.close()
+
+    assert lease.lease_id == "rent-1"
+    assert lease.phone_e164 == "+15717256466"
+    assert lease.phone_national == "5717256466"
+    assert lease.country_phone_code == "1"
+    assert [dict(request.url.params)["action"] for request in requests] == [
+        "getActiveActivations",
+        "getActiveActivations",
+        "getAllSms",
+    ]
+
+
+def test_hero_sms_longterm_repeated_allocate_refreshes_baseline_without_relocking() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        action = dict(request.url.params)["action"]
+        if action == "getActiveActivations":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "activationId": "rent-1",
+                            "serviceCode": "ts",
+                            "countryCode": 187,
+                            "phoneNumber": "+15717256466",
+                            "activationStatus": "2",
+                        }
+                    ]
+                },
+            )
+        assert action == "getAllSms"
+        return httpx.Response(200, json={"data": [{"id": f"msg-{calls}"}]})
+
+    adapter = HeroSmsLongTermPhoneProviderAdapter(_longterm_phone_config(), api_key="hero-key")
+    adapter._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        first = adapter.allocate()
+        second = adapter.allocate()
+    finally:
+        adapter.close()
+
+    assert first == second
+    assert calls == 4
+
+
+def test_hero_sms_longterm_accepts_active_activations_response_field() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        action = dict(request.url.params)["action"]
+        if action == "getActiveActivations":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": [
+                        {
+                            "activationId": "rent-active-field",
+                            "service": "paypal",
+                            "country": "US",
+                            "phoneNumber": "15717256466",
+                            "activationStatus": "2",
+                            "estDate": "2099-08-16 13:35:25",
+                        }
+                    ],
+                    "activeActivations": {
+                        "affected_rows": 1,
+                        "num_rows": 1,
+                        "rows": [],
+                    },
+                },
+            )
+        assert action == "getAllSms"
+        return httpx.Response(200, json={"data": []})
+
+    adapter = HeroSmsLongTermPhoneProviderAdapter(_longterm_phone_config(), api_key="hero-key")
+    adapter._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        lease = adapter.allocate()
+    finally:
+        adapter.close()
+
+    assert lease.lease_id == "rent-active-field"
+    assert lease.expires_at == "2099-08-16 13:35:25"
+
+
+def test_hero_sms_longterm_skips_locked_activation_and_uses_another_random_candidate() -> None:
+    active = [
+        {
+            "activationId": "rent-1",
+            "serviceCode": "ts",
+            "countryCode": "187",
+            "phoneNumber": "15717256465",
+            "activationStatus": "2",
+        },
+        {
+            "activationId": "rent-2",
+            "serviceCode": "paypal",
+            "countryCode": "US",
+            "phoneNumber": "15717256466",
+            "activationStatus": "2",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if params["action"] == "getActiveActivations":
+            return httpx.Response(200, json={"data": active})
+        assert params["action"] == "getAllSms"
+        return httpx.Response(200, json={"data": []})
+
+    first = HeroSmsLongTermPhoneProviderAdapter(_longterm_phone_config(), api_key="hero-key")
+    second = HeroSmsLongTermPhoneProviderAdapter(_longterm_phone_config(), api_key="hero-key")
+    first._client = httpx.Client(transport=httpx.MockTransport(handler))
+    second._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        first_lease = first.allocate()
+        second_lease = second.allocate()
+        assert second_lease.lease_id != first_lease.lease_id
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("active_data", "message"),
+    [
+        ([], "active activation not found"),
+        (
+            [
+                {
+                    "activationId": "rent-1",
+                    "serviceCode": "ts",
+                    "countryCode": "187",
+                    "phoneNumber": "15717***66",
+                    "activationStatus": "2",
+                }
+            ],
+            "masked phone number",
+        ),
+        (
+            [
+                {
+                    "activationId": "rent-1",
+                    "serviceCode": "ts",
+                    "countryCode": "187",
+                    "phoneNumber": "15717256466",
+                    "activationStatus": "2",
+                    "activationEndTime": "2020-01-01T00:00:00Z",
+                }
+            ],
+            "expired",
+        ),
+    ],
+)
+def test_hero_sms_longterm_selection_errors_are_explicit(active_data, message) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params)["action"] == "getActiveActivations"
+        return httpx.Response(200, json={"status": "success", "data": active_data})
+
+    adapter = HeroSmsLongTermPhoneProviderAdapter(_longterm_phone_config(), api_key="hero-key")
+    adapter._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(protocol_registration.ProtocolRegistrationWorkflowError, match=message):
+            adapter.allocate()
+    finally:
+        adapter.close()
+
+
+def test_hero_sms_longterm_optional_activation_id_filters_candidates() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        action = dict(request.url.params)["action"]
+        if action == "getActiveActivations":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "activationId": "rent-1",
+                            "serviceCode": "ts",
+                            "countryCode": "187",
+                            "phoneNumber": "15717256465",
+                            "activationStatus": "2",
+                        },
+                        {
+                            "activationId": "rent-2",
+                            "serviceCode": "ts",
+                            "countryCode": "187",
+                            "phoneNumber": "15717256466",
+                            "activationStatus": "2",
+                        },
+                    ]
+                },
+            )
+        assert action == "getAllSms"
+        return httpx.Response(200, json={"data": []})
+
+    adapter = HeroSmsLongTermPhoneProviderAdapter(
+        _longterm_phone_config(), api_key="hero-key", activation_id="rent-2"
+    )
+    adapter._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        lease = adapter.allocate()
+    finally:
+        adapter.close()
+
+    assert lease.lease_id == "rent-2"
+
+
+def test_hero_sms_longterm_ignores_history_and_non_code_until_new_six_digit_otp(
+    monkeypatch,
+) -> None:
+    poll_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal poll_count
+        action = dict(request.url.params)["action"]
+        if action == "getActiveActivations":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "activationId": "rent-1",
+                            "serviceCode": "ts",
+                            "countryCode": "187",
+                            "phoneNumber": "15717256466",
+                            "activationStatus": "2",
+                        }
+                    ]
+                },
+            )
+        assert action == "getAllSms"
+        poll_count += 1
+        if poll_count == 1:
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "old", "text": "PayPal code 111111"}]},
+            )
+        if poll_count == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "old", "text": "PayPal code 111111"},
+                        {"id": "noise", "text": "Welcome"},
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "old", "text": "PayPal code 111111"},
+                    {"id": "noise", "text": "Welcome"},
+                    {
+                        "id": "delayed-old",
+                        "service": "ts",
+                        "date": "2020-01-01T00:00:00Z",
+                        "text": "PayPal verification code: 222222",
+                    },
+                    {
+                        "id": "new",
+                        "service": "ts",
+                        "date": "2099-01-01T00:00:00Z",
+                        "text": "PayPal verification code: 654321",
+                    },
+                ]
+            },
+        )
+
+    adapter = HeroSmsLongTermPhoneProviderAdapter(_longterm_phone_config(), api_key="hero-key")
+    adapter._client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(protocol_registration.time, "sleep", lambda _seconds: None)
+    try:
+        adapter.allocate()
+        adapter.prepare_otp("rent-1")
+        assert adapter.poll_otp("rent-1") == "654321"
+    finally:
+        adapter.close()
+
+
 def test_hero_sms_phone_parts_match_legacy_normalization() -> None:
     assert _hero_phone_parts("07123 456789", "44") == (
         "+447123456789",
@@ -284,11 +954,11 @@ def test_hero_sms_country_defaults_and_single_country_fallback() -> None:
     job_input = handlers._protocol_registration_input({"mode": "phone_protocol_bind_email"})
 
     assert workflow_input.phone_country == ""
-    assert workflow_input.phone_countries == ["151", "73", "16"]
+    assert workflow_input.phone_countries == ["187"]
     assert plugin_config.country == ""
     assert plugin_config.countries == ["151", "73", "16"]
     assert job_input.phone_country == ""
-    assert job_input.phone_countries == ["151", "73", "16"]
+    assert job_input.phone_countries == ["187"]
 
     single_country_input = handlers._protocol_registration_input(
         {
@@ -328,6 +998,122 @@ def test_hero_sms_rejects_empty_country_configuration() -> None:
         match="country must be numeric",
     ):
         adapter._service_countries()
+
+
+def test_phone_browser_runner_uses_claimed_mail_and_closes_phone_provider(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePhone:
+        def __init__(self, cfg, *, api_key, event_callback):
+            captured["phone_cfg"] = cfg
+            captured["phone_api_key"] = api_key
+            captured["phone_event_callback"] = event_callback
+
+        def close(self) -> None:
+            captured["phone_closed"] = True
+
+    class FakeBrowser:
+        def __init__(self, config, *, event_callback):
+            captured["browser_config"] = config
+            captured["browser_event_callback"] = event_callback
+
+        def run(self, mail, phone, *, email, totp_code_provider):
+            captured.update(
+                {
+                    "mail": mail,
+                    "phone": phone,
+                    "email": email,
+                    "totp_code_provider": totp_code_provider,
+                }
+            )
+            result = AuthResult()
+            result.email = email
+            result.session_token = "session"
+            result.access_token = "access"
+            result.password_configured = True
+            return result
+
+    class Mail:
+        claim = SimpleNamespace(email="claimed@yandex.fi")
+
+    monkeypatch.setattr(protocol_registration, "HeroSmsPhoneProviderAdapter", FakePhone)
+    monkeypatch.setattr(protocol_registration, "BrowserPhoneEmailRegistration", FakeBrowser)
+
+    workflow = ProtocolRegistrationWorkflow.__new__(ProtocolRegistrationWorkflow)
+    workflow._hero_sms_api_key = "grizzly-key"
+    workflow._cloakbrowser_license_key = "cloak-key"
+    workflow._totp_code_resolver = lambda account_id: f"otp:{account_id}"
+
+    attempt = workflow._execute_phone_browser(
+        ProtocolRegistrationInput(
+            mode=PHONE_BROWSER_BIND_EMAIL,
+            proxy_country="FI",
+            browser_backend="cloakbrowser",
+            phone_country="187",
+        ),
+        mail=Mail(),
+        user_account_id="account-1",
+        work_id="work-1",
+        proxy_url="http://proxy.example",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    assert attempt.flow is None
+    assert attempt.proxy_url == "http://proxy.example"
+    assert attempt.proxy_country == "FI"
+    assert captured["email"] == "claimed@yandex.fi"
+    assert captured["phone_api_key"] == "grizzly-key"
+    assert captured["phone_closed"] is True
+    config = captured["browser_config"]
+    assert config.proxy_url == "http://proxy.example"
+    assert config.locale
+    assert config.browser_backend == "cloakbrowser"
+    assert config.browser_fingerprint == browser_fingerprint_for_email(
+        "claimed@yandex.fi"
+    )
+    assert captured["totp_code_provider"]() == "otp:account-1"
+
+
+def test_phone_protocol_runner_uses_claimed_mailbox_fingerprint(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePhone:
+        def __init__(self, config, *, api_key, event_callback):
+            captured["phone_config"] = config
+            captured["phone_api_key"] = api_key
+            captured["phone_event_callback"] = event_callback
+
+    class FakeFlow:
+        def __init__(self, config, *, trace_callback):
+            captured["config"] = config
+            captured["trace_callback"] = trace_callback
+
+        def run_phone_register(self, mail, phone):
+            captured["mail"] = mail
+            captured["phone"] = phone
+            return AuthResult()
+
+    monkeypatch.setattr(protocol_registration, "HeroSmsPhoneProviderAdapter", FakePhone)
+    monkeypatch.setattr(protocol_registration, "AuthFlow", FakeFlow)
+    workflow = ProtocolRegistrationWorkflow.__new__(ProtocolRegistrationWorkflow)
+    workflow._hero_sms_api_key = "hero-key"
+    workflow._make_http_trace_callback = lambda _emit: None
+    mail = SimpleNamespace(claim=SimpleNamespace(email="phone-protocol@example.com"))
+
+    workflow._execute_phone_protocol(
+        ProtocolRegistrationInput(mode="phone_protocol", proxy_country="US"),
+        mail=mail,
+        user_account_id="account-1",
+        work_id="work-1",
+        proxy_url="http://proxy.example",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    config = captured["config"]
+    assert config.browser_fingerprint == browser_fingerprint_for_email(
+        "phone-protocol@example.com"
+    )
+    assert captured["mail"] is mail
 
 
 def test_hero_sms_extracts_call_verification_code() -> None:
@@ -453,7 +1239,7 @@ def test_phone_protocol_existing_account_does_not_allocate_another_number() -> N
             self.failed.append((lease_id, reason))
 
     phone = PhoneProvider()
-    flow = ExistingAccountFlow(Config())
+    flow = ExistingAccountFlow(_proxy_config())
 
     with pytest.raises(RuntimeError, match="existing_phone_account"):
         flow.run_phone_register(SimpleNamespace(), phone)
@@ -529,6 +1315,77 @@ def test_registration_mail_adapter_lowercases_openai_email_but_keeps_mailbox_ema
     assert provider.wait_email == "DawnMontgomery148200@outlook.com"
     assert provider.complete_detail == "DawnMontgomery148200@outlook.com"
     assert provider.release_reason == "registration_failed:DawnMontgomery148200@outlook.com"
+
+
+def test_browser_registration_external_mail_reads_subject_otp_from_all_fields() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeMailProvider:
+        @staticmethod
+        def claim_random(**_kwargs) -> ClaimedMailAccount:
+            return ClaimedMailAccount(
+                account_id="mail-subject-code",
+                email="SubjectCode@outlook.com",
+                claim_token="claim-subject-code",
+                caller_id="caller",
+                task_id="task",
+                email_domain="outlook.com",
+            )
+
+        @staticmethod
+        def wait_for_otp_by_email(**kwargs) -> OtpMessage:
+            captured.update(kwargs)
+            if kwargs.get("code_source") != "all":
+                raise TimeoutError("OTP exists only in the message subject")
+            return OtpMessage(
+                code="482951",
+                raw={
+                    "data": {
+                        "subject": "Your ChatGPT verification code is 482951",
+                        "content": "",
+                        "html": "",
+                        "matched_source": "subject",
+                    }
+                },
+            )
+
+    adapter = RegistrationMailProviderAdapter(
+        mail_provider=FakeMailProvider(),  # type: ignore[arg-type]
+        caller_id="caller",
+        task_id="task",
+        provider="outlook",
+        project_key="openai-register",
+        email_domain="outlook.com",
+        otp_code_source="all",
+    )
+
+    email = adapter.create_mailbox()
+    code = adapter.wait_for_otp(email, timeout=90, issued_after=123.0, max_polls=4)
+
+    assert code == "482951"
+    assert captured == {
+        "email": "SubjectCode@outlook.com",
+        "timeout_s": 90,
+        "issued_after": 123.0,
+        "max_polls": 4,
+        "code_source": "all",
+    }
+
+
+def test_registration_otp_code_source_is_content_for_every_registration_path() -> None:
+    for mode, mail_provider in (
+        ("email_browser_no_phone", "outlook"),
+        ("email_browser_no_phone", "cloudflare_temp_mail"),
+        ("email_protocol_no_phone", "outlook"),
+        ("email_browser_no_phone", "hero_gmail"),
+    ):
+        assert (
+            protocol_registration.registration_otp_code_source(
+                mode=mode,
+                mail_provider=mail_provider,
+            )
+            == "content"
+        )
 
 
 def test_registration_mail_adapter_claims_new_mailbox_after_release() -> None:
@@ -638,6 +1495,96 @@ def test_registration_mail_adapter_ensures_fixed_domain_mail_before_returning_it
 
     assert email == "Worker@boluodadaxyz.xyz"
     assert calls == ["ensure:Worker@boluodadaxyz.xyz"]
+
+
+def test_registration_mail_adapter_creates_fresh_temp_mailbox_without_pool_claim(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    events: list[str] = []
+
+    class FakeMailProvider:
+        def claim_random(self, **_kwargs) -> ClaimedMailAccount:
+            raise AssertionError("temporary mailbox must not use pool claim")
+
+        def ensure_domain_email(self, *, email: str) -> dict:
+            calls.append(f"ensure:{email}")
+            return {"email": email, "ensured": True}
+
+        def wait_for_otp_by_email(self, *, email: str, **_kwargs) -> OtpMessage:
+            calls.append(f"wait:{email}")
+            return OtpMessage(code="123456", raw={})
+
+    monkeypatch.setattr(
+        protocol_registration,
+        "uuid4",
+        lambda: SimpleNamespace(hex="freshmailbox0000000000"),
+    )
+
+    adapter = RegistrationMailProviderAdapter(
+        mail_provider=FakeMailProvider(),  # type: ignore[arg-type]
+        caller_id="caller",
+        task_id="task",
+        provider="cloudflare_temp_mail",
+        project_key="openai-register",
+        email_domain="wangzi.xyz",
+        event_callback=lambda stage, _data, _level="INFO": events.append(stage),
+    )
+
+    email = adapter.create_mailbox()
+    code = adapter.wait_for_otp(email)
+    adapter.mark_used(email)
+
+    assert email == "freshmailbox@wangzi.xyz"
+    assert code == "123456"
+    assert calls == [
+        "ensure:freshmailbox@wangzi.xyz",
+        "wait:freshmailbox@wangzi.xyz",
+    ]
+    assert "mail.claim.started" not in events
+    assert "mail.ensure.started" not in events
+    assert events == [
+        "mail.create.started",
+        "mail.create.succeeded",
+        "mail.otp.wait.started",
+        "mail.otp.wait.succeeded",
+    ]
+
+
+def test_registration_mail_adapter_creates_another_temp_mail_after_failure(monkeypatch) -> None:
+    identifiers = iter(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"])
+    calls: list[str] = []
+
+    class FakeMailProvider:
+        def ensure_domain_email(self, *, email: str) -> dict:
+            calls.append(f"ensure:{email}")
+            return {"email": email, "ensured": True}
+
+    monkeypatch.setattr(
+        protocol_registration,
+        "uuid4",
+        lambda: SimpleNamespace(hex=next(identifiers)),
+    )
+
+    adapter = RegistrationMailProviderAdapter(
+        mail_provider=FakeMailProvider(),  # type: ignore[arg-type]
+        caller_id="caller",
+        task_id="task",
+        provider="cloudflare_temp_mail",
+        project_key="openai-register",
+        email_domain="wangzi.xyz",
+    )
+
+    first_email = adapter.create_mailbox()
+    adapter.mark_unused(first_email)
+    second_email = adapter.create_mailbox()
+
+    assert first_email == "aaaaaaaaaaaa@wangzi.xyz"
+    assert second_email == "bbbbbbbbbbbb@wangzi.xyz"
+    assert calls == [
+        "ensure:aaaaaaaaaaaa@wangzi.xyz",
+        "ensure:bbbbbbbbbbbb@wangzi.xyz",
+    ]
 
 
 def test_phone_email_binding_timeout_rotates_up_to_ten_mailboxes(monkeypatch) -> None:
@@ -1116,6 +2063,7 @@ def test_registration_codex_grizzly_provider_matches_invite_executor_defaults() 
 
 def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypatch) -> None:
     order: list[str] = []
+    emitted: dict[str, dict] = {}
 
     class FakeMailProvider:
         def claim_random(self, **_kwargs) -> ClaimedMailAccount:
@@ -1142,7 +2090,11 @@ def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypa
 
     class TestWorkflow(ProtocolRegistrationWorkflow):
         def _make_event_emitter(self, *, run_id: str, work_id: str, mode: str):
-            return lambda stage, data, level="INFO": order.append(f"event:{stage}")
+            def emit(stage, data, level="INFO") -> None:
+                order.append(f"event:{stage}")
+                emitted[stage] = data
+
+            return emit
 
         def _make_claim_persist_callback(self, work_id: str):
             return lambda claim: order.append(f"persist_claim:{claim.email}")
@@ -1184,6 +2136,7 @@ def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypa
         return CliproxyProxy(
             proxy_url="http://127.0.0.1:18088",
             country_code=country_code,
+            egress_ip="198.51.100.42",
         )
 
     class FakeAuthFlow:
@@ -1233,6 +2186,9 @@ def test_email_protocol_hashes_claimed_email_before_openai_registration(monkeypa
         "write_success:JosephStevenson892165@outlook.com"
     )
     assert result["account_detection"]["personal_chatgpt_account_id"] == "personal-1"
+    assert result["proxy_egress_ip"] == "198.51.100.42"
+    assert emitted["proxy.assigned"]["proxy_egress_ip"] == "198.51.100.42"
+    assert emitted["succeeded"]["proxy_egress_ip"] == "198.51.100.42"
     assert "delete_account" not in order
 
 
@@ -1317,9 +2273,17 @@ def test_email_protocol_rejects_valid_tokens_without_confirmed_password(
 
 
 def test_default_protocol_password_meets_current_minimum_length() -> None:
-    password = protocol_registration.AuthFlow._default_password_from_email("a@b")
+    first = protocol_registration.AuthFlow._default_password_from_email("a@b")
+    second = protocol_registration.AuthFlow._default_password_from_email("a@b")
 
-    assert len(password) >= 12
+    assert len(first) >= 12
+    assert len(second) >= 12
+    assert first != second
+    assert "a@b" not in first
+    assert any(character.isupper() for character in first)
+    assert any(character.islower() for character in first)
+    assert any(character.isdigit() for character in first)
+    assert first.isalnum()
 
 
 def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
@@ -1352,6 +2316,8 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
             assert config.headless is True
             assert config.otp_timeout_s == 180
             assert config.success_close_delay_s == 3.5
+            assert config.browser_backend == "cloakbrowser"
+            assert config.cloakbrowser_license_key == "cb_fixture_secret"
 
         def run(
             self,
@@ -1365,6 +2331,7 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
             result = AuthResult()
             result.email = email
             result.password = "saved-password"
+            result.password_configured = True
             result.session_token = "session-token"
             result.access_token = "access-token"
             result.cookie_header = "chatgpt-cookie=value"
@@ -1395,6 +2362,15 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
             order.append(f"detect_v4:{kwargs['proxy_url']}")
             return {"personal_chatgpt_account_id": "personal-1"}
 
+        def _run_post_registration_security(self, *_args, **_kwargs):
+            order.append("security_configured")
+            return AccountSecuritySetupResult(
+                password_status="configured",
+                password_value_confirmed=True,
+                mfa_status="configured",
+                twofauth_account_id="twofauth-browser-1",
+            )
+
         def _delete_placeholder_account(self, user_account_id: str) -> None:
             order.append("delete_account")
 
@@ -1413,10 +2389,12 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
 
     def totp_resolver(_account_id: str) -> str:
         return "123456"
+
     result = TestWorkflow(
         session_factory=lambda: None,
         mail_provider=FakeMailProvider(),
         totp_code_resolver=totp_resolver,
+        cloakbrowser_license_key="cb_fixture_secret",
     ).run(
         ProtocolRegistrationInput(
             mode="email_browser_no_phone",
@@ -1424,6 +2402,7 @@ def test_email_browser_reuses_registration_proxy_for_v4(monkeypatch) -> None:
             project_key="openai-register",
             use_proxy=False,
             browser_close_delay_s=3.5,
+            browser_backend="cloakbrowser",
         ),
         work_id="work-1",
         run_id="run-1",
@@ -1558,12 +2537,21 @@ def test_post_registration_detection_failure_keeps_persisted_account() -> None:
         def _detect_account_spaces_after_registration(self, **_kwargs) -> dict:
             raise RuntimeError("event step foreign key failed")
 
+        def _run_post_registration_security(self, *_args, **_kwargs):
+            return AccountSecuritySetupResult(
+                password_status="configured",
+                password_value_confirmed=True,
+                mfa_status="configured",
+            )
+
         def _delete_placeholder_account(self, _user_account_id: str) -> None:
             calls.append("delete_account")
 
     def runner(*_args, **_kwargs):
         result = AuthResult()
         result.email = "SavedBrowser@icloud.com"
+        result.password = "saved-password"
+        result.password_configured = True
         result.session_token = "session-token"
         result.access_token = "access-token"
         return protocol_registration._RegistrationAttempt(
@@ -1718,7 +2706,8 @@ def test_protocol_registration_work_defaults_codex_authorization_to_disabled(mon
         def __init__(self, **kwargs) -> None:
             captured.update(kwargs)
 
-        def run(self, *_args, **_kwargs):
+        def run(self, input_, **_kwargs):
+            captured["registration_input"] = input_
             return {"status": "ok"}
 
     monkeypatch.setattr(handlers, "_twofauth_client", lambda _settings: Client())
@@ -1735,17 +2724,107 @@ def test_protocol_registration_work_defaults_codex_authorization_to_disabled(mon
 
     result = handlers._run_protocol_registration_work(
         session_factory=lambda: None,
-        settings=SimpleNamespace(hero_sms_api_key=""),
+        settings=SimpleNamespace(
+            hero_sms_api_key="",
+            cloakbrowser_license_key="cb_fixture_secret",
+        ),
         input_json={
             "mode": "email_protocol_no_phone",
             "mail_provider": "icloud_hide_my_email",
+            "browser_backend": "cloakbrowser",
         },
     )
 
     assert result == {"status": "ok"}
     assert captured["authorize_codex_after_security"] is False
     assert captured["codex_phone_provider"] is None
+    assert captured["cloakbrowser_license_key"] == "cb_fixture_secret"
+    assert captured["registration_input"].browser_backend == "cloakbrowser"
+    assert not hasattr(captured["registration_input"], "cloakbrowser_license_key")
     assert captured["twofauth_closed"] is True
+
+
+@pytest.mark.parametrize("provider", ["hero_gmail", "hero_yandex"])
+def test_hero_registration_uses_hero_mail_and_security_clients(monkeypatch, provider: str) -> None:
+    captured: dict[str, object] = {}
+    closed: list[str] = []
+
+    class HeroMailProvider:
+        def close(self) -> None:
+            closed.append("hero_mail")
+
+    class TwoFAuthClient:
+        def close(self) -> None:
+            closed.append("twofauth")
+
+    class Workflow:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self, input_, **_kwargs):
+            captured["input"] = input_
+            return {"status": "ok"}
+
+    hero_mail = HeroMailProvider()
+    twofauth = TwoFAuthClient()
+    monkeypatch.setattr(handlers, "_hero_email_plugin", lambda _settings: hero_mail)
+    monkeypatch.setattr(handlers, "_twofauth_client", lambda _settings: twofauth)
+    monkeypatch.setattr(handlers, "_twofauth_otp_resolver", lambda _settings: None)
+    monkeypatch.setattr(handlers, "ProtocolRegistrationWorkflow", Workflow)
+
+    result = handlers._run_protocol_registration_work(
+        session_factory=lambda: None,
+        settings=SimpleNamespace(hero_sms_api_key=""),
+        input_json={
+            "mode": "email_browser_no_phone",
+            "mail_provider": provider,
+        },
+    )
+
+    assert result == {"status": "ok"}
+    assert captured["mail_provider"] is hero_mail
+    assert captured["twofauth_client"] is twofauth
+    assert captured["input"].mail_provider == provider
+    assert closed == ["twofauth", "hero_mail"]
+
+
+def test_non_paypal_protocol_registration_defaults_to_grizzly_sms(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Workflow:
+        def __init__(self, **kwargs) -> None:
+            captured["init"] = kwargs
+
+        def run(self, input_, **_kwargs):
+            captured["input"] = input_
+            return {"status": "ok"}
+
+    monkeypatch.setattr(handlers, "_mail_plugin", lambda _settings: object())
+    monkeypatch.setattr(handlers, "_twofauth_otp_resolver", lambda _settings: None)
+    monkeypatch.setattr(handlers, "ProtocolRegistrationWorkflow", Workflow)
+
+    result = handlers._run_protocol_registration_work(
+        session_factory=lambda: None,
+        settings=SimpleNamespace(
+            grizzly_sms_api_key="grizzly-key",
+            grizzly_sms_base_url="https://grizzly.example.test/handler_api.php",
+            grizzly_sms_service="dr",
+            grizzly_sms_max_price="0.18",
+        ),
+        input_json={
+            "mode": "phone_protocol_bind_email",
+            "mail_provider": "outlook",
+            "phone_base_url": "https://attacker.example.test/collect",
+            "phone_api_key_env": "ATTACKER_KEY",
+        },
+    )
+
+    assert result == {"status": "ok"}
+    assert captured["init"]["hero_sms_api_key"] == "grizzly-key"
+    assert captured["input"].phone_base_url == "https://grizzly.example.test/handler_api.php"
+    assert captured["input"].phone_api_key_env == "GRIZZLY_SMS_API_KEY"
+    assert captured["input"].phone_service == "dr"
+    assert captured["input"].phone_max_price == "0.18"
 
 
 def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> None:
@@ -1774,6 +2853,12 @@ def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> No
     result.chatgpt_account_id = "business-1"
     result.chatgpt_account_structure = "workspace"
     result.chatgpt_account_plan_type = "team"
+    result.browser_user_agent = "Mozilla/5.0 Fixture Firefox/152.0"
+    result.browser_platform = "Win32"
+    result.browser_timezone = "America/New_York"
+    result.browser_timezone_offset = -240
+    result.browser_accept_language = "en-US,en;q=0.5"
+    result.browser_impersonate = "firefox147"
     workflow = ProtocolRegistrationWorkflow(session_factory=lambda: None, mail_provider=object())
 
     detection = workflow._detect_account_spaces_after_registration(
@@ -1790,13 +2875,39 @@ def test_registration_space_detection_reuses_backfill_v4_flow(monkeypatch) -> No
         "access_token": "access-token",
         "cookie_header": "session-cookie=value",
         "proxy_url": "http://account-proxy.example",
+        "proxy_country": "",
         "oai_device_id": "device-1",
         "session_chatgpt_account_id": "business-1",
         "session_chatgpt_account_structure": "workspace",
         "session_chatgpt_account_plan_type": "team",
+        "browser_user_agent": "Mozilla/5.0 Fixture Firefox/152.0",
+        "browser_platform": "Win32",
+        "browser_timezone": "America/New_York",
+        "browser_timezone_offset": -240,
+        "browser_accept_language": "en-US,en;q=0.5",
+        "browser_impersonate": "firefox147",
         "require_personal_access_token": False,
         "run_id": "run-1",
     }
+
+
+def test_auth_result_serializes_browser_identity() -> None:
+    result = AuthResult()
+    result.browser_user_agent = "Mozilla/5.0 Fixture Firefox/152.0"
+    result.browser_platform = "Win32"
+    result.browser_timezone = "America/New_York"
+    result.browser_timezone_offset = -240
+    result.browser_accept_language = "en-US,en;q=0.5"
+    result.browser_impersonate = "firefox147"
+
+    payload = result.to_dict()
+
+    assert payload["browser_user_agent"] == "Mozilla/5.0 Fixture Firefox/152.0"
+    assert payload["browser_platform"] == "Win32"
+    assert payload["browser_timezone"] == "America/New_York"
+    assert payload["browser_timezone_offset"] == -240
+    assert payload["browser_accept_language"] == "en-US,en;q=0.5"
+    assert payload["browser_impersonate"] == "firefox147"
 
 
 def test_icloud_promotion_check_is_disabled_by_default() -> None:
@@ -1809,7 +2920,10 @@ def test_icloud_promotion_check_is_disabled_by_default() -> None:
             mail_provider="icloud_hide_my_email",
         ),
         user_account_id="account-1",
-        email="disabled@icloud.com",
+        registration_proxy=CliproxyProxy(
+            proxy_url="http://registration-proxy.example:8080",
+            country_code="US",
+        ),
         run_id="",
         emit=lambda stage, *_args, **_kwargs: calls.append(stage),
     )
@@ -1818,7 +2932,7 @@ def test_icloud_promotion_check_is_disabled_by_default() -> None:
     assert calls == ["promotion_check.skipped"]
 
 
-def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
+def test_icloud_promotion_check_reuses_registration_proxy(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
     class Detector:
@@ -1832,18 +2946,10 @@ def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
                 "status": "succeeded",
                 "has_promotion": True,
                 "promotion_id": "plus-1-month-free",
-                "proxy_country": "JP",
+                "proxy_country": "US",
             }
 
-    def resolve_proxy(*, email: str, country_code: str):
-        calls.append((email, country_code))
-        return CliproxyProxy(
-            proxy_url="http://jp-proxy.example:8080",
-            country_code=country_code,
-        )
-
     monkeypatch.setattr(protocol_registration, "BackfillSessionWorkflow", Detector)
-    monkeypatch.setattr(protocol_registration, "resolve_cliproxy_proxy", resolve_proxy)
     workflow = ProtocolRegistrationWorkflow(
         session_factory=lambda: None,
         mail_provider=object(),
@@ -1856,23 +2962,29 @@ def test_icloud_promotion_check_uses_email_hashed_jp_proxy(monkeypatch) -> None:
             mail_provider="icloud_hide_my_email",
         ),
         user_account_id="account-1",
-        email="MixedCase@icloud.com",
+        registration_proxy=CliproxyProxy(
+            proxy_url="http://registration-proxy.example:8080",
+            country_code="US",
+            egress_ip="203.0.113.24",
+            sid_source="registration_email_sha256",
+            probe_attempts=2,
+        ),
         run_id="",
         emit=lambda *_args, **_kwargs: None,
     )
 
     assert calls == [
-        ("MixedCase@icloud.com", "JP"),
-        ("probe", "http://jp-proxy.example:8080"),
+        ("probe", "http://registration-proxy.example:8080"),
     ]
     assert result == {
         "status": "succeeded",
         "has_promotion": True,
         "promotion_id": "plus-1-month-free",
-        "proxy_country": "JP",
+        "proxy_country": "US",
         "proxy_provider": "cliproxy",
-        "proxy_sid_source": "email_sha256",
-        "proxy_probe_attempts": 1,
+        "proxy_egress_ip": "203.0.113.24",
+        "proxy_sid_source": "registration_email_sha256",
+        "proxy_probe_attempts": 2,
     }
 
 
@@ -1958,7 +3070,7 @@ def test_auth_flow_registration_does_not_run_codex_oauth() -> None:
         def oauth_secondary_authorize_exchange(self) -> bool:
             raise AssertionError("registration must not call oauth_secondary_authorize_exchange")
 
-    flow = RegistrationOnlyAuthFlow(Config())
+    flow = RegistrationOnlyAuthFlow(_proxy_config())
     result = flow.run_register(FakeMailProvider())
 
     assert result.is_valid()
@@ -2063,7 +3175,7 @@ def test_auth_flow_legacy_password_registration_does_not_fallback_when_password_
             calls.append("kickoff_otp_delivery")
             return True
 
-    flow = PasswordFailureAuthFlow(Config())
+    flow = PasswordFailureAuthFlow(_proxy_config())
 
     with pytest.raises(RuntimeError, match="注册密码失败"):
         flow.run_register(FakeMailProvider())
@@ -2134,7 +3246,7 @@ def test_auth_flow_passwordless_signup_still_requires_password_before_otp() -> N
             self.result.access_token = "access-token"
             return self.result.session_token, self.result.access_token
 
-    flow = PasswordlessSignupAuthFlow(Config())
+    flow = PasswordlessSignupAuthFlow(_proxy_config())
     result = flow.run_register(FakeMailProvider())
 
     assert result.is_valid()
@@ -2174,7 +3286,7 @@ def test_email_password_registration_retries_transient_account_creation_failure(
     monkeypatch.setattr(
         "refactor_app.plugins.openai_auth_protocol.auth_flow.time.sleep", sleeps.append
     )
-    flow = RetryAuthFlow(Config())
+    flow = RetryAuthFlow(_proxy_config())
 
     assert flow.register_email_password_with_retry("retry@example.test") is True
     assert attempts == [1, 2, 3]
@@ -2191,7 +3303,7 @@ def test_email_password_registration_does_not_retry_non_transient_failure(monkey
             return False
 
     monkeypatch.setenv("EMAIL_PROTOCOL_REGISTER_PASSWORD_ATTEMPTS", "3")
-    flow = NonRetryAuthFlow(Config())
+    flow = NonRetryAuthFlow(_proxy_config())
 
     assert flow.register_email_password_with_retry("no-retry@example.test") is False
     assert attempts == [1]
@@ -2291,6 +3403,7 @@ def test_registration_signin_query_matches_legacy_password_flow() -> None:
     flow = AuthFlow.__new__(AuthFlow)
     flow.result = AuthResult()
     flow.session = Session()
+    flow._sentinel_runtime_context = create_sentinel_runtime_context("US")
     flow._trace_http = lambda *_args, **_kwargs: None
     flow._remember_oauth_params = lambda *_args, **_kwargs: None
     flow._inject_pkce_into_auth_url = lambda value: value
@@ -2368,6 +3481,7 @@ def test_auth_oauth_init_preserves_signin_device_identity() -> None:
     flow.result = AuthResult()
     flow.result.device_id = "signin-device-id"
     flow.session = Session()
+    flow._sentinel_runtime_context = create_sentinel_runtime_context("US")
     flow._auth_web_runtime = None
     flow._auth_web_runtime_page_url = ""
     flow._last_auth_oauth_init_url = ""
@@ -2379,6 +3493,7 @@ def test_auth_oauth_init_preserves_signin_device_identity() -> None:
         auth_session_logging_id="session-id",
         is_ready=True,
     )
+
     def load_document(*_args, **_kwargs):
         flow._auth_web_runtime = runtime
         return Response(
@@ -2492,7 +3607,7 @@ def test_http_trace_reports_fingerprint_and_cookie_names_without_values() -> Non
 
 
 def test_registration_headers_match_configured_browser_fingerprint() -> None:
-    flow = AuthFlow(Config())
+    flow = AuthFlow(_proxy_config())
 
     headers = flow._common_headers("https://auth.openai.com/create-account")
 

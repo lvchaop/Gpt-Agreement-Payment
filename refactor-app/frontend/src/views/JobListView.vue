@@ -141,6 +141,8 @@ const definitions: Record<string, { label: string; defaults: Record<string, Conf
       hero_sms_country: "187",
       hero_sms_max_price: "0.18",
       force_clean_browser_login: false,
+      proxy_mode: "cliproxy",
+      proxy_country: "US",
     },
     fields: [
       { key: "space_id", label: "个人空间（留空处理全部）", type: "space", spaceType: "personal" },
@@ -150,6 +152,8 @@ const definitions: Record<string, { label: string; defaults: Record<string, Conf
       { key: "hero_sms_country", label: "GrizzlySMS 国家编号", type: "text" },
       { key: "hero_sms_max_price", label: "GrizzlySMS 最大价格", type: "text" },
       { key: "force_clean_browser_login", label: "强制清理浏览器登录状态", type: "checkbox" },
+      { key: "proxy_mode", label: "代理模式（cliproxy / proxyserver）", type: "text" },
+      { key: "proxy_country", label: "代理国家代码", type: "text" },
     ],
   },
 };

@@ -167,6 +167,79 @@ def test_external_mail_api_client_pool_claim_contract() -> None:
     ]
 
 
+def test_external_mail_api_client_temp_mail_task_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/external/temp-emails/apply":
+            assert request.method == "POST"
+            assert json.loads(request.read()) == {
+                "caller_id": "worker-1",
+                "task_id": "task-1",
+                "domain": "wangzi.xyz",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "email": "fresh123@wangzi.xyz",
+                        "domain": "wangzi.xyz",
+                        "task_token": "tmptask_fresh123",
+                        "status": "active",
+                    },
+                },
+            )
+        if request.url.path == "/api/external/temp-emails/tmptask_fresh123/finish":
+            assert request.method == "POST"
+            assert json.loads(request.read()) == {
+                "result": "success",
+                "detail": "fresh123@wangzi.xyz",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "email": "fresh123@wangzi.xyz",
+                        "task_token": "tmptask_fresh123",
+                        "status": "finished",
+                    },
+                },
+            )
+        return httpx.Response(404, json={"success": False})
+
+    client = ExternalMailApiClient(
+        ExternalMailApiClientConfig(base_url="https://mail.example.test", api_key="mail-key"),
+        http_client=httpx.Client(
+            base_url="https://mail.example.test",
+            headers={"X-API-Key": "mail-key", "Accept": "application/json"},
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    mailbox = client.apply_temp_email(
+        caller_id="worker-1",
+        task_id="task-1",
+        domain="wangzi.xyz",
+    )
+    result = client.finish_temp_email(
+        task_token=mailbox.claim_token,
+        result="success",
+        detail=mailbox.email,
+    )
+
+    assert mailbox.account_id == "temp-task:tmptask_fresh123"
+    assert mailbox.email == "fresh123@wangzi.xyz"
+    assert mailbox.claim_token == "tmptask_fresh123"
+    assert result["data"]["status"] == "finished"
+    assert [request.url.path for request in requests] == [
+        "/api/external/temp-emails/apply",
+        "/api/external/temp-emails/tmptask_fresh123/finish",
+    ]
+
+
 def test_wait_for_otp_preserves_pool_email_case() -> None:
     seen_params: dict[str, str] = {}
 
@@ -268,7 +341,7 @@ def test_wait_for_otp_honors_max_polls() -> None:
     assert request_count == 2
 
 
-def test_domain_mail_ensures_missing_mailbox_then_uses_legacy_retrieval() -> None:
+def test_domain_mail_ensures_missing_mailbox_then_uses_content_retrieval() -> None:
     requests: list[httpx.Request] = []
     verification_attempts = 0
 
@@ -279,7 +352,7 @@ def test_domain_mail_ensures_missing_mailbox_then_uses_legacy_retrieval() -> Non
             verification_attempts += 1
             assert request.url.params["email"] == "worker@boluodadaxyz.xyz"
             assert request.url.params["code_length"] == "6"
-            assert request.url.params["code_source"] == "all"
+            assert request.url.params["code_source"] == "content"
             assert "code_regex" not in request.url.params
             if verification_attempts == 1:
                 return httpx.Response(
@@ -369,7 +442,15 @@ def test_ensure_domain_email_creates_domain_mail_before_otp_is_sent() -> None:
     ]
 
 
-@pytest.mark.parametrize("email", ["User@outlook.com", "hidden@icloud.com"])
+@pytest.mark.parametrize(
+    "email",
+    [
+        "User@outlook.com",
+        "User@outlook.in",
+        "User@outlook.ph",
+        "hidden@icloud.com",
+    ],
+)
 def test_ensure_domain_email_skips_outlook_and_icloud(email: str) -> None:
     client = ExternalMailApiClient(
         ExternalMailApiClientConfig(
@@ -390,7 +471,15 @@ def test_ensure_domain_email_skips_outlook_and_icloud(email: str) -> None:
     assert result == {"email": email, "ensured": False, "skipped": True}
 
 
-@pytest.mark.parametrize("email", ["User@outlook.com", "hidden@icloud.com"])
+@pytest.mark.parametrize(
+    "email",
+    [
+        "User@outlook.com",
+        "User@outlook.in",
+        "User@outlook.ph",
+        "hidden@icloud.com",
+    ],
+)
 def test_outlook_and_icloud_missing_mailboxes_are_not_auto_created(email: str) -> None:
     requests: list[httpx.Request] = []
 

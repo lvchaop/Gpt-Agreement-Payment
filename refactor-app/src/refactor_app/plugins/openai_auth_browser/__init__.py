@@ -13,6 +13,10 @@ from refactor_app.plugins.openai_auth_browser.personal_payment_method import (
     BrowserPaymentMethodResult,
     BrowserPersonalPaymentMethodError,
 )
+from refactor_app.plugins.openai_auth_browser.phone_email_registration import (
+    BrowserPhoneEmailRegistration,
+    BrowserPhoneEmailRegistrationConfig,
+)
 
 __all__ = [
     "BrowserAccountDeactivatedError",
@@ -26,4 +30,6 @@ __all__ = [
     "BrowserPaymentMethodResult",
     "BrowserPersonalPaymentMethodError",
     "CamoufoxEmailRegistration",
+    "BrowserPhoneEmailRegistration",
+    "BrowserPhoneEmailRegistrationConfig",
 ]

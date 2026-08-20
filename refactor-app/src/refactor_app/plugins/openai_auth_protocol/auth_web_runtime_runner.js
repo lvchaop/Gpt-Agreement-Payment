@@ -537,8 +537,21 @@ function installWebApis(options) {
     saveData: false,
   });
   const { plugins, mimeTypes } = createPluginArray();
-  const chromeMajor = String(options.chromeMajor || "142");
-  const chromeFullVersion = String(options.chromeFullVersion || `${chromeMajor}.0.0.0`);
+  const userAgentDataProfile = options.userAgentData;
+  if (
+    !userAgentDataProfile ||
+    !Array.isArray(userAgentDataProfile.brands) ||
+    !Array.isArray(userAgentDataProfile.fullVersionList)
+  ) {
+    throw new Error("Auth Web browser profile is missing Client Hint brand data");
+  }
+  const userAgentDataBrands = userAgentDataProfile.brands.map(({ brand, version }) => ({
+    brand: String(brand),
+    version: String(version),
+  }));
+  const userAgentDataFullVersionList = userAgentDataProfile.fullVersionList.map(
+    ({ brand, version }) => ({ brand: String(brand), version: String(version) }),
+  );
   const navigatorValue = {
     language: options.language,
     languages: options.languages,
@@ -554,28 +567,20 @@ function installWebApis(options) {
     plugins,
     mimeTypes,
     userAgentData: {
-      brands: [
-        { brand: "Chromium", version: chromeMajor },
-        { brand: "Google Chrome", version: chromeMajor },
-        { brand: "Not_A Brand", version: "99" },
-      ],
-      mobile: false,
-      platform: options.userAgentDataPlatform || "macOS",
+      brands: userAgentDataBrands,
+      mobile: Boolean(userAgentDataProfile.mobile),
+      platform: String(userAgentDataProfile.platform),
       async getHighEntropyValues(hints = []) {
         const values = {
-          architecture: "arm",
-          bitness: "64",
+          architecture: String(userAgentDataProfile.architecture),
+          bitness: String(userAgentDataProfile.bitness),
           brands: this.brands,
-          fullVersionList: [
-            { brand: "Chromium", version: chromeFullVersion },
-            { brand: "Google Chrome", version: chromeFullVersion },
-            { brand: "Not_A Brand", version: "99.0.0.0" },
-          ],
-          mobile: false,
-          model: "",
+          fullVersionList: userAgentDataFullVersionList,
+          mobile: this.mobile,
+          model: String(userAgentDataProfile.model),
           platform: this.platform,
-          platformVersion: "15.7.0",
-          uaFullVersion: chromeFullVersion,
+          platformVersion: String(userAgentDataProfile.platformVersion),
+          uaFullVersion: String(userAgentDataProfile.uaFullVersion),
         };
         return Object.fromEntries(hints.filter((hint) => hint in values).map((hint) => [hint, values[hint]]));
       },
@@ -1020,9 +1025,9 @@ async function initializeRuntime(payload) {
   authSessionLoggingId = String(metadata.auth_session_logging_id || identity.sessionLoggingId || "");
 
   datadogRum.startDurationVital("initialize_intl");
-  let intlLocale = "en-US";
+  let intlLocale = String(payload.webProfile.language || identity.locale || "");
   try {
-    intlLocale = Intl.getCanonicalLocales(identity.locale || payload.webProfile.language || "en-US")[0];
+    intlLocale = Intl.getCanonicalLocales(intlLocale)[0];
     new Intl.DateTimeFormat(intlLocale, { dateStyle: "medium", timeStyle: "short" }).format(
       new Date(),
     );
@@ -1057,7 +1062,7 @@ async function initializeRuntime(payload) {
   statsigClient = new statsigSdk.StatsigClient(
     payload.statsigClientKey,
     {
-      locale: identity.locale,
+      locale: intlLocale,
       ...(identity.ip ? { ip: identity.ip } : {}),
       ...(identity.country ? { country: identity.country } : {}),
       appVersion: payload.datadogConfig.version,
@@ -1119,6 +1124,17 @@ async function initializeRuntime(payload) {
   await flushRuntime();
   const datadogInternalContext =
     datadogRum.getInternalContext(performance.now()) || datadogRum.getInternalContext() || null;
+  const userAgentDataHighEntropyValues = await navigator.userAgentData.getHighEntropyValues([
+    "architecture",
+    "bitness",
+    "brands",
+    "fullVersionList",
+    "mobile",
+    "model",
+    "platform",
+    "platformVersion",
+    "uaFullVersion",
+  ]);
   return {
     authSessionLoggingId: metadata.auth_session_logging_id,
     deviceId: identity.deviceId,
@@ -1144,6 +1160,7 @@ async function initializeRuntime(payload) {
       innerHeight: globalThis.innerHeight,
       devicePixelRatio: globalThis.devicePixelRatio,
       userAgentData: navigator.userAgentData,
+      userAgentDataHighEntropyValues,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     },
   };

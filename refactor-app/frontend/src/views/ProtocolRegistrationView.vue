@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 
 import PageHeader from "../components/PageHeader.vue";
 import { resourcesApi } from "../api/resources";
+import type { ProtocolRegistrationBrowserBackend } from "../api/resources";
 import { useOpsStore } from "../stores/ops";
 
 const store = useOpsStore();
@@ -13,31 +14,41 @@ const mode = ref("email_protocol_no_phone");
 const count = ref(1);
 const workCount = ref(1);
 const proxyCountry = ref("US");
+const proxyState = ref("");
+const proxyAsn = ref("");
 const authorizeCodexAfterSecurity = ref(false);
 const mailProvider = ref("outlook");
 const emailDomain = ref("");
 const projectKey = ref("openai-register");
 const callerId = ref("refactor-app-protocol-registration");
+const browserBackend = ref<ProtocolRegistrationBrowserBackend>("camoufox");
 const browserHeadless = ref(true);
 const browserOtpTimeoutS = ref(180);
 const browserCloseDelayS = ref(10);
 
-const phoneBaseUrl = ref("https://hero-sms.com/stubs/handler_api.php");
-const phoneApiKeyEnv = ref("HERO_SMS_API_KEY");
+const phoneBaseUrl = ref("https://api.grizzlysms.com/stubs/handler_api.php");
+const phoneApiKeyEnv = ref("GRIZZLY_SMS_API_KEY");
 const phoneService = ref("dr");
 const phoneCountry = ref("");
-const phoneCountries = ref("151,73,16");
-const phoneMaxPrice = ref("0.05");
+const phoneCountries = ref("187");
+const phoneMaxPrice = ref("0.18");
 const phoneCountryMaxPrices = ref("");
 const phoneMaxNumberAttempts = ref(3);
 const phoneOtpTimeoutS = ref(180);
 const phoneOtpPollIntervalS = ref(3);
 const submitting = ref(false);
 
-watch(mailProvider, (provider) => {
+watch(mailProvider, (provider, previousProvider) => {
   if (provider === "icloud_hide_my_email") {
     emailDomain.value = "";
+  } else if (provider === "hero_gmail") {
+    emailDomain.value = "gmail.com";
+  } else if (provider === "hero_yandex") {
+    if (previousProvider !== "hero_yandex") emailDomain.value = "";
   } else {
+    if (previousProvider === "hero_gmail" || previousProvider === "hero_yandex") {
+      emailDomain.value = "";
+    }
     authorizeCodexAfterSecurity.value = false;
   }
 });
@@ -69,7 +80,15 @@ async function submitJob() {
     store.toast("国家代码格式错误", "请输入两位国家代码，例如 US 或 JP", "error");
     return;
   }
+  const normalizedProxyState = proxyState.value.trim();
+  const normalizedProxyAsn = proxyAsn.value.trim();
+  if (normalizedProxyState && normalizedProxyAsn) {
+    store.toast("代理筛选条件冲突", "州和 ASN 只能填写一个", "error");
+    return;
+  }
   proxyCountry.value = normalizedProxyCountry;
+  proxyState.value = normalizedProxyState;
+  proxyAsn.value = normalizedProxyAsn;
   submitting.value = true;
   try {
     const result = await resourcesApi.createProtocolRegistrationJob({
@@ -77,15 +96,18 @@ async function submitJob() {
       count: count.value,
       work_count: workCount.value,
       proxy_country: normalizedProxyCountry,
+      ...(normalizedProxyState ? { proxy_state: normalizedProxyState } : {}),
+      ...(normalizedProxyAsn ? { proxy_asn: normalizedProxyAsn } : {}),
       authorize_codex_after_security: authorizeCodexAfterSecurity.value,
       mail_provider: mailProvider.value,
       email_domain: emailDomain.value,
       project_key: projectKey.value,
       caller_id: callerId.value,
+      browser_backend: browserBackend.value,
       browser_headless: browserHeadless.value,
       browser_otp_timeout_s: browserOtpTimeoutS.value,
       browser_close_delay_s: browserCloseDelayS.value,
-      phone_provider: "hero_sms",
+      phone_provider: "grizzly_sms",
       phone_base_url: phoneBaseUrl.value,
       phone_api_key_env: phoneApiKeyEnv.value,
       phone_service: phoneService.value,
@@ -110,7 +132,7 @@ async function submitJob() {
   <div>
     <PageHeader
       title="账号注册"
-      description="邮箱支持浏览器或纯协议注册；手机号纯协议注册完成后绑定邮箱。"
+      description="邮箱支持浏览器或纯协议注册；手机号支持浏览器或纯协议注册并绑定邮箱。"
     />
 
     <section class="panel registration-panel">
@@ -121,6 +143,7 @@ async function submitJob() {
             <option value="email_protocol_no_phone">邮箱纯协议注册，不绑手机号</option>
             <option value="email_browser_no_phone">邮箱浏览器注册，不绑手机号</option>
             <option value="phone_protocol_bind_email">手机号纯协议注册，绑定邮箱</option>
+            <option value="phone_browser_bind_email">手机号浏览器注册，绑定邮箱</option>
           </select>
         </label>
         <label>
@@ -145,6 +168,25 @@ async function submitJob() {
           />
         </label>
         <label>
+          <span>注册代理州（可选）</span>
+          <input
+            v-model="proxyState"
+            class="input"
+            maxlength="80"
+            placeholder="例如 California"
+          />
+        </label>
+        <label>
+          <span>注册代理 ASN（可选）</span>
+          <input
+            v-model="proxyAsn"
+            class="input"
+            inputmode="numeric"
+            maxlength="12"
+            placeholder="例如 33363 或 AS33363"
+          />
+        </label>
+        <label>
           <span>邮箱 provider</span>
           <select v-model="mailProvider" class="input">
             <option value="outlook">outlook（outlook/hotmail/live）</option>
@@ -152,9 +194,18 @@ async function submitJob() {
             <option value="custom">custom</option>
             <option value="cloudflare_temp_mail">cloudflare_temp_mail</option>
             <option value="icloud_hide_my_email">iCloud 隐藏邮箱</option>
+            <option value="hero_gmail">Hero Gmail（新邮箱）</option>
+            <option value="hero_yandex">Hero Yandex（新邮箱）</option>
           </select>
         </label>
-        <label v-if="mailProvider === 'icloud_hide_my_email'" class="checkbox-field">
+        <label
+          v-if="
+            mailProvider === 'icloud_hide_my_email' ||
+            mailProvider === 'hero_gmail' ||
+            mailProvider === 'hero_yandex'
+          "
+          class="checkbox-field"
+        >
           <span>注册后 Codex 授权</span>
           <input v-model="authorizeCodexAfterSecurity" type="checkbox" />
         </label>
@@ -163,8 +214,16 @@ async function submitJob() {
           <input
             v-model="emailDomain"
             class="input"
-            :disabled="mailProvider === 'icloud_hide_my_email'"
-            :placeholder="mailProvider === 'icloud_hide_my_email' ? 'iCloud 模式无需填写' : '可空'"
+            :disabled="mailProvider === 'icloud_hide_my_email' || mailProvider === 'hero_gmail'"
+            :placeholder="
+              mailProvider === 'icloud_hide_my_email'
+                ? 'iCloud 模式无需填写'
+                : mailProvider === 'hero_gmail'
+                  ? 'Hero Gmail 固定使用 gmail.com'
+                  : mailProvider === 'hero_yandex'
+                    ? '可空；可填多个后缀，如 yandex.ru,yandex.com'
+                    : '可空'
+            "
           />
         </label>
         <label>
@@ -178,9 +237,19 @@ async function submitJob() {
       </div>
     </section>
 
-    <section v-if="mode === 'email_browser_no_phone'" class="panel registration-panel">
+    <section
+      v-if="mode === 'email_browser_no_phone' || mode === 'phone_browser_bind_email'"
+      class="panel registration-panel"
+    >
       <h2>浏览器配置</h2>
       <div class="grid">
+        <label>
+          <span>浏览器后端</span>
+          <select v-model="browserBackend" class="input">
+            <option value="camoufox">Camoufox</option>
+            <option value="cloakbrowser">CloakBrowser</option>
+          </select>
+        </label>
         <label>
           <span>Headless</span>
           <input v-model="browserHeadless" type="checkbox" />
@@ -196,7 +265,10 @@ async function submitJob() {
       </div>
     </section>
 
-    <section v-if="mode === 'phone_protocol_bind_email'" class="panel registration-panel">
+    <section
+      v-if="mode === 'phone_protocol_bind_email' || mode === 'phone_browser_bind_email'"
+      class="panel registration-panel"
+    >
       <h2>Hero SMS 配置</h2>
       <div class="grid">
         <label>
@@ -221,7 +293,7 @@ async function submitJob() {
         </label>
         <label>
           <span>maxPrice</span>
-          <input v-model="phoneMaxPrice" class="input" placeholder="默认 0.05" />
+          <input v-model="phoneMaxPrice" class="input" placeholder="默认 0.18" />
         </label>
         <label>
           <span>各国家 maxPrice</span>

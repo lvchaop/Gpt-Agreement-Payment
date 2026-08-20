@@ -224,10 +224,18 @@ function installRuntime(payload) {
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.document = document;
+  const language = String(payload.language || "").trim();
+  const languages = Array.isArray(payload.languages)
+    ? payload.languages.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  if (!language || languages.length === 0) {
+    throw new Error("Sentinel runtime requires proxy-derived language values");
+  }
+
   globalThis.navigator = {
     userAgent: String(payload.user_agent || "Mozilla/5.0"),
-    language: String(payload.language || "zh-CN"),
-    languages: Array.isArray(payload.languages) ? payload.languages : ["zh-CN", "zh"],
+    language,
+    languages,
     hardwareConcurrency: Number(payload.hardware_concurrency || 12),
     platform: String(payload.navigator_platform || "MacIntel"),
     vendor: "Google Inc.",

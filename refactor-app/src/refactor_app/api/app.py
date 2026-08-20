@@ -122,7 +122,7 @@ def _login_html(next_value: str, error: str = "") -> str:
     safe_next = escape(_safe_next(next_value), quote=True)
     error_html = f'<div class="error">{escape(error)}</div>' if error else ""
     return f"""<!doctype html>
-<html lang="zh-CN">
+<html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />

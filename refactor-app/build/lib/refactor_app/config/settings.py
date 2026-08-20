@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     database_max_overflow: int = 60
     database_pool_timeout_s: int = 60
     worker_capacity: int = 2000
+    worker_lease_seconds: int = Field(default=120, ge=60, le=3600)
+    worker_lease_requeue_interval_s: int = Field(default=15, ge=1, le=60)
+    worker_shutdown_grace_s: float = Field(default=1.0, ge=0, le=30)
+    worker_shutdown_handoff_delay_s: float = Field(default=1.0, ge=0.1, le=30)
     webshare_api_token: str = ""
     webshare_base_url: str = "https://proxy.webshare.io"
     webshare_download_url: str = ""
@@ -17,7 +21,30 @@ class Settings(BaseSettings):
     openai_chatgpt_base_url: str = "https://chatgpt.com"
     openai_probe_path_template: str = ""
     browser_impersonate: str = Field(default="chrome142", pattern=r"^chrome\d+[a-z]*$")
-    browser_static_asset_cache_enabled: bool = False
+    browser_static_asset_cache_enabled: bool = True
+    browser_log_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "BROWSER_LOG_ENABLED",
+            "REFACTOR_APP_BROWSER_LOG_ENABLED",
+        ),
+    )
+    browser_log_capture_bodies: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "BROWSER_LOG_CAPTURE_BODIES",
+            "REFACTOR_APP_BROWSER_LOG_CAPTURE_BODIES",
+        ),
+    )
+    browser_log_max_body_chars: int = Field(
+        default=100_000,
+        ge=1_000,
+        le=100_000,
+        validation_alias=AliasChoices(
+            "BROWSER_LOG_MAX_BODY_CHARS",
+            "REFACTOR_APP_BROWSER_LOG_MAX_BODY_CHARS",
+        ),
+    )
     external_mail_api_base_url: str = ""
     external_mail_api_key: str = ""
     external_mail_provider_name: str = "cloudflare_temp_mail"
@@ -25,6 +52,9 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("HERO_SMS_API_KEY", "REFACTOR_APP_HERO_SMS_API_KEY"),
     )
+    hero_sms_base_url: str = "https://hero-sms.com/stubs/handler_api.php"
+    hero_sms_request_timeout_s: int = Field(default=20, ge=1, le=120)
+    hero_sms_poll_interval_s: float = Field(default=3.0, ge=0.1, le=60.0)
     grizzly_sms_api_key: str = Field(
         default="",
         validation_alias=AliasChoices(
@@ -71,11 +101,97 @@ class Settings(BaseSettings):
     )
     protocol_register_proxy_url: str = ""
     protocol_register_proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    cliproxy_mode: str = Field(
+        default="remote",
+        pattern=r"^(?:remote|trojan_pool)$",
+        validation_alias=AliasChoices(
+            "CLIPROXY_MODE",
+            "REFACTOR_APP_CLIPROXY_MODE",
+        ),
+    )
+    cliproxy_trojan_pool_file: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_POOL_FILE",
+            "REFACTOR_APP_CLIPROXY_TROJAN_POOL_FILE",
+        ),
+    )
+    cliproxy_trojan_http_start_port: int = Field(
+        default=18081,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_HTTP_START_PORT",
+            "REFACTOR_APP_CLIPROXY_TROJAN_HTTP_START_PORT",
+        ),
+    )
+    cliproxy_trojan_work_dir: str = Field(
+        default="runtime/proxy/trojan-bridge",
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_WORK_DIR",
+            "REFACTOR_APP_CLIPROXY_TROJAN_WORK_DIR",
+        ),
+    )
+    cliproxy_trojan_executable: str = Field(
+        default="sing-box",
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_EXECUTABLE",
+            "REFACTOR_APP_CLIPROXY_TROJAN_EXECUTABLE",
+        ),
+    )
+    cliproxy_trojan_start_timeout_s: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=60.0,
+        validation_alias=AliasChoices(
+            "CLIPROXY_TROJAN_START_TIMEOUT_S",
+            "REFACTOR_APP_CLIPROXY_TROJAN_START_TIMEOUT_S",
+        ),
+    )
+    cliproxy_gateway_mode: str = Field(
+        default="auto",
+        pattern=r"^(?:auto|fixed)$",
+        validation_alias=AliasChoices(
+            "CLIPROXY_GATEWAY_MODE",
+            "REFACTOR_APP_CLIPROXY_GATEWAY_MODE",
+        ),
+    )
     cliproxy_host: str = Field(
-        default="us.cliproxy.io",
+        default="us.arxlabs.io",
         validation_alias=AliasChoices(
             "CLIPROXY_HOST",
             "REFACTOR_APP_CLIPROXY_HOST",
+        ),
+    )
+    cliproxy_us_host: str = Field(
+        default="us.arxlabs.io",
+        validation_alias=AliasChoices(
+            "CLIPROXY_US_HOST",
+            "REFACTOR_APP_CLIPROXY_US_HOST",
+        ),
+    )
+    cliproxy_sg_host: str = Field(
+        default="sg.arxlabs.io",
+        validation_alias=AliasChoices(
+            "CLIPROXY_SG_HOST",
+            "REFACTOR_APP_CLIPROXY_SG_HOST",
+        ),
+    )
+    cliproxy_egress_trace_url: str = Field(
+        default="https://www.cloudflare.com/cdn-cgi/trace",
+        validation_alias=AliasChoices(
+            "CLIPROXY_EGRESS_TRACE_URL",
+            "REFACTOR_APP_CLIPROXY_EGRESS_TRACE_URL",
+        ),
+    )
+    cliproxy_egress_trace_timeout_s: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=30.0,
+        validation_alias=AliasChoices(
+            "CLIPROXY_EGRESS_TRACE_TIMEOUT_S",
+            "REFACTOR_APP_CLIPROXY_EGRESS_TRACE_TIMEOUT_S",
         ),
     )
     cliproxy_port: int = Field(
@@ -115,6 +231,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "CLIPROXY_STATE",
             "REFACTOR_APP_CLIPROXY_STATE",
+        ),
+    )
+    cliproxy_jp_state: str = Field(
+        default="Tokyo",
+        validation_alias=AliasChoices(
+            "CLIPROXY_JP_STATE",
+            "REFACTOR_APP_CLIPROXY_JP_STATE",
         ),
     )
     cliproxy_session_duration_minutes: int = Field(
@@ -171,6 +294,145 @@ class Settings(BaseSettings):
     personal_plus_checkout_promo_campaign_id: str = Field(
         default="plus-1-month-free",
         validation_alias="PERSONAL_PLUS_CHECKOUT_PROMO_CAMPAIGN_ID",
+    )
+    personal_plus_checkout_ui_mode: str = Field(
+        default="hosted",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_UI_MODE",
+        pattern=r"^(?:hosted|custom)$",
+    )
+    personal_payment_method_checkout_ui_mode: str = Field(
+        default="custom",
+        validation_alias="PERSONAL_PAYMENT_METHOD_CHECKOUT_UI_MODE",
+        pattern=r"^(?:hosted|custom)$",
+    )
+    personal_plus_checkout_captcha_api_url: str = Field(
+        default="",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_CAPTCHA_API_URL",
+    )
+    personal_plus_checkout_captcha_client_key: str = Field(
+        default="",
+        validation_alias="PERSONAL_PLUS_CHECKOUT_CAPTCHA_CLIENT_KEY",
+    )
+    personal_paypal_link_billing_country: str = Field(
+        default="DE",
+        validation_alias="PERSONAL_PAYPAL_LINK_BILLING_COUNTRY",
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_link_proxy_country: str = Field(
+        default="BR",
+        validation_alias="PERSONAL_PAYPAL_LINK_PROXY_COUNTRY",
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_link_currency: str = Field(
+        default="EUR",
+        validation_alias="PERSONAL_PAYPAL_LINK_CURRENCY",
+        pattern=r"^[A-Za-z]{3}$",
+    )
+    personal_paypal_link_promo_campaign_id: str = Field(
+        default="plus-1-month-free",
+        validation_alias="PERSONAL_PAYPAL_LINK_PROMO_CAMPAIGN_ID",
+    )
+    personal_paypal_link_ui_mode: str = Field(
+        default="hosted",
+        validation_alias="PERSONAL_PAYPAL_LINK_UI_MODE",
+        pattern=r"^(?:hosted|custom)$",
+    )
+    personal_paypal_agreement_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_ENABLED",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_ENABLED",
+        ),
+    )
+    personal_paypal_agreement_country: str = Field(
+        default="US",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_COUNTRY",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_COUNTRY",
+        ),
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_agreement_proxy_country: str = Field(
+        default="US",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_PROXY_COUNTRY",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_PROXY_COUNTRY",
+        ),
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_agreement_buyer_mode: str = Field(
+        default="identity_elevation",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_BUYER_MODE",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_BUYER_MODE",
+        ),
+        pattern=r"^(?:identity_elevation|original)$",
+    )
+    personal_paypal_agreement_sms_service: str = Field(
+        default="ts",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_SMS_SERVICE",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_SMS_SERVICE",
+        ),
+        min_length=1,
+    )
+    personal_paypal_agreement_sms_country: str = Field(
+        default="187",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_SMS_COUNTRY",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_SMS_COUNTRY",
+        ),
+        pattern=r"^[0-9]+$",
+    )
+    personal_paypal_agreement_hero_lock_timeout_s: int = Field(
+        default=1800,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_HERO_LOCK_TIMEOUT_S",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_HERO_LOCK_TIMEOUT_S",
+        ),
+        ge=30,
+        le=7200,
+    )
+    personal_paypal_agreement_sms_max_price: str = Field(
+        default="0.18",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_SMS_MAX_PRICE",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_SMS_MAX_PRICE",
+        ),
+    )
+    personal_paypal_agreement_otp_timeout_s: int = Field(
+        default=180,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_OTP_TIMEOUT_S",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_OTP_TIMEOUT_S",
+        ),
+        ge=30,
+        le=1800,
+    )
+    personal_paypal_agreement_max_phone_attempts: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_MAX_PHONE_ATTEMPTS",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_MAX_PHONE_ATTEMPTS",
+        ),
+        ge=1,
+        le=10,
+    )
+    personal_paypal_agreement_max_card_attempts: int = Field(
+        default=5,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_MAX_CARD_ATTEMPTS",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_MAX_CARD_ATTEMPTS",
+        ),
+        ge=1,
+        le=20,
+    )
+    personal_paypal_agreement_finalize_checkout: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_FINALIZE_CHECKOUT",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_FINALIZE_CHECKOUT",
+        ),
     )
     icloud_post_registration_promotion_check_enabled: bool = Field(
         default=False,

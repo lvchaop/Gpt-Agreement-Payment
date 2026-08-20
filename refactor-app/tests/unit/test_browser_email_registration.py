@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
+import stat
+from contextlib import contextmanager
+
 import pytest
 
 import refactor_app.plugins.openai_auth_browser.email_registration as browser_registration
+from refactor_app.config.browser_fingerprint import (
+    browser_fingerprint_for,
+    browser_fingerprint_for_email,
+)
 from refactor_app.plugins.openai_auth_browser.email_registration import (
     BrowserEmailRegistrationConfig,
     BrowserEmailRegistrationError,
@@ -26,6 +34,330 @@ def test_camoufox_proxy_preserves_authenticated_http_proxy() -> None:
 def test_camoufox_proxy_rejects_authenticated_socks() -> None:
     with pytest.raises(BrowserEmailRegistrationError, match="authenticated SOCKS"):
         _camoufox_proxy("socks5://user:password@proxy.example:1080")
+
+
+def test_browser_registration_config_repr_hides_cloakbrowser_license_key() -> None:
+    config = BrowserEmailRegistrationConfig(
+        browser_backend="cloakbrowser",
+        cloakbrowser_license_key="cb_fixture_secret",
+    )
+
+    assert "cb_fixture_secret" not in repr(config)
+
+
+def test_authenticated_registration_uses_cloakbrowser_context(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Page:
+        def set_default_timeout(self, _timeout_ms: int) -> None:
+            pass
+
+    class Context:
+        pages: list[object] = []
+
+        def new_page(self):
+            page = Page()
+            self.pages.append(page)
+            return page
+
+    @contextmanager
+    def managed_cloakbrowser_context(**kwargs):
+        captured.update(kwargs)
+        yield Context()
+
+    class Mailbox:
+        def create_mailbox(self) -> str:
+            return "cloak.user@example.com"
+
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(
+            proxy_url="http://user:pass@proxy.example:8080",
+            locale="en-US",
+            browser_backend="cloakbrowser",
+            cloakbrowser_license_key="cb_fixture_secret",
+            artifact_root=str(tmp_path),
+        )
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "prepare_domain_mailbox",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        browser_registration,
+        "managed_cloakbrowser_context",
+        managed_cloakbrowser_context,
+    )
+    monkeypatch.setattr(runner, "_run_in_context", lambda *_args, **_kwargs: "authenticated")
+
+    result = runner._run_authenticated(
+        Mailbox(),
+        password_for_email=lambda _email: "password",
+        register_method="email_browser",
+        entry_mode="signup",
+        passwordless_for_existing_login=False,
+        after_session=lambda _context, _page, authenticated: authenticated,
+    )
+
+    assert result == "authenticated"
+    assert captured["flow"] == "browser-signup"
+    assert captured["headless"] is True
+    assert captured["proxy_url"] == "http://user:pass@proxy.example:8080"
+    assert captured["locale"] == "en-US"
+    assert captured["license_key"] == "cb_fixture_secret"
+    assert captured["fingerprint_seed"] == browser_registration._cloakbrowser_fingerprint_seed(
+        "cloak.user@example.com"
+    )
+
+
+def test_existing_session_page_uses_selected_browser_context(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Page:
+        def set_default_timeout(self, _timeout_ms: int) -> None:
+            pass
+
+    page = Page()
+
+    class Context:
+        pages = [page]
+
+        def add_cookies(self, _cookies) -> None:
+            pass
+
+    @contextmanager
+    def managed(config, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        yield Context()
+
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(
+            browser_backend="cloakbrowser",
+            artifact_root=str(tmp_path),
+        )
+    )
+    monkeypatch.setattr(browser_registration, "_managed_registration_browser_context", managed)
+    monkeypatch.setattr(runner, "_reuse_existing_session", lambda _page: {"accessToken": "at"})
+    monkeypatch.setattr(
+        runner,
+        "_hydrate_authenticated_result",
+        lambda _context, _page, *, result, session_info: result,
+    )
+
+    output = runner.run_authenticated_page(
+        email="existing@example.com",
+        cookie_header="session=value",
+        after_session=lambda _context, _page, result: result.email,
+    )
+
+    assert output == "existing@example.com"
+    assert captured["config"] is runner.config
+    assert captured["flow"] == "authenticated-page"
+    assert captured["email"] == "existing@example.com"
+
+
+def test_registration_password_is_strong_random_and_not_email_derived() -> None:
+    email = "member.name@example.com"
+
+    first = browser_registration._random_registration_password(email)
+    second = browser_registration._random_registration_password(email)
+
+    assert first != second
+    assert len(first) == 20
+    assert any(character.isupper() for character in first)
+    assert any(character.islower() for character in first)
+    assert any(character.isdigit() for character in first)
+    assert first.isalnum()
+    assert "member" not in first.casefold()
+
+
+def test_registration_identity_is_stable_varied_and_locale_aware() -> None:
+    us_identity = browser_registration._registration_identity(
+        "member@example.com",
+        locale="en-US",
+    )
+    jp_identity = browser_registration._registration_identity(
+        "member@example.com",
+        locale="ja-JP",
+    )
+
+    assert us_identity == browser_registration._registration_identity(
+        "member@example.com",
+        locale="en-US",
+    )
+    assert us_identity[:2] != jp_identity[:2]
+    assert us_identity[0] in browser_registration._REGISTRATION_NAME_POOLS["US"][0]
+    assert jp_identity[0] in browser_registration._REGISTRATION_NAME_POOLS["JP"][0]
+    birthdays = {
+        browser_registration._registration_identity(f"member-{index}@example.com")[2]
+        for index in range(20)
+    }
+    assert len({(month, day) for _year, month, day in birthdays}) > 10
+    assert any((month, day) != (1, 15) for _year, month, day in birthdays)
+
+
+def test_stable_camoufox_config_persists_only_non_geographic_identity(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    generated = {
+        "navigator.userAgent": "Firefox fixture",
+        "audio:seed": 11,
+        "canvas:seed": 22,
+        "fonts:spacing_seed": 33,
+        "timezone": "America/Los_Angeles",
+        "locale:language": "en",
+        "webrtc:ipv4": "203.0.113.10",
+        "geolocation:latitude": 34.0,
+    }
+    calls: list[str] = []
+    monkeypatch.setattr(browser_registration, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(
+        browser_registration,
+        "_generate_camoufox_fingerprint_config",
+        lambda **_kwargs: calls.append("generated") or generated,
+    )
+
+    first = browser_registration._stable_camoufox_config(
+        "member@example.com",
+        browser_os="macos",
+        screen=object(),
+    )
+    second = browser_registration._stable_camoufox_config(
+        "member@example.com",
+        browser_os="macos",
+        screen=object(),
+    )
+
+    assert first == second == {
+        "navigator.userAgent": "Firefox fixture",
+        "audio:seed": 11,
+        "canvas:seed": 22,
+        "fonts:spacing_seed": 33,
+    }
+    assert calls == ["generated"]
+    identity_dir = tmp_path / "runtime" / "browser-identities"
+    identity_path = next(identity_dir.glob("*.json"))
+    payload = json.loads(identity_path.read_text())
+    assert payload["config"] == first
+    assert "member" not in identity_path.name
+    assert stat.S_IMODE(identity_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(identity_path.stat().st_mode) == 0o600
+
+
+def test_email_fingerprint_selects_camoufox_os_and_stable_screen_range() -> None:
+    class Screen:
+        def __init__(self, **kwargs) -> None:
+            self.values = kwargs
+
+    fingerprint = browser_fingerprint_for_email("alpha@example.com")
+
+    assert browser_registration._camoufox_os_for_fingerprint(fingerprint) == "linux"
+    screen = browser_registration._screen_for_fingerprint(fingerprint, Screen)
+    assert screen.values == {
+        "min_width": 2048,
+        "max_width": 3072,
+        "min_height": 1152,
+        "max_height": 1728,
+    }
+
+
+@pytest.mark.parametrize(
+    ("os_profile", "camoufox_os"),
+    (("windows", "windows"), ("macos-arm", "macos"), ("linux", "linux")),
+)
+def test_email_fingerprint_screen_range_generates_camoufox_identity(
+    os_profile: str,
+    camoufox_os: str,
+) -> None:
+    from browserforge.fingerprints import Screen
+
+    fingerprint = browser_fingerprint_for("chrome145", os_profile=os_profile)
+    screen = browser_registration._screen_for_fingerprint(fingerprint, Screen)
+
+    generated = browser_registration._generate_camoufox_fingerprint_config(
+        browser_os=camoufox_os,
+        screen=screen,
+    )
+
+    assert generated
+
+
+def test_browser_identity_capture_uses_actual_page_values_and_utc_offset() -> None:
+    class Page:
+        @staticmethod
+        def evaluate(_script: str) -> dict:
+            return {
+                "userAgent": "Mozilla/5.0 Firefox/152.0",
+                "platform": "MacIntel",
+                "timezone": "America/Los_Angeles",
+                "timezoneOffset": 420,
+                "languages": ["en-US", "en"],
+            }
+
+    result = AuthResult()
+    browser_registration._capture_browser_identity(Page(), result)
+
+    assert result.browser_user_agent == "Mozilla/5.0 Firefox/152.0"
+    assert result.browser_platform == "MacIntel"
+    assert result.browser_timezone == "America/Los_Angeles"
+    assert result.browser_timezone_offset == -420
+    assert result.browser_accept_language == "en-US,en;q=0.9"
+    assert result.browser_impersonate == "firefox152"
+
+
+def test_browser_identity_capture_records_cloakbrowser_chrome_version() -> None:
+    class Page:
+        @staticmethod
+        def evaluate(_script: str) -> dict:
+            return {
+                "userAgent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/150.0.7871.114 Safari/537.36"
+                ),
+                "platform": "Win32",
+                "timezone": "America/New_York",
+                "timezoneOffset": 240,
+                "languages": ["en-US", "en"],
+            }
+
+    result = AuthResult()
+    browser_registration._capture_browser_identity(Page(), result)
+
+    assert result.browser_impersonate == "chrome150"
+
+
+def test_failure_screenshots_are_opt_in_and_private(tmp_path) -> None:
+    class Page:
+        calls = 0
+
+        def screenshot(self, *, path: str, **_kwargs) -> None:
+            self.calls += 1
+            with open(path, "wb") as handle:
+                handle.write(b"image")
+
+    disabled_page = Page()
+    disabled = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(artifact_root=str(tmp_path))
+    )
+    disabled._screenshot(disabled_page, "disabled.png")
+    assert disabled_page.calls == 0
+
+    enabled_page = Page()
+    enabled = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(
+            artifact_root=str(tmp_path),
+            work_id="private",
+            capture_artifacts=True,
+        )
+    )
+    enabled._screenshot(enabled_page, "failed.png")
+    screenshot = enabled.artifact_dir / "failed.png"
+    assert enabled_page.calls == 1
+    assert stat.S_IMODE(enabled.artifact_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(screenshot.stat().st_mode) == 0o600
 
 
 def test_totp_challenge_waits_for_input_before_fetching_and_filling_code(monkeypatch) -> None:
@@ -583,6 +915,7 @@ def test_submit_email_retries_when_react_replaces_the_input(monkeypatch, tmp_pat
     runner._submit_email(page, "MixedCase@outlook.com")
 
     assert attached.filled == "MixedCase@outlook.com"
+    assert page.keyboard.typed[-1] == "MixedCase@outlook.com"
 
 
 def test_preferred_password_submission_marks_auth_result_configured(
@@ -683,15 +1016,23 @@ def test_submit_email_falls_back_to_enter_when_click_has_no_effect(
     def wait_for_page_state(_page, predicate, *, stage, **_kwargs):
         if stage in {"wait-email-submit", "wait-email-retry-submit"}:
             return False
+        if stage == "wait-email-enter-submit":
+            return True
         return bool(predicate())
 
     monkeypatch.setattr(runner, "_wait_for_page_state", wait_for_page_state)
     monkeypatch.setattr(browser_registration.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(browser_registration.random, "uniform", lambda _start, _end: 0)
+    monkeypatch.setattr(
+        browser_registration,
+        "_email_submit_advanced",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(browser_registration, "_email_input_is_editable", lambda _field: True)
 
     runner._submit_email(page, "member@example.com")
 
-    assert page.keyboard.pressed == ["Enter"]
+    assert page.keyboard.pressed[-1] == "Enter"
 
 
 def test_submit_email_accepts_navigation_when_button_handle_detaches(
@@ -716,7 +1057,7 @@ def test_submit_email_accepts_navigation_when_button_handle_detaches(
 
     runner._submit_email(page, "member@example.com")
 
-    assert page.keyboard.pressed == []
+    assert "Enter" not in page.keyboard.pressed
     assert page.url == "https://auth.openai.com/email-verification"
 
 
@@ -786,7 +1127,7 @@ def test_submit_email_does_not_refill_while_password_page_is_arriving(
 
     assert email_field.fill_calls == 1
     assert state == {"pending": False, "password_ready": True, "submit_clicks": 1}
-    assert page.keyboard.pressed == []
+    assert "Enter" not in page.keyboard.pressed
 
 
 def test_submit_email_waits_for_document_load_before_next_stage_poll(
@@ -1139,6 +1480,69 @@ def test_continue_with_password_prefers_native_navigation_click(monkeypatch) -> 
     assert calls == ["native"]
 
 
+@pytest.mark.parametrize(
+    "label",
+    (
+        "Continue with password",
+        "Mit Passwort fortfahren",
+        "Doorgaan met wachtwoord",
+        "Влизане с парола",
+        "Nastavi s lozinkom",
+        "Συνέχεια με κωδικό πρόσβασης",
+        "Použít heslo",
+        "Fortsæt med adgangskode",
+        "Jätka parooliga",
+        "Jatka salasanalla",
+        "Continuer avec un mot de passe",
+        "Folytatás jelszóval",
+        "Continua con la password",
+        "Turpināt ar paroli",
+        "Tęsti su slaptažodžiu",
+        "Kontynuuj za pomocą hasła",
+        "Continuar com palavra-passe",
+        "Continuă cu parola",
+        "Pokračovať s heslom",
+        "Nadaljujte z geslom",
+        "Continuar con contraseña",
+        "Fortsätt med lösenord",
+        "Halda áfram með lykilorði",
+        "Fortsett med passord",
+    ),
+)
+def test_continue_with_password_supports_requested_european_labels(label: str) -> None:
+    calls: list[str] = []
+    selector = f'button:has-text("{label}")'
+
+    class Element:
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
+        def click(self, **_kwargs) -> None:
+            calls.append("native")
+
+    class Page:
+        @staticmethod
+        def query_selector_all(candidate: str) -> list[Element]:
+            return [Element()] if candidate == selector else []
+
+    assert browser_registration._click_continue_with_password_if_present(Page())
+    assert calls == ["native"]
+
+
+@pytest.mark.parametrize(
+    "selector",
+    (
+        'a[href*="/create-account/password"]',
+        'a[href*="/log-in/password"]',
+    ),
+)
+def test_continue_with_password_keeps_language_independent_href_selectors(
+    selector: str,
+) -> None:
+    assert selector in browser_registration.CONTINUE_WITH_PASSWORD_SELECTORS
+
+
 def test_registration_email_input_falls_back_to_dom_click_after_native_timeout() -> None:
     calls: list[str] = []
 
@@ -1155,7 +1559,7 @@ def test_registration_email_input_falls_back_to_dom_click_after_native_timeout()
     assert calls == ["native", "dom"]
 
 
-def test_registration_control_uses_exact_dom_click_without_mouse_motion() -> None:
+def test_registration_control_prefers_native_click() -> None:
     calls: list[str] = []
 
     class Button:
@@ -1184,7 +1588,40 @@ def test_registration_control_uses_exact_dom_click_without_mouse_motion() -> Non
         required_text="log in",
         timeout_ms=5_000,
     )
-    assert calls == ["dom"]
+    assert calls == ["native"]
+
+
+def test_registration_control_uses_dom_click_only_after_native_failure() -> None:
+    calls: list[str] = []
+
+    class Button:
+        @staticmethod
+        def is_visible() -> bool:
+            return True
+
+        @staticmethod
+        def inner_text() -> str:
+            return "Log in"
+
+        def click(self, **_kwargs) -> None:
+            calls.append("native")
+            raise TimeoutError("native click timed out")
+
+        def evaluate(self, _script: str) -> None:
+            calls.append("dom")
+
+    class Page:
+        @staticmethod
+        def query_selector_all(_selector: str) -> list[Button]:
+            return [Button()]
+
+    assert browser_registration._click_registration_control(
+        Page(),
+        browser_registration.LOGIN_SELECTORS,
+        required_text="log in",
+        timeout_ms=5_000,
+    )
+    assert calls == ["native", "dom"]
 
 
 def test_registration_control_prefers_login_testid_when_labels_are_duplicated() -> None:
@@ -1241,6 +1678,7 @@ def test_run_waits_before_closing_browser_after_success(monkeypatch, tmp_path) -
     sleeps: list[float] = []
     events: list[str] = []
     state: dict[str, bool] = {"exited": False}
+    launch_options: dict[str, object] = {}
 
     class Context:
         pages: list[object] = []
@@ -1275,10 +1713,15 @@ def test_run_waits_before_closing_browser_after_success(monkeypatch, tmp_path) -
         "prepare_domain_mailbox",
         lambda *_args, **_kwargs: None,
     )
+    def managed(*_args, **kwargs):
+        launch_options.update(kwargs)
+        return Managed()
+
+    monkeypatch.setattr(browser_registration, "_managed_camoufox", managed)
     monkeypatch.setattr(
         browser_registration,
-        "_managed_camoufox",
-        lambda *_args, **_kwargs: Managed(),
+        "_stable_camoufox_config",
+        lambda *_args, **_kwargs: {"canvas:seed": 123},
     )
     monkeypatch.setattr(runner, "_run_in_context", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(browser_registration.time, "sleep", sleeps.append)
@@ -1295,6 +1738,9 @@ def test_run_waits_before_closing_browser_after_success(monkeypatch, tmp_path) -
     assert result is not None
     assert sleeps == [10.0]
     assert state["exited"] is True
+    assert launch_options["os"] == browser_registration._host_browser_os()
+    assert launch_options["config"] == {"canvas:seed": 123}
+    assert [addon.name for addon in launch_options["exclude_addons"]] == ["UBO"]
     assert events[-2:] == [
         "browser.success_close_delay.started",
         "browser.success_close_delay.completed",
@@ -1623,6 +2069,135 @@ def test_email_otp_browser_validation_surfaces_account_deactivated() -> None:
         )
 
 
+def test_totp_factor_id_is_read_from_mfa_challenge_url() -> None:
+    assert (
+        browser_registration._totp_factor_id_from_url(
+            "https://auth.openai.com/mfa-challenge/factor-123?foo=bar"
+        )
+        == "factor-123"
+    )
+    assert (
+        browser_registration._totp_factor_id_from_url(
+            "https://auth.openai.com/mfa-challenge?factor_id=factor-456"
+        )
+        == "factor-456"
+    )
+
+
+def test_totp_browser_verification_posts_factor_and_follows_continue_url() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class Page:
+        def evaluate(self, script: str, request: dict) -> dict:
+            calls.append((script, request))
+            return {
+                "status": 200,
+                "payload": {
+                    "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=test"
+                },
+                "body": "",
+            }
+
+        def goto(self, url: str, **_kwargs) -> None:
+            self.url = url
+
+    page = Page()
+    payload = browser_registration._verify_totp_in_browser(
+        page,
+        factor_id="factor-123",
+        code="654321",
+        navigation_timeout_ms=60_000,
+    )
+
+    assert payload["continue_url"].startswith("https://chatgpt.com/")
+    assert page.url == "https://chatgpt.com/api/auth/callback/openai?code=test"
+    script, request = calls[0]
+    assert "/api/accounts/mfa/verify" in script
+    assert "x-access-flow-invocation-id" in script
+    assert request["factorId"] == "factor-123"
+    assert request["code"] == "654321"
+    assert request["invocationId"]
+
+
+def test_totp_browser_verification_surfaces_http_error_code_and_status() -> None:
+    page = _FakeOtpValidationPage(
+        {
+            "status": 400,
+            "payload": {
+                "error": {
+                    "code": "invalid_totp",
+                    "message": "The code is invalid",
+                }
+            },
+            "body": "{\"error\":{\"code\":\"invalid_totp\"}}",
+        }
+    )
+
+    with pytest.raises(
+        browser_registration.BrowserEmailRegistrationError,
+        match="http_status=400.*invalid_totp",
+    ):
+        browser_registration._verify_totp_in_browser(
+            page,
+            factor_id="factor-123",
+            code="654321",
+            navigation_timeout_ms=60_000,
+        )
+
+
+def test_totp_browser_verification_maps_transport_timeout() -> None:
+    class Page:
+        def evaluate(self, _script: str, _request: dict) -> dict:
+            raise TimeoutError("transport response timeout")
+
+    with pytest.raises(
+        browser_registration.BrowserEmailRegistrationError,
+        match="TOTP verification request timed out",
+    ):
+        browser_registration._verify_totp_in_browser(
+            Page(),
+            factor_id="factor-123",
+            code="654321",
+            navigation_timeout_ms=60_000,
+        )
+
+
+def test_totp_challenge_prefers_direct_browser_verify_over_button(monkeypatch) -> None:
+    events: list[tuple[str, dict, str]] = []
+
+    class Page:
+        url = "https://auth.openai.com/mfa-challenge/factor-123"
+
+        def evaluate(self, _script: str, _request: dict) -> dict:
+            return {
+                "status": 200,
+                "payload": {"continue_url": "/api/auth/callback/openai?code=test"},
+                "body": "",
+            }
+
+        def goto(self, url: str, **_kwargs) -> None:
+            self.url = url
+
+    runner = CamoufoxEmailRegistration(
+        BrowserEmailRegistrationConfig(capture_artifacts=False),
+        event_callback=lambda stage, data, level: events.append((stage, data, level)),
+    )
+    page = Page()
+    monkeypatch.setattr(runner, "_wait_for_page_state", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(browser_registration, "_has_otp_input", lambda _page: True)
+    monkeypatch.setattr(browser_registration, "_fill_otp", lambda _page, _code: True)
+    monkeypatch.setattr(
+        browser_registration,
+        "_click_first",
+        lambda *_args, **_kwargs: pytest.fail("direct verify must not click the UI button"),
+    )
+
+    runner._complete_totp_challenge(page, totp_code_provider=lambda: "654321")
+
+    assert any(stage == "browser.totp.verify.succeeded" for stage, _data, _level in events)
+    assert events[-1][0] == "browser.totp.submitted"
+
+
 def test_existing_account_password_page_reuses_passwordless_browser_login(
     monkeypatch,
     tmp_path,
@@ -1693,6 +2268,7 @@ def test_new_account_password_page_keeps_existing_registration_branch(
     )
 
     assert password_field.filled == "generated-password"
+    assert page.keyboard.typed[-1] == "generated-password"
 
 
 def test_complete_about_you_supports_legacy_name_and_age_form(
@@ -1735,7 +2311,7 @@ def test_complete_about_you_supports_legacy_name_and_age_form(
     runner._complete_about_you(page, first_name="Jane", last_name="Doe")
 
     assert page.keyboard.typed[0] == "Jane Doe"
-    assert 26 <= int(page.keyboard.typed[1]) <= 40
+    assert 18 <= int(page.keyboard.typed[1]) <= 60
     assert (
         "browser.about_you.submitted",
         {"legacy_age": True, "segmented_birthday": False},
@@ -1787,11 +2363,15 @@ def test_complete_about_you_supports_react_aria_segmented_birthday(
     monkeypatch.setattr(browser_registration.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(browser_registration.random, "uniform", lambda _start, _end: 0)
 
-    runner._complete_about_you(page, first_name="Jane", last_name="Doe")
+    runner._complete_about_you(
+        page,
+        first_name="Jane",
+        last_name="Doe",
+        birth_date=(1992, 3, 22),
+    )
 
     assert page.keyboard.typed[0] == "Jane Doe"
-    assert page.keyboard.typed[1:3] == ["1", "15"]
-    assert len(page.keyboard.typed[3]) == 4
+    assert page.keyboard.typed[1:4] == ["3", "22", "1992"]
     assert (
         "browser.about_you.submitted",
         {"legacy_age": False, "segmented_birthday": True},

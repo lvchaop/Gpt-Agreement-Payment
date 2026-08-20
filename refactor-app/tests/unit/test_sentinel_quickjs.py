@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from requests.cookies import RequestsCookieJar
 
+from refactor_app.config.browser_fingerprint import browser_fingerprint_for
 from refactor_app.plugins.openai_auth_protocol import sentinel, sentinel_quickjs
 from refactor_app.plugins.openai_auth_protocol.auth_flow import AuthFlow
 from refactor_app.plugins.openai_auth_protocol.config import Config
@@ -31,9 +32,11 @@ class _Session:
     def __init__(self, response: _Response) -> None:
         self.response = response
         self.urls: list[str] = []
+        self.requests: list[dict[str, object]] = []
 
-    def get(self, url: str, **_: object) -> _Response:
+    def get(self, url: str, **kwargs: object) -> _Response:
         self.urls.append(url)
+        self.requests.append(kwargs)
         return self.response
 
 
@@ -79,12 +82,16 @@ def test_loader_cache_is_replaced_with_full_sdk(
     sdk_file.parent.mkdir(parents=True)
     sdk_file.write_bytes(b"window.__sentinel_token_pending = [];")
     session = _Session(_Response(content=FULL_SDK))
+    context = sentinel_quickjs.create_sentinel_runtime_context("JP")
 
-    result = sentinel_quickjs._ensure_sdk_file(session, 30_000)
+    result = sentinel_quickjs._ensure_sdk_file(session, 30_000, context)
 
     assert result == sdk_file
     assert result.read_bytes() == FULL_SDK
     assert session.urls == [sentinel_quickjs.SENTINEL_SDK_URL]
+    assert session.requests[0]["headers"]["accept-language"] == (
+        "ja-JP,ja;q=0.9,en;q=0.5"
+    )
 
 
 def test_complete_sdk_cache_is_reused_without_download(
@@ -95,8 +102,9 @@ def test_complete_sdk_cache_is_reused_without_download(
     sdk_file.parent.mkdir(parents=True)
     sdk_file.write_bytes(FULL_SDK)
     session = _Session(_Response(content=b"unused"))
+    context = sentinel_quickjs.create_sentinel_runtime_context("US")
 
-    result = sentinel_quickjs._ensure_sdk_file(session, 30_000)
+    result = sentinel_quickjs._ensure_sdk_file(session, 30_000, context)
 
     assert result == sdk_file
     assert session.urls == []
@@ -108,9 +116,10 @@ def test_downloaded_loader_is_rejected(
 ) -> None:
     sdk_file = _use_temp_cache(monkeypatch, tmp_path)
     session = _Session(_Response(content=b"window.SentinelSDK = window.SentinelSDK || {};"))
+    context = sentinel_quickjs.create_sentinel_runtime_context("US")
 
     with pytest.raises(RuntimeError, match="incomplete"):
-        sentinel_quickjs._ensure_sdk_file(session, 30_000)
+        sentinel_quickjs._ensure_sdk_file(session, 30_000, context)
 
     assert not sdk_file.exists()
 
@@ -132,6 +141,41 @@ def test_runtime_context_is_stable_and_country_aware() -> None:
     assert restored == first
 
 
+def test_runtime_context_uses_supplied_complete_browser_fingerprint() -> None:
+    fingerprint = browser_fingerprint_for("chrome145", os_profile="windows")
+    context = sentinel_quickjs.create_sentinel_runtime_context(
+        "US",
+        browser_fingerprint=fingerprint,
+    )
+    profile = context.browser_profile
+
+    assert profile["user_agent"] == fingerprint.user_agent
+    assert profile["navigator_platform"] == "Win32"
+    assert profile["user_agent_data_platform"] == "Windows"
+    assert profile["sec_ch_ua"] == fingerprint.sec_ch_ua
+    assert profile["sec_ch_ua_platform"] == '"Windows"'
+    assert profile["chrome_major"] == "145"
+    assert profile["sec_ch_ua_arch"] == '"x86"'
+
+
+def test_runtime_context_requires_verified_proxy_country() -> None:
+    with pytest.raises(ValueError, match="ISO alpha-2"):
+        sentinel_quickjs.create_sentinel_runtime_context("")
+    with pytest.raises(ValueError, match="no IANA timezone"):
+        sentinel_quickjs.create_sentinel_runtime_context("ZZ")
+    with pytest.raises(ValueError, match="verified proxy egress country"):
+        sentinel_quickjs.get_sentinel_runtime_context(SimpleNamespace())
+
+
+def test_runtime_context_rejects_incomplete_proxy_locale_snapshot() -> None:
+    context = sentinel_quickjs.create_sentinel_runtime_context("US")
+    payload = context.to_dict()
+    payload["browser_profile"].pop("timezone_iana")
+
+    with pytest.raises(ValueError, match="runtime context is incomplete"):
+        sentinel_quickjs.SentinelRuntimeContext.from_dict(payload)
+
+
 def test_requirements_token_uses_stable_runtime_context() -> None:
     context = sentinel_quickjs.create_sentinel_runtime_context("US")
 
@@ -143,6 +187,20 @@ def test_requirements_token_uses_stable_runtime_context() -> None:
     assert first[7:9] == ["en-US", "en-US"]
     assert first[14] == second[14] == context.sentinel_sid
     assert first[16] == second[16] == 12
+
+
+def test_synthetic_requirements_token_uses_bound_proxy_locale() -> None:
+    context = sentinel_quickjs.create_sentinel_runtime_context("JP")
+    generator = sentinel.SentinelTokenGenerator(
+        device_id="device-id",
+        runtime_context=context,
+    )
+
+    token = generator.generate_requirements_token()
+    config = json.loads(base64.b64decode(token.removeprefix("gAAAAAC")).decode("utf-8"))
+
+    assert "GMT+0900" in config[1]
+    assert config[7:9] == ["ja-JP", "ja-JP"]
 
 
 def test_real_sdk_flow_passes_page_cookie_and_context_to_runner(
@@ -206,6 +264,7 @@ def test_checkout_flow_passes_explicit_page_url_and_chatgpt_cookies_to_runner(
     session = SimpleNamespace(cookies=RequestsCookieJar())
     session.cookies.set("auth-session", "auth-value", domain="auth.openai.com", path="/")
     session.cookies.set("chat-session", "chat-value", domain="chatgpt.com", path="/")
+    sentinel_quickjs.bind_sentinel_runtime_context(session, country_code="US")
     sdk_file = tmp_path / "sdk.js"
     sdk_file.write_bytes(FULL_SDK)
     captured: dict[str, object] = {}

@@ -26,15 +26,14 @@ from typing import Optional, Any, Callable
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from refactor_app.config.browser_fingerprint import (
-    BROWSER_IMPERSONATE,
-    BROWSER_SEC_CH_UA,
-    BROWSER_SEC_CH_UA_PLATFORM,
+    BROWSER_FINGERPRINT,
+    BrowserFingerprint,
 )
 from refactor_app.plugins.browser_runtime import managed_camoufox_context
 
 from .config import Config
 from .mail_provider import MailProvider
-from .http_client import create_http_session, USER_AGENT
+from .http_client import create_http_session
 from .sentinel_quickjs import bind_sentinel_runtime_context
 from .auth_web_runtime import AuthWebRuntime, start_auth_web_runtime
 
@@ -116,6 +115,12 @@ class AuthResult:
         self.chatgpt_account_id: str = ""
         self.chatgpt_account_structure: str = ""
         self.chatgpt_account_plan_type: str = ""
+        self.browser_user_agent: str = ""
+        self.browser_platform: str = ""
+        self.browser_timezone: str = ""
+        self.browser_timezone_offset: int | None = None
+        self.browser_accept_language: str = ""
+        self.browser_impersonate: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -140,6 +145,12 @@ class AuthResult:
             "chatgpt_account_id": self.chatgpt_account_id,
             "chatgpt_account_structure": self.chatgpt_account_structure,
             "chatgpt_account_plan_type": self.chatgpt_account_plan_type,
+            "browser_user_agent": self.browser_user_agent,
+            "browser_platform": self.browser_platform,
+            "browser_timezone": self.browser_timezone,
+            "browser_timezone_offset": self.browser_timezone_offset,
+            "browser_accept_language": self.browser_accept_language,
+            "browser_impersonate": self.browser_impersonate,
         }
 
 
@@ -156,11 +167,18 @@ def session_account_fields(payload: object) -> tuple[str, str, str]:
     )
 
 
-def default_password_from_email(email: str) -> str:
-    password = (email or "").replace("@", "")
-    if len(password) < 12:
-        password = f"{password}2026OpenAI"
-    return password
+def default_password_from_email(_email: str) -> str:
+    """Generate a strong registration password without encoding mailbox data."""
+    groups = (
+        "ABCDEFGHJKLMNPQRSTUVWXYZ",
+        "abcdefghijkmnopqrstuvwxyz",
+        "23456789",
+    )
+    characters = [secrets.choice(group) for group in groups]
+    alphabet = "".join(groups)
+    characters.extend(secrets.choice(alphabet) for _ in range(17))
+    secrets.SystemRandom().shuffle(characters)
+    return "".join(characters)
 
 
 def _bool_value(value: object) -> bool:
@@ -205,12 +223,15 @@ class AuthFlow:
     ):
         self.config = config
         self._trace_callback = trace_callback
-        self._impersonate_candidates = [BROWSER_IMPERSONATE]
-        self._impersonate_idx = 0
-        raw_session = create_http_session(
-            proxy=config.proxy,
-            impersonate=self._impersonate_candidates[self._impersonate_idx],
+        configured_fingerprint = getattr(config, "browser_fingerprint", None)
+        self._browser_fingerprint = (
+            configured_fingerprint
+            if isinstance(configured_fingerprint, BrowserFingerprint)
+            else BROWSER_FINGERPRINT
         )
+        self._impersonate_candidates = [self._browser_fingerprint.impersonate]
+        self._impersonate_idx = 0
+        raw_session = self._create_raw_http_session()
         self.session = _AuthFlowHttpSession(self, raw_session)
         proxy_meta = getattr(config, "proxy_meta", {}) or {}
         register_meta = proxy_meta.get("register") if isinstance(proxy_meta, dict) else {}
@@ -226,8 +247,20 @@ class AuthFlow:
         self._sentinel_runtime_context = bind_sentinel_runtime_context(
             self.session,
             country_code=sentinel_country,
+            browser_fingerprint=self._browser_fingerprint,
         )
         self.result = AuthResult()
+        browser_profile = self._sentinel_runtime_context.browser_profile
+        self.result.browser_user_agent = self._browser_fingerprint.user_agent
+        self.result.browser_platform = self._browser_fingerprint.navigator_platform
+        self.result.browser_timezone = str(browser_profile.get("timezone_iana") or "")
+        self.result.browser_timezone_offset = int(
+            browser_profile.get("timezone_offset_minutes") or 0
+        )
+        self.result.browser_accept_language = str(
+            browser_profile.get("accept_language") or ""
+        )
+        self.result.browser_impersonate = self._browser_fingerprint.impersonate
         self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in (
             "1",
             "true",
@@ -270,6 +303,30 @@ class AuthFlow:
         self._init_trace_dump()
         if self.config.proxy or getattr(self.config, "proxy_meta", None):
             logger.info("[proxy-trace] register %s", self._register_proxy_trace())
+
+    def _active_browser_fingerprint(self) -> BrowserFingerprint:
+        return getattr(self, "_browser_fingerprint", BROWSER_FINGERPRINT)
+
+    def _create_raw_http_session(self, *, impersonate: str | None = None) -> Any:
+        fingerprint = self._active_browser_fingerprint()
+        raw_session = create_http_session(
+            proxy=self.config.proxy,
+            impersonate=impersonate or fingerprint.impersonate,
+        )
+        headers = getattr(raw_session, "headers", None)
+        if headers is not None:
+            try:
+                headers.update(
+                    {
+                        "User-Agent": fingerprint.user_agent,
+                        "sec-ch-ua": fingerprint.sec_ch_ua,
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": fingerprint.sec_ch_ua_platform,
+                    }
+                )
+            except Exception:
+                pass
+        return raw_session
 
     def _mark_otp_sent(self, label: str, *, sent_at: float | None = None) -> float:
         self._last_otp_sent_at = float(sent_at if sent_at is not None else time.time())
@@ -321,13 +378,13 @@ class AuthFlow:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": self._common_headers(referer).get(
-                "Accept-Language", "en-US,en;q=0.9"
+                "Accept-Language", ""
             ),
             "Referer": referer,
             "User-Agent": self._common_headers(referer)["User-Agent"],
-            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua": self._active_browser_fingerprint().sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "sec-ch-ua-platform": self._active_browser_fingerprint().sec_ch_ua_platform,
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": self._auth_web_navigation_site(page_url, referer),
@@ -626,9 +683,8 @@ class AuthFlow:
         runtime_context = sentinel_snapshot.get("runtime_context")
         if not isinstance(runtime_context, dict):
             runtime_context = self._sentinel_runtime_context
-        raw_session = create_http_session(
-            proxy=self.config.proxy,
-            impersonate=self._impersonate_candidates[self._impersonate_idx],
+        raw_session = self._create_raw_http_session(
+            impersonate=self._impersonate_candidates[self._impersonate_idx]
         )
         self.session = _AuthFlowHttpSession(self, raw_session)
         self._sentinel_runtime_context = bind_sentinel_runtime_context(
@@ -642,6 +698,12 @@ class AuthFlow:
             if hasattr(self.result, key):
                 if key == "password_configured":
                     setattr(self.result, key, _bool_value(value))
+                elif key == "browser_timezone_offset":
+                    try:
+                        offset = int(value) if value not in (None, "") else None
+                    except (TypeError, ValueError):
+                        offset = None
+                    setattr(self.result, key, offset)
                 else:
                     setattr(self.result, key, str(value or ""))
         self.result.email = str(snapshot.get("email") or self.result.email or "")
@@ -949,7 +1011,7 @@ class AuthFlow:
                 except Exception as e:
                     logger.debug(f"HTTP trace callback failed: {e}")
 
-            if str(os.getenv("AUTH_DEBUG_HTTP", "1")).lower() not in ("0", "false", "no", "off"):
+            if str(os.getenv("AUTH_DEBUG_HTTP", "0")).lower() not in ("0", "false", "no", "off"):
                 logger.info(
                     "[AUTH DEBUG] %s | %s %s -> %s | final=%s | location=%s | req_body=%s | body=%s",
                     step,
@@ -1467,7 +1529,7 @@ class AuthFlow:
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": "https://chatgpt.com/",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": self._active_browser_fingerprint().user_agent,
                 },
                 timeout=30,
                 allow_redirects=False,
@@ -1545,7 +1607,7 @@ class AuthFlow:
             "Accept": "application/json",
             "Origin": "https://auth.openai.com",
             "Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            "User-Agent": USER_AGENT,
+            "User-Agent": self._active_browser_fingerprint().user_agent,
         }
         form = {
             "grant_type": "authorization_code",
@@ -1918,9 +1980,8 @@ class AuthFlow:
 
     def _reset_phone_protocol_attempt_state(self) -> None:
         self._stop_auth_web_runtime()
-        raw_session = create_http_session(
-            proxy=self.config.proxy,
-            impersonate=self._impersonate_candidates[self._impersonate_idx],
+        raw_session = self._create_raw_http_session(
+            impersonate=self._impersonate_candidates[self._impersonate_idx]
         )
         self.session = _AuthFlowHttpSession(self, raw_session)
         self._sentinel_runtime_context = bind_sentinel_runtime_context(
@@ -2031,7 +2092,7 @@ class AuthFlow:
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": "https://auth.openai.com/",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": self._active_browser_fingerprint().user_agent,
                 },
                 timeout=30,
                 allow_redirects=True,
@@ -2045,7 +2106,7 @@ class AuthFlow:
             "auth0-client": "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9",
             "Origin": "https://platform.openai.com",
             "Referer": "https://platform.openai.com/",
-            "User-Agent": USER_AGENT,
+            "User-Agent": self._active_browser_fingerprint().user_agent,
         }
         body = {
             "client_id": client_id,
@@ -2083,7 +2144,7 @@ class AuthFlow:
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://platform.openai.com/login",
-                "User-Agent": USER_AGENT,
+                "User-Agent": self._active_browser_fingerprint().user_agent,
             },
             timeout=30,
             allow_redirects=False,
@@ -2108,7 +2169,7 @@ class AuthFlow:
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": "https://platform.openai.com/login",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": self._active_browser_fingerprint().user_agent,
                 },
                 timeout=30,
                 allow_redirects=True,
@@ -2176,7 +2237,7 @@ class AuthFlow:
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": "https://platform.openai.com/login",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": self._active_browser_fingerprint().user_agent,
                 },
                 timeout=30,
                 allow_redirects=True,
@@ -2541,7 +2602,7 @@ class AuthFlow:
         imp = self._impersonate_candidates[self._impersonate_idx]
         logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}")
         self._stop_auth_web_runtime()
-        raw_session = create_http_session(proxy=self.config.proxy, impersonate=imp)
+        raw_session = self._create_raw_http_session(impersonate=imp)
         self.session = _AuthFlowHttpSession(self, raw_session)
         self._sentinel_runtime_context = bind_sentinel_runtime_context(
             self.session,
@@ -2609,7 +2670,6 @@ class AuthFlow:
             logger.warning("[phone-protocol] 浏览器 auth warmup 已被禁用")
             return False
         try:
-            from camoufox.sync_api import Camoufox
             from browserforge.fingerprints import Screen
             from browser_register import _camoufox_headless, _parse_proxy
         except Exception as e:
@@ -2625,7 +2685,6 @@ class AuthFlow:
                 headless,
             )
             with managed_camoufox_context(
-                Camoufox,
                 flow="protocol-auth-warmup",
                 headless=headless,
                 humanize=True,
@@ -2635,7 +2694,11 @@ class AuthFlow:
                 screen=Screen(max_width=1920, max_height=1080),
                 proxy=cf_proxy,
                 geoip=True,
-                locale="zh-CN",
+                locale=str(
+                    self._sentinel_runtime_context.browser_profile.get(
+                        "navigator_language", ""
+                    )
+                ),
             ) as ctx:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=90000)
@@ -2685,20 +2748,23 @@ class AuthFlow:
         except Exception:
             pass
 
+        browser_profile = self._sentinel_runtime_context.browser_profile
+        accept_language = str(browser_profile.get("accept_language") or "").strip()
         headers = {
             "Accept": "application/json",
-            "Accept-Language": "zh-CN,zh;q=0.9",
             "Referer": referer,
             "Origin": origin,
-            "User-Agent": USER_AGENT,
-            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "User-Agent": self._active_browser_fingerprint().user_agent,
+            "sec-ch-ua": self._active_browser_fingerprint().sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "sec-ch-ua-platform": self._active_browser_fingerprint().sec_ch_ua_platform,
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
             "Priority": "u=1, i",
         }
+        if accept_language:
+            headers["Accept-Language"] = accept_language
 
         # ChatGPT/Auth 两侧都使用同一个设备标识。
         try:
@@ -2872,13 +2938,13 @@ class AuthFlow:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": self._common_headers("https://chatgpt.com/").get(
-                "Accept-Language", "en-US,en;q=0.9"
+                "Accept-Language", ""
             ),
             "Referer": "https://chatgpt.com/",
             "User-Agent": self._common_headers()["User-Agent"],
-            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua": self._active_browser_fingerprint().sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "sec-ch-ua-platform": self._active_browser_fingerprint().sec_ch_ua_platform,
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "cross-site",
@@ -3342,13 +3408,13 @@ class AuthFlow:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": self._common_headers(referer).get(
-                "Accept-Language", "en-US,en;q=0.9"
+                "Accept-Language", ""
             ),
             "Referer": referer,
             "User-Agent": self._common_headers(referer)["User-Agent"],
-            "sec-ch-ua": BROWSER_SEC_CH_UA,
+            "sec-ch-ua": self._active_browser_fingerprint().sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+            "sec-ch-ua-platform": self._active_browser_fingerprint().sec_ch_ua_platform,
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "same-origin",

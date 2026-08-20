@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Protocol
 
+from refactor_app.application.workflows.proxy_locale import normalize_proxy_country
 from refactor_app.plugins.mail_external_api.plugin import prepare_domain_mailbox
 
 from .auth_flow import AuthFlow, AuthResult
@@ -118,11 +119,14 @@ def acquire_codex_refresh_token(
     email: str,
     password: str,
     proxy: str = "",
+    proxy_country: str = "",
     mail_provider: OtpProvider,
     trace_dump_path: str = "",
 ) -> CodexRtResult:
     config = Config()
     config.proxy = proxy or None
+    country = normalize_proxy_country(proxy_country)
+    config.proxy_meta = {"register": {"country_code": country}}
     if trace_dump_path:
         config.auth_trace_dump_enabled = True
         config.auth_trace_dump_path = trace_dump_path

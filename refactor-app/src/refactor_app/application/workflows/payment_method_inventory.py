@@ -112,6 +112,19 @@ def payment_method_inventory_summary(session: Session) -> dict[str, Any]:
         model=PaymentCardPoolModel,
         column=PaymentCardPoolModel.card_status,
     )
+    active_address_country_counts = {
+        str(country or "").strip().upper(): int(count or 0)
+        for country, count in session.execute(
+            select(
+                func.upper(PaymentAddressPoolModel.country),
+                func.count(),
+            )
+            .where(PaymentAddressPoolModel.address_status == "active")
+            .group_by(func.upper(PaymentAddressPoolModel.country))
+            .order_by(func.upper(PaymentAddressPoolModel.country))
+        ).all()
+        if str(country or "").strip()
+    }
     pending_personal_space_count = int(
         session.scalar(
             select(func.count())
@@ -140,6 +153,7 @@ def payment_method_inventory_summary(session: Session) -> dict[str, Any]:
         "name_status_counts": name_status_counts,
         "address_count": sum(address_status_counts.values()),
         "active_address_count": address_status_counts.get("active", 0),
+        "active_address_country_counts": active_address_country_counts,
         "address_status_counts": address_status_counts,
         "card_count": sum(card_status_counts.values()),
         "available_card_count": card_status_counts.get("available", 0),

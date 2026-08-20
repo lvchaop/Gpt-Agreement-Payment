@@ -4,6 +4,10 @@ import { withQuery } from "./types";
 
 export type { Row } from "./types";
 export type JobCreated = { job_id: string; job_status: string };
+export type ProtocolRegistrationBrowserBackend = "camoufox" | "cloakbrowser";
+export type ProtocolRegistrationJobRequest = Record<string, unknown> & {
+  browser_backend: ProtocolRegistrationBrowserBackend;
+};
 export type AccountWorkJobResult = JobCreated & {
   work_count: number;
   selected_count: number;
@@ -12,6 +16,15 @@ export type AccountWorkJobResult = JobCreated & {
   succeeded: number;
   failed: number;
   cancelled: number;
+};
+export type BackfillSessionJobRequest = {
+  user_account_ids: string[];
+  created_by?: string;
+  work_count?: number;
+  proxy_country?: string;
+};
+export type BackfillSessionJobResult = AccountWorkJobResult & {
+  proxy_country: string;
 };
 export type PersonalCodexAuthorizationJobResult = AccountWorkJobResult & {
   requested_count: number;
@@ -23,10 +36,80 @@ export type PersonalPaymentMethodBindSelectedJobResult = AccountWorkJobResult & 
   selection_skipped_count: number;
   selection_skipped: Array<{ space_id: string; reason: string }>;
 };
+export type PersonalPaymentMethodBindJobRequest = {
+  proxy_country: string;
+  auto_start_plus_checkout?: boolean;
+  checkout_ui_mode?: "hosted" | "custom";
+  created_by?: string;
+};
+export type PersonalPaymentMethodBindSelectedJobRequest = PersonalPaymentMethodBindJobRequest & {
+  space_ids: string[];
+};
 export type PersonalPromotionCheckSelectedJobResult = AccountWorkJobResult & {
   requested_count: number;
   selection_skipped_count: number;
   selection_skipped: Array<{ space_id: string; reason: string }>;
+};
+export type PersonalPayPalLinkSelectedJobResult = AccountWorkJobResult & {
+  requested_count: number;
+  selection_skipped_count: number;
+  selection_skipped: Array<{ space_id: string; reason: string }>;
+};
+export type PersonalPlusCheckoutJobRequest = {
+  proxy_country?: string;
+  checkout_proxy_country?: string;
+  update_proxy_country?: string;
+  promo_campaign_id?: string;
+  checkout_ui_mode?: "hosted" | "custom";
+  created_by?: string;
+};
+export type PersonalPlusCheckoutSelectedJobRequest = PersonalPlusCheckoutJobRequest & {
+  space_ids: string[];
+  work_count: number;
+};
+export type PersonalPlusCheckoutSelectedJobResult = AccountWorkJobResult & {
+  requested_count: number;
+  selection_skipped_count: number;
+  selection_skipped: Array<{ space_id: string; reason: string }>;
+};
+export type PersonalPayPalLinkJobRequest = {
+  payment_method_type?: "paypal" | "card" | "gcash" | "pix";
+  proxy_country?: string;
+  checkout_proxy_country?: string;
+  update_proxy_country?: string;
+  billing_country?: string;
+  currency?: string;
+  apply_promotion?: boolean;
+  promo_campaign_id?: string;
+  checkout_ui_mode?: "hosted" | "custom";
+  execute_agreement?: boolean;
+  agreement_country?: string;
+  agreement_proxy_country?: string;
+  agreement_buyer_mode?: "identity_elevation" | "original";
+  agreement_sms_country?: string;
+  agreement_max_card_attempts?: number;
+  agreement_finalize_checkout?: boolean;
+  created_by?: string;
+};
+export type PersonalPayPalLinkSelectedJobRequest = PersonalPayPalLinkJobRequest & {
+  space_ids: string[];
+  work_count: number;
+};
+export type SubscriptionRefreshSelectedJobRequest = {
+  space_ids: string[];
+  work_count: number;
+  created_by?: string;
+};
+export type SubscriptionRefreshSelectedJobResult = AccountWorkJobResult & {
+  requested_count: number;
+  selection_skipped_count: number;
+  selection_skipped: Array<{ space_id: string; reason: string }>;
+};
+export type PromotionOfferQuery = PageQuery & {
+  space_ids?: string;
+  countries?: string;
+  promotion_ids?: string;
+  status?: string;
 };
 
 export const resourcesApi = {
@@ -44,15 +127,15 @@ export const resourcesApi = {
     getJson<{ user_account_id: string; access_token: string }>(
       `/user-accounts/${encodeURIComponent(id)}/access-token`,
     ),
-  backfillSessionRt: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/user-accounts/backfill-session-rt-job", body),
-  backfillSession: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/user-accounts/backfill-session-job", body),
-  refreshSessionSpaceDetection: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/memberships/refresh-session-space-detection-job", body),
-  backfillRt: (body: Record<string, unknown>) =>
-    postJson<AccountWorkJobResult>("/user-accounts/backfill-rt-job", body),
-  createProtocolRegistrationJob: (body: Record<string, unknown>) =>
+  backfillSessionRt: (body: BackfillSessionJobRequest) =>
+    postJson<BackfillSessionJobResult>("/user-accounts/backfill-session-rt-job", body),
+  backfillSession: (body: BackfillSessionJobRequest) =>
+    postJson<BackfillSessionJobResult>("/user-accounts/backfill-session-job", body),
+  refreshSessionSpaceDetection: (body: BackfillSessionJobRequest) =>
+    postJson<BackfillSessionJobResult>("/memberships/refresh-session-space-detection-job", body),
+  backfillRt: (body: BackfillSessionJobRequest) =>
+    postJson<BackfillSessionJobResult>("/user-accounts/backfill-rt-job", body),
+  createProtocolRegistrationJob: (body: ProtocolRegistrationJobRequest) =>
     postJson<JobCreated>("/account-protocol-registration/jobs", body),
   createAccountEmailChangeJob: (body: Record<string, unknown>) =>
     postJson<AccountWorkJobResult>("/account-email-change/jobs", body),
@@ -79,6 +162,8 @@ export const resourcesApi = {
   deleteTeamAdminSession: (id: string) =>
     deleteJson<Row>(`/team-admin-sessions/${encodeURIComponent(id)}`),
   spaces: (params: PageQuery = {}) => getJson<PagedResult<Row>>(withQuery("/spaces", params)),
+  promotionOffers: (params: PromotionOfferQuery = {}) =>
+    getJson<PagedResult<Row>>(withQuery("/spaces/promotion-offers", params)),
   patchSpace: (id: string, body: Record<string, unknown>) =>
     patchJson<Row>(`/spaces/${encodeURIComponent(id)}`, body),
   paymentMethodPoolSummary: () => getJson<Row>("/payment-method-pools/summary"),
@@ -108,17 +193,32 @@ export const resourcesApi = {
     patchJson<Row>(`/payment-method-pools/cards/${encodeURIComponent(id)}`, body),
   deletePaymentCard: (id: string) =>
     deleteJson<Row>(`/payment-method-pools/cards/${encodeURIComponent(id)}`),
-  bindPersonalPaymentMethod: (id: string, body: Record<string, unknown> = {}) =>
+  bindPersonalPaymentMethod: (id: string, body: PersonalPaymentMethodBindJobRequest) =>
     postJson<AccountWorkJobResult>(
       `/spaces/${encodeURIComponent(id)}/payment-method-bind-job`,
       body,
     ),
-  createPersonalPlusCheckout: (id: string, body: Record<string, unknown> = {}) =>
+  createPersonalPlusCheckout: (id: string, body: PersonalPlusCheckoutJobRequest = {}) =>
     postJson<AccountWorkJobResult>(
       `/spaces/${encodeURIComponent(id)}/plus-checkout-job`,
       body,
     ),
-  bindSelectedPersonalPaymentMethods: (body: Record<string, unknown>) =>
+  createSelectedPersonalPlusCheckouts: (body: PersonalPlusCheckoutSelectedJobRequest) =>
+    postJson<PersonalPlusCheckoutSelectedJobResult>(
+      "/spaces/plus-checkout-selected-job",
+      body,
+    ),
+  createPersonalPayPalLink: (id: string, body: PersonalPayPalLinkJobRequest = {}) =>
+    postJson<AccountWorkJobResult>(
+      `/spaces/${encodeURIComponent(id)}/paypal-link-job`,
+      body,
+    ),
+  createSelectedPersonalPayPalLinks: (body: PersonalPayPalLinkSelectedJobRequest) =>
+    postJson<PersonalPayPalLinkSelectedJobResult>(
+      "/spaces/paypal-link-selected-job",
+      body,
+    ),
+  bindSelectedPersonalPaymentMethods: (body: PersonalPaymentMethodBindSelectedJobRequest) =>
     postJson<PersonalPaymentMethodBindSelectedJobResult>(
       "/spaces/payment-method-bind-selected-job",
       body,
@@ -126,6 +226,11 @@ export const resourcesApi = {
   checkSelectedPersonalPromotions: (body: Record<string, unknown>) =>
     postJson<PersonalPromotionCheckSelectedJobResult>(
       "/spaces/promotion-check-selected-job",
+      body,
+    ),
+  refreshSelectedSpaceSubscriptions: (body: SubscriptionRefreshSelectedJobRequest) =>
+    postJson<SubscriptionRefreshSelectedJobResult>(
+      "/spaces/subscription-refresh-selected-job",
       body,
     ),
   spaceReplenishEmailSummary: () =>

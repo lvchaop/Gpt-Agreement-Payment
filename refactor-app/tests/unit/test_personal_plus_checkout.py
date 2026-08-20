@@ -55,7 +55,7 @@ from refactor_app.plugins.openai_auth_browser.personal_plus_checkout import (
 def test_plus_checkout_defaults_are_configurable() -> None:
     settings = Settings(_env_file=None)
     assert settings.personal_plus_checkout_create_proxy_country == "US"
-    assert settings.personal_plus_checkout_promo_proxy_country == "JP"
+    assert settings.personal_plus_checkout_promo_proxy_country == "US"
     assert settings.personal_plus_checkout_promo_campaign_id == "plus-1-month-free"
     assert settings.personal_plus_checkout_captcha_api_url == ""
     assert settings.personal_plus_checkout_captcha_client_key == ""
@@ -90,7 +90,7 @@ def test_plus_checkout_scripts_cover_required_request_chain() -> None:
         "43d6e5cd4c6258927db3207098be4e966891d2024a3ad0db8bbc4844a50dc780"
     )
     assert hashlib.sha256(OAICS_SUBMIT_PLUS_CHECKOUT_SCRIPT.encode()).hexdigest() == (
-        "9119e066957b24c30666d21d8aa9d5957773202ebcb958f56fec479b002e2d05"
+        "4f4a5fdbe689f0de28920c3ae333f30029e995dd9f3f9fdd028b28852f443da9"
     )
     assert "/backend-api/payments/checkout" in CREATE_PLUS_CHECKOUT_SCRIPT
     assert "checkout_ui_mode" in CREATE_PLUS_CHECKOUT_SCRIPT
@@ -5149,6 +5149,24 @@ def test_workflow_run_uses_protocol_checkout_and_persists_session_before_sync(
         owner_user_account_id="user-1",
         external_space_id="account-1",
     )
+    name = SimpleNamespace(
+        full_name="Checkout Name",
+        use_count=3,
+        last_used_at=None,
+        updated_at=None,
+    )
+    address = SimpleNamespace(
+        phone="+12025550123",
+        line1="123 Protocol Street",
+        line2="Suite 4",
+        city="Wilmington",
+        state="DE",
+        postal_code="19801",
+        country="US",
+        use_count=5,
+        last_used_at=None,
+        updated_at=None,
+    )
 
     class Session:
         def __enter__(self):
@@ -5164,6 +5182,15 @@ def test_workflow_run_uses_protocol_checkout_and_persists_session_before_sync(
             if model is checkout_workflow_module.SpaceModel:
                 return space
             raise AssertionError(model)
+
+        @staticmethod
+        def scalar(statement):
+            entity = statement.column_descriptions[0]["entity"]
+            if entity is checkout_workflow_module.PaymentNamePoolModel:
+                return name
+            if entity is checkout_workflow_module.PaymentAddressPoolModel:
+                return address
+            raise AssertionError(entity)
 
         @staticmethod
         def commit():
@@ -5190,8 +5217,24 @@ def test_workflow_run_uses_protocol_checkout_and_persists_session_before_sync(
         assert config.account_id == "account-1"
         assert config.access_token == "access-old"
         assert config.session_token == "session-old"
-        assert config.promo_campaign_id == "promo-space"
-        assert config.billing == {"email": "person@example.com"}
+        assert config.promo_campaign_id == "configured-campaign"
+        assert config.billing == {"email": "person@example.com", "country": "US"}
+        assert config.oaics_billing_fallback_provider is not None
+        if provider == "oaics_checkout":
+            assert config.oaics_billing_fallback_provider() == {
+                "email": "person@example.com",
+                "name": "Checkout Name",
+                "phone": "+12025550123",
+                "line1": "123 Protocol Street",
+                "line2": "Suite 4",
+                "city": "Wilmington",
+                "state": "DE",
+                "postal_code": "19801",
+                "country": "US",
+            }
+        assert config.browser_headless is False
+        assert config.locale == "en-US"
+        assert config.browser_timezone == "America/Los_Angeles"
         assert kwargs["payment_method_id"] == "pm-bound"
         assert kwargs["proxy_url"] == "http://us-proxy.example:8080"
         promo = kwargs["promotion_callback"](
@@ -5240,6 +5283,8 @@ def test_workflow_run_uses_protocol_checkout_and_persists_session_before_sync(
     workflow = PersonalPlusCheckoutWorkflow(
         session_factory=Session,
         mail_provider=object(),
+        browser_headless=False,
+        promo_campaign_id="configured-campaign",
         promotion_updater=promotion_updater,
         protocol_checkout_runner=protocol_runner,
     )
@@ -5255,16 +5300,34 @@ def test_workflow_run_uses_protocol_checkout_and_persists_session_before_sync(
 
     result = workflow.run(space_id="space-1")
 
-    assert order == ["create", "promotion", "submit", "persist", "subscription"]
+    if provider == "oaics_checkout":
+        assert order == [
+            "create",
+            "persist",
+            "promotion",
+            "submit",
+            "persist",
+            "subscription",
+        ]
+        assert name.use_count == 4
+        assert address.use_count == 6
+        assert name.last_used_at is not None
+        assert address.last_used_at is not None
+    else:
+        assert order == ["create", "promotion", "submit", "persist", "subscription"]
+        assert name.use_count == 3
+        assert address.use_count == 5
+        assert name.last_used_at is None
+        assert address.last_used_at is None
     assert promotion_calls == [
         {
-            "proxy_url": "http://jp-proxy.example:8080",
+            "proxy_url": "http://us-proxy.example:8080",
             "checkout_url": (
                 f"https://chatgpt.com/checkout/openai_llc/{checkout_id}"
             ),
             "access_token": "access-refreshed-before-promotion",
             "account_id": "account-1",
-            "promo_campaign_id": "promo-space",
+            "promo_campaign_id": "configured-campaign",
             "cookie_header": "session=promotion",
             "user_agent": "Protocol UA",
         }
@@ -5272,9 +5335,196 @@ def test_workflow_run_uses_protocol_checkout_and_persists_session_before_sync(
     assert result["checkout_session_id"] == checkout_id
     assert result["checkout_result"]["provider"] == provider
     assert result["create_proxy_country"] == "US"
-    assert result["promo_proxy_country"] == "JP"
+    assert result["promo_proxy_country"] == "US"
     assert "access_token" not in result["session_refresh"]
     assert "cookie_header" not in result["session_refresh"]
+
+
+def test_workflow_run_uses_checkout_country_for_billing_currency_and_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = {
+        "user_account_id": "user-1",
+        "email": "person@example.com",
+        "external_space_id": "account-1",
+        "access_token": "access-fixture",
+        "session_token": "session-fixture",
+        "cookie_header": "session=fixture",
+        "auth_cookie_header": "auth=fixture",
+        "device_id": "device-fixture",
+        "payment_method_id": "pm-fixture",
+        "plan_type": "free",
+    }
+    promotion_calls: list[dict] = []
+    billing_calls: list[dict] = []
+    sync_calls: list[dict] = []
+
+    def protocol_runner(config, **kwargs):
+        assert config.billing_country == "VN"
+        assert config.country == "VN"
+        assert config.currency == "VND"
+        assert config.proxy_country == "VN"
+        assert config.billing == {"email": "person@example.com", "country": "VN"}
+        assert kwargs["proxy_url"] == "http://vn-proxy.example:8080"
+        assert config.oaics_billing_fallback_provider is not None
+        assert config.oaics_billing_fallback_provider()["country"] == "VN"
+        promo_update = kwargs["promotion_callback"](
+            checkout_url="https://chatgpt.com/checkout/openai_llc/oaics_fixture",
+            access_token="access-fixture",
+            cookie_header="session=fixture",
+            user_agent="Fixture UA",
+        )
+        return {
+            "created": {
+                "checkout_session_id": "oaics_fixture",
+                "checkout_url": (
+                    "https://chatgpt.com/checkout/openai_llc/oaics_fixture"
+                ),
+            },
+            "submitted": {
+                "promo_update": promo_update,
+                "payment_result": {"state": "succeeded"},
+                "session_after_payment": {"status": "succeeded"},
+            },
+        }
+
+    workflow = PersonalPlusCheckoutWorkflow(
+        session_factory=lambda: None,
+        checkout_proxy_country="VN",
+        update_proxy_country="VN",
+        promotion_updater=lambda **kwargs: promotion_calls.append(kwargs)
+        or {"status": "succeeded"},
+        protocol_checkout_runner=protocol_runner,
+    )
+    monkeypatch.setattr(workflow, "_load_context", lambda _space_id: context)
+    monkeypatch.setattr(
+        workflow,
+        "_reserve_checkout_billing_profile",
+        lambda **kwargs: billing_calls.append(kwargs)
+        or {"email": context["email"], "country": kwargs["country"]},
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_sync_subscription_snapshot",
+        lambda **kwargs: sync_calls.append(kwargs)
+        or {"status": "succeeded", "plan_type": "plus"},
+    )
+    monkeypatch.setattr(
+        checkout_workflow_module,
+        "resolve_cliproxy_proxy",
+        lambda **kwargs: SimpleNamespace(
+            proxy_url="http://vn-proxy.example:8080",
+            country_code=kwargs["country_code"],
+            sid_source="fixture",
+            probe_attempts=1,
+        ),
+    )
+
+    result = workflow.run(space_id="space-1")
+
+    assert billing_calls == [{"email": "person@example.com", "country": "VN"}]
+    assert promotion_calls[0]["proxy_url"] == "http://vn-proxy.example:8080"
+    assert sync_calls[0]["proxy_url"] == "http://vn-proxy.example:8080"
+    assert result["checkout_proxy_country"] == "VN"
+    assert result["update_proxy_country"] == "VN"
+    assert result["billing_country"] == "VN"
+    assert result["currency"] == "VND"
+
+
+def test_plus_checkout_without_local_promotion_uses_default_campaign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = SimpleNamespace(
+        id="user-1",
+        email="person@example.com",
+        password="password-fixture",
+        access_token="access-fixture",
+        session_token="session-fixture",
+        cookie_header="session=fixture",
+        auth_cookie_header="auth=fixture",
+        device_id="device-fixture",
+        mfa_status="",
+        twofauth_account_id="",
+        account_status="active",
+    )
+    space = SimpleNamespace(
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        has_promotion=False,
+        promotion_id="",
+        has_payment_method=True,
+        payment_method_status="bound",
+        payment_method_id="pm-fixture",
+        owner_user_account_id="user-1",
+        external_space_id="account-1",
+        plan_type="free",
+    )
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def get(model, _id):
+            if model is checkout_workflow_module.SpaceModel:
+                return space
+            if model is checkout_workflow_module.UserAccountModel:
+                return account
+            raise AssertionError(model)
+
+    promotion_calls: list[dict] = []
+
+    def protocol_runner(config, **kwargs):
+        assert config.promo_campaign_id == "plus-1-month-free"
+        promo_update = kwargs["promotion_callback"](
+            checkout_url="https://chatgpt.com/checkout/openai_llc/cs_fixture",
+            access_token="access-fixture",
+            cookie_header="session=fixture",
+            user_agent="Fixture UA",
+        )
+        return {
+            "created": {
+                "checkout_session_id": "cs_fixture",
+                "checkout_url": "https://chatgpt.com/checkout/openai_llc/cs_fixture",
+            },
+            "submitted": {
+                "promo_update": promo_update,
+                "payment_result": {"state": "succeeded"},
+                "session_after_payment": {"status": "succeeded"},
+            },
+        }
+
+    workflow = PersonalPlusCheckoutWorkflow(
+        session_factory=Session,
+        promo_campaign_id="",
+        promotion_updater=lambda **kwargs: promotion_calls.append(kwargs)
+        or {"status": "succeeded"},
+        protocol_checkout_runner=protocol_runner,
+    )
+    monkeypatch.setattr(
+        checkout_workflow_module,
+        "resolve_cliproxy_proxy",
+        lambda **_kwargs: SimpleNamespace(
+            proxy_url="http://us-proxy.example:8080",
+            country_code="US",
+            sid_source="fixture",
+            probe_attempts=1,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_sync_subscription_snapshot",
+        lambda **_kwargs: {"status": "succeeded", "plan_type": "plus"},
+    )
+
+    result = workflow.run(space_id="space-1")
+
+    assert promotion_calls[0]["promo_campaign_id"] == "plus-1-month-free"
+    assert result["promo_campaign_id"] == "plus-1-month-free"
 
 
 def test_workflow_preserves_protocol_consume_stop_disposition(
@@ -5398,6 +5648,152 @@ def test_failed_subscription_sync_fails_checkout_work() -> None:
                 "error_type": "OpenAIChatGPTClientError",
                 "error_message": "HTTP 401 token_expired",
             }
+        )
+
+
+@pytest.mark.parametrize(
+    "sync_failure",
+    [
+        {
+            "status": "failed",
+            "error_type": "OpenAIChatGPTClientError",
+            "error_message": "HTTP 401 token_expired",
+        },
+        {
+            "status": "failed",
+            "error_type": "PersonalPlusCheckoutError",
+            "error_message": "plus_checkout_subscription_not_active_plus",
+        },
+    ],
+    ids=["subscription-401", "subscription-still-free"],
+)
+def test_paid_checkout_sync_failure_returns_pending_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_failure: dict,
+) -> None:
+    protocol_calls: list[dict] = []
+
+    def protocol_runner(_config, **kwargs):
+        protocol_calls.append(kwargs)
+        return {
+            "created": {
+                "checkout_session_id": "cs_live_paid_fixture",
+                "processor_entity": "openai_llc",
+                "provider": "stripe",
+                "checkout_url": (
+                    "https://chatgpt.com/checkout/openai_llc/cs_live_paid_fixture"
+                ),
+            },
+            "submitted": {
+                "phase": "submitted",
+                "provider": "stripe",
+                "promo_update": {"status": "updated"},
+                "payment_result": {
+                    "state": "succeeded",
+                    "checkout_verification": {
+                        "status": "complete",
+                        "payment_status": "paid",
+                        "post_checkout_result": "success",
+                        "completion_success": True,
+                    },
+                },
+                "session_after_payment": {
+                    "status": "succeeded",
+                    "has_access_token": True,
+                },
+            },
+        }
+
+    workflow = PersonalPlusCheckoutWorkflow(
+        session_factory=lambda: None,
+        mail_provider=object(),
+        protocol_checkout_runner=protocol_runner,
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_load_context",
+        lambda _space_id: {
+            "user_account_id": "user-1",
+            "email": "person@example.com",
+            "external_space_id": "account-1",
+            "access_token": "access-fixture",
+            "session_token": "session-fixture",
+            "cookie_header": "session=fixture",
+            "auth_cookie_header": "auth=fixture",
+            "device_id": "device-fixture",
+            "payment_method_id": "pm-fixture",
+            "promotion_id": "plus-1-month-free",
+            "plan_type": "free",
+        },
+    )
+    monkeypatch.setattr(
+        checkout_workflow_module,
+        "resolve_cliproxy_proxy",
+        lambda *, email, country_code: SimpleNamespace(
+            proxy_url=f"http://{country_code.lower()}-proxy.example:8080",
+            country_code=country_code,
+            sid_source="fixture",
+            probe_attempts=1,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_sync_subscription_snapshot",
+        lambda **_kwargs: dict(sync_failure),
+    )
+
+    result = workflow.run(space_id="space-1", work_id="work-1", run_id="run-1")
+
+    assert len(protocol_calls) == 1
+    assert result["subscription_sync"] == {
+        **sync_failure,
+        "status": "pending",
+        "error_code": "plus_checkout_subscription_sync_pending",
+        "payment_confirmed": True,
+        "recovery_mode": "subscription_sync_only",
+    }
+    assert {
+        key: result[key]
+        for key in (
+            "failure_scope",
+            "exception_type",
+            "attempt_disposition",
+            "terminal",
+            "error_code",
+            "recovery_mode",
+            "payment_checkpoint_stage",
+        )
+    } == {
+        "failure_scope": "personal_plus_checkout",
+        "exception_type": "PersonalPlusCheckoutError",
+        "attempt_disposition": "consume_stop",
+        "terminal": True,
+        "error_code": "plus_checkout_subscription_sync_pending",
+        "recovery_mode": "subscription_sync_only",
+        "payment_checkpoint_stage": "checkout_completed",
+    }
+
+
+def test_subscription_sync_failure_without_success_route_evidence_still_fails() -> None:
+    with pytest.raises(
+        checkout_workflow_module.PersonalPlusCheckoutError,
+        match="plus_checkout_subscription_sync_failed",
+    ):
+        PersonalPlusCheckoutWorkflow._finalize_post_payment_subscription_sync(
+            {
+                "status": "failed",
+                "error_type": "OpenAIChatGPTClientError",
+                "error_message": "HTTP 401 token_expired",
+            },
+            submitted={
+                "payment_result": {
+                    "state": "succeeded",
+                    "checkout_verification": {
+                        "status": "complete",
+                        "payment_status": "paid",
+                    },
+                }
+            },
         )
 
 
@@ -5677,13 +6073,13 @@ def test_existing_us_page_only_routes_promotion_update_through_jp(monkeypatch) -
         ),
     ]
     assert len(promotion_calls) == 1
-    assert promotion_calls[0]["proxy_url"] == "http://jp-proxy.example:8080"
+    assert promotion_calls[0]["proxy_url"] == "http://us-proxy.example:8080"
     assert promotion_calls[0]["cookie_header"] == (
         "session=fresh-cookie; __Secure-next-auth.session-token=fresh-token"
     )
     assert promotion_calls[0]["access_token"] == "current-access-token"
     assert result["create_proxy_country"] == "US"
-    assert result["promo_proxy_country"] == "JP"
+    assert result["promo_proxy_country"] == "US"
     assert result["checkout_result"]["promo_update"] == {"updated": True}
     assert result["checkout_result"]["session_after_payment"]["status"] == "succeeded"
     assert result["session_refresh"]["status"] == "succeeded"
@@ -5905,16 +6301,23 @@ def test_payment_method_work_handler_runs_protocol_bind_before_plus_checkout(mon
 
     result = runner._work_handlers["space.personal_payment_method_bind.space"](
         None,
-        {"space_id": "space-1", "checkout_ui_mode": "custom"},
+        {
+            "space_id": "space-1",
+            "proxy_country": "de",
+            "checkout_ui_mode": "custom",
+        },
     )
 
     assert captured["plus_created"]["captcha_api_url"] == "https://captcha.example"
     assert captured["plus_created"]["captcha_client_key"] == "client-key-1"
     assert captured["plus_created"]["checkout_ui_mode"] == "custom"
+    assert captured["plus_created"]["checkout_proxy_country"] == "DE"
+    assert captured["plus_created"]["update_proxy_country"] == "DE"
     assert "mail_provider" not in captured["plus_created"]
     assert "captcha_api_url" not in captured["bind_created"]
     assert "captcha_client_key" not in captured["bind_created"]
     assert captured["bind_created"]["checkout_ui_mode"] == "custom"
+    assert captured["bind_created"]["registration_proxy_country"] == "DE"
     assert "mail_provider" not in captured["bind_created"]
     assert captured["bind_run"]["space_id"] == "space-1"
     assert captured["plus_run"]["space_id"] == "space-1"
@@ -5922,6 +6325,136 @@ def test_payment_method_work_handler_runs_protocol_bind_before_plus_checkout(mon
         "payment_method_status": "bound",
         "after_bind_success": {"status": "succeeded"},
     }
+
+
+def test_plus_checkout_work_handler_binds_missing_payment_method_before_retry(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+    captured: dict[str, dict] = {}
+
+    class PlusWorkflow:
+        attempt = 0
+
+        def __init__(self, **kwargs):
+            captured["plus_created"] = kwargs
+
+        def run(self, **kwargs):
+            type(self).attempt += 1
+            calls.append(("checkout", kwargs))
+            if type(self).attempt == 1:
+                raise handlers.PersonalPlusCheckoutError(
+                    "plus_checkout_payment_method_required",
+                    error_code="plus_checkout_payment_method_required",
+                )
+            return {"status": "succeeded"}
+
+    class BindWorkflow:
+        def __init__(self, **kwargs):
+            captured["bind_created"] = kwargs
+
+        def run(self, **kwargs):
+            calls.append(("bind", kwargs))
+            return {
+                "payment_method_id": "pm_bound",
+                "payment_method_status": "bound",
+            }
+
+    monkeypatch.setattr(handlers, "PersonalPlusCheckoutWorkflow", PlusWorkflow)
+    monkeypatch.setattr(handlers, "PersonalPaymentMethodBindWorkflow", BindWorkflow)
+    monkeypatch.setattr(handlers, "_twofauth_otp_resolver", lambda _settings: None)
+    runner = JobRunner(lambda: None)
+    register_core_handlers(
+        runner,
+        session_factory=lambda: None,
+        settings=Settings(),
+    )
+
+    result = runner._work_handlers["space.personal_plus_checkout.space"](
+        None,
+        {
+            "space_id": "space-1",
+            "proxy_country": "de",
+            "_work_id": "work-1",
+            "_run_id": "run-1",
+            "checkout_proxy_country": "jp",
+            "checkout_attempt_mode": "new",
+            "checkout_ui_mode": "hosted",
+        },
+    )
+
+    assert [name for name, _kwargs in calls] == ["checkout", "bind", "checkout"]
+    assert calls[1][1] == {
+        "space_id": "space-1",
+        "work_id": "work-1-bind",
+        "run_id": "run-1",
+        "payment_card_id": "",
+    }
+    assert captured["bind_created"]["checkout_ui_mode"] == "custom"
+    assert captured["bind_created"]["require_local_promotion"] is False
+    assert captured["bind_created"]["registration_proxy_country"] == "JP"
+    assert result == {
+        "status": "succeeded",
+        "payment_method_bind": {
+            "payment_method_id": "pm_bound",
+            "payment_method_status": "bound",
+        },
+        "checkout_attempt_mode": "new",
+    }
+
+
+def test_payment_method_work_handler_promotes_sync_pending_marker(monkeypatch) -> None:
+    marker = {
+        "failure_scope": "personal_plus_checkout",
+        "exception_type": "PersonalPlusCheckoutError",
+        "attempt_disposition": "consume_stop",
+        "terminal": True,
+        "error_code": "plus_checkout_subscription_sync_pending",
+        "recovery_mode": "subscription_sync_only",
+        "payment_checkpoint_stage": "checkout_completed",
+    }
+
+    class PlusWorkflow:
+        @staticmethod
+        def run(**_kwargs):
+            return {
+                **marker,
+                "subscription_sync": {
+                    "status": "pending",
+                    "payment_confirmed": True,
+                },
+            }
+
+    class BindWorkflow:
+        @staticmethod
+        def run(**_kwargs):
+            return {"payment_method_status": "bound"}
+
+    monkeypatch.setattr(
+        handlers,
+        "PersonalPlusCheckoutWorkflow",
+        lambda **_kwargs: PlusWorkflow(),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "PersonalPaymentMethodBindWorkflow",
+        lambda **_kwargs: BindWorkflow(),
+    )
+    monkeypatch.setattr(handlers, "_twofauth_otp_resolver", lambda _settings: None)
+    runner = JobRunner(lambda: None)
+    register_core_handlers(
+        runner,
+        session_factory=lambda: None,
+        settings=Settings(),
+    )
+
+    result = runner._work_handlers["space.personal_payment_method_bind.space"](
+        None,
+        {"space_id": "space-1"},
+    )
+
+    assert result["after_bind_success"]["subscription_sync"]["status"] == "pending"
+    assert {key: result[key] for key in marker} == marker
 
 
 @pytest.mark.parametrize("checkout_ui_mode", ["hosted", "custom"])
@@ -5994,8 +6527,9 @@ def test_personal_plus_checkout_tick_job_propagates_settings_captcha_config(
             "input_json": {
                 "space_id": "space-1",
                 "checkout_attempt_mode": "new",
-                "create_proxy_country": "US",
-                "promo_proxy_country": "JP",
+                "proxy_country": "US",
+                "checkout_proxy_country": "US",
+                "update_proxy_country": "US",
                 "promo_campaign_id": "plus-1-month-free",
                 "checkout_ui_mode": checkout_ui_mode,
                 "browser_headless": True,
@@ -6065,6 +6599,7 @@ def test_personal_payment_method_bind_tick_job_propagates_settings_captcha_confi
             "limit": 1,
             "work_count": 1,
             "payment_card_id": "card-1",
+            "proxy_country": "de",
             "checkout_ui_mode": checkout_ui_mode,
         },
     )
@@ -6077,6 +6612,7 @@ def test_personal_payment_method_bind_tick_job_propagates_settings_captcha_confi
             "execution_key": "personal-payment-method:space-1",
             "input_json": {
                 "space_id": "space-1",
+                "proxy_country": "DE",
                 "auto_start_plus_checkout": True,
                 "checkout_ui_mode": checkout_ui_mode,
                 "browser_headless": True,
@@ -6087,3 +6623,4 @@ def test_personal_payment_method_bind_tick_job_propagates_settings_captcha_confi
             },
         }
     ]
+    assert result["proxy_country"] == "DE"

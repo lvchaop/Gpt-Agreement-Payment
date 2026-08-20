@@ -129,7 +129,7 @@ def _mock_loaded_account(ids: dict[str, str]):
         session_token="",
         password="",
     )
-    return account, auth, "http://proxy.example.test:8080"
+    return account, auth, "http://proxy.example.test:8080", "US"
 
 
 def test_business_codex_oauth_writes_credential_auth_mode(
@@ -207,6 +207,7 @@ def test_business_codex_browser_fallback_receives_account_totp_provider(
             account,
             auth,
             "http://proxy.example.test:8080",
+            "US",
         ),
     )
     monkeypatch.setattr(

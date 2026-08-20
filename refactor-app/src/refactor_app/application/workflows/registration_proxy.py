@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from hashlib import sha256
+from ipaddress import ip_address
 from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
 from uuid import uuid4
@@ -19,6 +20,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in minimal test envs
 
     curl_requests = _MissingCurlRequests()
 
+from refactor_app.application.workflows.proxy_locale import (
+    accept_language_for_proxy_country,
+)
 from refactor_app.application.workflows.trojan_proxy_pool import (
     TrojanProxyPoolError,
     get_trojan_proxy_pool_manager,
@@ -30,6 +34,7 @@ TROJAN_POOL_PROVIDER = "local_trojan_pool"
 DEFAULT_CLIPROXY_PROBE_URL = "https://chatgpt.com/api/auth/csrf"
 DEFAULT_CLIPROXY_EGRESS_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 _COUNTRY_CODE_PATTERN = re.compile(r"^[A-Z]{2}$")
+_ASN_PATTERN = re.compile(r"^(?:AS)?([0-9]{1,10})$", re.IGNORECASE)
 _SUPPORTED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
 _SUPPORTED_GATEWAY_MODES = frozenset({"auto", "fixed"})
 _SUPPORTED_CLIPROXY_MODES = frozenset({"remote", "trojan_pool"})
@@ -256,22 +261,34 @@ class CliproxyProxyConfig:
 class CliproxyProxy:
     proxy_url: str = field(repr=False)
     country_code: str
+    egress_ip: str = ""
     sid: str = field(default="", repr=False)
     sid_source: str = "email_sha256"
     probe_attempts: int = 1
     provider: str = CLIPROXY_PROVIDER
     proxy_mode: str = "cliproxy_sticky"
     proxy_source: str = "target_email_hash"
+    route_state: str = ""
+    route_asn: str = ""
+
+
+@dataclass(frozen=True)
+class ProxyEgressTrace:
+    ip_address: str
+    country_code: str
 
 
 def resolve_cliproxy_proxy(
     *,
     email: str,
     country_code: str = "US",
+    state: str = "",
+    asn: str = "",
     config: CliproxyProxyConfig | None = None,
     probe: ProxyProbe | None = None,
+    force_new_sid: bool = False,
 ) -> CliproxyProxy:
-    """Resolve and health-check a stable Cliproxy SID for an email."""
+    """Resolve and health-check a stable Cliproxy SID, with optional rotation."""
 
     if config is None:
         from refactor_app.config.settings import get_settings
@@ -280,7 +297,15 @@ def resolve_cliproxy_proxy(
     config.validate()
     normalized_email = normalize_registration_proxy_email(email)
     normalized_country = normalize_registration_proxy_country(country_code)
+    normalized_state, normalized_asn = normalize_cliproxy_route_selector(
+        state=state,
+        asn=asn,
+    )
     if config.mode.strip().lower() == "trojan_pool":
+        if normalized_state or normalized_asn:
+            raise CliproxyProxyError(
+                "Cliproxy state/ASN routing requires remote account mode"
+            )
         return _resolve_trojan_pool_proxy(
             email=normalized_email,
             country_code=normalized_country,
@@ -291,33 +316,58 @@ def resolve_cliproxy_proxy(
     # Cliproxy keeps a SID pinned to its first resolved exit. Scope the stable
     # hash by country so one account's US browser and JP promo request cannot
     # reuse the same pinned route.
-    stable_sid = cliproxy_stable_sid(normalized_email, normalized_country)
+    # An explicit route selector gets its own sticky-session namespace. This
+    # prevents changing state/ASN for an account from reusing a SID pinned to a
+    # previous route.
+    effective_state = normalized_state
+    if not effective_state and not normalized_asn:
+        effective_state = (
+            config.state
+            if normalized_country == "US"
+            else config.jp_state
+            if normalized_country == "JP"
+            else ""
+        )
+        effective_state = normalize_cliproxy_state(effective_state)
+    stable_sid = cliproxy_stable_sid(
+        normalized_email,
+        normalized_country,
+        state=effective_state,
+        asn=normalized_asn,
+    )
     attempt_limit = int(config.max_sid_attempts)
-    candidate_sids = [stable_sid]
+    candidate_sids = [] if force_new_sid else [stable_sid]
     while len(candidate_sids) < attempt_limit:
         candidate = uuid4().hex
         if candidate not in candidate_sids:
             candidate_sids.append(candidate)
 
+    resolved_egress_ip = ""
+    probe_fn: ProxyProbe
     if probe is None:
 
-        def probe_fn(proxy_url: str) -> bool:
+        def default_probe(proxy_url: str) -> bool:
+            nonlocal resolved_egress_ip
+            resolved_egress_ip = ""
             if not probe_cliproxy_proxy(
                 proxy_url,
                 probe_url=config.probe_url,
                 timeout_s=config.probe_timeout_s,
                 require_csrf_token=config.probe_require_csrf_token,
+                country_code=normalized_country,
             ):
                 return False
-            return (
-                detect_proxy_egress_country(
-                    proxy_url,
-                    trace_url=config.egress_trace_url,
-                    timeout_s=config.egress_trace_timeout_s,
-                )
-                == normalized_country
+            egress = detect_proxy_egress(
+                proxy_url,
+                trace_url=config.egress_trace_url,
+                timeout_s=config.egress_trace_timeout_s,
             )
+            if egress.country_code != normalized_country:
+                return False
+            resolved_egress_ip = egress.ip_address
+            return True
 
+        probe_fn = default_probe
     else:
         probe_fn = probe
     failures: list[str] = []
@@ -333,23 +383,21 @@ def resolve_cliproxy_proxy(
             username=config.username,
             password=config.password,
             state=(
-                config.state
-                if normalized_country == "US"
-                else config.jp_state
-                if normalized_country == "JP"
-                else ""
+                effective_state
             ),
+            asn=normalized_asn,
             session_duration_minutes=config.session_duration_minutes,
             sid_source=sid_source,
             probe_attempts=attempt_number,
         )
+        resolved_egress_ip = ""
         try:
             alive = bool(probe_fn(candidate_proxy.proxy_url))
         except Exception as exc:
             alive = False
             failures.append(type(exc).__name__)
         if alive:
-            return candidate_proxy
+            return replace(candidate_proxy, egress_ip=resolved_egress_ip)
         failures.append("probe_false")
 
     failure_types = ",".join(dict.fromkeys(failures)) or "probe_false"
@@ -378,18 +426,39 @@ def _resolve_trojan_pool_proxy(
     except TrojanProxyPoolError as exc:
         raise CliproxyProxyError(str(exc)) from exc
 
-    probe_fn = probe or (
-        lambda proxy_url: probe_cliproxy_proxy(
-            proxy_url,
-            probe_url=config.probe_url,
-            timeout_s=config.probe_timeout_s,
-            require_csrf_token=config.probe_require_csrf_token,
-        )
-    )
+    resolved_egress_ip = ""
+    probe_fn: ProxyProbe
+    if probe is None:
+
+        def default_probe(proxy_url: str) -> bool:
+            nonlocal resolved_egress_ip
+            resolved_egress_ip = ""
+            if not probe_cliproxy_proxy(
+                proxy_url,
+                probe_url=config.probe_url,
+                timeout_s=config.probe_timeout_s,
+                require_csrf_token=config.probe_require_csrf_token,
+                country_code=country_code,
+            ):
+                return False
+            egress = detect_proxy_egress(
+                proxy_url,
+                trace_url=config.egress_trace_url,
+                timeout_s=config.egress_trace_timeout_s,
+            )
+            if egress.country_code != country_code:
+                return False
+            resolved_egress_ip = egress.ip_address
+            return True
+
+        probe_fn = default_probe
+    else:
+        probe_fn = probe
     failures: list[str] = []
     attempt_limit = min(len(candidates), int(config.max_sid_attempts))
     stable_sid = cliproxy_stable_sid(email, country_code)
     for attempt_number, node in enumerate(candidates[:attempt_limit], start=1):
+        resolved_egress_ip = ""
         try:
             alive = bool(probe_fn(node.local_http_url))
         except Exception as exc:
@@ -399,6 +468,7 @@ def _resolve_trojan_pool_proxy(
             return CliproxyProxy(
                 proxy_url=node.local_http_url,
                 country_code=node.country_code,
+                egress_ip=resolved_egress_ip,
                 sid=stable_sid,
                 sid_source=(
                     "email_sha256" if attempt_number == 1 else "email_sha256_failover"
@@ -461,6 +531,21 @@ def detect_proxy_egress_country(
 ) -> str:
     """Read Cloudflare Trace through the selected Cliproxy exit."""
 
+    return detect_proxy_egress(
+        proxy_url,
+        trace_url=trace_url,
+        timeout_s=timeout_s,
+    ).country_code
+
+
+def detect_proxy_egress(
+    proxy_url: str,
+    *,
+    trace_url: str = DEFAULT_CLIPROXY_EGRESS_TRACE_URL,
+    timeout_s: float = 5.0,
+) -> ProxyEgressTrace:
+    """Read and retain the exit IP and country through the selected proxy."""
+
     normalized_proxy = str(proxy_url or "").strip()
     normalized_trace_url = str(trace_url or "").strip()
     if not normalized_proxy or not normalized_trace_url:
@@ -489,23 +574,35 @@ def detect_proxy_egress_country(
     status = int(getattr(response, "status_code", 0) or 0)
     if status != 200:
         raise CliproxyProxyError(f"Cliproxy proxy egress trace returned HTTP {status}")
-    return _parse_egress_trace_country(str(getattr(response, "text", "") or ""))
+    return _parse_egress_trace(str(getattr(response, "text", "") or ""))
 
 
 def _parse_egress_trace_country(payload: str) -> str:
+    return _parse_egress_trace(payload).country_code
+
+
+def _parse_egress_trace(payload: str) -> ProxyEgressTrace:
     trace = dict(
         line.split("=", 1)
         for line in str(payload or "").splitlines()
         if "=" in line
     )
+    raw_ip_address = str(trace.get("ip") or "").strip()
     country_code = str(trace.get("loc") or "").strip().upper()
+    try:
+        normalized_ip_address = str(ip_address(raw_ip_address))
+    except ValueError:
+        normalized_ip_address = ""
     if (
-        not trace.get("ip")
+        not normalized_ip_address
         or not _COUNTRY_CODE_PATTERN.fullmatch(country_code)
         or country_code == "XX"
     ):
         raise CliproxyProxyError("Cliproxy egress trace did not return a usable IP location")
-    return country_code
+    return ProxyEgressTrace(
+        ip_address=normalized_ip_address,
+        country_code=country_code,
+    )
 
 
 def build_cliproxy_proxy(
@@ -519,6 +616,7 @@ def build_cliproxy_proxy(
     username: str,
     password: str,
     state: str = "",
+    asn: str = "",
     session_duration_minutes: int = 15,
     sid_source: str = "email_sha256",
     probe_attempts: int = 1,
@@ -542,11 +640,16 @@ def build_cliproxy_proxy(
     if not password:
         raise CliproxyProxyError("Cliproxy password is missing")
 
+    normalized_state, normalized_asn = normalize_cliproxy_route_selector(
+        state=state,
+        asn=asn,
+    )
     cliproxy_username = cliproxy_username_for_email(
         base_username=username,
         country_code=normalized_country,
         sid=normalized_sid,
-        state=state,
+        state=normalized_state,
+        asn=normalized_asn,
         session_duration_minutes=session_duration_minutes,
     )
     proxy_url = (
@@ -559,19 +662,36 @@ def build_cliproxy_proxy(
         sid=normalized_sid,
         sid_source=str(sid_source or "email_sha256"),
         probe_attempts=max(1, int(probe_attempts)),
+        route_state=normalized_state,
+        route_asn=normalized_asn,
     )
 
 
-def cliproxy_stable_sid(email: str, country_code: str = "") -> str:
+def cliproxy_stable_sid(
+    email: str,
+    country_code: str = "",
+    *,
+    state: str = "",
+    asn: str = "",
+) -> str:
     normalized_email = normalize_registration_proxy_email(email)
     normalized_country = (
         normalize_registration_proxy_country(country_code)
         if str(country_code or "").strip()
         else ""
     )
-    hash_input = (
-        f"{normalized_email}|{normalized_country}" if normalized_country else normalized_email
+    normalized_state, normalized_asn = normalize_cliproxy_route_selector(
+        state=state,
+        asn=asn,
     )
+    hash_parts = [normalized_email]
+    if normalized_country:
+        hash_parts.append(normalized_country)
+    if normalized_state:
+        hash_parts.append(f"st={normalized_state}")
+    elif normalized_asn:
+        hash_parts.append(f"asn={normalized_asn}")
+    hash_input = "|".join(hash_parts)
     return sha256(hash_input.encode("utf-8")).hexdigest()
 
 
@@ -581,6 +701,7 @@ def cliproxy_username_for_email(
     country_code: str,
     sid: str,
     state: str = "",
+    asn: str = "",
     session_duration_minutes: int = 15,
 ) -> str:
     base = str(base_username or "").strip()
@@ -596,11 +717,54 @@ def cliproxy_username_for_email(
             "Cliproxy session duration must be between 1 and 120 minutes"
         )
     parts = [base, "region", country]
-    normalized_state = re.sub(r"\s+", "_", str(state or "").strip())
+    normalized_state, normalized_asn = normalize_cliproxy_route_selector(
+        state=state,
+        asn=asn,
+    )
     if normalized_state:
         parts.extend(("st", normalized_state))
+    elif normalized_asn:
+        parts.extend(("asn", normalized_asn))
     parts.extend(("sid", normalized_sid, "t", str(duration)))
     return "-".join(parts)
+
+
+def normalize_cliproxy_state(state: str) -> str:
+    """Normalize a Cliproxy state selector to one username-safe token."""
+
+    normalized = re.sub(r"\s+", "_", str(state or "").strip())
+    if not normalized:
+        return ""
+    if len(normalized) > 80 or not re.fullmatch(r"[A-Za-z0-9_]+", normalized):
+        raise CliproxyProxyError(
+            "Cliproxy state must contain only ASCII letters, digits, spaces, or underscores"
+        )
+    return normalized
+
+
+def normalize_cliproxy_asn(asn: str | int) -> str:
+    """Normalize an ASN selector, accepting either ``33363`` or ``AS33363``."""
+
+    raw = str(asn or "").strip()
+    if not raw:
+        return ""
+    match = _ASN_PATTERN.fullmatch(raw)
+    if match is None:
+        raise CliproxyProxyError("Cliproxy ASN must be a number such as AS33363")
+    value = int(match.group(1))
+    if not 1 <= value <= 4_294_967_295:
+        raise CliproxyProxyError("Cliproxy ASN must be between 1 and 4294967295")
+    return f"AS{value}"
+
+
+def normalize_cliproxy_route_selector(*, state: str = "", asn: str | int = "") -> tuple[str, str]:
+    """Return mutually exclusive, username-safe state and ASN selectors."""
+
+    normalized_state = normalize_cliproxy_state(state)
+    normalized_asn = normalize_cliproxy_asn(asn)
+    if normalized_state and normalized_asn:
+        raise CliproxyProxyError("Cliproxy state and ASN selectors are mutually exclusive")
+    return normalized_state, normalized_asn
 
 
 def normalize_registration_proxy_email(email: str) -> str:
@@ -623,6 +787,7 @@ def probe_cliproxy_proxy(
     probe_url: str = DEFAULT_CLIPROXY_PROBE_URL,
     timeout_s: float = 10.0,
     require_csrf_token: bool = True,
+    country_code: str = "",
 ) -> bool:
     """Verify authentication, connectivity, and the target ChatGPT edge."""
 
@@ -631,9 +796,10 @@ def probe_cliproxy_proxy(
     try:
         headers = {
             "accept": "application/json",
-            "accept-language": "zh-CN,zh;q=0.9",
             "referer": "https://chatgpt.com/",
         }
+        if str(country_code or "").strip():
+            headers["accept-language"] = accept_language_for_proxy_country(country_code)
         with curl_requests.Session(
             impersonate=BROWSER_IMPERSONATE,
             proxies=_curl_proxies(proxy_url),

@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from refactor_app.application.workflows.account_auth import ensure_account_proxy_url
+from refactor_app.application.workflows.proxy_locale import normalize_proxy_country
 from refactor_app.application.workflows.space_session_otp_remote import (
     MAX_REMOTE_SESSION_OTP_BATCH_SIZE,
     remote_session_otp_code_available_condition,
@@ -285,7 +286,7 @@ class SpaceSessionOtpWorkflow:
                 user_account_id,
                 bind_reason="space_session_otp_prepare",
             )
-            proxy_id = _active_account_proxy_id(
+            proxy_id, proxy_country = _active_account_proxy_context(
                 session_factory=self._session_factory,
                 user_account_id=user_account_id,
             )
@@ -293,6 +294,7 @@ class SpaceSessionOtpWorkflow:
                 email=email,
                 password=password,
                 proxy=proxy_url,
+                proxy_country=proxy_country,
                 mail_provider=self._mail_provider,
             )
             status = str(result.snapshot.get("phase") or "")
@@ -307,6 +309,7 @@ class SpaceSessionOtpWorkflow:
                 "_prepare_job_id": job_id,
                 "_prepare_work_id": work_id,
                 "_proxy_id": proxy_id,
+                "_proxy_country": proxy_country,
             }
             snapshot_id = self._write_snapshot(
                 user_account_id=user_account_id,
@@ -351,7 +354,7 @@ class SpaceSessionOtpWorkflow:
             timeout_s=barrier_timeout_s,
         )
         try:
-            snapshot_json, proxy_url = self._load_submit_input(
+            snapshot_json, proxy_url, proxy_country = self._load_submit_input(
                 space_id=space_id,
                 space_membership_id=space_membership_id,
                 user_account_id=user_account_id,
@@ -374,6 +377,7 @@ class SpaceSessionOtpWorkflow:
             result = submit_prepared_chatgpt_session_otp(
                 snapshot=snapshot_json,
                 proxy=proxy_url,
+                proxy_country=proxy_country,
                 mail_provider=self._mail_provider,
                 before_validate=participant.wait_ready,
                 before_skip=participant.wait_skipped,
@@ -427,7 +431,7 @@ class SpaceSessionOtpWorkflow:
         space_membership_id: str,
         user_account_id: str,
         snapshot_id: str,
-    ) -> tuple[dict, str]:
+    ) -> tuple[dict, str, str]:
         with self._session_factory() as session:
             _active_member_account(
                 session=session,
@@ -448,7 +452,8 @@ class SpaceSessionOtpWorkflow:
             proxy_url = str(snapshot_json.get("proxy") or "").strip()
             if not proxy_url:
                 raise SpaceSessionOtpWorkflowError("session OTP snapshot has no original proxy")
-            return snapshot_json, proxy_url
+            proxy_country = _snapshot_proxy_country(snapshot_json)
+            return snapshot_json, proxy_url, proxy_country
 
     def _write_snapshot(
         self,
@@ -645,11 +650,11 @@ def _active_member_account(
     return membership, account
 
 
-def _active_account_proxy_id(
+def _active_account_proxy_context(
     *,
     session_factory: Callable[[], Session],
     user_account_id: str,
-) -> str:
+) -> tuple[str, str]:
     with session_factory() as session:
         row = session.execute(
             select(UserAccountProxyBindingModel, ProxyInventoryModel)
@@ -664,9 +669,26 @@ def _active_account_proxy_id(
             .limit(1)
         ).first()
         if row is None:
-            return ""
+            raise SpaceSessionOtpWorkflowError("account has no active proxy binding")
         _, proxy = row
-        return proxy.id
+        return proxy.id, normalize_proxy_country(proxy.country_code)
+
+
+def _snapshot_proxy_country(snapshot_json: dict) -> str:
+    country = str(snapshot_json.get("_proxy_country") or "")
+    if not country:
+        sentinel = (
+            snapshot_json.get("sentinel")
+            if isinstance(snapshot_json.get("sentinel"), dict)
+            else {}
+        )
+        runtime_context = (
+            sentinel.get("runtime_context")
+            if isinstance(sentinel.get("runtime_context"), dict)
+            else {}
+        )
+        country = str(runtime_context.get("country_code") or "")
+    return normalize_proxy_country(country)
 
 
 def _wait_for_submit_barrier(

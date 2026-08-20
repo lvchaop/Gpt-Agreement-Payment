@@ -12,6 +12,10 @@ from refactor_app.application.workflows.payment_method_inventory import (
     PAYMENT_METHOD_COOLDOWN_HOURS,
     PAYMENT_METHOD_MAX_ATTEMPTS,
 )
+from refactor_app.application.workflows.proxy_locale import (
+    locale_for_proxy_country,
+    timezone_for_proxy_country,
+)
 from refactor_app.application.workflows.registration_proxy import (
     detect_proxy_egress_country,
     resolve_cliproxy_proxy,
@@ -39,15 +43,6 @@ PREFERRED_PAYMENT_CARD_BIN8_PREFIXES = (
     "42954405",
     "42954411",
 )
-_PAYMENT_LOCALE_BY_PROXY_COUNTRY = {
-    "JP": "ja-JP",
-    "US": "en-US",
-}
-_PAYMENT_TIMEZONE_BY_PROXY_COUNTRY = {
-    "JP": "Asia/Tokyo",
-    "US": "America/Los_Angeles",
-}
-
 _NETWORK_ERROR_MARKERS = (
     "network",
     "timeout",
@@ -108,17 +103,11 @@ class PersonalPaymentMethodBindError(RuntimeError):
 
 
 def _payment_locale_for_proxy_country(country_code: str) -> str:
-    return _PAYMENT_LOCALE_BY_PROXY_COUNTRY.get(
-        str(country_code or "").strip().upper(),
-        "en-US",
-    )
+    return locale_for_proxy_country(country_code)
 
 
 def _payment_timezone_for_proxy_country(country_code: str) -> str:
-    return _PAYMENT_TIMEZONE_BY_PROXY_COUNTRY.get(
-        str(country_code or "").strip().upper(),
-        "UTC",
-    )
+    return timezone_for_proxy_country(country_code)
 
 
 @dataclass(frozen=True)
@@ -205,12 +194,25 @@ class PersonalPaymentMethodBindWorkflow:
         totp_code_resolver: Callable[[str], str] | None = None,
         promo_campaign_id: str = "plus-1-month-free",
         checkout_ui_mode: str = "custom",
+        require_local_promotion: bool = True,
         after_bind_success: Callable[[str, Any, Any], dict[str, Any]] | None = None,
     ) -> None:
         self._session_factory = session_factory
-        self._registration_proxy_country = registration_proxy_country
+        self._registration_proxy_country = str(
+            registration_proxy_country or "US"
+        ).strip().upper()
+        if (
+            len(self._registration_proxy_country) != 2
+            or not self._registration_proxy_country.isascii()
+            or not self._registration_proxy_country.isalpha()
+        ):
+            raise PersonalPaymentMethodBindError(
+                "payment_method_country_invalid",
+                self._registration_proxy_country,
+            )
         self._promo_campaign_id = str(promo_campaign_id or "").strip()
         self._checkout_ui_mode = str(checkout_ui_mode or "custom").strip().lower()
+        self._require_local_promotion = bool(require_local_promotion)
         self._after_bind_success = after_bind_success
 
     def run(
@@ -250,6 +252,8 @@ class PersonalPaymentMethodBindWorkflow:
                     "card_id": attempt.card_id,
                     "card_last4": attempt.card_last4,
                     "attempt_count": attempt.attempt_count,
+                    "billing_country": attempt.country,
+                    "proxy_country": self._registration_proxy_country,
                     "work_id": work_id,
                 },
             )
@@ -401,7 +405,9 @@ class PersonalPaymentMethodBindWorkflow:
                     "payment_method_space_not_active",
                     space.space_status,
                 )
-            if not space.has_promotion or not str(space.promotion_id or "").strip():
+            if self._require_local_promotion and (
+                not space.has_promotion or not str(space.promotion_id or "").strip()
+            ):
                 raise PersonalPaymentMethodBindError(
                     "payment_method_promotion_required",
                     space.id,
@@ -470,7 +476,9 @@ class PersonalPaymentMethodBindWorkflow:
             space = session.get(SpaceModel, space_id, with_for_update=True)
             if space is None:
                 raise PersonalPaymentMethodBindError("space_not_found", space_id)
-            if not space.has_promotion or not str(space.promotion_id or "").strip():
+            if self._require_local_promotion and (
+                not space.has_promotion or not str(space.promotion_id or "").strip()
+            ):
                 raise PersonalPaymentMethodBindError(
                     "payment_method_promotion_required",
                     space.id,
@@ -505,7 +513,11 @@ class PersonalPaymentMethodBindWorkflow:
                 )
                 address = session.scalar(
                     select(PaymentAddressPoolModel)
-                    .where(PaymentAddressPoolModel.address_status == "active")
+                    .where(
+                        PaymentAddressPoolModel.address_status == "active",
+                        PaymentAddressPoolModel.country
+                        == self._registration_proxy_country,
+                    )
                     .order_by(func.random())
                     .with_for_update(skip_locked=True)
                     .limit(1)
@@ -519,13 +531,25 @@ class PersonalPaymentMethodBindWorkflow:
                 pool_rows = [("name", name), ("address", address), *pool_rows]
             missing = [pool_name for pool_name, row in pool_rows if row is None]
             if missing:
-                error_code = f"payment_{'_'.join(missing)}_pool_empty"
+                if billing_template is None and address is None:
+                    error_code = "payment_address_pool_country_empty"
+                    error_message = (
+                        "no active payment address for "
+                        f"{self._registration_proxy_country}"
+                    )
+                else:
+                    error_code = f"payment_{'_'.join(missing)}_pool_empty"
+                    error_message = ""
                 space.payment_method_status = "failed"
                 space.payment_method_last_error_code = error_code
-                space.payment_method_last_error_message = ""
+                space.payment_method_last_error_message = error_message
                 space.updated_at = now
                 session.commit()
-                raise PersonalPaymentMethodBindError(error_code)
+                raise PersonalPaymentMethodBindError(
+                    error_code,
+                    error_message,
+                    diagnostics={"country": self._registration_proxy_country},
+                )
 
             assert card is not None
             space.payment_method_attempt_count += 1
@@ -856,6 +880,8 @@ class PersonalPaymentMethodBindWorkflow:
                 "payment_method_last4": result.last4,
                 "payment_method_brand": result.brand,
                 "payment_method_status": "bound",
+                "billing_country": attempt.country,
+                "proxy_country": self._registration_proxy_country,
                 "attempt_count": space.payment_method_attempt_count,
                 "already_bound": False,
             }

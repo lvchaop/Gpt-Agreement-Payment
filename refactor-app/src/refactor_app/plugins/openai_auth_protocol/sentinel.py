@@ -27,13 +27,15 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from refactor_app.config.browser_fingerprint import (
     BROWSER_SEC_CH_UA,
     BROWSER_SEC_CH_UA_PLATFORM,
     BROWSER_USER_AGENT,
 )
+
+from .sentinel_quickjs import SentinelRuntimeContext, get_sentinel_runtime_context
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +67,20 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id: str | None = None, user_agent: str | None = None):
+    def __init__(
+        self,
+        device_id: str | None = None,
+        user_agent: str | None = None,
+        *,
+        runtime_context: SentinelRuntimeContext,
+    ):
         self.device_id = device_id or str(uuid.uuid4())
-        self.user_agent = user_agent or DEFAULT_UA
+        self.runtime_context = runtime_context
+        self.user_agent = (
+            user_agent
+            or str(runtime_context.browser_profile.get("user_agent") or "")
+            or DEFAULT_UA
+        )
         self.requirements_seed = str(random.random())
         self.sid = str(uuid.uuid4())
 
@@ -85,8 +98,15 @@ class SentinelTokenGenerator:
         return format(h & 0xFFFFFFFF, "08x")
 
     def _get_config(self) -> list:
-        now = datetime.now(timezone.utc)
-        date_str = now.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
+        profile = self.runtime_context.browser_profile
+        offset_minutes = int(profile["timezone_offset_minutes"])
+        now = datetime.now(timezone(timedelta(minutes=offset_minutes)))
+        sign = "+" if offset_minutes >= 0 else "-"
+        absolute_offset = abs(offset_minutes)
+        gmt = f"GMT{sign}{absolute_offset // 60:02d}{absolute_offset % 60:02d}"
+        date_str = now.strftime(
+            f"%a %b %d %Y %H:%M:%S {gmt} ({profile['timezone_name']})"
+        )
         perf_now = random.uniform(1000, 50000)
         time_origin = time.time() * 1000 - perf_now
         nav_prop = random.choice(
@@ -122,9 +142,8 @@ class SentinelTokenGenerator:
             self.user_agent,
             SENTINEL_SDK_URL,
             None,
-            None,
-            "en-US",
-            "en-US,en",
+            str(profile["navigator_language"]),
+            ",".join(profile["navigator_languages"]),
             random.random(),
             f"{nav_prop}−undefined",
             random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
@@ -178,7 +197,13 @@ def fetch_sentinel_challenge(
     request_p: str | None = None,
 ) -> dict | None:
     """POST `/sentinel/req` 并返回响应 JSON。失败返回 None。"""
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    runtime_context = get_sentinel_runtime_context(session)
+    profile = runtime_context.browser_profile
+    generator = SentinelTokenGenerator(
+        device_id=device_id,
+        user_agent=user_agent,
+        runtime_context=runtime_context,
+    )
     req_body = {
         "p": str(request_p or "").strip() or generator.generate_requirements_token(),
         "id": device_id,
@@ -188,12 +213,15 @@ def fetch_sentinel_challenge(
         "Content-Type": "text/plain;charset=UTF-8",
         "Accept": "*/*",
         "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": str(runtime_context.browser_profile["accept_language"]),
         "Referer": SENTINEL_REFERER,
         "Origin": "https://sentinel.openai.com",
-        "User-Agent": user_agent or DEFAULT_UA,
-        "sec-ch-ua": sec_ch_ua or DEFAULT_SEC_CH_UA,
+        "User-Agent": user_agent or str(profile.get("user_agent") or DEFAULT_UA),
+        "sec-ch-ua": sec_ch_ua or str(profile.get("sec_ch_ua") or DEFAULT_SEC_CH_UA),
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+        "sec-ch-ua-platform": str(
+            profile.get("sec_ch_ua_platform") or BROWSER_SEC_CH_UA_PLATFORM
+        ),
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
@@ -206,7 +234,7 @@ def fetch_sentinel_challenge(
         body_preview = (
             (getattr(response, "text", "") or "").replace("\n", " ").replace("\r", " ")[:500]
         )
-        logger.info(
+        logger.debug(
             "[SENTINEL DEBUG] python /req flow=%s status=%s p_len=%s body=%s",
             flow,
             getattr(response, "status_code", "N/A"),
@@ -217,7 +245,7 @@ def fetch_sentinel_challenge(
             payload = response.json()
             if isinstance(payload, dict):
                 pow_data = payload.get("proofofwork") or {}
-                logger.info(
+                logger.debug(
                     "[SENTINEL DEBUG] python /req parsed token_len=%s pow_required=%s pow_seed_len=%s difficulty=%s",
                     len(str(payload.get("token") or "")),
                     bool(pow_data.get("required")),
@@ -253,19 +281,23 @@ def build_sentinel_token(
         impersonate=impersonate,
     )
     if not challenge:
-        logger.warning("[SENTINEL DEBUG] python build_sentinel_token no challenge flow=%s", flow)
+        logger.debug("[SENTINEL DEBUG] python build_sentinel_token no challenge flow=%s", flow)
         return None
 
     c_value = str(challenge.get("token") or "").strip()
     if not c_value:
-        logger.warning(
+        logger.debug(
             "[SENTINEL DEBUG] python challenge missing token flow=%s keys=%s",
             flow,
             sorted(challenge.keys()),
         )
         return None
 
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    generator = SentinelTokenGenerator(
+        device_id=device_id,
+        user_agent=user_agent,
+        runtime_context=get_sentinel_runtime_context(session),
+    )
     pow_data = challenge.get("proofofwork") or {}
     if pow_data.get("required") and pow_data.get("seed"):
         p_value = generator.generate_token(
@@ -303,19 +335,23 @@ def build_sentinel_tokens(
         impersonate=impersonate,
     )
     if not challenge:
-        logger.warning("[SENTINEL DEBUG] python build_sentinel_tokens no challenge flow=%s", flow)
+        logger.debug("[SENTINEL DEBUG] python build_sentinel_tokens no challenge flow=%s", flow)
         return None
 
     c_value = str(challenge.get("token") or "").strip()
     if not c_value:
-        logger.warning(
+        logger.debug(
             "[SENTINEL DEBUG] python challenge missing token flow=%s keys=%s",
             flow,
             sorted(challenge.keys()),
         )
         return None
 
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    generator = SentinelTokenGenerator(
+        device_id=device_id,
+        user_agent=user_agent,
+        runtime_context=get_sentinel_runtime_context(session),
+    )
     pow_data = challenge.get("proofofwork") or {}
     if pow_data.get("required") and pow_data.get("seed"):
         p_value = generator.generate_token(
@@ -337,7 +373,7 @@ def get_sentinel_token(
     session,
     device_id: str,
     flow: str = "authorize_continue",
-    user_agent: str = DEFAULT_UA,
+    user_agent: str | None = None,
     page_url: str | None = None,
 ) -> str:
     """Generate a real-SDK token; synthetic fallback is explicit and off by default."""
@@ -379,7 +415,9 @@ def get_sentinel_token(
 
     logger.warning("Sentinel synthetic /req failed; using explicit no-challenge fallback")
     fallback_p = SentinelTokenGenerator(
-        device_id=device_id, user_agent=user_agent
+        device_id=device_id,
+        user_agent=user_agent,
+        runtime_context=get_sentinel_runtime_context(session),
     ).generate_requirements_token()
     return json.dumps(
         {
@@ -397,7 +435,7 @@ def get_sentinel_tokens(
     session,
     device_id: str,
     flow: str = "authorize_continue",
-    user_agent: str = DEFAULT_UA,
+    user_agent: str | None = None,
     initialize_first: bool = False,
     page_url: str | None = None,
 ) -> tuple[str, str]:
@@ -451,7 +489,9 @@ def get_sentinel_tokens(
 
     logger.warning("Sentinel synthetic /req failed; using explicit no-challenge fallback")
     fallback_p = SentinelTokenGenerator(
-        device_id=device_id, user_agent=user_agent
+        device_id=device_id,
+        user_agent=user_agent,
+        runtime_context=get_sentinel_runtime_context(session),
     ).generate_requirements_token()
     return json.dumps(
         {

@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from refactor_app.application.jobs.attempt_disposition import (
-    personal_plus_checkout_failure_metadata,
+    work_failure_metadata,
 )
 from refactor_app.application.jobs.queue import (
     DEFAULT_WORK_LEASE_SECONDS,
@@ -380,7 +380,7 @@ class JobRunner:
                     claimed_at=claimed_at,
                 ):
                     return work_id
-                failure_metadata = personal_plus_checkout_failure_metadata(exc)
+                failure_metadata = work_failure_metadata(exc)
                 failure_context = {
                     **work_context,
                     "error": f"{type(exc).__name__}: {exc}",
@@ -499,6 +499,18 @@ def _finalize_parent_work_job(session: Session, *, job_id: str, run_id: str = ""
     if not job_id:
         return
     session.flush()
+
+    # Concurrent workers finish in separate transactions. Serialize their
+    # aggregate-status writes so the last waiter recounts after earlier work
+    # commits instead of persisting a stale "running" snapshot.
+    job = session.scalars(
+        select(JobModel)
+        .where(JobModel.id == job_id)
+        .with_for_update()
+    ).one_or_none()
+    if job is None:
+        return
+
     summary = {
         "queued": 0,
         "running": 0,
@@ -515,8 +527,18 @@ def _finalize_parent_work_job(session: Session, *, job_id: str, run_id: str = ""
     for status, count in rows:
         if status in summary:
             summary[status] = int(count or 0)
+    failure_counts = {
+        str(error_code or "handler_error"): int(count or 0)
+        for error_code, count in session.execute(
+            select(WorkItemModel.error_code, func.count())
+            .where(
+                WorkItemModel.job_id == job_id,
+                WorkItemModel.work_status == "failed",
+            )
+            .group_by(WorkItemModel.error_code)
+        ).all()
+    }
 
-    job = session.get(JobModel, job_id)
     run = session.get(JobRunModel, run_id) if run_id else None
     if run is None:
         run = session.scalars(
@@ -527,15 +549,19 @@ def _finalize_parent_work_job(session: Session, *, job_id: str, run_id: str = ""
         ).first()
 
     now = datetime.now(UTC)
-    job_cancelled = job is not None and job.job_status == "cancelled"
-    if job is not None and not job_cancelled:
+    job_cancelled = job.job_status == "cancelled"
+    if not job_cancelled:
         if summary["queued"] == 0 and summary["running"] == 0:
             job.job_status = "failed" if summary["failed"] > 0 else "succeeded"
         else:
             job.job_status = "running"
         job.updated_at = now
     if run is not None:
-        run.output_json = summary
+        run.output_json = {
+            **dict(run.output_json or {}),
+            **summary,
+            "failure_counts": failure_counts,
+        }
         if job_cancelled:
             run.run_status = "cancelled"
             run.finished_at = now
@@ -546,11 +572,22 @@ def _finalize_parent_work_job(session: Session, *, job_id: str, run_id: str = ""
             run.run_status = "failed" if summary["failed"] > 0 else "succeeded"
             run.finished_at = now
             if run.run_status == "failed":
-                run.error_code = "work_failed"
+                run.error_code = (
+                    next(iter(failure_counts))
+                    if len(failure_counts) == 1
+                    else "multiple_work_failures"
+                )
+                details = ", ".join(
+                    f"{code}={count}"
+                    for code, count in sorted(
+                        failure_counts.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                )
                 run.error_message = (
                     f"failed={summary['failed']} queued={summary['queued']} "
-                    f"running={summary['running']}"
-                )
+                    f"running={summary['running']} errors=[{details}]"
+                )[:1000]
             else:
                 run.error_code = ""
                 run.error_message = ""

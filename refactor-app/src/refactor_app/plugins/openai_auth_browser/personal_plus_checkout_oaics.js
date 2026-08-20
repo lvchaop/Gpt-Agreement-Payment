@@ -1695,9 +1695,13 @@
     };
 
     const metadataController = stripe?._controller || stripe?._implementation?._controller;
+    const runtimeLocale = String(navigator.language || "").trim();
+    if (!runtimeLocale) {
+      throw new Error("Browser locale is required for Stripe checkout runtime.");
+    }
     const stripeRuntime = {
       referrerHost: location.host,
-      locale: navigator.language || "en-US",
+      locale: runtimeLocale,
       stripeJsId: metadataController?._stripeJsId,
       apiVersion: metadataController?._apiVersion,
       stripeAccount: metadataController?._stripeAccount,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import refactor_app.plugins.openai_auth_protocol.account_security as account_security
 from refactor_app.plugins.openai_auth_protocol.account_security import (
     ProtocolAccountSecurity,
     ProtocolAccountSecurityConfig,
@@ -175,3 +176,90 @@ def test_protocol_security_records_missing_twofauth_client_without_enrolling() -
     assert [call["url"] for call in session.calls] == [
         "https://chatgpt.com/backend-api/accounts/mfa_info"
     ]
+
+
+def test_protocol_security_reuses_captured_firefox_identity() -> None:
+    session = _MfaSession()
+    auth_result = _registered_result()
+    auth_result.browser_user_agent = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) "
+        "Gecko/20100101 Firefox/152.0"
+    )
+    auth_result.browser_platform = "MacIntel"
+    auth_result.browser_accept_language = "en-US,en;q=0.9"
+    auth_result.browser_impersonate = "firefox152"
+
+    ProtocolAccountSecurity(ProtocolAccountSecurityConfig()).run(
+        auth_result=auth_result,
+        twofauth_client=None,
+        http_session=session,
+    )
+
+    headers = session.calls[0]["headers"]
+    assert headers["User-Agent"] == auth_result.browser_user_agent
+    assert headers["Accept-Language"] == "en-US,en;q=0.9"
+    assert not any(name.casefold().startswith("sec-ch-ua") for name in headers)
+
+
+def test_protocol_security_uses_supported_firefox_tls_alias(monkeypatch) -> None:
+    session = _MfaSession()
+    captured: dict[str, str] = {}
+
+    def create_session(*, proxy: str, impersonate: str):
+        captured.update(proxy=proxy, impersonate=impersonate)
+        return session
+
+    monkeypatch.setattr(account_security, "create_http_session", create_session)
+    auth_result = _registered_result()
+    auth_result.browser_user_agent = "Mozilla/5.0 Gecko/20100101 Firefox/152.0"
+    auth_result.browser_impersonate = "firefox152"
+
+    ProtocolAccountSecurity(
+        ProtocolAccountSecurityConfig(proxy_url="http://proxy.example:8080")
+    ).run(
+        auth_result=auth_result,
+        twofauth_client=None,
+    )
+
+    assert captured == {
+        "proxy": "http://proxy.example:8080",
+        "impersonate": "firefox",
+    }
+
+
+def test_protocol_security_reuses_cloakbrowser_chromium_identity(monkeypatch) -> None:
+    session = _MfaSession()
+    captured: dict[str, str] = {}
+
+    def create_session(*, proxy: str, impersonate: str):
+        captured.update(proxy=proxy, impersonate=impersonate)
+        return session
+
+    monkeypatch.setattr(account_security, "create_http_session", create_session)
+    auth_result = _registered_result()
+    auth_result.browser_user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/150.0.7871.114 Safari/537.36"
+    )
+    auth_result.browser_platform = "Win32"
+    auth_result.browser_impersonate = "chrome150"
+
+    ProtocolAccountSecurity(
+        ProtocolAccountSecurityConfig(proxy_url="http://proxy.example:8080")
+    ).run(
+        auth_result=auth_result,
+        twofauth_client=None,
+    )
+
+    assert captured == {
+        "proxy": "http://proxy.example:8080",
+        "impersonate": "chrome",
+    }
+    headers = session.calls[0]["headers"]
+    assert headers["User-Agent"] == auth_result.browser_user_agent
+    assert headers["sec-ch-ua"] == (
+        '"Chromium";v="150", "Google Chrome";v="150", '
+        '"Not_A Brand";v="99"'
+    )
+    assert headers["sec-ch-ua-platform"] == '"Windows"'

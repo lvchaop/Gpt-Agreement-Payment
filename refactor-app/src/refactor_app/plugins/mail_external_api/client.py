@@ -30,6 +30,8 @@ class ExternalMailApiPaths:
     mark_used: str = "/mailbox/{external_lease_id}/used"
     mark_failed: str = "/mailbox/{external_lease_id}/failed"
     release: str = "/mailbox/{external_lease_id}/release"
+    apply_temp_email: str = "/api/external/temp-emails/apply"
+    finish_temp_email: str = "/api/external/temp-emails/{task_token}/finish"
     ensure_email: str = "/api/external/temp-emails/ensure"
     verification_code: str = "/api/external/verification-code"
     claim_random: str = "/api/external/pool/claim-random"
@@ -125,6 +127,66 @@ class ExternalMailApiClient:
         if not _is_domain_mail_address(normalized):
             return {"email": normalized, "ensured": False, "skipped": True}
         return self.ensure_email(email=normalized)
+
+    def apply_temp_email(
+        self,
+        *,
+        caller_id: str,
+        task_id: str,
+        prefix: str = "",
+        domain: str = "",
+    ) -> ClaimedMailAccount:
+        if not caller_id:
+            raise ExternalMailApiClientError("apply_temp_email requires caller_id")
+        if not task_id:
+            raise ExternalMailApiClientError("apply_temp_email requires task_id")
+        body: dict[str, Any] = {"caller_id": caller_id, "task_id": task_id}
+        if prefix:
+            body["prefix"] = prefix
+        if domain:
+            body["domain"] = domain
+        payload = self._request_json(
+            "POST",
+            self._config.paths.apply_temp_email,
+            json=body,
+        )
+        if payload.get("success") is not True:
+            raise ExternalMailApiClientError(f"temp-email apply failed: {_error_message(payload)}")
+        data = _payload_data(payload)
+        email = _first_text(data, "email")
+        task_token = _first_text(data, "task_token")
+        if not email:
+            raise ExternalMailApiClientError("temp-email apply response missing email")
+        if not task_token:
+            raise ExternalMailApiClientError("temp-email apply response missing task_token")
+        return ClaimedMailAccount(
+            account_id=f"temp-task:{task_token}",
+            email=email,
+            claim_token=task_token,
+            caller_id=caller_id,
+            task_id=task_id,
+            email_domain=_first_text(data, "domain") or email.rpartition("@")[2],
+            raw=payload,
+        )
+
+    def finish_temp_email(
+        self,
+        *,
+        task_token: str,
+        result: str,
+        detail: str = "",
+    ) -> dict[str, Any]:
+        normalized_token = str(task_token or "").strip()
+        if not normalized_token:
+            raise ExternalMailApiClientError("finish_temp_email requires task_token")
+        payload = self._request_json(
+            "POST",
+            self._config.paths.finish_temp_email.format(task_token=normalized_token),
+            json={"result": str(result or "").strip(), "detail": str(detail or "").strip()},
+        )
+        if payload.get("success") is not True:
+            raise ExternalMailApiClientError(f"temp-email finish failed: {_error_message(payload)}")
+        return payload
 
     def claim_random(
         self,
@@ -227,7 +289,7 @@ class ExternalMailApiClient:
                     "email": lookup_email,
                     "since_minutes": str(since_minutes),
                     "code_length": "6" if is_domain_mail else "6-6",
-                    "code_source": "all" if is_domain_mail else normalized_code_source,
+                    "code_source": normalized_code_source,
                 }
                 if not is_domain_mail:
                     params["code_regex"] = SIX_DIGIT_CODE_REGEX
@@ -465,7 +527,16 @@ def _error_message(payload: dict[str, Any]) -> str:
 
 def _is_domain_mail_address(email: str) -> bool:
     domain = (email.rsplit("@", 1)[-1] if "@" in email else "").strip().lower()
-    return bool(domain) and domain not in OUTLOOK_MAIL_DOMAINS and domain not in ICLOUD_MAIL_DOMAINS
+    return (
+        bool(domain)
+        and not _is_outlook_mail_domain(domain)
+        and domain not in ICLOUD_MAIL_DOMAINS
+    )
+
+
+def _is_outlook_mail_domain(domain: str) -> bool:
+    normalized = str(domain or "").strip().lower().rstrip(".")
+    return normalized in OUTLOOK_MAIL_DOMAINS or normalized.startswith("outlook.")
 
 
 def _is_missing_mailbox_error(payload: dict[str, Any]) -> bool:

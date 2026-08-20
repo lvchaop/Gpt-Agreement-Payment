@@ -18,8 +18,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
-from refactor_app.config.browser_fingerprint import BROWSER_FINGERPRINT
+from refactor_app.application.workflows.proxy_locale import (
+    browser_context_for_proxy_country,
+    normalize_proxy_country,
+    timezone_offset_minutes_for_proxy_country,
+)
+from refactor_app.config.browser_fingerprint import (
+    BROWSER_FINGERPRINT,
+    BrowserFingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,101 +49,6 @@ _FLOW_PAGE_URL = {
     "oauth_create_account": "https://auth.openai.com/about-you",
 }
 _CHECKOUT_FLOW = "checkout_session_approval"
-
-# These values are copied from the known-good registration project's captured
-# browser profile. HTTP UA/client hints still come from this project's configured
-# curl_cffi impersonation so the TLS and JavaScript identities use one Chrome major.
-_SCREEN_PROFILE = {
-    "screen_width": 1800,
-    "screen_height": 1169,
-    "hardware_concurrency": 12,
-    "js_heap_size_limit": 4_395_630_592,
-    "device_memory": 8,
-    "device_pixel_ratio": 2,
-}
-_LOCALE_PROFILES = {
-    "JP": {
-        "navigator_language": "ja-JP",
-        "navigator_languages": ["ja-JP"],
-        "accept_language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-        "timezone_iana": "Asia/Tokyo",
-        "timezone_offset_minutes": 540,
-        "timezone_name": "Japan Standard Time",
-    },
-    "CN": {
-        "navigator_language": "zh-CN",
-        "navigator_languages": ["zh-CN"],
-        "accept_language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "timezone_iana": "Asia/Shanghai",
-        "timezone_offset_minutes": 480,
-        "timezone_name": "China Standard Time",
-    },
-    "HK": {
-        "navigator_language": "zh-HK",
-        "navigator_languages": ["zh-HK"],
-        "accept_language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6",
-        "timezone_iana": "Asia/Hong_Kong",
-        "timezone_offset_minutes": 480,
-        "timezone_name": "Hong Kong Standard Time",
-    },
-    "TW": {
-        "navigator_language": "zh-TW",
-        "navigator_languages": ["zh-TW"],
-        "accept_language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "timezone_iana": "Asia/Taipei",
-        "timezone_offset_minutes": 480,
-        "timezone_name": "Taipei Standard Time",
-    },
-    "US": {
-        "navigator_language": "en-US",
-        "navigator_languages": ["en-US"],
-        "accept_language": "en-US,en;q=0.9",
-        "timezone_iana": "America/Los_Angeles",
-        "timezone_offset_minutes": -420,
-        "timezone_name": "Pacific Daylight Time",
-    },
-    "SG": {
-        "navigator_language": "en-SG",
-        "navigator_languages": ["en-SG"],
-        "accept_language": "en-SG,en-US;q=0.9,en;q=0.8",
-        "timezone_iana": "Asia/Singapore",
-        "timezone_offset_minutes": 480,
-        "timezone_name": "Singapore Standard Time",
-    },
-    "GB": {
-        "navigator_language": "en-GB",
-        "navigator_languages": ["en-GB"],
-        "accept_language": "en-GB,en-US;q=0.9,en;q=0.8",
-        "timezone_iana": "Europe/London",
-        "timezone_offset_minutes": 60,
-        "timezone_name": "British Summer Time",
-    },
-    "DE": {
-        "navigator_language": "de-DE",
-        "navigator_languages": ["de-DE"],
-        "accept_language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-        "timezone_iana": "Europe/Berlin",
-        "timezone_offset_minutes": 120,
-        "timezone_name": "Central European Summer Time",
-    },
-    "FR": {
-        "navigator_language": "fr-FR",
-        "navigator_languages": ["fr-FR"],
-        "accept_language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "timezone_iana": "Europe/Paris",
-        "timezone_offset_minutes": 120,
-        "timezone_name": "Central European Summer Time",
-    },
-    "NL": {
-        "navigator_language": "nl-NL",
-        "navigator_languages": ["nl-NL"],
-        "accept_language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
-        "timezone_iana": "Europe/Amsterdam",
-        "timezone_offset_minutes": 120,
-        "timezone_name": "Central European Summer Time",
-    },
-}
-_LOCALE_ALIASES = {"CA": "US", "AU": "GB"}
 
 _NAVIGATOR_PROTO_SAMPLES = [
     "createAuctionNonce-function createAuctionNonce() { [native code] }",
@@ -241,10 +155,25 @@ class SentinelRuntimeContext:
             "react_container_key",
             "react_resources_key",
         )
-        if not isinstance(profile, dict) or any(not str(data.get(key) or "") for key in required):
+        profile_required = (
+            "navigator_language",
+            "navigator_languages",
+            "accept_language",
+            "timezone_iana",
+            "timezone_offset_minutes",
+            "timezone_name",
+        )
+        if (
+            not isinstance(profile, dict)
+            or any(not str(data.get(key) or "") for key in required)
+            or any(key not in profile or profile[key] in (None, "") for key in profile_required)
+            or not isinstance(profile.get("navigator_languages"), list)
+            or not profile.get("navigator_languages")
+        ):
             raise ValueError("Sentinel runtime context is incomplete")
+        country_code = normalize_proxy_country(str(data.get("country_code") or ""))
         return cls(
-            country_code=str(data.get("country_code") or "US").upper(),
+            country_code=country_code,
             sentinel_sid=str(data["sentinel_sid"]),
             react_listening_key=str(data["react_listening_key"]),
             react_container_key=str(data["react_container_key"]),
@@ -253,28 +182,46 @@ class SentinelRuntimeContext:
         )
 
 
-def create_sentinel_runtime_context(country_code: str = "") -> SentinelRuntimeContext:
-    country = str(country_code or os.getenv("OPENAI_SENTINEL_PROXY_COUNTRY", "US")).upper()
-    locale_key = _LOCALE_ALIASES.get(country, country)
-    locale = dict(_LOCALE_PROFILES.get(locale_key, _LOCALE_PROFILES["US"]))
+def create_sentinel_runtime_context(
+    country_code: str = "",
+    *,
+    browser_fingerprint: BrowserFingerprint | None = None,
+) -> SentinelRuntimeContext:
+    fingerprint = browser_fingerprint or BROWSER_FINGERPRINT
+    country = normalize_proxy_country(country_code)
+    browser_context = browser_context_for_proxy_country(country)
+    timezone_now = datetime.now(ZoneInfo(browser_context.timezone))
+    locale = {
+        "navigator_language": browser_context.locale,
+        "navigator_languages": [browser_context.locale],
+        "accept_language": browser_context.accept_language,
+        "timezone_iana": browser_context.timezone,
+        "timezone_offset_minutes": timezone_offset_minutes_for_proxy_country(country),
+        "timezone_name": timezone_now.tzname() or browser_context.timezone,
+    }
     suffix = uuid.uuid4().hex[:11]
     react_container_key = f"__reactContainer${suffix}"
     profile: dict[str, Any] = {
-        **_SCREEN_PROFILE,
         **locale,
+        "screen_width": fingerprint.screen_width,
+        "screen_height": fingerprint.screen_height,
+        "hardware_concurrency": fingerprint.hardware_concurrency,
+        "js_heap_size_limit": fingerprint.js_heap_size_limit,
+        "device_memory": fingerprint.device_memory,
+        "device_pixel_ratio": fingerprint.device_pixel_ratio,
         "browser_family": "chrome",
-        "navigator_platform": BROWSER_FINGERPRINT.navigator_platform,
+        "navigator_platform": fingerprint.navigator_platform,
         "navigator_vendor": "Google Inc.",
-        "user_agent_data_platform": BROWSER_FINGERPRINT.sec_ch_ua_platform.strip('"'),
-        "user_agent": BROWSER_FINGERPRINT.user_agent,
-        "chrome_major": str(BROWSER_FINGERPRINT.major_version),
-        "chrome_full_version": BROWSER_FINGERPRINT.sec_ch_ua_full_version.strip('"'),
-        "sec_ch_ua": BROWSER_FINGERPRINT.sec_ch_ua,
-        "sec_ch_ua_platform": BROWSER_FINGERPRINT.sec_ch_ua_platform,
-        "sec_ch_ua_full_version_list": BROWSER_FINGERPRINT.sec_ch_ua_full_version_list,
-        "sec_ch_ua_platform_version": '"15.7.0"',
-        "sec_ch_ua_arch": '"arm"',
-        "sec_ch_ua_bitness": '"64"',
+        "user_agent_data_platform": fingerprint.sec_ch_ua_platform.strip('"'),
+        "user_agent": fingerprint.user_agent,
+        "chrome_major": str(fingerprint.major_version),
+        "chrome_full_version": fingerprint.sec_ch_ua_full_version.strip('"'),
+        "sec_ch_ua": fingerprint.sec_ch_ua,
+        "sec_ch_ua_platform": fingerprint.sec_ch_ua_platform,
+        "sec_ch_ua_full_version_list": fingerprint.sec_ch_ua_full_version_list,
+        "sec_ch_ua_platform_version": fingerprint.sec_ch_ua_platform_version,
+        "sec_ch_ua_arch": fingerprint.sec_ch_ua_arch,
+        "sec_ch_ua_bitness": fingerprint.sec_ch_ua_bitness,
         "sec_ch_ua_model": '""',
         "window_feature_flags": {"requestIdleCallback": 0},
     }
@@ -293,22 +240,30 @@ def bind_sentinel_runtime_context(
     *,
     country_code: str = "",
     context: SentinelRuntimeContext | dict[str, Any] | None = None,
+    browser_fingerprint: BrowserFingerprint | None = None,
 ) -> SentinelRuntimeContext:
     existing = getattr(session, _SESSION_CONTEXT_ATTR, None)
     if isinstance(existing, SentinelRuntimeContext):
         return existing
     if isinstance(context, dict):
         context = SentinelRuntimeContext.from_dict(context)
-    resolved = context or create_sentinel_runtime_context(country_code)
+    resolved = context or create_sentinel_runtime_context(
+        country_code,
+        browser_fingerprint=browser_fingerprint,
+    )
     setattr(session, _SESSION_CONTEXT_ATTR, resolved)
+    setattr(session, "_openai_sentinel_country_code", resolved.country_code)
     return resolved
 
 
 def get_sentinel_runtime_context(session: Any) -> SentinelRuntimeContext:
-    return bind_sentinel_runtime_context(
-        session,
-        country_code=str(getattr(session, "_openai_sentinel_country_code", "") or ""),
-    )
+    existing = getattr(session, _SESSION_CONTEXT_ATTR, None)
+    if isinstance(existing, SentinelRuntimeContext):
+        return existing
+    country_code = str(getattr(session, "_openai_sentinel_country_code", "") or "")
+    if not country_code:
+        raise ValueError("Sentinel requires a verified proxy egress country")
+    return bind_sentinel_runtime_context(session, country_code=country_code)
 
 
 def _resolve_node_binary() -> str:
@@ -342,7 +297,11 @@ def _is_complete_sdk_bundle(content: bytes) -> bool:
     )
 
 
-def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
+def _ensure_sdk_file(
+    session: Any,
+    timeout_ms: int,
+    context: SentinelRuntimeContext,
+) -> Path:
     cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-demo" / SENTINEL_VERSION
     cache_dir.mkdir(parents=True, exist_ok=True)
     sdk_file = cache_dir / "sdk.js"
@@ -363,12 +322,14 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
         SENTINEL_SDK_URL,
         headers={
             "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
+            "accept-language": str(context.browser_profile["accept_language"]),
             "referer": "https://auth.openai.com/",
-            "user-agent": DEFAULT_UA,
-            "sec-ch-ua": DEFAULT_SEC_CH_UA,
+            "user-agent": str(context.browser_profile["user_agent"]),
+            "sec-ch-ua": str(context.browser_profile["sec_ch_ua"]),
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_FINGERPRINT.sec_ch_ua_platform,
+            "sec-ch-ua-platform": str(
+                context.browser_profile["sec_ch_ua_platform"]
+            ),
             "sec-fetch-dest": "script",
             "sec-fetch-mode": "no-cors",
             "sec-fetch-site": "same-site",
@@ -881,7 +842,7 @@ def get_sentinel_tokens_via_quickjs(
     resolved_page_url, cookie_domain = _resolve_page_url(flow, page_url)
     context = get_sentinel_runtime_context(session)
     _ensure_oai_did_cookies(session, did)
-    sdk_file = _ensure_sdk_file(session, timeout_ms)
+    sdk_file = _ensure_sdk_file(session, timeout_ms, context)
     cookie = _cookie_header_for_domain(session, cookie_domain, did)
     if initialize_first:
         token_text = _run_sentinel_lifecycle_runner(

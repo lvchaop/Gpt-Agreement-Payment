@@ -186,7 +186,7 @@
   });
 
   const stripe = window.Stripe(publishableKey);
-  const elements = stripe.elements({ locale: 'zh' });
+  const elements = stripe.elements({ locale: 'auto' });
   const cardElement = elements.create('card', {
     hidePostalCode: true,
     style: {
@@ -382,7 +382,7 @@
   try {
     const googlePayElements = stripe.elements({
       clientSecret,
-      locale: 'zh'
+      locale: 'auto'
     });
     const expressCheckoutElement = googlePayElements.create('expressCheckout', {
       paymentMethods: {

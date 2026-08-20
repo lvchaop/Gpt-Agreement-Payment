@@ -4,10 +4,22 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from refactor_app.application.jobs.attempt_disposition import (
+    PERSONAL_PLUS_CHECKOUT_FAILURE_SCOPE,
+    checkpoint_personal_plus_checkout_failure,
+    checkpoint_personal_plus_checkout_sync_pending,
+    has_personal_plus_checkout_consume_stop,
+    has_personal_plus_checkout_sync_failure,
+    personal_plus_checkout_consume_stop_exists_for,
+    personal_plus_checkout_sync_failure_exists_for,
+    resolve_personal_plus_checkout_sync_failures,
+    try_acquire_personal_plus_checkout_lock,
+)
 from refactor_app.application.jobs.queue import WorkQueue
 from refactor_app.application.jobs.runner import JobRunner
 from refactor_app.application.workflows.account_auth import (
@@ -32,6 +44,16 @@ from refactor_app.application.workflows.mail import (
 from refactor_app.application.workflows.personal_payment_method import (
     PersonalPaymentMethodBindWorkflow,
 )
+from refactor_app.application.workflows.personal_paypal_agreement import (
+    PayPalAgreementCardPoolProvider,
+    PersonalPayPalAgreementError,
+    PersonalPayPalAgreementWorkflow,
+    sanitize_personal_paypal_agreement_output,
+)
+from refactor_app.application.workflows.personal_paypal_link import (
+    PersonalPayPalLinkWorkflow,
+    paypal_checkout_currency_for_country,
+)
 from refactor_app.application.workflows.personal_plus_checkout import (
     PersonalPlusCheckoutWorkflow,
 )
@@ -40,6 +62,7 @@ from refactor_app.application.workflows.protocol_registration import (
     EMAIL_PROTOCOL_NO_PHONE,
     ICLOUD_HIDE_MY_EMAIL_PROVIDER,
     PHONE_PROTOCOL_BIND_EMAIL,
+    HeroSmsLongTermPhoneProviderAdapter,
     HeroSmsPhoneProviderAdapter,
     ProtocolRegistrationInput,
     ProtocolRegistrationWorkflow,
@@ -65,6 +88,10 @@ from refactor_app.application.workflows.space_authorization import (
 from refactor_app.application.workflows.space_auto_replenish import (
     MAX_INVITE_BATCH_SIZE,
     SpaceAutoReplenishWorkflow,
+)
+from refactor_app.application.workflows.space_credential_heartbeat import (
+    PersonalCodexCredentialHeartbeatInput,
+    PersonalCodexCredentialHeartbeatWorkflow,
 )
 from refactor_app.application.workflows.space_direct_push import (
     SpaceDirectPushInput,
@@ -97,6 +124,7 @@ from refactor_app.config.settings import Settings
 from refactor_app.infrastructure.db.models import (
     DownstreamChannelModel,
     SpaceCredentialModel,
+    SpaceMembershipModel,
     SpaceModel,
     UserAccountModel,
     WorkItemModel,
@@ -112,6 +140,21 @@ from refactor_app.plugins.proxy_webshare.plugin import WebshareProxyPlugin
 from refactor_app.plugins.twofauth import TwoFAuthClient, TwoFAuthClientConfig
 
 SessionFactory = Callable[[], Session]
+
+_PAYPAL_AGREEMENT_GRIZZLY_COUNTRIES = {
+    "AU": "175",
+    "BR": "73",
+    "CA": "36",
+    "DE": "43",
+    "FR": "78",
+    "GB": "16",
+    "JP": "182",
+    "NL": "48",
+    "PL": "15",
+    "SG": "10351",
+    "TH": "52",
+    "US": "187",
+}
 
 
 def register_core_handlers(
@@ -228,6 +271,12 @@ def register_core_handlers(
     )
     runner.register(
         "space_credential.push.bulk",
+        lambda _session, input_json: {
+            "work_count": len(input_json.get("space_credential_ids") or []),
+        },
+    )
+    runner.register(
+        "space.personal_codex_credential_heartbeat.tick",
         lambda _session, input_json: {
             "work_count": len(input_json.get("space_credential_ids") or []),
         },
@@ -350,12 +399,21 @@ def register_core_handlers(
         "space.personal_payment_method_bind.tick",
         lambda _session, input_json: _run_personal_payment_method_bind_tick_job(
             session_factory=session_factory,
+            settings=settings,
             input_json=input_json,
         ),
     )
     runner.register(
         "space.personal_plus_checkout.tick",
         lambda _session, input_json: _run_personal_plus_checkout_tick_job(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
+    )
+    runner.register(
+        "space.personal_paypal_link.tick",
+        lambda _session, input_json: _run_personal_paypal_link_tick_job(
             session_factory=session_factory,
             settings=settings,
             input_json=input_json,
@@ -466,6 +524,14 @@ def register_core_handlers(
         },
     )
     runner.register_work(
+        "space.personal_codex_credential_heartbeat.account",
+        lambda _session, input_json: _run_personal_codex_credential_heartbeat_work(
+            session_factory=session_factory,
+            settings=settings,
+            input_json=input_json,
+        ),
+    )
+    runner.register_work(
         "space.recycle.binding",
         lambda _session, input_json: (
             SpaceRecycleSweepWorkflow(
@@ -511,44 +577,82 @@ def register_core_handlers(
     )
 
     def personal_payment_method_workflow(input_json: dict) -> PersonalPaymentMethodBindWorkflow:
-        after_bind_success = None
-        if bool(input_json.get("auto_start_plus_checkout", True)):
-            plus_workflow = PersonalPlusCheckoutWorkflow(
-                session_factory=session_factory,
-                mail_provider=_mail_plugin(settings),
-                us_proxy_country=settings.personal_plus_checkout_create_proxy_country,
-                jp_proxy_country=settings.personal_plus_checkout_promo_proxy_country,
-                promo_campaign_id=settings.personal_plus_checkout_promo_campaign_id,
-                totp_code_resolver=totp_code_resolver,
-            )
-            def after_bind_success(space_id, page, _result):
-                return plus_workflow.run_on_existing_page(
-                    space_id=space_id,
-                    page=page,
-                    work_id=str(input_json.get("_work_id") or "") + "-plus",
-                    run_id=str(input_json.get("_run_id") or ""),
-                )
         return PersonalPaymentMethodBindWorkflow(
             session_factory=session_factory,
-            mail_provider=_mail_plugin(settings),
             registration_proxy_country=settings.personal_plus_checkout_create_proxy_country,
-            totp_code_resolver=totp_code_resolver,
-            after_bind_success=after_bind_success,
+            promo_campaign_id=settings.personal_plus_checkout_promo_campaign_id,
+            checkout_ui_mode=str(
+                input_json.get("checkout_ui_mode")
+                or getattr(settings, "personal_payment_method_checkout_ui_mode", "custom")
+                or "custom"
+            ),
         )
 
-    runner.register_work(
-        "space.personal_payment_method_bind.space",
-        lambda _session, input_json: personal_payment_method_workflow(input_json).run(
-            space_id=str(input_json["space_id"]),
-            run_id=str(input_json.get("_run_id") or ""),
-            work_id=str(input_json.get("_work_id") or ""),
-        ),
-    )
-    runner.register_work(
-        "space.personal_plus_checkout.space",
-        lambda _session, input_json: PersonalPlusCheckoutWorkflow(
+    def terminal_plus_checkout_output(space_id: str) -> dict[str, Any]:
+        return {
+            "_work_outcome": "skipped",
+            "space_id": space_id,
+            "skip_reason": "personal_plus_checkout_consume_stop_exists",
+            "failure_scope": PERSONAL_PLUS_CHECKOUT_FAILURE_SCOPE,
+            "attempt_disposition": "consume_stop",
+            "terminal": True,
+        }
+
+    def concurrent_plus_checkout_output(space_id: str) -> dict[str, Any]:
+        return {
+            "_work_outcome": "skipped",
+            "space_id": space_id,
+            "skip_reason": "personal_plus_checkout_in_progress",
+            "failure_scope": PERSONAL_PLUS_CHECKOUT_FAILURE_SCOPE,
+            "attempt_disposition": "release",
+            "terminal": False,
+        }
+
+    def acquire_plus_checkout_guard(
+        work_session: Session | None,
+        *,
+        space_id: str,
+        start_new_checkout: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        if work_session is None:
+            return None, False
+
+        def prior_attempt_state() -> tuple[dict[str, Any] | None, bool]:
+            terminal = has_personal_plus_checkout_consume_stop(
+                work_session,
+                space_id=space_id,
+            )
+            if terminal and start_new_checkout:
+                return None, False
+            recoverable_sync = bool(
+                terminal
+                and has_personal_plus_checkout_sync_failure(
+                    work_session,
+                    space_id=space_id,
+                )
+            )
+            if terminal and not recoverable_sync:
+                return terminal_plus_checkout_output(space_id), False
+            return None, recoverable_sync
+
+        guard_output, sync_only = prior_attempt_state()
+        if guard_output is not None:
+            return guard_output, sync_only
+        if not try_acquire_personal_plus_checkout_lock(
+            work_session,
+            space_id=space_id,
+        ):
+            return concurrent_plus_checkout_output(space_id), False
+        # Close the check/lock race: a prior worker may have committed its
+        # terminal marker immediately before this transaction acquired the lock.
+        return prior_attempt_state()
+
+    def personal_plus_checkout_workflow(
+        input_json: dict,
+    ) -> PersonalPlusCheckoutWorkflow:
+        return PersonalPlusCheckoutWorkflow(
             session_factory=session_factory,
-            mail_provider=_mail_plugin(settings),
+            openai_provider=_openai_plugin(settings),
             us_proxy_country=str(
                 input_json.get("create_proxy_country")
                 or settings.personal_plus_checkout_create_proxy_country
@@ -561,12 +665,416 @@ def register_core_handlers(
                 input_json.get("promo_campaign_id")
                 or settings.personal_plus_checkout_promo_campaign_id
             ),
+            checkout_ui_mode=str(
+                input_json.get("checkout_ui_mode")
+                or getattr(settings, "personal_plus_checkout_ui_mode", "hosted")
+                or "hosted"
+            ),
+            browser_headless=bool(input_json.get("browser_headless", True)),
+            browser_log_enabled=bool(
+                input_json.get(
+                    "browser_log_enabled",
+                    getattr(settings, "browser_log_enabled", False),
+                )
+            ),
+            browser_log_capture_bodies=bool(
+                input_json.get(
+                    "browser_log_capture_bodies",
+                    getattr(settings, "browser_log_capture_bodies", False),
+                )
+            ),
+            browser_log_max_body_chars=int(
+                input_json.get(
+                    "browser_log_max_body_chars",
+                    getattr(settings, "browser_log_max_body_chars", 20_000),
+                )
+            ),
             totp_code_resolver=totp_code_resolver,
-        ).run(
-            space_id=str(input_json["space_id"]),
-            work_id=str(input_json.get("_work_id") or ""),
-            run_id=str(input_json.get("_run_id") or ""),
+            captcha_api_url=str(
+                input_json.get("captcha_api_url")
+                or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+                or ""
+            ),
+            captcha_client_key=str(
+                input_json.get("captcha_client_key")
+                or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+                or ""
+            ),
+        )
+
+    def reconcile_plus_subscription(
+        work_session: Session | None,
+        *,
+        workflow: PersonalPlusCheckoutWorkflow,
+        space_id: str,
+        work_id: str,
+        run_id: str,
+        proxy_url_override: str = "",
+    ) -> dict[str, Any]:
+        reconcile_kwargs = {
+            "space_id": space_id,
+            "work_id": work_id,
+            "run_id": run_id,
+        }
+        if proxy_url_override:
+            reconcile_kwargs["proxy_url_override"] = proxy_url_override
+        output = workflow.reconcile_subscription(**reconcile_kwargs)
+        if work_session is not None:
+            output["resolved_markers"] = resolve_personal_plus_checkout_sync_failures(
+                work_session,
+                space_id=space_id,
+                work_id=work_id,
+            )
+        return output
+
+    def checkpoint_plus_checkout_failure(
+        work_session: Session | None,
+        *,
+        work_id: str,
+        exc: BaseException,
+    ) -> None:
+        if work_session is None:
+            return
+        try:
+            checkpoint_personal_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+        except Exception:
+            # Preserve the checkout exception so the runner can make its own
+            # failure-record attempt with a clean transaction.
+            try:
+                work_session.rollback()
+            except Exception:
+                pass
+
+    def run_personal_payment_method_work(
+        work_session: Session | None,
+        input_json: dict,
+    ) -> dict[str, Any]:
+        space_id = str(input_json["space_id"])
+        run_id = str(input_json.get("_run_id") or "")
+        work_id = str(input_json.get("_work_id") or "")
+        guard_output, sync_only = acquire_plus_checkout_guard(
+            work_session,
+            space_id=space_id,
+        )
+        if guard_output is not None:
+            return guard_output
+        if sync_only:
+            plus_workflow = personal_plus_checkout_workflow(input_json)
+            return reconcile_plus_subscription(
+                work_session,
+                workflow=plus_workflow,
+                space_id=space_id,
+                work_id=work_id,
+                run_id=run_id,
+            )
+        output = personal_payment_method_workflow(input_json).run(
+            space_id=space_id,
+            run_id=run_id,
+            work_id=work_id,
+            payment_card_id=str(input_json.get("payment_card_id") or ""),
+        )
+        if not bool(input_json.get("auto_start_plus_checkout", True)):
+            return output
+
+        plus_workflow = personal_plus_checkout_workflow(input_json)
+        try:
+            output["after_bind_success"] = plus_workflow.run(
+                space_id=space_id,
+                work_id=f"{work_id}-plus",
+                run_id=run_id,
+            )
+        except Exception as exc:
+            checkpoint_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+            raise
+        return output
+
+    runner.register_work(
+        "space.personal_payment_method_bind.space",
+        lambda work_session, input_json: run_personal_payment_method_work(
+            work_session,
+            input_json,
         ),
+    )
+
+    def run_personal_plus_checkout_work(
+        work_session: Session | None,
+        input_json: dict,
+    ) -> dict[str, Any]:
+        space_id = str(input_json["space_id"])
+        work_id = str(input_json.get("_work_id") or "")
+        start_new_checkout = (
+            str(input_json.get("checkout_attempt_mode") or "").strip().lower() == "new"
+        )
+        guard_output, sync_only = acquire_plus_checkout_guard(
+            work_session,
+            space_id=space_id,
+            start_new_checkout=start_new_checkout,
+        )
+        if guard_output is not None:
+            return guard_output
+        workflow = personal_plus_checkout_workflow(input_json)
+        try:
+            if sync_only:
+                return reconcile_plus_subscription(
+                    work_session,
+                    workflow=workflow,
+                    space_id=space_id,
+                    work_id=work_id,
+                    run_id=str(input_json.get("_run_id") or ""),
+                )
+            output = workflow.run(
+                space_id=space_id,
+                work_id=work_id,
+                run_id=str(input_json.get("_run_id") or ""),
+            )
+            if start_new_checkout:
+                output = {**output, "checkout_attempt_mode": "new"}
+                if work_session is not None:
+                    output["resolved_markers"] = (
+                        resolve_personal_plus_checkout_sync_failures(
+                            work_session,
+                            space_id=space_id,
+                            work_id=work_id,
+                        )
+                    )
+            return output
+        except Exception as exc:
+            checkpoint_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+            raise
+
+    runner.register_work(
+        "space.personal_plus_checkout.space",
+        lambda work_session, input_json: run_personal_plus_checkout_work(
+            work_session,
+            input_json,
+        ),
+    )
+
+    def run_personal_paypal_link_work(
+        work_session: Session | None,
+        input_json: dict[str, Any],
+    ) -> dict[str, Any]:
+        billing_country = str(
+            input_json.get("billing_country")
+            or settings.personal_paypal_link_billing_country
+        ).strip().upper()
+        checkout_proxy_country = str(
+            input_json.get("checkout_proxy_country")
+            or input_json.get("proxy_country")
+            or settings.personal_paypal_link_proxy_country
+        ).strip().upper()
+        work_id = str(input_json.get("_work_id") or "")
+        run_id = str(input_json.get("_run_id") or "")
+        space_id = str(input_json["space_id"])
+        guard_output, sync_only = acquire_plus_checkout_guard(
+            work_session,
+            space_id=space_id,
+        )
+        if guard_output is not None:
+            return guard_output
+        if sync_only:
+            return reconcile_plus_subscription(
+                work_session,
+                workflow=PersonalPlusCheckoutWorkflow(
+                    session_factory=session_factory,
+                    us_proxy_country=checkout_proxy_country,
+                    openai_provider=_openai_plugin(settings),
+                ),
+                space_id=space_id,
+                work_id=work_id,
+                run_id=run_id,
+            )
+
+        link_workflow = PersonalPayPalLinkWorkflow(
+            session_factory=session_factory,
+            proxy_country=checkout_proxy_country,
+            checkout_proxy_country=checkout_proxy_country,
+            update_proxy_country=str(
+                input_json.get("update_proxy_country")
+                or checkout_proxy_country
+            ),
+            billing_country=billing_country,
+            currency=paypal_checkout_currency_for_country(billing_country),
+            apply_promotion=bool(input_json.get("apply_promotion", True)),
+            promo_campaign_id=str(
+                input_json.get("promo_campaign_id")
+                or settings.personal_paypal_link_promo_campaign_id
+            ),
+            checkout_ui_mode=str(
+                input_json.get("checkout_ui_mode")
+                or settings.personal_paypal_link_ui_mode
+            ),
+        )
+        execute_agreement = bool(input_json.get("execute_agreement"))
+        phone_provider: HeroSmsPhoneProviderAdapter | None = None
+        agreement_workflow: PersonalPayPalAgreementWorkflow | None = None
+        if execute_agreement:
+            if not settings.personal_paypal_agreement_enabled:
+                raise PersonalPayPalAgreementError(
+                    "paypal_agreement_disabled",
+                    "PayPal agreement execution is disabled by configuration",
+                )
+            agreement_country = str(
+                input_json.get("agreement_country") or ""
+            ).strip().upper()
+            agreement_proxy_country = str(
+                input_json.get("agreement_proxy_country") or ""
+            ).strip().upper()
+            if not agreement_country:
+                raise PersonalPayPalAgreementError(
+                    "paypal_agreement_country_required",
+                    "agreement_country is required for PayPal agreement execution",
+                    attempt_disposition="release",
+                )
+            if not agreement_proxy_country:
+                raise PersonalPayPalAgreementError(
+                    "paypal_agreement_proxy_country_required",
+                    "agreement_proxy_country is required for PayPal agreement execution",
+                    attempt_disposition="release",
+                )
+            phone_provider = _personal_paypal_agreement_phone_provider(
+                session_factory=session_factory,
+                settings=settings,
+                input_json=input_json,
+                space_id=space_id,
+                work_id=work_id,
+                run_id=run_id,
+            )
+            try:
+                def persist_payment_checkpoint(stage: str) -> None:
+                    if not work_id:
+                        raise PersonalPayPalAgreementError(
+                            "paypal_agreement_checkpoint_work_id_missing",
+                            "PayPal agreement payment checkpoint requires a work id",
+                            diagnostics={
+                                "stage": "paypal_agreement_checkpoint",
+                                "recovery_mode": "subscription_sync_only",
+                                "payment_checkpoint_stage": stage,
+                            },
+                        )
+                    with session_factory() as checkpoint_session:
+                        persisted = checkpoint_personal_plus_checkout_sync_pending(
+                            checkpoint_session,
+                            work_id=work_id,
+                            stage=stage,
+                        )
+                    if not persisted:
+                        raise PersonalPayPalAgreementError(
+                            "paypal_agreement_checkpoint_persist_failed",
+                            "PayPal agreement payment checkpoint could not be persisted",
+                            diagnostics={
+                                "stage": "paypal_agreement_checkpoint",
+                                "recovery_mode": "subscription_sync_only",
+                                "payment_checkpoint_stage": stage,
+                            },
+                        )
+
+                agreement_workflow = PersonalPayPalAgreementWorkflow(
+                    session_factory=session_factory,
+                    phone_provider=phone_provider,
+                    card_provider=PayPalAgreementCardPoolProvider(
+                        session_factory=session_factory,
+                        space_id=space_id,
+                    ),
+                    country=agreement_country,
+                    proxy_country=agreement_proxy_country,
+                    buyer_mode=str(
+                        input_json.get("agreement_buyer_mode")
+                        or settings.personal_paypal_agreement_buyer_mode
+                    ),
+                    max_card_attempts=int(
+                        input_json.get("agreement_max_card_attempts")
+                        or settings.personal_paypal_agreement_max_card_attempts
+                    ),
+                    max_phone_attempts=settings.personal_paypal_agreement_max_phone_attempts,
+                    finalize_checkout=bool(
+                        input_json.get(
+                            "agreement_finalize_checkout",
+                            settings.personal_paypal_agreement_finalize_checkout,
+                        )
+                    ),
+                    payment_checkpoint=persist_payment_checkpoint,
+                )
+            except Exception:
+                try:
+                    phone_provider.close()
+                except Exception:
+                    pass
+                raise
+        try:
+            link_result = link_workflow.run(
+                space_id=space_id,
+                work_id=work_id,
+                run_id=run_id,
+            )
+            if agreement_workflow is None:
+                return link_result
+
+            agreement = agreement_workflow.run(
+                space_id=space_id,
+                link_result=link_result,
+                checkout_proxy_country=checkout_proxy_country,
+                billing_country=billing_country,
+                currency=paypal_checkout_currency_for_country(billing_country),
+                checkout_ui_mode=str(
+                    input_json.get("checkout_ui_mode")
+                    or settings.personal_paypal_link_ui_mode
+                ),
+                checkout_proxy=link_workflow.resolved_checkout_proxy,
+                work_id=work_id,
+                run_id=run_id,
+            )
+            if agreement.get("status") == "completed":
+                subscription_reconciliation = reconcile_plus_subscription(
+                    work_session,
+                    workflow=PersonalPlusCheckoutWorkflow(
+                        session_factory=session_factory,
+                        us_proxy_country=checkout_proxy_country,
+                        openai_provider=_openai_plugin(settings),
+                    ),
+                    space_id=space_id,
+                    work_id=work_id,
+                    run_id=run_id,
+                    proxy_url_override=(
+                        link_workflow.resolved_checkout_proxy.proxy_url
+                    ),
+                )
+                agreement["subscription_reconciliation"] = subscription_reconciliation
+            return {
+                **sanitize_personal_paypal_agreement_output(link_result),
+                "status": agreement["status"],
+                "agreement_status": agreement["status"],
+                "agreement": agreement,
+            }
+        except Exception as exc:
+            checkpoint_plus_checkout_failure(
+                work_session,
+                work_id=work_id,
+                exc=exc,
+            )
+            raise
+        finally:
+            if phone_provider is not None:
+                try:
+                    phone_provider.close()
+                except Exception:
+                    pass
+
+    runner.register_work(
+        "space.personal_paypal_link.space",
+        run_personal_paypal_link_work,
     )
     runner.register_work(
         "space.personal_promotion_check.space",
@@ -1261,6 +1769,7 @@ def _run_space_auto_replenish_invite_job(
 def _run_personal_payment_method_bind_tick_job(
     *,
     session_factory: SessionFactory,
+    settings: Settings,
     input_json: dict,
 ) -> dict:
     job_id = str(input_json.get("_job_id") or "")
@@ -1269,6 +1778,23 @@ def _run_personal_payment_method_bind_tick_job(
     limit = max(1, int(input_json.get("limit") or 10))
     work_count = max(1, int(input_json.get("work_count") or 1))
     auto_start_plus_checkout = bool(input_json.get("auto_start_plus_checkout", True))
+    checkout_ui_mode = str(
+        input_json.get("checkout_ui_mode")
+        or getattr(settings, "personal_payment_method_checkout_ui_mode", "custom")
+        or "custom"
+    ).strip().lower()
+    browser_headless = bool(input_json.get("browser_headless", True))
+    captcha_api_url = str(
+        input_json.get("captcha_api_url")
+        or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+        or ""
+    ).strip()
+    captcha_client_key = str(
+        input_json.get("captcha_client_key")
+        or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+        or ""
+    ).strip()
+    payment_card_id = str(input_json.get("payment_card_id") or "").strip()
     with session_factory() as session:
         now = datetime.now(UTC)
         existing_count = int(
@@ -1298,6 +1824,7 @@ def _run_personal_payment_method_bind_tick_job(
                     SpaceModel.promotion_id != "",
                     SpaceModel.has_payment_method.is_(False),
                     SpaceModel.payment_method_status != "bound",
+                    SpaceModel.payment_method_status != "binding",
                     or_(
                         SpaceModel.payment_method_attempt_count < 3,
                         (
@@ -1318,26 +1845,38 @@ def _run_personal_payment_method_bind_tick_job(
             selected = session.scalars(stmt.limit(limit)).all()
             queue = WorkQueue(session)
             for space in selected:
+                work_input = {
+                    "space_id": space.id,
+                    "auto_start_plus_checkout": auto_start_plus_checkout,
+                    "browser_headless": browser_headless,
+                    "captcha_api_url": captcha_api_url,
+                    "captcha_client_key": captcha_client_key,
+                    "_run_id": run_id,
+                }
+                if checkout_ui_mode:
+                    work_input["checkout_ui_mode"] = checkout_ui_mode
+                if payment_card_id:
+                    work_input["payment_card_id"] = payment_card_id
                 queue.enqueue(
                     job_id=job_id,
                     work_type="space.personal_payment_method_bind.space",
                     execution_key=f"personal-payment-method:{space.id}",
-                    input_json={
-                        "space_id": space.id,
-                        "auto_start_plus_checkout": auto_start_plus_checkout,
-                        "_run_id": run_id,
-                    },
+                    input_json=work_input,
                 )
             session.commit()
     summary = _work_summary(session_factory=session_factory, job_id=job_id)
-    return {
+    result = {
         "space_id": requested_space_id,
         "selected_count": existing_count or len(selected),
         "limit": limit,
         "work_count": work_count,
         "auto_start_plus_checkout": auto_start_plus_checkout,
+        "browser_headless": browser_headless,
         **summary,
     }
+    if checkout_ui_mode:
+        result["checkout_ui_mode"] = checkout_ui_mode
+    return result
 
 
 def _run_personal_plus_checkout_tick_job(
@@ -1368,6 +1907,23 @@ def _run_personal_plus_checkout_tick_job(
         input_json.get("promo_campaign_id")
         or settings.personal_plus_checkout_promo_campaign_id
     ).strip()
+    checkout_ui_mode = str(
+        input_json.get("checkout_ui_mode")
+        or getattr(settings, "personal_plus_checkout_ui_mode", "hosted")
+        or "hosted"
+    ).strip().lower()
+    browser_headless = bool(input_json.get("browser_headless", True))
+    checkout_attempt_mode = str(input_json.get("checkout_attempt_mode") or "").strip().lower()
+    captcha_api_url = str(
+        input_json.get("captcha_api_url")
+        or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+        or ""
+    ).strip()
+    captcha_client_key = str(
+        input_json.get("captcha_client_key")
+        or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+        or ""
+    ).strip()
     with session_factory() as session:
         existing_count = int(
             session.scalar(
@@ -1394,8 +1950,23 @@ def _run_personal_plus_checkout_tick_job(
                     SpaceModel.has_payment_method.is_(True),
                     SpaceModel.payment_method_status == "bound",
                     UserAccountModel.account_status == "active",
-                    UserAccountModel.cookie_header != "",
-                    UserAccountModel.auth_cookie_header != "",
+                    or_(
+                        UserAccountModel.access_token != "",
+                        (
+                            (UserAccountModel.cookie_header != "")
+                            & (UserAccountModel.auth_cookie_header != "")
+                        ),
+                    ),
+                    or_(
+                        func.lower(func.coalesce(SpaceModel.plan_type, "")).notin_(
+                            ("plus", "chatgptplusplan")
+                        ),
+                        personal_plus_checkout_sync_failure_exists_for(SpaceModel.id),
+                    ),
+                    or_(
+                        ~personal_plus_checkout_consume_stop_exists_for(SpaceModel.id),
+                        personal_plus_checkout_sync_failure_exists_for(SpaceModel.id),
+                    ),
                 )
                 .order_by(SpaceModel.updated_at.asc(), SpaceModel.id.asc())
             )
@@ -1412,23 +1983,157 @@ def _run_personal_plus_checkout_tick_job(
                     execution_key=f"personal-plus-checkout:{space.id}",
                     input_json={
                         "space_id": space.id,
+                        "checkout_attempt_mode": checkout_attempt_mode,
                         "create_proxy_country": create_country,
                         "promo_proxy_country": promo_country,
                         "promo_campaign_id": promo_campaign_id,
+                        "browser_headless": browser_headless,
+                        "captcha_api_url": captcha_api_url,
+                        "captcha_client_key": captcha_client_key,
                         "_run_id": run_id,
+                        **(
+                            {"checkout_ui_mode": checkout_ui_mode}
+                            if checkout_ui_mode
+                            else {}
+                        ),
                     },
                 )
             session.commit()
     summary = _work_summary(session_factory=session_factory, job_id=job_id)
-    return {
+    result = {
         "space_id": requested_space_id,
         "selected_count": existing_count or len(selected),
         "limit": limit,
         "work_count": work_count,
+        "checkout_attempt_mode": checkout_attempt_mode,
         "create_proxy_country": create_country,
         "promo_proxy_country": promo_country,
         "promo_campaign_id": promo_campaign_id,
         **summary,
+    }
+    if checkout_ui_mode:
+        result["checkout_ui_mode"] = checkout_ui_mode
+    return result
+
+
+def _run_personal_paypal_link_tick_job(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    job_id = str(input_json.get("_job_id") or "")
+    run_id = str(input_json.get("_run_id") or "")
+    requested_space_id = str(input_json.get("space_id") or "").strip()
+    checkout_proxy_country = str(
+        input_json.get("checkout_proxy_country")
+        or input_json.get("proxy_country")
+        or settings.personal_paypal_link_proxy_country
+    ).strip().upper()
+    update_proxy_country = str(
+        input_json.get("update_proxy_country") or checkout_proxy_country
+    ).strip().upper()
+    if update_proxy_country != checkout_proxy_country:
+        raise ValueError("update proxy country must match checkout/provider proxy country")
+    proxy_country = checkout_proxy_country
+    billing_country = str(
+        input_json.get("billing_country")
+        or settings.personal_paypal_link_billing_country
+    ).strip().upper()
+    currency = paypal_checkout_currency_for_country(billing_country)
+    apply_promotion = bool(input_json.get("apply_promotion", True))
+    promo_campaign_id = str(
+        input_json.get("promo_campaign_id")
+        or settings.personal_paypal_link_promo_campaign_id
+    ).strip()
+    checkout_ui_mode = str(
+        input_json.get("checkout_ui_mode") or settings.personal_paypal_link_ui_mode
+    ).strip().lower()
+    agreement_input = {
+        "execute_agreement": bool(input_json.get("execute_agreement")),
+        "agreement_country": input_json.get("agreement_country"),
+        "agreement_proxy_country": input_json.get("agreement_proxy_country"),
+        "agreement_buyer_mode": str(
+            input_json.get("agreement_buyer_mode")
+            or settings.personal_paypal_agreement_buyer_mode
+        ),
+        "agreement_sms_country": str(input_json.get("agreement_sms_country") or ""),
+        "agreement_max_card_attempts": int(
+            input_json.get("agreement_max_card_attempts")
+            or settings.personal_paypal_agreement_max_card_attempts
+        ),
+        "agreement_finalize_checkout": bool(
+            input_json.get(
+                "agreement_finalize_checkout",
+                settings.personal_paypal_agreement_finalize_checkout,
+            )
+        ),
+    }
+    with session_factory() as session:
+        existing_count = int(
+            session.scalar(
+                select(func.count())
+                .select_from(WorkItemModel)
+                .where(
+                    WorkItemModel.job_id == job_id,
+                    WorkItemModel.work_type == "space.personal_paypal_link.space",
+                )
+            )
+            or 0
+        )
+        selected_count = existing_count
+        if existing_count == 0 and requested_space_id:
+            space = session.scalar(
+                select(SpaceModel)
+                .join(UserAccountModel, UserAccountModel.id == SpaceModel.owner_user_account_id)
+                .where(
+                    SpaceModel.id == requested_space_id,
+                    SpaceModel.provider == "openai_chatgpt",
+                    SpaceModel.space_type == "personal",
+                    SpaceModel.space_status == "active",
+                    UserAccountModel.account_status == "active",
+                    UserAccountModel.access_token != "",
+                )
+            )
+            if space is not None and (
+                not apply_promotion
+                or (space.has_promotion and str(space.promotion_id or "").strip())
+            ):
+                WorkQueue(session).enqueue(
+                    job_id=job_id,
+                    work_type="space.personal_paypal_link.space",
+                    execution_key=f"personal-paypal-link:{space.id}",
+                    input_json={
+                        "space_id": space.id,
+                        "proxy_country": proxy_country,
+                        "checkout_proxy_country": checkout_proxy_country,
+                        "update_proxy_country": update_proxy_country,
+                        "billing_country": billing_country,
+                        "currency": currency,
+                        "apply_promotion": apply_promotion,
+                        "promo_campaign_id": promo_campaign_id,
+                        "checkout_ui_mode": checkout_ui_mode,
+                        **agreement_input,
+                        "_run_id": run_id,
+                    },
+                )
+                selected_count = 1
+                session.commit()
+    return {
+        "space_id": requested_space_id,
+        "selected_count": selected_count,
+        "limit": 1,
+        "work_count": 1,
+        "proxy_country": proxy_country,
+        "checkout_proxy_country": checkout_proxy_country,
+        "update_proxy_country": update_proxy_country,
+        "billing_country": billing_country,
+        "currency": currency,
+        "apply_promotion": apply_promotion,
+        "promo_campaign_id": promo_campaign_id,
+        "checkout_ui_mode": checkout_ui_mode,
+        **agreement_input,
+        **_work_summary(session_factory=session_factory, job_id=job_id),
     }
 
 
@@ -1444,6 +2149,13 @@ def _space_auto_replenish_workflow(
         invite_executor_base_url=settings.session_otp_executor_base_url,
         invite_executor_api_key=settings.session_otp_executor_api_key,
         registration_proxy_country=settings.protocol_register_proxy_country,
+        browser_log_enabled=bool(getattr(settings, "browser_log_enabled", False)),
+        browser_log_capture_bodies=bool(
+            getattr(settings, "browser_log_capture_bodies", False)
+        ),
+        browser_log_max_body_chars=int(
+            getattr(settings, "browser_log_max_body_chars", 20_000)
+        ),
         totp_code_resolver=_twofauth_otp_resolver(settings),
     )
 
@@ -1510,6 +2222,92 @@ def _run_remote_session_otp_submit_work(
     return result
 
 
+def _run_personal_codex_credential_heartbeat_work(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict,
+) -> dict:
+    # Cliproxy is the default for heartbeat runs; proxyserver remains available
+    # only when an older or explicitly overridden job requests it.
+    proxy_mode = str(input_json.get("proxy_mode") or "cliproxy").strip().lower()
+    proxy_country = str(input_json.get("proxy_country") or "US").strip().upper()
+    resolved_proxy_urls: dict[str, str] = {}
+
+    def resolve_proxy(user_account_id: str) -> str:
+        if user_account_id in resolved_proxy_urls:
+            return resolved_proxy_urls[user_account_id]
+        if proxy_mode == "cliproxy":
+            with session_factory() as session:
+                account = session.get(UserAccountModel, user_account_id)
+                if account is None:
+                    raise RuntimeError(f"user account not found: {user_account_id}")
+                email = account.email
+            proxy_url = resolve_cliproxy_proxy(
+                email=email,
+                country_code=proxy_country,
+            ).proxy_url
+        else:
+            proxy_url = ensure_account_proxy_url(
+                session_factory,
+                user_account_id,
+                bind_reason="space_personal_codex_credential_heartbeat",
+            )
+        resolved_proxy_urls[user_account_id] = proxy_url
+        return proxy_url
+
+    def reauthorize(space_membership_id: str) -> dict:
+        with session_factory() as session:
+            membership = session.get(SpaceMembershipModel, space_membership_id)
+            if membership is None:
+                raise RuntimeError(f"space membership not found: {space_membership_id}")
+            proxy_url = resolve_proxy(membership.user_account_id)
+        result = _run_personal_codex_authorization_work(
+            session_factory=session_factory,
+            settings=settings,
+            input_json={
+                **input_json,
+                "space_membership_id": space_membership_id,
+                "proxy_url_override": proxy_url,
+            },
+        )
+        if result.get("_work_outcome") == "skipped":
+            reason = str(
+                result.get("skip_reason")
+                or result.get("skipped_reason")
+                or "personal_codex_reauthorization_skipped"
+            )
+            raise RuntimeError(reason)
+        return result
+
+    def repush(space_credential_id: str, downstream_channel_id: str) -> str:
+        return SpaceDirectPushWorkflow(
+            session_factory=session_factory,
+            downstream_provider=_downstream_plugin_from_channel_id(
+                session_factory,
+                downstream_channel_id,
+            ),
+        ).run(
+            SpaceDirectPushInput(
+                space_credential_id=space_credential_id,
+                downstream_channel_id=downstream_channel_id,
+                is_retry=True,
+            )
+        )
+
+    return PersonalCodexCredentialHeartbeatWorkflow(
+        session_factory=session_factory,
+        openai_provider=_openai_plugin(settings),
+        proxy_resolver=resolve_proxy,
+        reauthorize=reauthorize,
+        repush=repush,
+    ).run(
+        PersonalCodexCredentialHeartbeatInput(
+            space_credential_id=str(input_json["space_credential_id"]),
+        )
+    )
+
+
 def _run_personal_codex_authorization_work(
     *,
     session_factory: SessionFactory,
@@ -1530,7 +2328,7 @@ def _run_personal_codex_authorization_work(
         }
 
     run_id = str(input_json.get("_run_id") or "")
-    phone_provider = _personal_codex_hero_phone_provider(
+    phone_provider = _personal_codex_grizzly_phone_provider(
         session_factory=session_factory,
         settings=settings,
         input_json=input_json,
@@ -1546,6 +2344,7 @@ def _run_personal_codex_authorization_work(
         run_id=run_id,
         personal_space_id=target.space_id,
         force_clean_browser_login=bool(input_json.get("force_clean_browser_login")),
+        proxy_url_override=str(input_json.get("proxy_url_override") or ""),
     )
     with session_factory() as session:
         credential_id = session.scalar(
@@ -1627,7 +2426,116 @@ def _run_personal_promotion_check_work(
     }
 
 
-def _personal_codex_hero_phone_provider(
+def _personal_paypal_agreement_phone_provider(
+    *,
+    session_factory: SessionFactory,
+    settings: Settings,
+    input_json: dict[str, Any],
+    space_id: str,
+    work_id: str,
+    run_id: str,
+) -> HeroSmsLongTermPhoneProviderAdapter:
+    api_key = str(getattr(settings, "hero_sms_api_key", "") or "").strip()
+    if not api_key:
+        raise PersonalPayPalAgreementError(
+            "paypal_agreement_sms_api_key_missing",
+            "HERO_SMS_API_KEY is required for PayPal agreement execution",
+        )
+    agreement_country = str(
+        input_json.get("agreement_country")
+        or getattr(settings, "personal_paypal_agreement_country", "US")
+        or "US"
+    ).strip().upper()
+    if agreement_country != "US":
+        raise PersonalPayPalAgreementError(
+            "paypal_agreement_hero_country_mismatch",
+            "The configured one-day Hero phone is US; agreement_country must be US",
+            diagnostics={"agreement_country": agreement_country, "hero_country": "US"},
+        )
+    country = str(
+        getattr(settings, "personal_paypal_agreement_sms_country", "187") or "187"
+    ).strip()
+    configured_country = str(input_json.get("agreement_sms_country") or "").strip()
+    if configured_country and configured_country != country:
+        raise PersonalPayPalAgreementError(
+            "paypal_agreement_sms_country_mismatch",
+            "The configured Hero long-term phone is US/187; agreement_sms_country must remain 187",
+            diagnostics={"configured_country": configured_country, "hero_country": country},
+        )
+    if not country.isdigit():
+        raise PersonalPayPalAgreementError(
+            "paypal_agreement_sms_country_invalid",
+            "PayPal agreement Hero country must be a numeric country id",
+        )
+
+    def emit(stage: str, data: dict, level: str = "INFO") -> None:
+        if not run_id:
+            return
+        try:
+            with session_factory() as session:
+                EventWriter(session).write(
+                    run_id=run_id,
+                    event_type=f"personal_paypal_agreement.phone.{stage}",
+                    message=f"PayPal agreement phone {stage}",
+                    level=level,
+                    data_json={
+                        "space_id": space_id,
+                        "work_id": work_id,
+                        "sms_country": country,
+                        **data,
+                    },
+                )
+                session.commit()
+        except Exception:
+            # Diagnostics must never change the SMS lease lifecycle.
+            pass
+
+    try:
+        return HeroSmsLongTermPhoneProviderAdapter(
+            PhoneConfig(
+                enabled=True,
+                provider="hero_sms_long_term",
+                base_url=str(
+                    getattr(
+                        settings,
+                        "hero_sms_base_url",
+                        "https://hero-sms.com/stubs/handler_api.php",
+                    )
+                    or "https://hero-sms.com/stubs/handler_api.php"
+                ).strip(),
+                api_key_env="HERO_SMS_API_KEY",
+                service=str(settings.personal_paypal_agreement_sms_service or "ts").strip(),
+                country=country,
+                countries=[country],
+                maxPrice="",
+                max_number_attempts=settings.personal_paypal_agreement_max_phone_attempts,
+                request_timeout_s=int(
+                    getattr(settings, "hero_sms_request_timeout_s", 20) or 20
+                ),
+                otp_timeout_s=settings.personal_paypal_agreement_otp_timeout_s,
+                otp_poll_interval_s=float(
+                    getattr(settings, "hero_sms_poll_interval_s", 3.0) or 3.0
+                ),
+            ),
+            api_key=api_key,
+            activation_id="",
+            lock_timeout_s=int(
+                getattr(settings, "personal_paypal_agreement_hero_lock_timeout_s", 1800)
+                or 1800
+            ),
+            country_phone_code="1",
+            event_callback=emit,
+        )
+    except PersonalPayPalAgreementError:
+        raise
+    except Exception as exc:
+        raise PersonalPayPalAgreementError(
+            "paypal_agreement_sms_provider_init_failed",
+            str(exc),
+        ) from exc
+
+
+def _personal_codex_grizzly_phone_provider(
     *,
     session_factory: SessionFactory,
     settings: Settings,
@@ -1636,16 +2544,24 @@ def _personal_codex_hero_phone_provider(
 ):
     if not bool(input_json.get("use_hero_sms_for_add_phone")):
         return None
-    country = str(input_json.get("hero_sms_country") or "").strip()
-    max_price = str(input_json.get("hero_sms_max_price") or "0.05").strip()
+    country = str(
+        input_json.get("hero_sms_country")
+        or getattr(settings, "grizzly_sms_country", "187")
+        or "187"
+    ).strip()
+    max_price = str(
+        input_json.get("hero_sms_max_price")
+        or getattr(settings, "grizzly_sms_max_price", "0.18")
+        or "0.18"
+    ).strip()
     if not country or not country.isdigit():
-        raise RuntimeError("hero_sms_country must be a numeric Hero country id")
+        raise RuntimeError("grizzly_sms_country must be a numeric GrizzlySMS country id")
     try:
         parsed_max_price = Decimal(max_price)
     except InvalidOperation as exc:
-        raise RuntimeError("hero_sms_max_price must be a positive number") from exc
+        raise RuntimeError("grizzly_sms_max_price must be a positive number") from exc
     if not parsed_max_price.is_finite() or parsed_max_price <= 0:
-        raise RuntimeError("hero_sms_max_price must be a positive number")
+        raise RuntimeError("grizzly_sms_max_price must be a positive number")
 
     def emit(stage: str, data: dict, level: str = "INFO") -> None:
         if not run_id:
@@ -1653,8 +2569,8 @@ def _personal_codex_hero_phone_provider(
         with session_factory() as session:
             EventWriter(session).write(
                 run_id=run_id,
-                event_type=f"account_auth.hero_sms.{stage}",
-                message=f"Hero SMS {stage}",
+                event_type=f"account_auth.grizzly_sms.{stage}",
+                message=f"GrizzlySMS {stage}",
                 level=level,
                 data_json=data,
             )
@@ -1663,20 +2579,45 @@ def _personal_codex_hero_phone_provider(
     return HeroSmsPhoneProviderAdapter(
         PhoneConfig(
             enabled=True,
-            provider="hero_sms",
-            base_url="https://hero-sms.com/stubs/handler_api.php",
-            api_key_env="HERO_SMS_API_KEY",
-            service="dr",
-            country="",
+            provider="grizzly_sms",
+            base_url=str(
+                getattr(
+                    settings,
+                    "grizzly_sms_base_url",
+                    "https://api.grizzlysms.com/stubs/handler_api.php",
+                )
+                or "https://api.grizzlysms.com/stubs/handler_api.php"
+            ).strip(),
+            api_key_env="GRIZZLY_SMS_API_KEY",
+            service=str(getattr(settings, "grizzly_sms_service", "dr") or "dr").strip(),
+            country=country,
             countries=[country],
             maxPrice=max_price,
-            max_number_attempts=3,
-            otp_timeout_s=180,
-            otp_poll_interval_s=3.0,
+            max_number_attempts=max(
+                1,
+                int(getattr(settings, "grizzly_sms_max_number_attempts", 3) or 3),
+            ),
+            request_timeout_s=max(
+                1,
+                int(getattr(settings, "grizzly_sms_request_timeout_s", 20) or 20),
+            ),
+            otp_timeout_s=max(
+                1,
+                int(getattr(settings, "grizzly_sms_otp_timeout_s", 120) or 120),
+            ),
+            otp_poll_interval_s=max(
+                0.1,
+                float(getattr(settings, "grizzly_sms_poll_interval_s", 3.0) or 3.0),
+            ),
         ),
-        api_key=settings.hero_sms_api_key,
+        api_key=str(getattr(settings, "grizzly_sms_api_key", "") or "").strip(),
         event_callback=emit,
     )
+
+
+def _personal_codex_hero_phone_provider(**kwargs):
+    """Compatibility alias; the standalone Codex path now uses GrizzlySMS."""
+    return _personal_codex_grizzly_phone_provider(**kwargs)
 
 
 def _registration_codex_grizzly_phone_provider(
@@ -1706,7 +2647,7 @@ def _registration_codex_grizzly_phone_provider(
     return HeroSmsPhoneProviderAdapter(
         PhoneConfig(
             enabled=True,
-            provider="hero_sms",
+            provider="grizzly_sms",
             base_url=str(
                 getattr(
                     settings,
@@ -1746,10 +2687,25 @@ def _protocol_registration_input(
     input_json: dict,
     *,
     default_proxy_country: str = "US",
+    default_phone_provider: str = "grizzly_sms",
+    default_phone_base_url: str = "https://api.grizzlysms.com/stubs/handler_api.php",
+    default_phone_api_key_env: str = "GRIZZLY_SMS_API_KEY",
+    default_phone_service: str = "dr",
+    default_phone_country: str = "",
+    default_phone_countries: tuple[str, ...] = ("187",),
+    default_phone_max_price: str = "0.18",
+    default_phone_max_number_attempts: int = 3,
+    default_phone_request_timeout_s: int = 20,
+    default_phone_otp_timeout_s: int = 120,
+    default_phone_otp_poll_interval_s: float = 3.0,
+    allow_phone_endpoint_override: bool = True,
+    default_browser_log_enabled: bool = False,
+    default_browser_log_capture_bodies: bool = False,
+    default_browser_log_max_body_chars: int = 20_000,
 ) -> ProtocolRegistrationInput:
     raw_phone_countries = input_json.get("phone_countries")
     if raw_phone_countries is None:
-        raw_phone_countries = ["151", "73", "16"]
+        raw_phone_countries = list(default_phone_countries)
     raw_browser_close_delay = input_json.get("browser_close_delay_s", 10.0)
     if raw_browser_close_delay in (None, ""):
         raw_browser_close_delay = 10.0
@@ -1769,21 +2725,69 @@ def _protocol_registration_input(
             0.0,
             float(raw_browser_close_delay),
         ),
-        phone_provider=str(input_json.get("phone_provider") or "hero_sms"),
-        phone_base_url=str(
-            input_json.get("phone_base_url") or "https://hero-sms.com/stubs/handler_api.php"
+        browser_log_enabled=bool(
+            input_json.get("browser_log_enabled", default_browser_log_enabled)
         ),
-        phone_api_key_env=str(input_json.get("phone_api_key_env") or "HERO_SMS_API_KEY"),
-        phone_service=str(input_json.get("phone_service") or "dr"),
-        phone_country=str(input_json.get("phone_country") or ""),
+        browser_log_capture_bodies=bool(
+            input_json.get(
+                "browser_log_capture_bodies",
+                default_browser_log_capture_bodies,
+            )
+        ),
+        browser_log_max_body_chars=max(
+            1_000,
+            int(
+                input_json.get(
+                    "browser_log_max_body_chars",
+                    default_browser_log_max_body_chars,
+                )
+            ),
+        ),
+        phone_provider=str(
+            input_json.get("phone_provider") or default_phone_provider
+        ),
+        phone_base_url=str(
+            (
+                input_json.get("phone_base_url")
+                if allow_phone_endpoint_override
+                else ""
+            )
+            or default_phone_base_url
+        ),
+        phone_api_key_env=str(
+            (
+                input_json.get("phone_api_key_env")
+                if allow_phone_endpoint_override
+                else ""
+            )
+            or default_phone_api_key_env
+        ),
+        phone_service=str(input_json.get("phone_service") or default_phone_service),
+        phone_country=str(input_json.get("phone_country") or default_phone_country),
         phone_countries=[str(item).strip() for item in raw_phone_countries if str(item).strip()],
-        phone_max_price=str(input_json.get("phone_max_price") or "0.05"),
+        phone_max_price=str(input_json.get("phone_max_price") or default_phone_max_price),
         phone_country_max_prices=dict(input_json.get("phone_country_max_prices") or {}),
-        phone_max_number_attempts=max(1, int(input_json.get("phone_max_number_attempts") or 3)),
-        phone_otp_timeout_s=max(1, int(input_json.get("phone_otp_timeout_s") or 180)),
+        phone_max_number_attempts=max(
+            1,
+            int(
+                input_json.get("phone_max_number_attempts")
+                or default_phone_max_number_attempts
+            ),
+        ),
+        phone_request_timeout_s=max(
+            1,
+            int(input_json.get("phone_request_timeout_s") or default_phone_request_timeout_s),
+        ),
+        phone_otp_timeout_s=max(
+            1,
+            int(input_json.get("phone_otp_timeout_s") or default_phone_otp_timeout_s),
+        ),
         phone_otp_poll_interval_s=max(
-            1.0,
-            float(input_json.get("phone_otp_poll_interval_s") or 3.0),
+            0.1,
+            float(
+                input_json.get("phone_otp_poll_interval_s")
+                or default_phone_otp_poll_interval_s
+            ),
         ),
     )
 
@@ -1882,6 +2886,48 @@ def _run_protocol_registration_work(
     registration_input = _protocol_registration_input(
         input_json,
         default_proxy_country=str(getattr(settings, "protocol_register_proxy_country", "US")),
+        default_phone_provider="grizzly_sms",
+        default_phone_base_url=str(
+            getattr(
+                settings,
+                "grizzly_sms_base_url",
+                "https://api.grizzlysms.com/stubs/handler_api.php",
+            )
+            or "https://api.grizzlysms.com/stubs/handler_api.php"
+        ),
+        default_phone_api_key_env="GRIZZLY_SMS_API_KEY",
+        default_phone_service=str(getattr(settings, "grizzly_sms_service", "dr") or "dr"),
+        default_phone_country=str(
+            getattr(settings, "grizzly_sms_country", "187") or "187"
+        ),
+        default_phone_countries=(
+            str(getattr(settings, "grizzly_sms_country", "187") or "187"),
+        ),
+        default_phone_max_price=str(
+            getattr(settings, "grizzly_sms_max_price", "0.18") or "0.18"
+        ),
+        default_phone_max_number_attempts=int(
+            getattr(settings, "grizzly_sms_max_number_attempts", 3) or 3
+        ),
+        default_phone_request_timeout_s=int(
+            getattr(settings, "grizzly_sms_request_timeout_s", 20) or 20
+        ),
+        default_phone_otp_timeout_s=int(
+            getattr(settings, "grizzly_sms_otp_timeout_s", 120) or 120
+        ),
+        default_phone_otp_poll_interval_s=float(
+            getattr(settings, "grizzly_sms_poll_interval_s", 3.0) or 3.0
+        ),
+        allow_phone_endpoint_override=False,
+        default_browser_log_enabled=bool(
+            getattr(settings, "browser_log_enabled", False)
+        ),
+        default_browser_log_capture_bodies=bool(
+            getattr(settings, "browser_log_capture_bodies", False)
+        ),
+        default_browser_log_max_body_chars=int(
+            getattr(settings, "browser_log_max_body_chars", 20_000)
+        ),
     )
     twofauth_client = (
         _twofauth_client(settings)
@@ -1903,7 +2949,7 @@ def _run_protocol_registration_work(
         return ProtocolRegistrationWorkflow(
             session_factory=session_factory,
             mail_provider=_mail_plugin(settings),
-            hero_sms_api_key=settings.hero_sms_api_key,
+            hero_sms_api_key=str(getattr(settings, "grizzly_sms_api_key", "") or ""),
             twofauth_client=twofauth_client,
             authorize_codex_after_security=authorize_codex_after_security,
             promotion_check_enabled=(

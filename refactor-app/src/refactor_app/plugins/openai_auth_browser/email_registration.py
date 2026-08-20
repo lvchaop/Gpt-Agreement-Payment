@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+import calendar
+import hashlib
+import json
+import os
+import platform
 import random
+import re
+import secrets
 import shutil
+import string
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from uuid import uuid4
 
-from refactor_app.plugins.browser_runtime import (
-    managed_camoufox_context as _managed_camoufox,
+from refactor_app.config.browser_fingerprint import (
+    BrowserFingerprint,
 )
+from refactor_app.plugins.browser_runtime import managed_camoufox_context
+from refactor_app.plugins.cloakbrowser_runtime import managed_cloakbrowser_context
 from refactor_app.plugins.mail_external_api.plugin import prepare_domain_mailbox
 from refactor_app.plugins.openai_auth_browser.browser_logging import (
     BrowserLogRecorder,
@@ -28,7 +39,6 @@ from refactor_app.plugins.openai_auth_browser.personal_payment_method import (
 )
 from refactor_app.plugins.openai_auth_protocol.auth_flow import (
     AuthResult,
-    default_password_from_email,
     session_account_fields,
 )
 from refactor_app.plugins.openai_auth_protocol.codex_browser_rt import (
@@ -47,7 +57,20 @@ from refactor_app.plugins.openai_chatgpt.client import (
 )
 
 TraceEmitter = Callable[[str, dict[str, Any], str], None]
+_managed_camoufox = managed_camoufox_context
 APP_ROOT = Path(__file__).resolve().parents[4]
+# The identity catalog now follows the normalized-email browser fingerprint.
+# Bump this when the selected OS/screen constraints change so stale host-based
+# identities cannot be reused for a different mailbox profile.
+_BROWSER_IDENTITY_VERSION = 2
+_DYNAMIC_CAMOUFOX_CONFIG_KEYS = {
+    "headers.Accept-Language",
+    "navigator.language",
+    "navigator.languages",
+    "timezone",
+}
+_DYNAMIC_CAMOUFOX_CONFIG_PREFIXES = ("geolocation:", "locale:", "webrtc:")
+SUPPORTED_BROWSER_BACKENDS = frozenset({"camoufox", "cloakbrowser"})
 
 
 class BrowserEmailRegistrationError(RuntimeError):
@@ -62,11 +85,176 @@ class BrowserChatGPTAccountMissingError(BrowserEmailRegistrationError):
     pass
 
 
+class _BrowserTotpVerificationUnavailable(RuntimeError):
+    """The browser page cannot issue the direct MFA request.
+
+    This is deliberately separate from a failed MFA response. A real response
+    must never fall through to the UI click path, otherwise a rejected code or
+    a transport failure is misreported as a no-op button click.
+    """
+
+
+
+def _random_registration_password(_email: str = "") -> str:
+    """Create a strong password without deriving any bytes from the mailbox."""
+    groups = (
+        string.ascii_uppercase,
+        string.ascii_lowercase,
+        string.digits,
+    )
+    characters = [secrets.choice(group) for group in groups]
+    alphabet = "".join(groups)
+    characters.extend(secrets.choice(alphabet) for _ in range(17))
+    secrets.SystemRandom().shuffle(characters)
+    return "".join(characters)
+
+
+def _host_browser_os(system: str = "") -> str:
+    host = str(system or platform.system()).strip().casefold()
+    if host == "darwin":
+        return "macos"
+    if host == "windows":
+        return "windows"
+    return "linux"
+
+
+def _stable_camoufox_config(email: str, *, browser_os: str, screen: Any) -> dict[str, Any]:
+    """Persist only the non-geographic Camoufox identity for one mailbox."""
+    normalized_email = str(email or "").strip().casefold()
+    identity_hash = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()
+    identity_dir = APP_ROOT / "runtime" / "browser-identities"
+    identity_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    identity_dir.chmod(0o700)
+    path = identity_dir / f"{identity_hash}.json"
+
+    existing = _read_camoufox_identity(path, browser_os=browser_os)
+    if existing is not None:
+        return existing
+
+    generated = _sanitize_camoufox_config(
+        _generate_camoufox_fingerprint_config(browser_os=browser_os, screen=screen)
+    )
+    if not generated:
+        raise BrowserEmailRegistrationError("Camoufox returned an empty browser identity")
+    payload = json.dumps(
+        {
+            "version": _BROWSER_IDENTITY_VERSION,
+            "browser_os": browser_os,
+            "config": generated,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing = _read_camoufox_identity(path, browser_os=browser_os)
+        if existing is not None:
+            return existing
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        temporary.write_bytes(payload)
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    else:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    path.chmod(0o600)
+    return generated
+
+
+def _read_camoufox_identity(path: Path, *, browser_os: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != _BROWSER_IDENTITY_VERSION:
+        return None
+    if str(payload.get("browser_os") or "") != browser_os:
+        return None
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return None
+    sanitized = _sanitize_camoufox_config(config)
+    return sanitized or None
+
+
+def _camoufox_os_for_fingerprint(fingerprint: BrowserFingerprint) -> str:
+    platform_name = str(fingerprint.sec_ch_ua_platform or "").strip('"').casefold()
+    return {
+        "windows": "windows",
+        "linux": "linux",
+        "macos": "macos",
+    }.get(platform_name, _host_browser_os())
+
+
+def _screen_for_fingerprint(fingerprint: BrowserFingerprint, screen_type: Any) -> Any:
+    """Keep Camoufox near the mailbox's stable display family."""
+    width = int(fingerprint.screen_width)
+    height = int(fingerprint.screen_height)
+    try:
+        return screen_type(
+            min_width=max(800, round(width * 0.8)),
+            max_width=round(width * 1.2),
+            min_height=max(600, round(height * 0.8)),
+            max_height=round(height * 1.2),
+        )
+    except (TypeError, ValueError):
+        return screen_type(max_width=1920, max_height=1080)
+
+
+def _generate_camoufox_fingerprint_config(*, browser_os: str, screen: Any) -> dict[str, Any]:
+    from camoufox import DefaultAddons
+    from camoufox.utils import launch_options
+
+    options = launch_options(
+        os=browser_os,
+        screen=screen,
+        exclude_addons=[DefaultAddons.UBO],
+        env={},
+    )
+    chunks: list[tuple[int, str]] = []
+    for key, value in dict(options.get("env") or {}).items():
+        match = re.fullmatch(r"CAMOU_CONFIG_(\d+)", str(key))
+        if match:
+            chunks.append((int(match.group(1)), str(value)))
+    if not chunks:
+        raise BrowserEmailRegistrationError("Camoufox did not generate a browser identity")
+    try:
+        config = json.loads("".join(value for _, value in sorted(chunks)))
+    except (ValueError, TypeError) as exc:
+        raise BrowserEmailRegistrationError(
+            "Camoufox generated an invalid browser identity"
+        ) from exc
+    if not isinstance(config, dict):
+        raise BrowserEmailRegistrationError("Camoufox generated an invalid browser identity")
+    return config
+
+
+def _sanitize_camoufox_config(config: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in config.items():
+        normalized_key = str(key)
+        if normalized_key in _DYNAMIC_CAMOUFOX_CONFIG_KEYS:
+            continue
+        if normalized_key.startswith(_DYNAMIC_CAMOUFOX_CONFIG_PREFIXES):
+            continue
+        sanitized[normalized_key] = value
+    return sanitized
+
+
 @dataclass(frozen=True)
 class BrowserEmailRegistrationConfig:
     proxy_url: str = ""
     headless: bool = True
-    locale: str = "en-US"
+    locale: str = ""
+    # Optional normalized-email fingerprint. Browser workflows pass this so
+    # registration, link extraction, and Plus checkout share one identity.
+    browser_fingerprint: BrowserFingerprint | None = None
     otp_timeout_s: int = 180
     navigation_timeout_ms: int = 60_000
     # Email submission is an SPA transition. Keep this shorter than the full
@@ -77,10 +265,85 @@ class BrowserEmailRegistrationConfig:
     failure_close_delay_s: float = 0.0
     work_id: str = ""
     artifact_root: str = ""
-    capture_artifacts: bool = True
+    capture_artifacts: bool = False
     browser_log_enabled: bool = False
     browser_log_capture_bodies: bool = False
     browser_log_max_body_chars: int = 20_000
+    browser_backend: str = "camoufox"
+    cloakbrowser_license_key: str = field(default="", repr=False)
+
+
+def _normalize_browser_backend(value: str) -> str:
+    backend = str(value or "camoufox").strip().casefold()
+    aliases = {"cloak": "cloakbrowser", "camou": "camoufox"}
+    backend = aliases.get(backend, backend)
+    if backend not in SUPPORTED_BROWSER_BACKENDS:
+        raise BrowserEmailRegistrationError(f"unsupported browser backend: {backend}")
+    return backend
+
+
+def _cloakbrowser_fingerprint_seed(email: str) -> str:
+    digest = hashlib.sha256(str(email or "").strip().casefold().encode("utf-8")).digest()
+    return str(int.from_bytes(digest[:8], "big"))
+
+
+@contextmanager
+def _managed_registration_browser_context(
+    config: BrowserEmailRegistrationConfig,
+    *,
+    flow: str,
+    email: str,
+    profile_dir: str,
+):
+    backend = _normalize_browser_backend(config.browser_backend)
+    if backend == "cloakbrowser":
+        with managed_cloakbrowser_context(
+            flow=flow,
+            user_data_dir=profile_dir,
+            headless=config.headless,
+            humanize=True,
+            proxy_url=config.proxy_url,
+            geoip=True,
+            locale=config.locale,
+            fingerprint_seed=_cloakbrowser_fingerprint_seed(email),
+            license_key=config.cloakbrowser_license_key,
+        ) as context:
+            yield context
+        return
+
+    from browserforge.fingerprints import Screen
+    from camoufox import DefaultAddons
+
+    fingerprint = config.browser_fingerprint
+    if fingerprint is None:
+        # Preserve the direct runner's legacy behavior for callers that do not
+        # provide an account identity; production workflows always provide it.
+        browser_os = _host_browser_os()
+        screen = Screen(max_width=1920, max_height=1080)
+    else:
+        browser_os = _camoufox_os_for_fingerprint(fingerprint)
+        screen = _screen_for_fingerprint(fingerprint, Screen)
+    fingerprint_config = _stable_camoufox_config(
+        email,
+        browser_os=browser_os,
+        screen=screen,
+    )
+    with _managed_camoufox(
+        flow=flow,
+        headless=config.headless,
+        humanize=True,
+        persistent_context=True,
+        user_data_dir=profile_dir,
+        os=browser_os,
+        screen=screen,
+        config=fingerprint_config,
+        exclude_addons=[DefaultAddons.UBO],
+        proxy=_camoufox_proxy(config.proxy_url),
+        main_world_eval=True,
+        geoip=True,
+        locale=config.locale,
+    ) as context:
+        yield context
 
 
 @dataclass(frozen=True)
@@ -110,7 +373,8 @@ class CamoufoxEmailRegistration:
                 else APP_ROOT / "runtime" / "artifacts"
             )
             self.artifact_dir = root / "protocol-register" / (config.work_id or str(uuid4()))
-            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            self.artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.artifact_dir.chmod(0o700)
 
     def run(
         self,
@@ -120,7 +384,7 @@ class CamoufoxEmailRegistration:
     ) -> AuthResult:
         return self._run_authenticated(
             mail_provider,
-            password_for_email=default_password_from_email,
+            password_for_email=_random_registration_password,
             register_method="email_browser",
             entry_mode="signup",
             passwordless_for_existing_login=True,
@@ -133,7 +397,7 @@ class CamoufoxEmailRegistration:
         """Complete the existing browser login/register flow and return its web session."""
         return self._run_authenticated(
             mail_provider,
-            password_for_email=default_password_from_email,
+            password_for_email=_random_registration_password,
             register_method="email_browser_passwordless",
             entry_mode="login",
             passwordless_for_existing_login=True,
@@ -152,7 +416,7 @@ class CamoufoxEmailRegistration:
         password = str(login_password or "").strip()
         return self._run_authenticated(
             mail_provider,
-            password_for_email=default_password_from_email,
+            password_for_email=_random_registration_password,
             register_method="email_browser_payment",
             entry_mode="login",
             passwordless_for_existing_login=not bool(password),
@@ -176,24 +440,14 @@ class CamoufoxEmailRegistration:
         profile_dir = tempfile.mkdtemp(prefix="refactor_browser_checkout_")
         result = AuthResult()
         result.email = normalized_email
-        from browserforge.fingerprints import Screen
-        from camoufox.sync_api import Camoufox
 
         self._emit("browser.started", {"email": normalized_email, "headless": self.config.headless})
         try:
-            with _managed_camoufox(
-                Camoufox,
+            with _managed_registration_browser_context(
+                self.config,
                 flow="authenticated-page",
-                headless=self.config.headless,
-                humanize=True,
-                persistent_context=True,
-                user_data_dir=profile_dir,
-                os="windows",
-                screen=Screen(max_width=1920, max_height=1080),
-                proxy=_camoufox_proxy(self.config.proxy_url),
-                main_world_eval=True,
-                geoip=False,
-                locale=self.config.locale,
+                email=normalized_email,
+                profile_dir=profile_dir,
             ) as context:
                 browser_log = self._install_browser_log(context)
                 try:
@@ -261,7 +515,7 @@ class CamoufoxEmailRegistration:
 
         return self._run_authenticated(
             mail_provider,
-            password_for_email=default_password_from_email,
+            password_for_email=_random_registration_password,
             register_method="email_browser_passwordless",
             entry_mode="login",
             passwordless_for_existing_login=not bool(str(login_password or "").strip()),
@@ -301,7 +555,7 @@ class CamoufoxEmailRegistration:
 
         return self._run_authenticated(
             mail_provider,
-            password_for_email=default_password_from_email,
+            password_for_email=_random_registration_password,
             register_method="email_browser_passwordless",
             entry_mode="login",
             passwordless_for_existing_login=not bool(str(login_password or "").strip()),
@@ -366,7 +620,7 @@ class CamoufoxEmailRegistration:
 
         return self._run_authenticated(
             mail_provider,
-            password_for_email=default_password_from_email,
+            password_for_email=_random_registration_password,
             register_method="email_browser_passwordless",
             entry_mode="login",
             passwordless_for_existing_login=True,
@@ -388,9 +642,6 @@ class CamoufoxEmailRegistration:
         auth_cookie_header: str = "",
         prefer_password_flow: bool = False,
     ) -> Any:
-        from browserforge.fingerprints import Screen
-        from camoufox.sync_api import Camoufox
-
         email = mail_provider.create_mailbox()
         # Match the protocol/OAuth entrypoint: domain-backed mailboxes are
         # created before the provider starts polling for the first code.
@@ -399,30 +650,19 @@ class CamoufoxEmailRegistration:
         result.email = email
         result.password = str(login_password or password_for_email(email) or "")
         result.register_method = register_method
-        first_name, last_name = _registration_name()
+        first_name, last_name, birthday = _registration_identity(
+            email,
+            locale=self.config.locale,
+        )
         profile_dir = tempfile.mkdtemp(prefix="refactor_browser_register_")
         page = None
         self._emit("browser.started", {"email": email, "headless": self.config.headless})
         try:
-            with _managed_camoufox(
-                Camoufox,
+            with _managed_registration_browser_context(
+                self.config,
                 flow=f"browser-{entry_mode}",
-                headless=self.config.headless,
-                humanize=True,
-                persistent_context=True,
-                user_data_dir=profile_dir,
-                os="windows",
-                screen=Screen(max_width=1920, max_height=1080),
-                proxy=_camoufox_proxy(self.config.proxy_url),
-                # Stripe.js is attached to the page's main world. Camoufox
-                # evaluates automation scripts in an isolated world unless
-                # this bridge is explicitly enabled.
-                main_world_eval=True,
-                # The proxy already determines the egress location. GeoIP is
-                # only fingerprint data here and otherwise causes a 66 MB
-                # database download before the first page can render.
-                geoip=False,
-                locale=self.config.locale,
+                email=email,
+                profile_dir=profile_dir,
             ) as context:
                 browser_log = self._install_browser_log(context)
                 try:
@@ -448,6 +688,7 @@ class CamoufoxEmailRegistration:
                                 result=result,
                                 first_name=first_name,
                                 last_name=last_name,
+                                birth_date=birthday,
                                 entry_mode=entry_mode,
                                 passwordless_for_existing_login=(passwordless_for_existing_login),
                                 prefer_password_flow=prefer_password_flow,
@@ -508,6 +749,7 @@ class CamoufoxEmailRegistration:
         result: AuthResult,
         first_name: str,
         last_name: str,
+        birth_date: tuple[int, int, int] | None = None,
         entry_mode: str = "signup",
         passwordless_for_existing_login: bool = False,
         prefer_password_flow: bool = False,
@@ -523,7 +765,12 @@ class CamoufoxEmailRegistration:
             prefer_password_flow=prefer_password_flow,
             totp_code_provider=totp_code_provider,
         )
-        self._complete_about_you(page, first_name=first_name, last_name=last_name)
+        self._complete_about_you(
+            page,
+            first_name=first_name,
+            last_name=last_name,
+            birth_date=birth_date,
+        )
         session_info = self._wait_for_chatgpt_session(
             page,
             on_user_already_exists_retry=lambda: self._resume_existing_login_after_retry(
@@ -589,6 +836,7 @@ class CamoufoxEmailRegistration:
         result.device_id = _cookie_value(cookies, ("oai-did", "oai-device-id"))
         csrf_cookie = _cookie_value(cookies, ("__Host-next-auth.csrf-token",))
         result.csrf_token = csrf_cookie.split("|", 1)[0] if csrf_cookie else ""
+        _capture_browser_identity(page, result)
         if not result.is_valid():
             self._screenshot(page, "missing-session.png")
             raise BrowserEmailRegistrationError(
@@ -808,18 +1056,23 @@ class CamoufoxEmailRegistration:
                 time.sleep(0.5)
                 continue
             try:
-                _click_registration_input(field, timeout_ms=5_000)
-                time.sleep(0.3)
                 current = _visible_email_input(page) or field
-                current.fill(email, timeout=5_000)
+                _type_registration_value(
+                    page,
+                    current,
+                    email,
+                    timeout_ms=5_000,
+                )
                 if _input_value(current) != email:
-                    # React can replace the input during fill. Re-query the new
+                    # React can replace the input during typing. Re-query the new
                     # element, then use the browser event path once.
                     current = _visible_email_input(page) or current
-                    _click_registration_input(current, timeout_ms=5_000)
-                    page.keyboard.press("Control+A")
-                    page.keyboard.press("Backspace")
-                    page.keyboard.type(email, delay=30)
+                    _type_registration_value(
+                        page,
+                        current,
+                        email,
+                        timeout_ms=5_000,
+                    )
                 if _input_value(current) != email:
                     raise BrowserEmailRegistrationError(
                         "email input value did not persist before submit"
@@ -868,7 +1121,12 @@ class CamoufoxEmailRegistration:
             # disabled email field means the first submit is still navigating.
             try:
                 if _input_value(current) != email:
-                    current.fill(email, timeout=5_000)
+                    _type_registration_value(
+                        page,
+                        current,
+                        email,
+                        timeout_ms=5_000,
+                    )
                 clicked = _click_first_native(
                     page,
                     EMAIL_CONTINUE_SELECTORS,
@@ -876,7 +1134,7 @@ class CamoufoxEmailRegistration:
                 )
             except Exception as exc:
                 # The auth SPA can replace the read/write email input with the
-                # read-only password-page copy during fill. Accept that real
+                # read-only password-page copy during typing. Accept that real
                 # transition instead of reporting a stale ElementHandle error.
                 advanced = self._wait_for_email_submit_transition(
                     page,
@@ -885,9 +1143,7 @@ class CamoufoxEmailRegistration:
                     timeout_s=8.0,
                 )
                 if not advanced:
-                    raise BrowserEmailRegistrationError(
-                        f"email form retry failed: {exc}"
-                    ) from exc
+                    raise BrowserEmailRegistrationError(f"email form retry failed: {exc}") from exc
             if not advanced:
                 advanced = self._wait_for_email_submit_transition(
                     page,
@@ -1106,8 +1362,12 @@ class CamoufoxEmailRegistration:
             raise BrowserEmailRegistrationError(
                 f"password page is neither registration nor login url={page.url}"
             )
-        field.click(timeout=5_000)
-        field.fill(password)
+        _type_registration_value(
+            page,
+            field,
+            password,
+            timeout_ms=5_000,
+        )
         time.sleep(random.uniform(0.5, 1.2))
         if not _click_first(page, CONTINUE_SELECTORS, timeout_ms=5_000, physical=True):
             raise BrowserEmailRegistrationError("password continue button not found")
@@ -1443,6 +1703,57 @@ class CamoufoxEmailRegistration:
             raise BrowserEmailRegistrationError("2FAuth returned an invalid TOTP code")
         if not _fill_otp(page, code):
             raise BrowserEmailRegistrationError("TOTP input not found")
+
+        # The MFA page is an SPA and its visible button is not a reliable
+        # completion signal. Match the browser HAR and submit the challenge
+        # from the same page context so cookies, origin, and device headers
+        # are identical to the preceding login requests.
+        factor_id = _totp_factor_id_from_url(str(page.url or ""))
+        if factor_id and callable(getattr(page, "evaluate", None)):
+            self._emit(
+                "browser.totp.verify.started",
+                {"factor_id": factor_id, "url": page.url},
+            )
+            try:
+                payload = _verify_totp_in_browser(
+                    page,
+                    factor_id=factor_id,
+                    code=code,
+                    navigation_timeout_ms=self.config.navigation_timeout_ms,
+                )
+            except _BrowserTotpVerificationUnavailable:
+                # A lightweight test page or an older auth surface may not
+                # expose page.evaluate. Keep the existing physical fallback
+                # for that case only; real HTTP failures are raised above it.
+                payload = None
+            except BrowserEmailRegistrationError as exc:
+                self._emit(
+                    "browser.totp.verify.failed",
+                    {
+                        "factor_id": factor_id,
+                        "url": page.url,
+                        "error": str(exc)[:800],
+                    },
+                    "WARN",
+                )
+                raise
+            else:
+                page_data = payload.get("page") if isinstance(payload, dict) else {}
+                page_data = page_data if isinstance(page_data, dict) else {}
+                self._emit(
+                    "browser.totp.verify.succeeded",
+                    {
+                        "factor_id": factor_id,
+                        "page_type": str(page_data.get("type") or "").strip(),
+                        "url": page.url,
+                    },
+                )
+                self._emit(
+                    "browser.totp.submitted",
+                    {"url": page.url, "method": "direct_verify"},
+                )
+                return
+
         submitted = _click_first(
             page,
             CONTINUE_SELECTORS,
@@ -1457,7 +1768,14 @@ class CamoufoxEmailRegistration:
                 submitted = False
         if not submitted:
             raise BrowserEmailRegistrationError("TOTP continue button not found")
-        self._emit("browser.totp.submitted", {"url": page.url})
+        self._emit(
+            "browser.totp.submitted",
+            {
+                "url": page.url,
+                "method": "ui_click",
+                "factor_id": factor_id,
+            },
+        )
         if not self._wait_for_page_state(
             page,
             lambda: (
@@ -1466,9 +1784,19 @@ class CamoufoxEmailRegistration:
             stage="wait-totp-submit",
             timeout_s=30,
         ):
-            raise BrowserEmailRegistrationError("TOTP submit had no effect")
+            raise BrowserEmailRegistrationError(
+                "TOTP UI submit produced no navigation: "
+                f"url={page.url} factor_id={factor_id or 'unknown'}"
+            )
 
-    def _complete_about_you(self, page, *, first_name: str, last_name: str) -> None:
+    def _complete_about_you(
+        self,
+        page,
+        *,
+        first_name: str,
+        last_name: str,
+        birth_date: tuple[int, int, int] | None = None,
+    ) -> None:
         name: dict[str, Any] | None = None
         birthday: dict[str, Any] | None = None
         birthday_segments: list[dict[str, Any]] = []
@@ -1509,13 +1837,19 @@ class CamoufoxEmailRegistration:
             return
         elements = page.query_selector_all("input")
         name_field = elements[name["index"]]
+        birth_year, birth_month, birth_day = birth_date or _random_registration_birthday()
         try:
             name_field.focus()
             page.keyboard.type(f"{first_name} {last_name}", delay=random.randint(30, 80))
-            age = str(random.randint(26, 40))
-            year = time.gmtime().tm_year - int(age)
+            age = str(max(18, time.gmtime().tm_year - birth_year))
             if birthday is None:
-                _fill_segmented_birthday(page, birthday_segments, year=year)
+                _fill_segmented_birthday(
+                    page,
+                    birthday_segments,
+                    year=birth_year,
+                    month=birth_month,
+                    day=birth_day,
+                )
             else:
                 birthday_field = elements[birthday["index"]]
                 birthday_field.focus()
@@ -1525,15 +1859,15 @@ class CamoufoxEmailRegistration:
                     page.keyboard.type(age, delay=random.randint(40, 100))
                 elif birthday["type"] == "date":
                     try:
-                        birthday_field.fill(f"{year}-01-15")
+                        birthday_field.fill(f"{birth_year:04d}-{birth_month:02d}-{birth_day:02d}")
                     except Exception:
                         page.keyboard.type(
-                            f"{year}-01-15",
+                            f"{birth_year:04d}-{birth_month:02d}-{birth_day:02d}",
                             delay=random.randint(30, 70),
                         )
                 else:
                     page.keyboard.type(
-                        f"01/15/{year}",
+                        f"{birth_month:02d}/{birth_day:02d}/{birth_year:04d}",
                         delay=random.randint(30, 70),
                     )
             time.sleep(random.uniform(0.4, 0.9))
@@ -1789,7 +2123,9 @@ class CamoufoxEmailRegistration:
         if not self.config.capture_artifacts or self.artifact_dir is None:
             return
         try:
-            page.screenshot(path=str(self.artifact_dir / filename), full_page=True)
+            path = self.artifact_dir / filename
+            page.screenshot(path=str(path), full_page=True)
+            path.chmod(0o600)
         except Exception:
             pass
 
@@ -1827,16 +2163,46 @@ PASSWORD_INPUT_SELECTORS = (
     'input[type="password"]',
     'input[name="password"]',
 )
+_CONTINUE_WITH_PASSWORD_LABELS = (
+    "Continue with password",
+    "Mit Passwort fortfahren",
+    "Doorgaan met wachtwoord",
+    "Влизане с парола",
+    "Nastavi s lozinkom",
+    "Συνέχεια με κωδικό πρόσβασης",
+    "Použít heslo",
+    "Fortsæt med adgangskode",
+    "Jätka parooliga",
+    "Jatka salasanalla",
+    "Continuer avec un mot de passe",
+    "Folytatás jelszóval",
+    "Continua con la password",
+    "Turpināt ar paroli",
+    "Tęsti su slaptažodžiu",
+    "Kontynuuj za pomocą hasła",
+    "Continuar com palavra-passe",
+    "Continuă cu parola",
+    "Pokračovať s heslom",
+    "Nadaljujte z geslom",
+    "Continuar con contraseña",
+    "Fortsätt med lösenord",
+    "Halda áfram með lykilorði",
+    "Fortsett med passord",
+    "使用密码继续",
+    "使用密碼繼續",
+    "パスワードで続行",
+)
 CONTINUE_WITH_PASSWORD_SELECTORS = (
+    'a[href*="/create-account/password"]',
     'a[href*="/log-in/password"]',
-    'button:has-text("Continue with password")',
-    'a:has-text("Continue with password")',
-    'button:has-text("使用密码")',
-    'a:has-text("使用密码")',
-    'button:has-text("使用密碼")',
-    'a:has-text("使用密碼")',
-    'button:has-text("パスワードで続行")',
-    'a:has-text("パスワードで続行")',
+    *(
+        selector
+        for label in _CONTINUE_WITH_PASSWORD_LABELS
+        for selector in (
+            f'button:has-text("{label}")',
+            f'a:has-text("{label}")',
+        )
+    ),
 )
 LOGIN_SELECTORS = (
     'button[data-testid="login-button"]',
@@ -1921,34 +2287,334 @@ TRY_AGAIN_SELECTORS = (
 )
 
 
-def _registration_name() -> tuple[str, str]:
-    first_names = (
-        "James",
-        "John",
-        "Emily",
-        "Sophia",
-        "Michael",
-        "Oliver",
-        "Emma",
-        "William",
-        "Amelia",
-        "Lucas",
-        "Mia",
-        "Ethan",
+_REGISTRATION_NAME_POOLS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "US": (
+        (
+            "Aiden",
+            "Amelia",
+            "Avery",
+            "Benjamin",
+            "Camila",
+            "Charlotte",
+            "Daniel",
+            "Elijah",
+            "Emily",
+            "Ethan",
+            "Evelyn",
+            "Harper",
+            "Henry",
+            "Isabella",
+            "Jack",
+            "James",
+            "Liam",
+            "Lucas",
+            "Mason",
+            "Mia",
+            "Noah",
+            "Olivia",
+            "Sofia",
+            "William",
+        ),
+        (
+            "Anderson",
+            "Baker",
+            "Brown",
+            "Campbell",
+            "Clark",
+            "Davis",
+            "Garcia",
+            "Harris",
+            "Hernandez",
+            "Jackson",
+            "Johnson",
+            "Lee",
+            "Lewis",
+            "Martinez",
+            "Miller",
+            "Moore",
+            "Nelson",
+            "Rodriguez",
+            "Smith",
+            "Taylor",
+            "Thomas",
+            "Thompson",
+            "Walker",
+            "Wilson",
+        ),
+    ),
+    "JP": (
+        (
+            "Akari",
+            "Aoi",
+            "Daichi",
+            "Haruka",
+            "Haruto",
+            "Hina",
+            "Hinata",
+            "Kaito",
+            "Mei",
+            "Ren",
+            "Riku",
+            "Rin",
+            "Sakura",
+            "Sota",
+            "Yui",
+            "Yuto",
+        ),
+        (
+            "Abe",
+            "Endo",
+            "Fujita",
+            "Hayashi",
+            "Ito",
+            "Kato",
+            "Kobayashi",
+            "Matsumoto",
+            "Mori",
+            "Nakamura",
+            "Saito",
+            "Sato",
+            "Suzuki",
+            "Takahashi",
+            "Tanaka",
+            "Yamada",
+        ),
+    ),
+    "DE": (
+        (
+            "Anna",
+            "Ben",
+            "Clara",
+            "Emilia",
+            "Felix",
+            "Finn",
+            "Hannah",
+            "Jonas",
+            "Laura",
+            "Leon",
+            "Lina",
+            "Lukas",
+            "Marie",
+            "Maximilian",
+            "Mia",
+            "Paul",
+        ),
+        (
+            "Bauer",
+            "Becker",
+            "Fischer",
+            "Hoffmann",
+            "Klein",
+            "Koch",
+            "Krueger",
+            "Lehmann",
+            "Meyer",
+            "Mueller",
+            "Richter",
+            "Schmidt",
+            "Schneider",
+            "Schulz",
+            "Wagner",
+            "Weber",
+        ),
+    ),
+    "GB": (
+        (
+            "Alice",
+            "Amelia",
+            "Arthur",
+            "Charlotte",
+            "Ella",
+            "Emily",
+            "Florence",
+            "Freddie",
+            "George",
+            "Harry",
+            "Isla",
+            "Jack",
+            "Leo",
+            "Noah",
+            "Oliver",
+            "Sophie",
+        ),
+        (
+            "Adams",
+            "Bennett",
+            "Clarke",
+            "Davies",
+            "Edwards",
+            "Evans",
+            "Green",
+            "Hall",
+            "Harris",
+            "Hughes",
+            "Jones",
+            "Lewis",
+            "Roberts",
+            "Taylor",
+            "Thomas",
+            "Williams",
+        ),
+    ),
+    "FR": (
+        (
+            "Alice",
+            "Ambre",
+            "Arthur",
+            "Camille",
+            "Chloe",
+            "Emma",
+            "Gabriel",
+            "Hugo",
+            "Jade",
+            "Jules",
+            "Leo",
+            "Louis",
+            "Louise",
+            "Lucas",
+            "Nathan",
+            "Rose",
+        ),
+        (
+            "Bernard",
+            "David",
+            "Dubois",
+            "Durand",
+            "Fournier",
+            "Garcia",
+            "Lambert",
+            "Laurent",
+            "Lefebvre",
+            "Leroy",
+            "Martin",
+            "Mercier",
+            "Michel",
+            "Moreau",
+            "Roux",
+            "Simon",
+        ),
+    ),
+    "ES": (
+        (
+            "Alejandro",
+            "Alvaro",
+            "Carmen",
+            "Daniel",
+            "David",
+            "Elena",
+            "Hugo",
+            "Lucia",
+            "Manuel",
+            "Maria",
+            "Mateo",
+            "Pablo",
+            "Paula",
+            "Sofia",
+            "Valeria",
+            "Vega",
+        ),
+        (
+            "Alonso",
+            "Blanco",
+            "Castro",
+            "Diaz",
+            "Fernandez",
+            "Garcia",
+            "Gomez",
+            "Gonzalez",
+            "Lopez",
+            "Martin",
+            "Martinez",
+            "Moreno",
+            "Navarro",
+            "Perez",
+            "Ruiz",
+            "Sanchez",
+        ),
+    ),
+    "IT": (
+        (
+            "Alessandro",
+            "Andrea",
+            "Aurora",
+            "Beatrice",
+            "Chiara",
+            "Davide",
+            "Elisa",
+            "Francesco",
+            "Giulia",
+            "Leonardo",
+            "Lorenzo",
+            "Luca",
+            "Marco",
+            "Matteo",
+            "Sofia",
+            "Tommaso",
+        ),
+        (
+            "Bianchi",
+            "Colombo",
+            "Conti",
+            "Costa",
+            "De Luca",
+            "Esposito",
+            "Ferrari",
+            "Fontana",
+            "Gallo",
+            "Greco",
+            "Lombardi",
+            "Mancini",
+            "Marino",
+            "Ricci",
+            "Romano",
+            "Rossi",
+        ),
+    ),
+}
+
+
+def _registration_identity(
+    email: str,
+    *,
+    locale: str = "",
+) -> tuple[str, str, tuple[int, int, int]]:
+    country = _registration_country(locale)
+    first_names, last_names = _REGISTRATION_NAME_POOLS.get(
+        country,
+        _REGISTRATION_NAME_POOLS["US"],
     )
-    last_names = (
-        "Smith",
-        "Johnson",
-        "Williams",
-        "Brown",
-        "Jones",
-        "Garcia",
-        "Miller",
-        "Davis",
-        "Rodriguez",
-        "Martinez",
-    )
-    return random.choice(first_names), random.choice(last_names)
+    digest = hashlib.sha256(
+        f"{str(email or '').strip().casefold()}|{str(locale or '').strip().casefold()}".encode()
+    ).digest()
+    first_name = first_names[int.from_bytes(digest[0:4], "big") % len(first_names)]
+    last_name = last_names[int.from_bytes(digest[4:8], "big") % len(last_names)]
+    birth_year = 1980 + int.from_bytes(digest[8:10], "big") % 23
+    birth_month = 1 + digest[10] % 12
+    maximum_day = calendar.monthrange(birth_year, birth_month)[1]
+    birth_day = 1 + digest[11] % maximum_day
+    return first_name, last_name, (birth_year, birth_month, birth_day)
+
+
+def _registration_country(locale: str) -> str:
+    parts = [part for part in re.split(r"[-_]", str(locale or "").strip()) if part]
+    for part in reversed(parts[1:]):
+        if len(part) == 2 and part.isalpha():
+            return part.upper()
+    language = parts[0].casefold() if parts else ""
+    return {
+        "de": "DE",
+        "es": "ES",
+        "fr": "FR",
+        "it": "IT",
+        "ja": "JP",
+    }.get(language, "US")
+
+
+def _random_registration_birthday() -> tuple[int, int, int]:
+    year = 1980 + secrets.randbelow(23)
+    month = 1 + secrets.randbelow(12)
+    day = 1 + secrets.randbelow(calendar.monthrange(year, month)[1])
+    return year, month, day
 
 
 def _chatgpt_home_url() -> str:
@@ -2048,6 +2714,39 @@ def _click_registration_input(element, *, timeout_ms: int) -> None:
                 f"native={type(native_error).__name__}: {native_error}; "
                 f"dom={type(dom_error).__name__}: {dom_error}"
             ) from dom_error
+
+
+def _type_registration_value(
+    page: Any,
+    element: Any,
+    value: str,
+    *,
+    timeout_ms: int,
+) -> None:
+    """Enter registration credentials through keyboard events."""
+    _click_registration_input(element, timeout_ms=timeout_ms)
+    press = getattr(element, "press", None)
+    if callable(press):
+        press("ControlOrMeta+A", timeout=timeout_ms)
+        press("Backspace", timeout=timeout_ms)
+    else:
+        page.keyboard.press("ControlOrMeta+A")
+        page.keyboard.press("Backspace")
+
+    delay = random.randint(35, 85)
+    type_value = getattr(element, "type", None)
+    if callable(type_value):
+        type_value(str(value), delay=delay, timeout=timeout_ms)
+        return
+
+    # Lightweight test adapters do not expose ElementHandle.type(). Keep their
+    # value model synchronized after exercising the same keyboard path.
+    page.keyboard.type(str(value), delay=delay)
+    if _input_value(element) != str(value):
+        fill = getattr(element, "fill", None)
+        if not callable(fill):
+            raise BrowserEmailRegistrationError("registration input does not support typing")
+        fill(str(value), timeout=timeout_ms)
 
 
 def _click_registration_control(
@@ -2160,14 +2859,14 @@ def _click_continue_with_password_if_present(page) -> bool:
 
 
 def _physical_click_element(page, element, *, timeout_ms: int) -> bool:
-    """Dispatch the element click directly; use native click only as fallback."""
+    """Use Playwright's native input path, with DOM dispatch as a fallback."""
     del page
     try:
-        element.evaluate("(el) => { el.click(); return true; }")
+        element.click(timeout=timeout_ms, no_wait_after=True)
         return True
     except Exception:
         try:
-            element.click(timeout=timeout_ms, no_wait_after=True)
+            element.evaluate("(el) => { el.click(); return true; }")
             return True
         except Exception:
             return False
@@ -2226,6 +2925,67 @@ def _input_value(element: Any) -> str:
         except Exception:
             pass
     return ""
+
+
+def _capture_browser_identity(page: Any, result: AuthResult) -> None:
+    try:
+        identity = page.evaluate(
+            """() => ({
+                userAgent: navigator.userAgent || '',
+                platform: navigator.platform || '',
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+                timezoneOffset: new Date().getTimezoneOffset(),
+                languages: Array.from(navigator.languages || [navigator.language]).filter(Boolean),
+            })"""
+        )
+    except Exception:
+        return
+    if not isinstance(identity, dict):
+        return
+    user_agent = str(identity.get("userAgent") or "").strip()
+    result.browser_user_agent = user_agent
+    result.browser_platform = str(identity.get("platform") or "").strip()
+    result.browser_timezone = str(identity.get("timezone") or "").strip()
+    try:
+        browser_offset = identity.get("timezoneOffset")
+        result.browser_timezone_offset = (
+            -int(browser_offset) if browser_offset is not None else None
+        )
+    except (TypeError, ValueError):
+        result.browser_timezone_offset = None
+    languages = identity.get("languages")
+    result.browser_accept_language = _accept_language_from_browser(languages)
+    # Preserve the browser's real version in the result. Protocol clients map
+    # versions newer than curl_cffi's named profiles to its rolling alias.
+    firefox_match = re.search(r"Firefox/(\d+)", user_agent, flags=re.IGNORECASE)
+    chrome_match = re.search(r"(?:Chrome|Chromium)/(\d+)", user_agent, flags=re.IGNORECASE)
+    if firefox_match:
+        result.browser_impersonate = f"firefox{firefox_match.group(1)}"
+    elif chrome_match:
+        result.browser_impersonate = f"chrome{chrome_match.group(1)}"
+    else:
+        result.browser_impersonate = ""
+
+
+def _accept_language_from_browser(value: Any) -> str:
+    if not isinstance(value, (list, tuple)):
+        return ""
+    languages: list[str] = []
+    for item in value:
+        language = str(item or "").strip()
+        if language and language not in languages:
+            languages.append(language)
+    if not languages:
+        return ""
+    if len(languages) == 1 and "-" in languages[0]:
+        base_language = languages[0].split("-", 1)[0]
+        if base_language not in languages:
+            languages.append(base_language)
+    parts = [languages[0]]
+    for index, language in enumerate(languages[1:], start=1):
+        quality = max(0.1, 1.0 - index / 10)
+        parts.append(f"{language};q={quality:.1f}")
+    return ",".join(parts)
 
 
 def _type_email_otp(page, inputs: list[Any], code: str) -> bool:
@@ -2312,6 +3072,164 @@ def _validate_email_otp_in_browser(
         wait_until="domcontentloaded",
         timeout=navigation_timeout_ms,
     )
+    return payload
+
+
+def _totp_factor_id_from_url(current_url: str) -> str:
+    parsed = urlparse(str(current_url or ""))
+    segments = [unquote(segment).strip() for segment in parsed.path.split("/") if segment]
+    for index, segment in enumerate(segments[:-1]):
+        if segment.casefold() == "mfa-challenge" and segments[index + 1]:
+            return segments[index + 1]
+    query = parse_qs(parsed.query)
+    for key in ("factor_id", "factorId", "id"):
+        values = query.get(key) or []
+        if values and str(values[0]).strip():
+            return unquote(str(values[0]).strip())
+    return ""
+
+
+def _verify_totp_in_browser(
+    page,
+    *,
+    factor_id: str,
+    code: str,
+    navigation_timeout_ms: int,
+) -> dict[str, Any]:
+    """Verify TOTP through the authenticated auth.openai.com page context."""
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        raise _BrowserTotpVerificationUnavailable("browser page has no evaluate method")
+    normalized_factor_id = str(factor_id or "").strip()
+    normalized_code = str(code or "").strip()
+    if not normalized_factor_id:
+        raise _BrowserTotpVerificationUnavailable("TOTP challenge has no factor id")
+    if not normalized_code.isdigit():
+        raise BrowserEmailRegistrationError("2FAuth returned an invalid TOTP code")
+
+    request = {
+        "factorId": normalized_factor_id,
+        "code": normalized_code,
+        "invocationId": str(uuid4()),
+    }
+    try:
+        result = evaluate(
+            """async ({factorId, code, invocationId}) => {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 30000);
+                try {
+                    const response = await fetch('/api/accounts/mfa/verify', {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                            'accept': 'application/json',
+                            'content-type': 'application/json',
+                            'x-access-flow-invocation-id': invocationId,
+                        },
+                        body: JSON.stringify({id: factorId, type: 'totp', code}),
+                        signal: controller.signal,
+                    });
+                    const text = await response.text();
+                    let payload = {};
+                    try { payload = JSON.parse(text); } catch (_) {}
+                    return {
+                        status: response.status,
+                        payload,
+                        body: text.slice(0, 2000),
+                    };
+                } catch (error) {
+                    return {
+                        network_error: `${error?.name || 'FetchError'}: ${error?.message || error}`,
+                    };
+                } finally {
+                    clearTimeout(timer);
+                }
+            }""",
+            request,
+        )
+    except Exception as exc:
+        detail = str(exc)[:500]
+        lowered = detail.casefold()
+        if "timeout" in lowered or "timed out" in lowered or "abort" in lowered:
+            raise BrowserEmailRegistrationError(
+                f"TOTP verification request timed out: {detail}"
+            ) from exc
+        raise BrowserEmailRegistrationError(
+            f"TOTP verification browser request failed: {detail}"
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise BrowserEmailRegistrationError(
+            "TOTP verification browser response was not an object"
+        )
+    network_error = str(result.get("network_error") or "").strip()
+    if network_error:
+        lowered = network_error.casefold()
+        if "timeout" in lowered or "timed out" in lowered or "abort" in lowered:
+            raise BrowserEmailRegistrationError(
+                f"TOTP verification request timed out: {network_error}"
+            )
+        raise BrowserEmailRegistrationError(
+            f"TOTP verification transport failed: {network_error}"
+        )
+
+    try:
+        status = int(result.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    payload = result.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    body = str(result.get("body") or "")[:800]
+    safe_body = body.replace(normalized_code, "[redacted]")
+    if status // 100 != 2:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error_code = str(error.get("code") or "unknown")
+            error_message = str(error.get("message") or "")
+        else:
+            error_code = str(error or payload.get("code") or "unknown")
+            error_message = str(payload.get("message") or "")
+        message = (error_message or safe_body or "unknown")[:500]
+        error_type = (
+            BrowserAccountDeactivatedError
+            if error_code == "account_deactivated"
+            else BrowserEmailRegistrationError
+        )
+        raise error_type(
+            "OpenAI TOTP verification failed: "
+            f"http_status={status or 'unknown'} code={error_code} "
+            f"message={message}"
+        )
+
+    page_data = payload.get("page")
+    page_data = page_data if isinstance(page_data, dict) else {}
+    page_type = str(page_data.get("type") or "").strip().lower()
+    continue_url = str(payload.get("continue_url") or "").strip()
+    if not continue_url and page_type == "external_url":
+        page_payload = page_data.get("payload")
+        page_payload = page_payload if isinstance(page_payload, dict) else {}
+        continue_url = str(page_payload.get("url") or "").strip()
+    if not continue_url:
+        raise BrowserEmailRegistrationError(
+            "OpenAI TOTP verification response has no continuation URL: "
+            f"http_status={status or 'unknown'} page_type={page_type or 'unknown'} "
+            f"body={safe_body}"
+        )
+    try:
+        page.goto(
+            urljoin("https://auth.openai.com", continue_url),
+            wait_until="domcontentloaded",
+            timeout=navigation_timeout_ms,
+        )
+    except Exception as exc:
+        detail = str(exc)[:500]
+        if "timeout" in detail.casefold() or "timed out" in detail.casefold():
+            raise BrowserEmailRegistrationError(
+                f"TOTP continuation navigation timed out: {detail}"
+            ) from exc
+        raise BrowserEmailRegistrationError(
+            f"TOTP continuation navigation failed: {detail}"
+        ) from exc
     return payload
 
 
@@ -2523,18 +3441,20 @@ def _fill_segmented_birthday(
     metadata: list[dict[str, Any]],
     *,
     year: int,
+    month: int,
+    day: int,
 ) -> None:
     elements = page.query_selector_all('[role="spinbutton"]')
-    fallback_values = ("1", "15", str(year))
+    fallback_values = (str(month), str(day), str(year))
     for position, item in enumerate(metadata[:3]):
         label = str(item.get("ariaLabel") or "").casefold()
         maximum = _metadata_int(item.get("valueMax"))
         if "year" in label or maximum >= 1000:
             value = str(year)
         elif "month" in label or maximum == 12:
-            value = "1"
+            value = str(month)
         elif "day" in label or 28 <= maximum <= 31:
-            value = "15"
+            value = str(day)
         else:
             value = fallback_values[position]
         field = elements[int(item["index"])]

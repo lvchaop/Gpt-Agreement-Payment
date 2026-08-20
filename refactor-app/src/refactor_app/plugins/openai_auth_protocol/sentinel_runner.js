@@ -1387,6 +1387,27 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
   let cachedChallenge = null;
   let cachedProof = "";
   const externalProof = String(args["request-p"] || "").trim();
+  const language = pick(args.language, cfg("language"), process.env.SENTINEL_LANGUAGE);
+  const languages = normalizeList(
+    pick(args.languages, cfg("languages")),
+    process.env.SENTINEL_LANGUAGES
+  );
+  const timeZone = pick(
+    args["time-zone"],
+    args.timezone,
+    cfg("timeZone", "time_zone", "timezone"),
+    process.env.SENTINEL_TIME_ZONE
+  );
+  const timezoneName = pick(
+    args["timezone-name"],
+    cfg("timezoneName", "timezone_name"),
+    process.env.SENTINEL_TIMEZONE_NAME
+  );
+  const timezoneOffsetValue = pick(
+    args["timezone-offset-minutes"],
+    cfg("timezoneOffsetMinutes", "timezone_offset_minutes"),
+    process.env.SENTINEL_TIMEZONE_OFFSET_MINUTES
+  );
   const options = {
     flow,
     sentinelSid: pick(args["sentinel-sid"], cfg("sentinelSid", "sentinel_sid"), process.env.SENTINEL_SID, ""),
@@ -1420,11 +1441,11 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     navigatorVendor: pick(args["navigator-vendor"], cfg("navigatorVendor", "navigator_vendor"), process.env.SENTINEL_NAVIGATOR_VENDOR, "Google Inc."),
     userAgentDataPlatform: pick(args["user-agent-data-platform"], cfg("userAgentDataPlatform", "user_agent_data_platform"), process.env.SENTINEL_UA_DATA_PLATFORM, "macOS"),
     requestIdleCallback: truthy(pick(args["request-idle-callback"], cfg("requestIdleCallback", "request_idle_callback"), process.env.SENTINEL_REQUEST_IDLE_CALLBACK, "0")),
-    language: pick(args.language, cfg("language"), process.env.SENTINEL_LANGUAGE, "ja-JP"),
-    languages: normalizeList(pick(args.languages, cfg("languages")), process.env.SENTINEL_LANGUAGES || "ja-JP"),
-    timeZone: pick(args["time-zone"], args.timezone, cfg("timeZone", "time_zone", "timezone"), process.env.SENTINEL_TIME_ZONE, "Asia/Tokyo"),
-    timezoneName: pick(args["timezone-name"], cfg("timezoneName", "timezone_name"), process.env.SENTINEL_TIMEZONE_NAME, "Japan Standard Time"),
-    timezoneOffsetMinutes: Number(pick(args["timezone-offset-minutes"], cfg("timezoneOffsetMinutes", "timezone_offset_minutes"), process.env.SENTINEL_TIMEZONE_OFFSET_MINUTES, 540)),
+    language,
+    languages,
+    timeZone,
+    timezoneName,
+    timezoneOffsetMinutes: Number(timezoneOffsetValue),
     hardwareConcurrency: Number(pick(args.cores, cfg("cores", "hardwareConcurrency"), process.env.SENTINEL_CORES, 6)),
     jsHeapSizeLimit: Number(pick(args["js-heap-size-limit"], cfg("jsHeapSizeLimit", "js_heap_size_limit"), process.env.SENTINEL_JS_HEAP_SIZE_LIMIT, 4395630592)),
     fixedRandom:
@@ -1499,6 +1520,16 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
       };
     },
   };
+
+  if (!options.language || options.languages.length === 0) {
+    throw new Error("Sentinel runner requires proxy-derived language values");
+  }
+  if (!options.timeZone || !options.timezoneName || timezoneOffsetValue === "") {
+    throw new Error("Sentinel runner requires proxy-derived timezone values");
+  }
+  if (!Number.isFinite(options.timezoneOffsetMinutes)) {
+    throw new Error("Sentinel runner timezone offset must be numeric");
+  }
 
   if (options.timeZone) {
     process.env.TZ = options.timeZone;

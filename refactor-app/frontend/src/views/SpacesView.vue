@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { BadgePercent, CreditCard, Expand, KeyRound, Plus, Power, PowerOff, RefreshCw, Server, ServerOff, Trash2, Upload, UserPlus } from "@lucide/vue";
+import { BadgePercent, CreditCard, Expand, KeyRound, Link2, Plus, Power, PowerOff, RefreshCw, Server, ServerOff, Trash2, Upload, UserPlus } from "@lucide/vue";
 
 import DataTable from "../components/DataTable.vue";
 import type { Column, TableFilter } from "../components/DataTable.vue";
@@ -10,8 +10,35 @@ import FormDrawer from "../components/FormDrawer.vue";
 import EntitySelect from "../components/EntitySelect.vue";
 import ResourcePage from "../components/ResourcePage.vue";
 import { resourcesApi, type Row } from "../api/resources";
+import type { PageQuery, PagedResult } from "../api/types";
 import { useOpsStore } from "../stores/ops";
 import { splitPaymentImportLines } from "../utils/paymentMethodImport";
+
+const paypalEuroCountries = new Set([
+  "AD", "AT", "BE", "CY", "DE", "EE", "ES", "FI", "FR", "GR", "HR", "IE", "IT",
+  "LT", "LU", "LV", "MC", "ME", "MT", "NL", "PT", "SI", "SK", "SM",
+]);
+const paypalCheckoutCurrencyByCountry: Readonly<Record<string, string>> = {
+  AE: "AED", AU: "AUD", BR: "BRL", CA: "CAD", CH: "CHF", CL: "CLP", CO: "COP",
+  CZ: "CZK", DK: "DKK", GB: "GBP", ID: "IDR", IL: "ILS", IN: "INR", JP: "JPY",
+  KR: "KRW", MX: "MXN", MY: "MYR", NO: "NOK", NZ: "NZD", PH: "PHP", PL: "PLN",
+  SE: "SEK", SG: "SGD", TH: "THB", TR: "USD", TW: "TWD", US: "USD", VN: "VND", ZA: "ZAR",
+};
+const paypalLinkCurrencyOptions = [
+  "AED", "AUD", "BRL", "CAD", "CHF", "CLP", "COP", "CZK", "DKK", "EUR",
+  "GBP", "IDR", "ILS", "INR", "JPY", "KRW", "MXN", "MYR", "NOK", "NZD",
+  "PHP", "PLN", "SEK", "SGD", "THB", "TWD", "USD", "VND", "ZAR",
+];
+const paypalAgreementSmsCountryByCountry: Readonly<Record<string, string>> = {
+  AU: "175", BR: "73", CA: "36", DE: "43", FR: "78", GB: "16", JP: "182",
+  NL: "48", PL: "15", SG: "10351", TH: "52", US: "187",
+};
+
+function paypalCheckoutCurrencyForCountry(country: string) {
+  const normalized = country.trim().toUpperCase();
+  if (paypalEuroCountries.has(normalized)) return "EUR";
+  return paypalCheckoutCurrencyByCountry[normalized] || "USD";
+}
 
 const store = useOpsStore();
 const router = useRouter();
@@ -43,12 +70,31 @@ const hostingTarget = ref<Row | null>(null);
 const unhostingTarget = ref<Row | null>(null);
 const paymentBindTarget = ref<Row | null>(null);
 const plusCheckoutTarget = ref<Row | null>(null);
+const paypalLinkTarget = ref<Row | null>(null);
 const selectedSpaces = ref<Row[]>([]);
 const selectedPaymentBindOpen = ref(false);
 const selectedPromotionCheckOpen = ref(false);
+const selectedPlusCheckoutOpen = ref(false);
+const selectedPayPalLinkOpen = ref(false);
 const checkingSelectedPromotions = ref(false);
+const creatingSelectedPlusCheckouts = ref(false);
+const creatingSelectedPayPalLinks = ref(false);
+const backfillingSelectedSessions = ref(false);
+const backfillSessionProxyCountry = ref("US");
+const backfillSessionConfirmOpen = ref(false);
+const backfillSessionWorkCount = ref(10);
+const refreshingSelectedSubscriptions = ref(false);
 const promotionProxyCountry = ref("JP");
 const promotionWorkCount = ref(5);
+const promotionOffersOpen = ref(false);
+const promotionOffersLoading = ref(false);
+const promotionOffersError = ref("");
+const promotionOffersResult = ref<PagedResult<Row>>({
+  items: [], page: 1, page_size: 50, total: 0, total_pages: 1, sort: "-last_checked_at",
+});
+const promotionOffersQuery = ref<PageQuery>({
+  page: 1, page_size: 50, sort: "-last_checked_at", q: "", countries: "", status: "",
+});
 const expandingSpaceId = ref("");
 const updatingSpaceStatusId = ref("");
 const updatingAutoReplenishId = ref("");
@@ -56,9 +102,73 @@ const preparingAutoInviteId = ref("");
 const updatingHostingSpaceId = ref("");
 const bindingPaymentSpaceId = ref("");
 const plusCheckoutSpaceId = ref("");
+const paypalLinkSpaceId = ref("");
+const paymentBindCountry = ref("US");
 const plusCheckoutCreateCountry = ref("US");
-const plusCheckoutPromoCountry = ref("JP");
+const plusCheckoutPromoCountry = ref("US");
 const plusCheckoutCampaign = ref("plus-1-month-free");
+const plusCheckoutWorkCount = ref(5);
+const paypalLinkCountry = ref("BR");
+const paypalLinkUpdateCountry = ref("BR");
+const paypalLinkBillingCountry = ref("DE");
+const paypalLinkCurrency = ref("EUR");
+const paypalLinkCurrencyEdited = ref(false);
+const paypalLinkApplyPromotion = ref(true);
+const paypalLinkCampaign = ref("plus-1-month-free");
+const paypalLinkUiMode = ref<"hosted" | "custom">("hosted");
+const paypalLinkPaymentMethodType = ref<"paypal" | "card" | "gcash" | "pix">("paypal");
+const paypalLinkWorkCount = ref(5);
+const paypalAgreementEnabled = ref(true);
+const paypalAgreementCountry = ref("US");
+const paypalAgreementProxyCountry = ref("US");
+const paypalAgreementBuyerMode = ref<"identity_elevation" | "original">("identity_elevation");
+const paypalAgreementSmsCountry = ref("187");
+const paypalAgreementMaxCardAttempts = ref(5);
+const paypalAgreementFinalizeCheckout = ref(true);
+watch(paypalLinkBillingCountry, (country) => {
+  if (["gcash", "pix"].includes(paypalLinkPaymentMethodType.value)) return;
+  if (paypalLinkCurrencyEdited.value) return;
+  const normalized = country.trim().toUpperCase();
+  paypalLinkCurrency.value = paypalCheckoutCurrencyForCountry(normalized);
+});
+watch(paypalLinkCountry, (country) => {
+  paypalLinkUpdateCountry.value = country.trim().toUpperCase();
+});
+watch(paypalLinkPaymentMethodType, (paymentMethodType, previousPaymentMethodType) => {
+  if (paymentMethodType !== "paypal") paypalAgreementEnabled.value = false;
+  if (paymentMethodType === "gcash") {
+    paypalLinkCurrencyEdited.value = false;
+    paypalLinkUpdateCountry.value = paypalLinkCountry.value.trim().toUpperCase();
+    paypalLinkBillingCountry.value = "PH";
+    paypalLinkCurrency.value = "PHP";
+    paypalLinkUiMode.value = "custom";
+  } else if (paymentMethodType === "pix") {
+    paypalLinkCurrencyEdited.value = false;
+    paypalLinkCountry.value = "BR";
+    paypalLinkUpdateCountry.value = "BR";
+    paypalLinkBillingCountry.value = "BR";
+    paypalLinkCurrency.value = "BRL";
+    paypalLinkUiMode.value = "custom";
+  } else if (previousPaymentMethodType === "pix") {
+    paypalLinkCurrencyEdited.value = false;
+    paypalLinkBillingCountry.value = "DE";
+    paypalLinkUpdateCountry.value = paypalLinkCountry.value.trim().toUpperCase();
+    paypalLinkCurrency.value = "EUR";
+  } else if (previousPaymentMethodType === "gcash") {
+    paypalLinkCurrencyEdited.value = false;
+    paypalLinkUpdateCountry.value = paypalLinkCountry.value.trim().toUpperCase();
+    paypalLinkCurrency.value = paypalCheckoutCurrencyForCountry(paypalLinkBillingCountry.value);
+  }
+});
+watch(plusCheckoutCreateCountry, (country) => {
+  plusCheckoutPromoCountry.value = country.trim().toUpperCase();
+});
+watch(paypalAgreementCountry, (country) => {
+  const normalized = country.trim().toUpperCase();
+  paypalAgreementProxyCountry.value = normalized;
+  const smsCountry = paypalAgreementSmsCountryByCountry[normalized];
+  paypalAgreementSmsCountry.value = smsCountry || "";
+});
 const autoStartPlusCheckout = ref(true);
 const bindingSelectedPaymentSpaces = ref(false);
 const showPaymentPoolPanel = ref(false);
@@ -66,6 +176,30 @@ const paymentNamesText = ref("");
 const paymentAddressesText = ref("");
 const paymentCardsText = ref("");
 const paymentInventorySummary = ref<Row>({});
+const paymentAddressCountryOptions = computed(() => {
+  const rawCounts = paymentInventorySummary.value.active_address_country_counts;
+  const counts = rawCounts && typeof rawCounts === "object" && !Array.isArray(rawCounts)
+    ? rawCounts as Record<string, unknown>
+    : {};
+  const options = Object.entries(counts)
+    .map(([country, count]) => ({
+      country: country.trim().toUpperCase(),
+      count: Number(count) || 0,
+    }))
+    .filter((option) => /^[A-Z]{2}$/.test(option.country) && option.count > 0);
+  const selectedCountry = paymentBindCountry.value.trim().toUpperCase();
+  if (/^[A-Z]{2}$/.test(selectedCountry) && !options.some(
+    (option) => option.country === selectedCountry,
+  )) {
+    options.push({ country: selectedCountry, count: 0 });
+  }
+  return options.sort((left, right) => left.country.localeCompare(right.country));
+});
+const selectedPaymentAddressCount = computed(() => (
+  paymentAddressCountryOptions.value.find(
+    (option) => option.country === paymentBindCountry.value.trim().toUpperCase(),
+  )?.count || 0
+));
 const importingPaymentInventory = ref(false);
 const showReplenishEmailPanel = ref(false);
 const replenishEmailsText = ref("");
@@ -85,6 +219,11 @@ const businessSpaceLoader = async (query: string) => {
 };
 const selectedSpaceIds = computed(() => Array.from(new Set(
   selectedSpaces.value.map((row) => String(row.id || "").trim()).filter(Boolean),
+)));
+const selectedAccountIds = computed(() => Array.from(new Set(
+  selectedSpaces.value
+    .map((row) => String(row.owner_user_account_id || "").trim())
+    .filter(Boolean),
 )));
 const selectedPersonalSpaceCount = computed(() => selectedSpaces.value.filter(
   (row) => String(row.space_type || "") === "personal",
@@ -106,6 +245,8 @@ const columns: Column[] = [
   { key: "plan_type", label: "订阅类型", badge: true, sortable: true },
   { key: "has_promotion", label: "是否有优惠", type: "boolean" },
   { key: "promotion_id", label: "优惠 ID", mono: true },
+  { key: "promotion_offer_count", label: "优惠数量", type: "number" },
+  { key: "promotion_country_summary", label: "优惠国家", summary: 24 },
   { key: "last_session_refresh_at", label: "最近 Session 时间", type: "datetime", relativeTime: true, sortable: true },
   { key: "credential_type", label: "凭证类型", badge: true },
   { key: "auth_mode", label: "授权模式", badge: true },
@@ -178,6 +319,21 @@ const filters: TableFilter[] = [
     ],
   },
   {
+    key: "promotion_country",
+    label: "优惠国家",
+    input: true,
+    placeholder: "ISO2 国家代码，可多个逗号分隔",
+  },
+  {
+    key: "promotion_status",
+    label: "优惠记录状态",
+    options: [
+      { label: "可用", value: "eligible" },
+      { label: "失效", value: "ineligible" },
+      { label: "过期记录", value: "stale" },
+    ],
+  },
+  {
     key: "payment_method_status",
     label: "支付状态",
     options: [
@@ -221,6 +377,50 @@ const adminSessionColumns = [
   { key: "expires_at", label: "Cookie/Session 过期时间", mono: true, summary: 30 },
   { key: "imported_at", label: "导入/更新时间", mono: true, summary: 30 },
 ];
+const promotionOfferColumns: Column[] = [
+  { key: "email", label: "账号邮箱", mono: true, summary: 30 },
+  { key: "space_name", label: "空间" },
+  { key: "proxy_country", label: "检测国家", badge: true, sortable: true },
+  { key: "promotion_id", label: "优惠 ID", mono: true, sortable: true },
+  { key: "promotion_name", label: "优惠名称", summary: 28 },
+  { key: "currency", label: "币种" },
+  { key: "amount", label: "金额" },
+  { key: "discount", label: "折扣" },
+  { key: "duration", label: "时长" },
+  { key: "status", label: "状态", badge: true },
+  { key: "last_checked_at", label: "最近检测", type: "datetime", relativeTime: true, sortable: true },
+];
+
+async function loadPromotionOffers(next: PageQuery = {}) {
+  promotionOffersQuery.value = { ...promotionOffersQuery.value, ...next };
+  promotionOffersLoading.value = true;
+  promotionOffersError.value = "";
+  try {
+    promotionOffersResult.value = await resourcesApi.promotionOffers(promotionOffersQuery.value);
+    promotionOffersQuery.value.page = promotionOffersResult.value.page;
+    promotionOffersQuery.value.page_size = promotionOffersResult.value.page_size;
+    promotionOffersQuery.value.sort = promotionOffersResult.value.sort;
+  } catch (err) {
+    promotionOffersError.value = String((err as Error).message ?? err);
+  } finally {
+    promotionOffersLoading.value = false;
+  }
+}
+
+function togglePromotionOffers() {
+  promotionOffersOpen.value = !promotionOffersOpen.value;
+  if (promotionOffersOpen.value) {
+    promotionOffersQuery.value = {
+      page: 1,
+      page_size: 50,
+      sort: "-last_checked_at",
+      q: "",
+      countries: "",
+      status: "",
+    };
+    void loadPromotionOffers();
+  }
+}
 
 async function importAdminSession() {
   let raw: Record<string, unknown>;
@@ -530,10 +730,17 @@ async function importPaymentMethodPools() {
 async function bindPersonalPaymentMethod() {
   const id = String(paymentBindTarget.value?.id || "");
   if (!id) return;
+  const country = paymentBindCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(country)) {
+    store.toast("绑卡配置无效", "绑卡国家必须是两位国家代码。", "warning");
+    return;
+  }
+  paymentBindCountry.value = country;
   bindingPaymentSpaceId.value = id;
   try {
     const name = String(paymentBindTarget.value?.name || paymentBindTarget.value?.external_space_id || id);
     const result = await resourcesApi.bindPersonalPaymentMethod(id, {
+      proxy_country: country,
       auto_start_plus_checkout: autoStartPlusCheckout.value,
       checkout_ui_mode: "custom",
       created_by: "ops:personal-payment-method-bind",
@@ -557,16 +764,17 @@ async function createPersonalPlusCheckout() {
   const createCountry = plusCheckoutCreateCountry.value.trim().toUpperCase();
   const promoCountry = plusCheckoutPromoCountry.value.trim().toUpperCase();
   const campaign = plusCheckoutCampaign.value.trim();
-  if (!/^[A-Z]{2}$/.test(createCountry) || !/^[A-Z]{2}$/.test(promoCountry) || !campaign) {
-    store.toast("支付配置无效", "US/JP 必须是两位国家代码，优惠 ID 不能为空。", "warning");
+  if (!/^[A-Z]{2}$/.test(createCountry) || promoCountry !== createCountry || !campaign) {
+    store.toast("支付配置无效", "Checkout/Update 代理必须是相同的两位国家代码，优惠 ID 不能为空。", "warning");
     return;
   }
   plusCheckoutSpaceId.value = id;
   try {
     const name = String(plusCheckoutTarget.value?.name || plusCheckoutTarget.value?.external_space_id || id);
     const result = await resourcesApi.createPersonalPlusCheckout(id, {
-      create_proxy_country: createCountry,
-      promo_proxy_country: promoCountry,
+      proxy_country: createCountry,
+      checkout_proxy_country: createCountry,
+      update_proxy_country: promoCountry,
       promo_campaign_id: campaign,
       created_by: "ops:personal-plus-checkout",
     });
@@ -581,8 +789,328 @@ async function createPersonalPlusCheckout() {
   }
 }
 
+function openSelectedPlusCheckout() {
+  if (!selectedSpaceIds.value.length) {
+    store.toast("未选择空间", "请先选择需要提交直卡 Checkout 的个人空间。", "warning");
+    return;
+  }
+  const firstPromotion = selectedSpaces.value.find(
+    (row) => String(row.space_type || "") === "personal" && String(row.promotion_id || "").trim(),
+  );
+  plusCheckoutCampaign.value = String(firstPromotion?.promotion_id || "plus-1-month-free");
+  selectedPlusCheckoutOpen.value = true;
+}
+
+async function createSelectedPersonalPlusCheckouts() {
+  const spaceIds = selectedSpaceIds.value;
+  if (!spaceIds.length) return;
+  const checkoutCountry = plusCheckoutCreateCountry.value.trim().toUpperCase();
+  const updateCountry = plusCheckoutPromoCountry.value.trim().toUpperCase();
+  const campaign = plusCheckoutCampaign.value.trim();
+  const workCount = Number(plusCheckoutWorkCount.value);
+  if (!/^[A-Z]{2}$/.test(checkoutCountry) || updateCountry !== checkoutCountry || !campaign) {
+    store.toast("支付配置无效", "Checkout/Update 代理必须是相同的两位国家代码，优惠 ID 不能为空。", "warning");
+    return;
+  }
+  if (!Number.isInteger(workCount) || workCount < 1 || workCount > 50) {
+    store.toast("并发配置无效", "并发数必须是 1 到 50 的整数。", "warning");
+    return;
+  }
+  creatingSelectedPlusCheckouts.value = true;
+  try {
+    const result = await resourcesApi.createSelectedPersonalPlusCheckouts({
+      space_ids: spaceIds,
+      proxy_country: checkoutCountry,
+      checkout_proxy_country: checkoutCountry,
+      update_proxy_country: updateCountry,
+      promo_campaign_id: campaign,
+      checkout_ui_mode: "hosted",
+      work_count: workCount,
+      created_by: "ops:personal-plus-checkout-selected",
+    });
+    if (!result.job_id) {
+      const firstReason = result.selection_skipped[0]?.reason || "没有符合条件的个人空间";
+      store.toast(
+        "未创建批量直卡 Checkout Job",
+        `选中=${result.requested_count} 跳过=${result.selection_skipped_count} · ${firstReason}`,
+        "warning",
+      );
+      return;
+    }
+    selectedPlusCheckoutOpen.value = false;
+    store.toast(
+      "批量直卡 Checkout Job 已创建",
+      `代理=${checkoutCountry} 选中=${result.requested_count} 排队=${result.selected_count} 跳过=${result.selection_skipped_count} 并发=${workCount}`,
+      result.selection_skipped_count ? "warning" : "success",
+    );
+    pageRef.value?.clearSelection();
+    await pageRef.value?.load();
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("批量直卡 Checkout Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    creatingSelectedPlusCheckouts.value = false;
+  }
+}
+
+function openPersonalPayPalLink(row: Row) {
+  paypalLinkTarget.value = row;
+  paypalLinkCampaign.value = String(row.promotion_id || "plus-1-month-free");
+}
+
+function paypalAgreementRequestConfig() {
+  const agreementCountry = paypalAgreementCountry.value.trim().toUpperCase();
+  const agreementProxyCountry = paypalAgreementProxyCountry.value.trim().toUpperCase();
+  const agreementSmsCountry = paypalAgreementSmsCountry.value.trim();
+  const agreementMaxCardAttempts = Number(paypalAgreementMaxCardAttempts.value);
+  const agreementEnabled = paypalLinkPaymentMethodType.value !== "paypal"
+    ? false
+    : paypalAgreementEnabled.value;
+  if (
+    agreementEnabled
+    && (!/^[A-Z]{2}$/.test(agreementCountry) || !/^[A-Z]{2}$/.test(agreementProxyCountry))
+  ) {
+    store.toast("协议授权配置无效", "协议国家和协议代理国家必须是两位代码。", "warning");
+    return null;
+  }
+  if (agreementEnabled && agreementSmsCountry && !/^\d+$/.test(agreementSmsCountry)) {
+    store.toast("协议授权配置无效", "短信国家编号只能包含数字。", "warning");
+    return null;
+  }
+  if (agreementEnabled && (!Number.isInteger(agreementMaxCardAttempts) || agreementMaxCardAttempts < 1 || agreementMaxCardAttempts > 20)) {
+    store.toast("协议授权配置无效", "最大换卡次数必须是 1 到 20 的整数。", "warning");
+    return null;
+  }
+  return {
+    execute_agreement: agreementEnabled,
+    agreement_country: agreementCountry,
+    agreement_proxy_country: agreementProxyCountry,
+    agreement_buyer_mode: paypalAgreementBuyerMode.value,
+    agreement_sms_country: agreementSmsCountry,
+    agreement_max_card_attempts: agreementMaxCardAttempts,
+    agreement_finalize_checkout: paypalAgreementFinalizeCheckout.value,
+  };
+}
+
+async function createPersonalPayPalLink() {
+  const id = String(paypalLinkTarget.value?.id || "");
+  if (!id) return;
+  const country = paypalLinkCountry.value.trim().toUpperCase();
+  const updateCountry = paypalLinkUpdateCountry.value.trim().toUpperCase();
+  const billingCountry = paypalLinkBillingCountry.value.trim().toUpperCase();
+  const currency = paypalLinkPaymentMethodType.value === "gcash"
+    ? "PHP"
+    : paypalLinkPaymentMethodType.value === "pix"
+      ? "BRL"
+    : paypalLinkCurrency.value.trim().toUpperCase();
+  paypalLinkCurrency.value = currency;
+  const campaign = paypalLinkCampaign.value.trim();
+  const agreementConfig = paypalAgreementRequestConfig();
+  if (!agreementConfig) return;
+  const paymentLabel = paypalLinkPaymentMethodType.value === "gcash"
+    ? "GCash"
+    : paypalLinkPaymentMethodType.value === "pix"
+      ? "PIX"
+    : paypalLinkPaymentMethodType.value === "card"
+      ? "Card"
+      : "PayPal";
+  if (!/^[A-Z]{2}$/.test(country) || updateCountry !== country || !/^[A-Z]{2}$/.test(billingCountry) || !/^[A-Z]{3}$/.test(currency)) {
+    store.toast("PP 提链配置无效", "代理和账单国家必须是两位代码，币种必须是三位代码。", "warning");
+    return;
+  }
+  if (paypalLinkApplyPromotion.value && !campaign) {
+    store.toast("PP 提链配置无效", "启用优惠时必须填写 campaign。", "warning");
+    return;
+  }
+  paypalLinkSpaceId.value = id;
+  try {
+    const name = String(paypalLinkTarget.value?.name || paypalLinkTarget.value?.external_space_id || id);
+    const result = await resourcesApi.createPersonalPayPalLink(id, {
+      proxy_country: country,
+      checkout_proxy_country: country,
+      update_proxy_country: updateCountry,
+      billing_country: billingCountry,
+      currency,
+      apply_promotion: paypalLinkApplyPromotion.value,
+      promo_campaign_id: campaign,
+      checkout_ui_mode: paypalLinkUiMode.value,
+      payment_method_type: paypalLinkPaymentMethodType.value,
+      ...agreementConfig,
+      created_by: "ops:personal-paypal-link",
+    });
+    paypalLinkTarget.value = null;
+    store.toast(
+      agreementConfig.execute_agreement ? "PayPal 提链 + 协议授权 Job 已创建" : `${paymentLabel} 提链 Job 已创建`,
+      `${name} · 账单 ${billingCountry}/${currency} · 代理 ${country}`,
+      "success",
+    );
+    await pageRef.value?.load();
+    if (result.job_id) await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast(`${paymentLabel} 提链 Job 创建失败`, String((err as Error).message ?? err), "error");
+  } finally {
+    paypalLinkSpaceId.value = "";
+  }
+}
+
 function updateSelection(rows: Row[]) {
   selectedSpaces.value = rows;
+}
+
+async function backfillSelectedSessions() {
+  const accountIds = selectedAccountIds.value;
+  if (!accountIds.length) {
+    store.toast("未找到可补 Session 的账号", "选中的空间没有账号归属，请选择个人空间或有账号归属的空间。", "warning");
+    return;
+  }
+  const proxyCountry = backfillSessionProxyCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(proxyCountry)) {
+    store.toast("代理国家无效", "请输入两位国家代码，例如 US。", "warning");
+    return;
+  }
+  backfillSessionProxyCountry.value = proxyCountry;
+  backfillingSelectedSessions.value = true;
+  try {
+    const result = await resourcesApi.backfillSession({
+      user_account_ids: accountIds,
+      work_count: Math.max(1, Math.min(500, backfillSessionWorkCount.value)),
+      proxy_country: proxyCountry,
+      created_by: "ops:space-selected-session-backfill",
+    });
+    backfillSessionConfirmOpen.value = false;
+    store.toast(
+      "补 Session Job 已创建",
+      `账号=${accountIds.length} 排队=${result.selected_count} Work=${result.work_count}`,
+      "success",
+    );
+    pageRef.value?.clearSelection();
+    await pageRef.value?.load();
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("补 Session Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    backfillingSelectedSessions.value = false;
+  }
+}
+
+async function refreshSelectedSubscriptions() {
+  const spaceIds = selectedSpaceIds.value;
+  if (!spaceIds.length) return;
+  refreshingSelectedSubscriptions.value = true;
+  try {
+    const result = await resourcesApi.refreshSelectedSpaceSubscriptions({
+      space_ids: spaceIds,
+      work_count: Math.min(spaceIds.length, 50),
+      created_by: "ops:space-subscription-refresh-selected",
+    });
+    if (!result.job_id) {
+      const firstReason = result.selection_skipped[0]?.reason || "没有符合条件的个人空间";
+      store.toast(
+        "没有可刷新的订阅",
+        `选中=${result.requested_count} 跳过=${result.selection_skipped_count} · ${firstReason}`,
+        "warning",
+      );
+      pageRef.value?.clearSelection();
+      await pageRef.value?.load();
+      return;
+    }
+    store.toast(
+      "刷新订阅 Job 已创建",
+      `空间=${spaceIds.length} 排队=${result.selected_count} 跳过=${result.selection_skipped_count} Work=${result.work_count}`,
+      result.selection_skipped_count ? "warning" : "success",
+    );
+    pageRef.value?.clearSelection();
+    await pageRef.value?.load();
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("刷新订阅 Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    refreshingSelectedSubscriptions.value = false;
+  }
+}
+
+function openSelectedPayPalLink() {
+  if (!selectedSpaceIds.value.length) {
+    store.toast("未选择空间", "请先选择需要提链或协议授权的个人空间。", "warning");
+    return;
+  }
+  const firstPromotion = selectedSpaces.value.find(
+    (row) => String(row.space_type || "") === "personal" && String(row.promotion_id || "").trim(),
+  );
+  paypalLinkCampaign.value = String(firstPromotion?.promotion_id || "plus-1-month-free");
+  selectedPayPalLinkOpen.value = true;
+}
+
+async function createSelectedPersonalPayPalLinks() {
+  const spaceIds = selectedSpaceIds.value;
+  if (!spaceIds.length) return;
+  const country = paypalLinkCountry.value.trim().toUpperCase();
+  const updateCountry = paypalLinkUpdateCountry.value.trim().toUpperCase();
+  const billingCountry = paypalLinkBillingCountry.value.trim().toUpperCase();
+  const currency = paypalLinkPaymentMethodType.value === "gcash"
+    ? "PHP"
+    : paypalLinkPaymentMethodType.value === "pix"
+      ? "BRL"
+    : paypalLinkCurrency.value.trim().toUpperCase();
+  paypalLinkCurrency.value = currency;
+  const campaign = paypalLinkCampaign.value.trim();
+  const agreementConfig = paypalAgreementRequestConfig();
+  if (!agreementConfig) return;
+  const paymentLabel = paypalLinkPaymentMethodType.value === "gcash"
+    ? "GCash"
+    : paypalLinkPaymentMethodType.value === "pix"
+      ? "PIX"
+    : paypalLinkPaymentMethodType.value === "card"
+      ? "Card"
+      : "PayPal";
+  if (!/^[A-Z]{2}$/.test(country) || updateCountry !== country || !/^[A-Z]{2}$/.test(billingCountry) || !/^[A-Z]{3}$/.test(currency)) {
+    store.toast("PP 提链配置无效", "代理和账单国家必须是两位代码，币种必须是三位代码。", "warning");
+    return;
+  }
+  if (paypalLinkApplyPromotion.value && !campaign) {
+    store.toast("PP 提链配置无效", "启用优惠时必须填写 campaign。", "warning");
+    return;
+  }
+  creatingSelectedPayPalLinks.value = true;
+  try {
+    const result = await resourcesApi.createSelectedPersonalPayPalLinks({
+      space_ids: spaceIds,
+      proxy_country: country,
+      checkout_proxy_country: country,
+      update_proxy_country: updateCountry,
+      billing_country: billingCountry,
+      currency,
+      apply_promotion: paypalLinkApplyPromotion.value,
+      promo_campaign_id: campaign,
+      checkout_ui_mode: paypalLinkUiMode.value,
+      payment_method_type: paypalLinkPaymentMethodType.value,
+      work_count: paypalLinkWorkCount.value,
+      ...agreementConfig,
+      created_by: "ops:personal-paypal-link-selected",
+    });
+    if (!result.job_id) {
+      const firstReason = result.selection_skipped[0]?.reason || "没有符合条件的个人空间";
+      store.toast(
+        `未创建 ${paymentLabel} 提链 Job`,
+        `选中=${result.requested_count} 跳过=${result.selection_skipped_count} · ${firstReason}`,
+        "warning",
+      );
+      return;
+    }
+    selectedPayPalLinkOpen.value = false;
+    store.toast(
+      agreementConfig.execute_agreement ? "批量 PayPal 提链 + 协议授权 Job 已创建" : `批量 ${paymentLabel} 提链 Job 已创建`,
+      `账单=${billingCountry}/${currency} 代理=${country} 选中=${result.requested_count} 排队=${result.selected_count} 跳过=${result.selection_skipped_count}`,
+      result.selection_skipped_count ? "warning" : "success",
+    );
+    pageRef.value?.clearSelection();
+    await pageRef.value?.load();
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast(`批量 ${paymentLabel} 提链 Job 创建失败`, String((err as Error).message ?? err), "error");
+  } finally {
+    creatingSelectedPayPalLinks.value = false;
+  }
 }
 
 async function openSelectedPaymentMethodBind() {
@@ -597,10 +1125,17 @@ async function openSelectedPaymentMethodBind() {
 async function bindSelectedPersonalPaymentMethods() {
   const spaceIds = selectedSpaceIds.value;
   if (!spaceIds.length) return;
+  const country = paymentBindCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(country)) {
+    store.toast("绑卡配置无效", "绑卡国家必须是两位国家代码。", "warning");
+    return;
+  }
+  paymentBindCountry.value = country;
   bindingSelectedPaymentSpaces.value = true;
   try {
     const result = await resourcesApi.bindSelectedPersonalPaymentMethods({
       space_ids: spaceIds,
+      proxy_country: country,
       auto_start_plus_checkout: autoStartPlusCheckout.value,
       checkout_ui_mode: "custom",
       created_by: "ops:personal-payment-method-bind-selected",
@@ -700,6 +1235,7 @@ onMounted(() => {
     :columns="columns"
     :loader="resourcesApi.spaces"
     :filters="filters"
+    batch-search
     empty-text="暂无空间。"
     @selection-change="updateSelection"
   >
@@ -708,8 +1244,23 @@ onMounted(() => {
       <button class="btn" :disabled="!selectedSpaceIds.length || bindingSelectedPaymentSpaces" @click="openSelectedPaymentMethodBind">
         <CreditCard :size="16" />绑定选中账号（{{ selectedSpaceIds.length }}）
       </button>
+      <button class="btn" :disabled="!selectedAccountIds.length || backfillingSelectedSessions" @click="backfillSessionConfirmOpen = true">
+        <RefreshCw :size="16" />补选中账号 Session（{{ selectedAccountIds.length }}）
+      </button>
+      <button class="btn" :disabled="!selectedSpaceIds.length || refreshingSelectedSubscriptions" @click="refreshSelectedSubscriptions">
+        <RefreshCw :size="16" />{{ refreshingSelectedSubscriptions ? "提交刷新订阅中..." : "刷新选中订阅" }}（{{ selectedSpaceIds.length }}）
+      </button>
       <button class="btn" :disabled="!selectedSpaceIds.length || checkingSelectedPromotions" @click="openSelectedPromotionCheck">
         <BadgePercent :size="16" />检测选中优惠（{{ selectedSpaceIds.length }}）
+      </button>
+      <button class="btn" @click="togglePromotionOffers">
+        <BadgePercent :size="16" />{{ promotionOffersOpen ? "隐藏优惠明细" : "查看优惠明细" }}
+      </button>
+      <button class="btn" :disabled="!selectedSpaceIds.length || creatingSelectedPlusCheckouts" @click="openSelectedPlusCheckout">
+        <CreditCard :size="16" />直卡 Checkout（{{ selectedSpaceIds.length }}）
+      </button>
+      <button class="btn" :disabled="!selectedSpaceIds.length || creatingSelectedPayPalLinks" @click="openSelectedPayPalLink">
+        <Link2 :size="16" />支付提链（{{ selectedSpaceIds.length }}）
       </button>
       <button class="btn" @click="openPaymentPoolImport"><CreditCard :size="16" />支付资料池</button>
       <button class="btn" @click="openReplenishEmailImport"><Upload :size="16" />导入补号邮箱</button>
@@ -743,6 +1294,36 @@ onMounted(() => {
           </template>
         </DataTable>
       </section>
+      <section v-if="promotionOffersOpen" class="admin-table-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>优惠明细</h2>
+            <p>每行代表一个空间在一个检测国家下返回的一个优惠。搜索框支持邮箱、空间名和优惠 ID。</p>
+          </div>
+          <button class="icon-btn labeled" @click="loadPromotionOffers()">
+            <RefreshCw :size="15" :class="{ spin: promotionOffersLoading }" />刷新
+          </button>
+        </div>
+        <DataTable
+          :columns="promotionOfferColumns"
+          :rows="promotionOffersResult.items"
+          :total="promotionOffersResult.total"
+          :page="promotionOffersResult.page"
+          :page-size="promotionOffersResult.page_size"
+          :sort="promotionOffersResult.sort"
+          :loading="promotionOffersLoading"
+          :error="promotionOffersError"
+          :filters="[
+            { key: 'countries', label: '检测国家', input: true, placeholder: 'ISO2 国家代码，可多个逗号分隔' },
+            { key: 'status', label: '状态', options: [{ label: '可用', value: 'eligible' }, { label: '失效', value: 'ineligible' }, { label: '过期记录', value: 'stale' }] },
+          ]"
+          :selectable="false"
+          remote
+          empty-text="暂无优惠明细。"
+          @query-change="loadPromotionOffers"
+          @refresh="loadPromotionOffers()"
+        />
+      </section>
     </template>
     <template #rowActions="{ row }">
       <div class="row-actions">
@@ -756,13 +1337,22 @@ onMounted(() => {
           <CreditCard :size="14" />绑定支付方式
         </button>
         <button
-          v-if="String(row.space_type || '') === 'personal' && Boolean(row.has_promotion) && Boolean(row.has_payment_method) && String(row.payment_method_status || '') === 'bound'"
+          v-if="String(row.space_type || '') === 'personal' && Boolean(row.has_promotion)"
           class="btn primary small"
           :disabled="String(row.space_status || '') !== 'active' || plusCheckoutSpaceId === String(row.id || '')"
-          title="使用已有支付方式提交 Plus Checkout"
+          title="提交 Plus Checkout；未绑定支付方式时先自动绑定"
           @click.stop="plusCheckoutTarget = row"
         >
           <BadgePercent :size="14" />Plus 支付
+        </button>
+        <button
+          v-if="String(row.space_type || '') === 'personal'"
+          class="btn secondary small"
+          :disabled="String(row.space_status || '') !== 'active' || paypalLinkSpaceId === String(row.id || '')"
+          title="生成 PayPal、GCash 或 Card 支付链接"
+          @click.stop="openPersonalPayPalLink(row)"
+        >
+          <Link2 :size="14" />支付提链
         </button>
         <label
           v-if="String(row.space_type || '') === 'business'"
@@ -837,6 +1427,28 @@ onMounted(() => {
     </template>
   </ResourcePage>
 
+  <ConfirmModal
+    :open="backfillSessionConfirmOpen"
+    title="补选中账号 Session"
+    message="选择本次登录使用的代理国家，确认后按账号去重创建补 Session Work。"
+    :summary="{ '选中空间': selectedSpaceIds.length, '去重账号': selectedAccountIds.length, '代理国家': backfillSessionProxyCountry.toUpperCase(), '同时执行 Work': backfillSessionWorkCount }"
+    confirm-text="创建补 Session Job"
+    :busy="backfillingSelectedSessions"
+    @close="backfillSessionConfirmOpen = false"
+    @confirm="backfillSelectedSessions"
+  >
+    <div class="promotion-check-config">
+      <label class="field">
+        <span>代理国家</span>
+        <input v-model="backfillSessionProxyCountry" class="input" maxlength="2" pattern="[A-Za-z]{2}" placeholder="US" @input="backfillSessionProxyCountry = backfillSessionProxyCountry.toUpperCase()" />
+      </label>
+      <label class="field">
+        <span>并发数</span>
+        <input v-model.number="backfillSessionWorkCount" class="input" type="number" min="1" max="500" />
+      </label>
+    </div>
+  </ConfirmModal>
+
   <FormDrawer :open="showCredentialPanel" title="创建 Business Access Token" description="为已加入 Business 空间的成员创建空间凭证。" submit-text="创建凭证 Job" :busy="creatingCredential" width="wide" @close="showCredentialPanel = false" @submit="createBusinessCredentials">
     <label class="field"><span>成员账号</span><EntitySelect v-model="credentialUserAccountIds" :loader="accountLoader" multiple placeholder="按邮箱搜索并添加账号" /></label>
     <label class="field"><span>Business 空间</span><EntitySelect v-model="credentialExternalSpaceId" :loader="businessSpaceLoader" placeholder="按空间名称或外部 ID 搜索" /></label>
@@ -883,12 +1495,20 @@ onMounted(() => {
     :open="Boolean(paymentBindTarget)"
     title="绑定个人空间支付方式"
     message="使用该账号绑定的静态代理登录个人空间，并依次尝试最多三张未使用卡片。"
-    :summary="{ '空间': paymentBindTarget?.name, '外部空间 ID': paymentBindTarget?.external_space_id, '已尝试': paymentBindTarget?.payment_method_attempt_count, '冷却至': paymentBindTarget?.payment_method_cooldown_until || '无', '可用卡': paymentInventorySummary.available_card_count ?? 0 }"
+    :summary="{ '空间': paymentBindTarget?.name, '外部空间 ID': paymentBindTarget?.external_space_id, '绑卡国家': paymentBindCountry, '该国地址': selectedPaymentAddressCount, '已尝试': paymentBindTarget?.payment_method_attempt_count, '冷却至': paymentBindTarget?.payment_method_cooldown_until || '无', '可用卡': paymentInventorySummary.available_card_count ?? 0 }"
     confirm-text="创建绑卡 Job"
     :busy="Boolean(bindingPaymentSpaceId)"
     @close="paymentBindTarget = null"
     @confirm="bindPersonalPaymentMethod"
   >
+    <label class="field">
+      <span>绑卡国家（地址 + 代理）</span>
+      <select v-model="paymentBindCountry" class="input">
+        <option v-for="option in paymentAddressCountryOptions" :key="option.country" :value="option.country">
+          {{ option.country }}（可用地址 {{ option.count }}）
+        </option>
+      </select>
+    </label>
     <label class="auto-replenish-toggle">
       <input v-model="autoStartPlusCheckout" type="checkbox" />
       <span>绑卡成功后继续 Plus 支付</span>
@@ -897,29 +1517,266 @@ onMounted(() => {
   <ConfirmModal
     :open="Boolean(plusCheckoutTarget)"
     title="提交 Plus Checkout"
-    message="前置要求为有效优惠和已绑定支付方式；先用 US 创建 Checkout，再用 JP 更新优惠并提交。支付成功后重新获取 Session。"
-    :summary="{ '空间': plusCheckoutTarget?.name, '优惠': plusCheckoutTarget?.promotion_id, '支付卡': plusCheckoutTarget?.payment_method_last4 || '已绑定' }"
+    message="需要有效优惠；未绑定支付方式时先自动绑定，成功后继续 Checkout。ChatGPT、Checkout Update、Stripe/Confirm 复用同一个 Checkout 代理。"
+    :summary="{ '空间': plusCheckoutTarget?.name, '优惠': plusCheckoutTarget?.promotion_id, '支付卡': plusCheckoutTarget?.payment_method_last4 || '未绑定，将先绑定', 'Checkout 代理': plusCheckoutCreateCountry, 'Update 代理': plusCheckoutPromoCountry }"
     confirm-text="创建 Plus 支付 Job"
     :busy="Boolean(plusCheckoutSpaceId)"
     @close="plusCheckoutTarget = null"
     @confirm="createPersonalPlusCheckout"
   >
     <div class="promotion-check-config">
-      <label class="field"><span>创建 Checkout 代理国家</span><input v-model="plusCheckoutCreateCountry" class="input" maxlength="2" autocomplete="off" /></label>
-      <label class="field"><span>更新优惠代理国家</span><input v-model="plusCheckoutPromoCountry" class="input" maxlength="2" autocomplete="off" /></label>
+      <label class="field"><span>Checkout 代理国家</span><input v-model="plusCheckoutCreateCountry" class="input" maxlength="2" autocomplete="off" /></label>
+      <label class="field"><span>Update 代理国家</span><input :value="plusCheckoutPromoCountry" class="input" readonly /></label>
       <label class="field"><span>优惠 campaign</span><input v-model="plusCheckoutCampaign" class="input" autocomplete="off" /></label>
+    </div>
+  </ConfirmModal>
+  <ConfirmModal
+    :open="selectedPlusCheckoutOpen"
+    title="批量直卡 Checkout"
+    message="为选中的有效个人空间创建独立 Checkout Work；未绑定支付方式的空间会先自动绑定。每个 Work 的 ChatGPT、Update 和 Stripe/Confirm 使用同一个代理。"
+    :summary="{ '选中空间': selectedSpaceIds.length, '个人空间': selectedPersonalSpaceCount, 'Checkout 代理': plusCheckoutCreateCountry, 'Update 代理': plusCheckoutPromoCountry, '并发': plusCheckoutWorkCount }"
+    confirm-text="创建批量 Checkout Job"
+    :busy="creatingSelectedPlusCheckouts"
+    @close="selectedPlusCheckoutOpen = false"
+    @confirm="createSelectedPersonalPlusCheckouts"
+  >
+    <div class="promotion-check-config">
+      <label class="field"><span>Checkout 代理国家</span><input v-model="plusCheckoutCreateCountry" class="input" maxlength="2" autocomplete="off" /></label>
+      <label class="field"><span>Update 代理国家</span><input :value="plusCheckoutPromoCountry" class="input" readonly /></label>
+      <label class="field"><span>优惠 campaign</span><input v-model="plusCheckoutCampaign" class="input" autocomplete="off" /></label>
+      <label class="field"><span>并发数</span><input v-model.number="plusCheckoutWorkCount" class="input" type="number" min="1" max="50" step="1" /></label>
+    </div>
+  </ConfirmModal>
+  <ConfirmModal
+    :open="Boolean(paypalLinkTarget)"
+    title="支付提链 + PayPal 协议授权"
+    message="生成 PayPal、GCash、PIX 或 Card 支付链接；只有 PayPal 可继续执行协议授权。"
+    :summary="{ '空间': paypalLinkTarget?.name, '支付方式': paypalLinkPaymentMethodType === 'card' ? 'Card / 默认 pm_*' : paypalLinkPaymentMethodType === 'gcash' ? 'GCash' : paypalLinkPaymentMethodType === 'pix' ? 'PIX' : 'PayPal', '账单': `${paypalLinkBillingCountry}/${paypalLinkCurrency}`, 'Checkout / Provider 代理': paypalLinkCountry, 'Update 代理': paypalLinkUpdateCountry, '模式': paypalLinkUiMode === 'hosted' ? 'Hosted / CS' : 'Custom / OAICS', '协议授权': paypalAgreementEnabled ? `${paypalAgreementCountry}/${paypalAgreementProxyCountry}` : '关闭（仅提链）' }"
+    :confirm-text="paypalLinkPaymentMethodType === 'paypal' && paypalAgreementEnabled ? '创建提链 + 授权 Job' : '创建提链 Job'"
+    :busy="Boolean(paypalLinkSpaceId)"
+    @close="paypalLinkTarget = null"
+    @confirm="createPersonalPayPalLink"
+  >
+    <div class="promotion-check-config">
+      <label class="field">
+        <span>Checkout / Provider 代理国家</span>
+        <input v-model="paypalLinkCountry" class="input" maxlength="2" autocomplete="off" list="paypal-country-options" :disabled="paypalLinkPaymentMethodType === 'pix'" />
+        <datalist id="paypal-country-options">
+          <option value="US" /><option value="DE" /><option value="GB" /><option value="FR" />
+          <option value="NL" /><option value="CA" /><option value="AU" /><option value="JP" />
+          <option value="BR" /><option value="TH" /><option value="TR" />
+        </datalist>
+      </label>
+      <label class="field">
+        <span>账单国家</span>
+        <select v-model="paypalLinkBillingCountry" class="input" :disabled="paypalLinkPaymentMethodType === 'pix'">
+          <option value="DE">DE</option><option value="CA">CA</option><option value="US">US</option>
+          <option value="AU">AU</option><option value="GB">GB</option><option value="JP">JP</option><option value="PH">PH</option><option value="PL">PL</option>
+          <option value="SG">SG</option><option value="TR">TR</option><option value="VN">VN</option><option value="BR">BR</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Update 代理国家</span>
+        <input :value="paypalLinkUpdateCountry" class="input" readonly />
+      </label>
+      <label class="field">
+        <span>币种</span>
+        <input
+          v-model="paypalLinkCurrency"
+          class="input"
+          maxlength="3"
+          autocomplete="off"
+          list="paypal-currency-options"
+          :disabled="paypalLinkPaymentMethodType === 'gcash' || paypalLinkPaymentMethodType === 'pix'"
+          @input="paypalLinkCurrencyEdited = true"
+        />
+        <datalist id="paypal-currency-options">
+          <option v-for="currency in paypalLinkCurrencyOptions" :key="currency" :value="currency" />
+        </datalist>
+      </label>
+      <label class="field">
+        <span>Checkout 模式</span>
+        <select v-model="paypalLinkUiMode" class="input" :disabled="paypalLinkPaymentMethodType === 'pix'">
+          <option value="hosted">Hosted / CS</option>
+          <option value="custom">Custom / OAICS</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>支付方式</span>
+        <select v-model="paypalLinkPaymentMethodType" class="input">
+          <option value="paypal">PayPal</option>
+          <option value="card">Card（使用默认 pm_*）</option>
+          <option value="gcash">GCash（PH / PHP，代理可配置）</option>
+          <option value="pix">PIX（BR / BRL，同一代理）</option>
+        </select>
+      </label>
+      <label class="auto-replenish-toggle">
+        <input v-model="paypalAgreementEnabled" type="checkbox" :disabled="paypalLinkPaymentMethodType !== 'paypal'" />
+        <span>执行 PayPal 协议授权{{ paypalLinkPaymentMethodType !== "paypal" ? "（仅 PayPal 可用）" : "（关闭后仅提链）" }}</span>
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>协议国家</span>
+        <input v-model="paypalAgreementCountry" class="input" maxlength="2" autocomplete="off" list="paypal-country-options" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>协议代理国家</span>
+        <input v-model="paypalAgreementProxyCountry" class="input" maxlength="2" autocomplete="off" list="paypal-country-options" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>买家模式</span>
+        <select v-model="paypalAgreementBuyerMode" class="input">
+          <option value="identity_elevation">Identity elevation</option>
+          <option value="original">Original</option>
+        </select>
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>短信国家编号</span>
+        <input v-model="paypalAgreementSmsCountry" class="input" inputmode="numeric" autocomplete="off" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>最大换卡次数</span>
+        <input v-model.number="paypalAgreementMaxCardAttempts" class="input" type="number" min="1" max="20" step="1" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="auto-replenish-toggle">
+        <input v-model="paypalAgreementFinalizeCheckout" type="checkbox" />
+        <span>授权成功后校验 Checkout 到账</span>
+      </label>
+      <label class="auto-replenish-toggle">
+        <input v-model="paypalLinkApplyPromotion" type="checkbox" />
+        <span>应用优惠</span>
+      </label>
+      <label v-if="paypalLinkApplyPromotion" class="field">
+        <span>优惠 campaign</span>
+        <input v-model="paypalLinkCampaign" class="input" autocomplete="off" />
+      </label>
+    </div>
+  </ConfirmModal>
+  <ConfirmModal
+    :open="selectedPayPalLinkOpen"
+    title="批量支付提链 + PayPal 协议授权"
+    message="为选中的有效个人空间分别创建 PayPal、GCash、PIX 或 Card 提链 Work。"
+    :summary="{ '选中空间': selectedSpaceIds.length, '个人空间': selectedPersonalSpaceCount, '支付方式': paypalLinkPaymentMethodType === 'card' ? 'Card / 默认 pm_*' : paypalLinkPaymentMethodType === 'gcash' ? 'GCash' : paypalLinkPaymentMethodType === 'pix' ? 'PIX' : 'PayPal', '账单': `${paypalLinkBillingCountry}/${paypalLinkCurrency}`, 'Checkout / Provider 代理': paypalLinkCountry, 'Update 代理': paypalLinkUpdateCountry, '并发': paypalLinkWorkCount, '模式': paypalLinkUiMode === 'hosted' ? 'Hosted / CS' : 'Custom / OAICS', '协议授权': paypalAgreementEnabled ? `${paypalAgreementCountry}/${paypalAgreementProxyCountry}` : '关闭（仅提链）' }"
+    :confirm-text="paypalLinkPaymentMethodType === 'paypal' && paypalAgreementEnabled ? '创建批量提链 + 授权 Job' : '创建批量提链 Job'"
+    :busy="creatingSelectedPayPalLinks"
+    @close="selectedPayPalLinkOpen = false"
+    @confirm="createSelectedPersonalPayPalLinks"
+  >
+    <div class="promotion-check-config">
+      <label class="field">
+        <span>Checkout / Provider 代理国家</span>
+        <input v-model="paypalLinkCountry" class="input" maxlength="2" autocomplete="off" list="selected-paypal-country-options" :disabled="paypalLinkPaymentMethodType === 'pix'" />
+        <datalist id="selected-paypal-country-options">
+          <option value="US" /><option value="DE" /><option value="GB" /><option value="FR" />
+          <option value="NL" /><option value="CA" /><option value="AU" /><option value="JP" />
+          <option value="BR" /><option value="TH" /><option value="TR" />
+        </datalist>
+      </label>
+      <label class="field">
+        <span>账单国家</span>
+        <select v-model="paypalLinkBillingCountry" class="input" :disabled="paypalLinkPaymentMethodType === 'pix'">
+          <option value="DE">DE</option><option value="CA">CA</option><option value="US">US</option>
+          <option value="AU">AU</option><option value="GB">GB</option><option value="JP">JP</option><option value="PH">PH</option><option value="PL">PL</option>
+          <option value="SG">SG</option><option value="TR">TR</option><option value="VN">VN</option><option value="BR">BR</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Update 代理国家</span>
+        <input :value="paypalLinkUpdateCountry" class="input" readonly />
+      </label>
+      <label class="field">
+        <span>币种</span>
+        <input
+          v-model="paypalLinkCurrency"
+          class="input"
+          maxlength="3"
+          autocomplete="off"
+          list="selected-paypal-currency-options"
+          :disabled="paypalLinkPaymentMethodType === 'gcash' || paypalLinkPaymentMethodType === 'pix'"
+          @input="paypalLinkCurrencyEdited = true"
+        />
+        <datalist id="selected-paypal-currency-options">
+          <option v-for="currency in paypalLinkCurrencyOptions" :key="currency" :value="currency" />
+        </datalist>
+      </label>
+      <label class="field">
+        <span>Checkout 模式</span>
+        <select v-model="paypalLinkUiMode" class="input" :disabled="paypalLinkPaymentMethodType === 'pix'">
+          <option value="hosted">Hosted / CS</option>
+          <option value="custom">Custom / OAICS</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>支付方式</span>
+        <select v-model="paypalLinkPaymentMethodType" class="input">
+          <option value="paypal">PayPal</option>
+          <option value="card">Card（使用默认 pm_*）</option>
+          <option value="gcash">GCash（PH / PHP，代理可配置）</option>
+          <option value="pix">PIX（BR / BRL，同一代理）</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>并发数</span>
+        <input v-model.number="paypalLinkWorkCount" class="input" type="number" min="1" max="50" step="1" />
+      </label>
+      <label class="auto-replenish-toggle">
+        <input v-model="paypalAgreementEnabled" type="checkbox" :disabled="paypalLinkPaymentMethodType !== 'paypal'" />
+        <span>执行 PayPal 协议授权{{ paypalLinkPaymentMethodType !== "paypal" ? "（仅 PayPal 可用）" : "（关闭后仅提链）" }}</span>
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>协议国家</span>
+        <input v-model="paypalAgreementCountry" class="input" maxlength="2" autocomplete="off" list="selected-paypal-country-options" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>协议代理国家</span>
+        <input v-model="paypalAgreementProxyCountry" class="input" maxlength="2" autocomplete="off" list="selected-paypal-country-options" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>买家模式</span>
+        <select v-model="paypalAgreementBuyerMode" class="input">
+          <option value="identity_elevation">Identity elevation</option>
+          <option value="original">Original</option>
+        </select>
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>短信国家编号</span>
+        <input v-model="paypalAgreementSmsCountry" class="input" inputmode="numeric" autocomplete="off" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="field">
+        <span>最大换卡次数</span>
+        <input v-model.number="paypalAgreementMaxCardAttempts" class="input" type="number" min="1" max="20" step="1" />
+      </label>
+      <label v-if="paypalAgreementEnabled" class="auto-replenish-toggle">
+        <input v-model="paypalAgreementFinalizeCheckout" type="checkbox" />
+        <span>授权成功后校验 Checkout 到账</span>
+      </label>
+      <label class="auto-replenish-toggle">
+        <input v-model="paypalLinkApplyPromotion" type="checkbox" />
+        <span>应用优惠</span>
+      </label>
+      <label v-if="paypalLinkApplyPromotion" class="field">
+        <span>优惠 campaign</span>
+        <input v-model="paypalLinkCampaign" class="input" autocomplete="off" />
+      </label>
     </div>
   </ConfirmModal>
   <ConfirmModal
     :open="selectedPaymentBindOpen"
     title="批量绑定个人空间支付方式"
     message="为选中的有效个人空间创建绑卡 Work；已绑定、冷却中、非个人空间、无效账号和已有活动绑卡任务的项目会跳过。每个空间仍按现有规则最多尝试三张卡。"
-    :summary="{ '选中空间': selectedSpaceIds.length, '个人空间': selectedPersonalSpaceCount, '未绑定且可尝试': selectedUnboundPersonalSpaceCount, '可用卡': paymentInventorySummary.available_card_count ?? 0 }"
+    :summary="{ '选中空间': selectedSpaceIds.length, '个人空间': selectedPersonalSpaceCount, '未绑定且可尝试': selectedUnboundPersonalSpaceCount, '绑卡国家': paymentBindCountry, '该国地址': selectedPaymentAddressCount, '可用卡': paymentInventorySummary.available_card_count ?? 0 }"
     confirm-text="创建批量绑卡 Job"
     :busy="bindingSelectedPaymentSpaces"
     @close="selectedPaymentBindOpen = false"
     @confirm="bindSelectedPersonalPaymentMethods"
   >
+    <label class="field">
+      <span>绑卡国家（地址 + 代理）</span>
+      <select v-model="paymentBindCountry" class="input">
+        <option v-for="option in paymentAddressCountryOptions" :key="option.country" :value="option.country">
+          {{ option.country }}（可用地址 {{ option.count }}）
+        </option>
+      </select>
+    </label>
     <label class="auto-replenish-toggle">
       <input v-model="autoStartPlusCheckout" type="checkbox" />
       <span>绑卡成功后继续 Plus 支付</span>

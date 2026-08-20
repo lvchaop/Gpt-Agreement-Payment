@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import random
 import re
+import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import httpx
 from sqlalchemy.orm import Session
+
+try:  # pragma: no cover - fcntl is available on the supported host platforms.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 from refactor_app.application.workflows.account_auth import (
     BackfillRtWorkflow,
@@ -82,15 +92,19 @@ class ProtocolRegistrationInput:
     browser_headless: bool = True
     browser_otp_timeout_s: int = 180
     browser_close_delay_s: float = 10.0
-    phone_provider: str = "hero_sms"
-    phone_base_url: str = "https://hero-sms.com/stubs/handler_api.php"
-    phone_api_key_env: str = "HERO_SMS_API_KEY"
+    browser_log_enabled: bool = False
+    browser_log_capture_bodies: bool = False
+    browser_log_max_body_chars: int = 20_000
+    phone_provider: str = "grizzly_sms"
+    phone_base_url: str = "https://api.grizzlysms.com/stubs/handler_api.php"
+    phone_api_key_env: str = "GRIZZLY_SMS_API_KEY"
     phone_service: str = "dr"
     phone_country: str = ""
-    phone_countries: list[str] = field(default_factory=lambda: ["151", "73", "16"])
-    phone_max_price: str = "0.05"
+    phone_countries: list[str] = field(default_factory=lambda: ["187"])
+    phone_max_price: str = "0.18"
     phone_country_max_prices: dict[str, str] = field(default_factory=dict)
     phone_max_number_attempts: int = 3
+    phone_request_timeout_s: int = 20
     phone_otp_timeout_s: int = 180
     phone_otp_poll_interval_s: float = 3.0
 
@@ -205,10 +219,11 @@ class ProtocolRegistrationWorkflow:
                     "user_account_id": user_account_id,
                     "has_proxy": True,
                     "proxy_type": "static_proxy",
-                    "proxy_mode": "cliproxy_sticky",
-                    "proxy_source": "target_email_hash",
+                    "proxy_mode": proxy.proxy_mode,
+                    "proxy_source": proxy.proxy_source,
                     "proxy_provider": proxy.provider,
                     "proxy_country": proxy.country_code,
+                    "proxy_egress_ip": proxy.egress_ip,
                     "proxy_sid_source": proxy.sid_source,
                     "proxy_probe_attempts": proxy.probe_attempts,
                 },
@@ -219,6 +234,7 @@ class ProtocolRegistrationWorkflow:
                 user_account_id=user_account_id,
                 work_id=work_id,
                 proxy_url=proxy.proxy_url,
+                proxy_mode=proxy.proxy_mode,
                 emit=emit,
             )
             result = attempt.result
@@ -299,6 +315,7 @@ class ProtocolRegistrationWorkflow:
                 "mail_claim": _safe_claim_dict(claimed),
                 "proxy_provider": proxy.provider,
                 "proxy_country": proxy.country_code,
+                "proxy_egress_ip": proxy.egress_ip,
                 "proxy_sid_source": proxy.sid_source,
                 "proxy_probe_attempts": proxy.probe_attempts,
             }
@@ -368,6 +385,7 @@ class ProtocolRegistrationWorkflow:
         user_account_id: str,
         work_id: str,
         proxy_url: str,
+        proxy_mode: str = "cliproxy_sticky",
         emit: TraceEmitter,
     ) -> _RegistrationAttempt:
         del user_account_id, work_id
@@ -377,7 +395,7 @@ class ProtocolRegistrationWorkflow:
             "register": {
                 "region": input_.proxy_country.upper(),
                 "country_code": input_.proxy_country.upper(),
-                "mode": "cliproxy_sticky",
+                "mode": proxy_mode,
             }
         }
         flow = AuthFlow(cfg, trace_callback=self._make_http_trace_callback(emit))
@@ -396,8 +414,10 @@ class ProtocolRegistrationWorkflow:
         user_account_id: str,
         work_id: str,
         proxy_url: str,
+        proxy_mode: str = "cliproxy_sticky",
         emit: TraceEmitter,
     ) -> _RegistrationAttempt:
+        del proxy_mode
         del user_account_id
         browser = CamoufoxEmailRegistration(
             BrowserEmailRegistrationConfig(
@@ -406,6 +426,12 @@ class ProtocolRegistrationWorkflow:
                 otp_timeout_s=max(1, int(input_.browser_otp_timeout_s or 180)),
                 success_close_delay_s=max(0.0, float(input_.browser_close_delay_s or 0.0)),
                 work_id=work_id,
+                browser_log_enabled=bool(input_.browser_log_enabled),
+                browser_log_capture_bodies=bool(input_.browser_log_capture_bodies),
+                browser_log_max_body_chars=max(
+                    1_000,
+                    int(input_.browser_log_max_body_chars or 20_000),
+                ),
             ),
             event_callback=emit,
         )
@@ -423,6 +449,7 @@ class ProtocolRegistrationWorkflow:
         user_account_id: str,
         work_id: str,
         proxy_url: str,
+        proxy_mode: str = "cliproxy_sticky",
         emit: TraceEmitter,
     ) -> _RegistrationAttempt:
         del user_account_id, work_id
@@ -432,7 +459,7 @@ class ProtocolRegistrationWorkflow:
             "register": {
                 "region": input_.proxy_country.upper(),
                 "country_code": input_.proxy_country.upper(),
-                "mode": "cliproxy_sticky",
+                "mode": proxy_mode,
             }
         }
         cfg.phone = _phone_config(input_)
@@ -792,7 +819,8 @@ class ProtocolRegistrationWorkflow:
                     "user_account_id": user_account_id,
                     "proxy_provider": proxy.provider,
                     "proxy_country": proxy.country_code,
-                    "proxy_source": "target_email_hash",
+                    "proxy_egress_ip": proxy.egress_ip,
+                    "proxy_source": proxy.proxy_source,
                     "proxy_sid_source": proxy.sid_source,
                     "proxy_probe_attempts": proxy.probe_attempts,
                 },
@@ -813,6 +841,7 @@ class ProtocolRegistrationWorkflow:
                     "promotion_id": str(result.get("promotion_id") or ""),
                     "proxy_provider": proxy.provider,
                     "proxy_country": proxy.country_code,
+                    "proxy_egress_ip": proxy.egress_ip,
                     "proxy_sid_source": proxy.sid_source,
                     "proxy_probe_attempts": proxy.probe_attempts,
                 },
@@ -820,6 +849,7 @@ class ProtocolRegistrationWorkflow:
             return {
                 **result,
                 "proxy_provider": proxy.provider,
+                "proxy_egress_ip": proxy.egress_ip,
                 "proxy_sid_source": proxy.sid_source,
                 "proxy_probe_attempts": proxy.probe_attempts,
             }
@@ -1327,18 +1357,736 @@ class HeroSmsPhoneProviderAdapter:
             self._event_callback(stage, data, level)
 
 
+class _HeroActivationLockUnavailable(RuntimeError):
+    pass
+
+
+class HeroSmsLongTermPhoneProviderAdapter(HeroSmsPhoneProviderAdapter):
+    """Reuse an already-rented HeroSMS activation for PayPal OTPs.
+
+    The normal :class:`HeroSmsPhoneProviderAdapter` owns a short-lived
+    ``getNumberV2`` activation and therefore marks it complete/cancelled.  A
+    long-term number is owned outside this workflow.  This adapter only reads
+    the active activation and its SMS history; the lease lock remains held
+    until ``close`` so concurrent PayPal jobs cannot consume one another's
+    messages.
+    """
+
+    _activation_lock_registry: dict[str, threading.Lock] = {}
+    _activation_lock_registry_guard = threading.Lock()
+    _dial_codes = {
+        "187": "1",  # United States (Hero country id)
+    }
+    _paypal_service_codes = frozenset({"ts", "pp", "paypal"})
+
+    def __init__(
+        self,
+        cfg: PhoneConfig,
+        *,
+        api_key: str = "",
+        activation_id: str = "",
+        lock_timeout_s: float | None = None,
+        country_phone_code: str = "",
+        event_callback: TraceEmitter | None = None,
+    ) -> None:
+        super().__init__(cfg, api_key=api_key, event_callback=event_callback)
+        self.activation_id = str(
+            activation_id
+            or getattr(cfg, "activation_id", "")
+            or (getattr(cfg, "allocate_payload", None) or {}).get("activation_id", "")
+            or (getattr(cfg, "allocate_payload", None) or {}).get("activationId", "")
+            or ""
+        ).strip()
+        self.lock_timeout_s = (
+            max(1.0, float(lock_timeout_s)) if lock_timeout_s is not None else None
+        )
+        self.country_phone_code = re.sub(r"\D+", "", str(country_phone_code or ""))
+        self._lease: PhoneLease | None = None
+        self._baseline_ids: set[str] = set()
+        self._baseline_fingerprints: set[str] = set()
+        self._otp_not_before: datetime | None = None
+        self._thread_lock: threading.Lock | None = None
+        self._lock_file: Any = None
+        self._closed = False
+
+    def allocate(self) -> PhoneLease:
+        """Return the selected active activation and establish an SMS baseline."""
+        if self._closed:
+            raise ProtocolRegistrationWorkflowError("Hero SMS long-term adapter is closed")
+
+        # A retry on the same adapter must not re-acquire a non-reentrant lock.
+        # Refreshing the baseline makes a subsequent OTP wait start at the new
+        # attempt while preserving the rented number.
+        if self._lease is not None:
+            messages = self._get_sms_messages(self._lease.lease_id)
+            self._set_baseline(messages)
+            self._emit(
+                "phone.longterm.baseline.refreshed",
+                {"lease_id": self._lease.lease_id, "message_count": len(messages)},
+            )
+            return self._lease
+
+        service, country = self._required_selection()
+        timeout = self.lock_timeout_s or max(1.0, float(self.cfg.otp_timeout_s or 180) + 30.0)
+        deadline = time.time() + timeout
+        waiting_emitted = False
+        while True:
+            eligible = self._eligible_active_leases(service=service, country=country)
+            random.shuffle(eligible)
+            for lease in eligible:
+                if not self._try_acquire_activation_lock(lease.lease_id):
+                    self._emit(
+                        "phone.longterm.activation.skipped_locked",
+                        {"lease_id": lease.lease_id},
+                        "DEBUG",
+                    )
+                    continue
+                try:
+                    # Re-read the active list after locking. The activation may
+                    # have expired while this worker was waiting.
+                    current = {
+                        item.lease_id: item
+                        for item in self._eligible_active_leases(
+                            service=service,
+                            country=country,
+                        )
+                    }.get(lease.lease_id)
+                    if current is None:
+                        self._release_activation_lock()
+                        continue
+                    return self._claim_locked_lease(current)
+                except Exception:
+                    self._release_activation_lock()
+                    raise
+
+            if time.time() >= deadline:
+                raise ProtocolRegistrationWorkflowError(
+                    "Hero SMS long-term has no unlocked active PayPal activation "
+                    f"after waiting {int(timeout)} seconds"
+                )
+            if not waiting_emitted:
+                self._emit(
+                    "phone.longterm.activation.waiting_for_lock",
+                    {"candidate_count": len(eligible)},
+                    "INFO",
+                )
+                waiting_emitted = True
+            time.sleep(min(1.0, max(0.05, deadline - time.time())))
+
+    def prepare_otp(self, lease_id: str) -> None:
+        """Refresh the SMS baseline immediately before triggering an OTP.
+
+        PayPal may take a little time between phone allocation and challenge
+        initiation.  Callers that have such a boundary can use this hook to
+        exclude anything received during that setup period while retaining the
+        activation lock.
+        """
+        if self._closed:
+            raise ProtocolRegistrationWorkflowError("Hero SMS long-term adapter is closed")
+        if self._lease is None or self._lease.lease_id != str(lease_id or "").strip():
+            raise ProtocolRegistrationWorkflowError(
+                f"Hero SMS long-term lease mismatch for OTP preparation: {lease_id}"
+            )
+        messages = self._get_sms_messages(self._lease.lease_id)
+        self._set_baseline(messages)
+        self._otp_not_before = datetime.now(UTC) - timedelta(seconds=2)
+        self._emit(
+            "phone.longterm.baseline.prepared",
+            {"lease_id": self._lease.lease_id, "message_count": len(messages)},
+        )
+
+    def poll_otp(self, lease_id: str) -> str:
+        if self._closed:
+            raise ProtocolRegistrationWorkflowError("Hero SMS long-term adapter is closed")
+        lease = self._lease
+        if lease is None:
+            raise ProtocolRegistrationWorkflowError(
+                "Hero SMS long-term poll requires allocate first"
+            )
+        if str(lease_id or "").strip() != lease.lease_id:
+            raise ProtocolRegistrationWorkflowError(
+                f"Hero SMS long-term lease mismatch: expected {lease.lease_id}, got {lease_id}"
+            )
+
+        timeout_s = max(1, int(self.cfg.otp_timeout_s or 180))
+        interval_s = max(1.0, float(self.cfg.otp_poll_interval_s or 3.0))
+        deadline = time.time() + timeout_s
+        self._emit(
+            "phone.longterm.otp.wait.started",
+            {"lease_id": lease.lease_id, "timeout_s": timeout_s},
+        )
+        while time.time() < deadline:
+            messages = self._get_sms_messages(lease.lease_id)
+            for message in messages:
+                message_id = _hero_sms_message_id(message)
+                fingerprint = _hero_sms_message_fingerprint(message)
+                if message_id and message_id in self._baseline_ids:
+                    continue
+                if fingerprint in self._baseline_fingerprints:
+                    continue
+
+                # Mark every new message as observed, including non-OTP text,
+                # so a noisy message cannot be reconsidered on every poll.
+                if message_id:
+                    self._baseline_ids.add(message_id)
+                self._baseline_fingerprints.add(fingerprint)
+                message_time = _hero_sms_message_time(message)
+                if (
+                    self._otp_not_before is not None
+                    and message_time is not None
+                    and message_time < self._otp_not_before
+                ):
+                    continue
+                if not self._is_paypal_sms(message):
+                    continue
+                code = _hero_sms_six_digit_code(message)
+                if code:
+                    self._emit(
+                        "phone.longterm.otp.wait.succeeded",
+                        {"lease_id": lease.lease_id, "message_id": message_id, "has_code": True},
+                    )
+                    return code
+            time.sleep(interval_s)
+
+        self._emit(
+            "phone.longterm.otp.wait.failed",
+            {"lease_id": lease.lease_id, "error": f"timeout ({timeout_s}s)"},
+            "ERROR",
+        )
+        raise TimeoutError(f"Hero SMS long-term OTP timeout lease={lease.lease_id}")
+
+    def _is_paypal_sms(self, message: dict[str, Any]) -> bool:
+        service = str(
+            message.get("service")
+            or message.get("serviceCode")
+            or message.get("service_code")
+            or ""
+        ).strip().lower()
+        source = " ".join(
+            str(message.get(key) or "")
+            for key in ("phoneFrom", "sender", "from", "text", "body")
+        ).lower()
+        return service in self._paypal_service_codes or "paypal" in source
+
+    def mark_verified(self, lease_id: str) -> None:
+        """Keep the day-rental active; verification is a local workflow state."""
+        self._emit(
+            "phone.longterm.status.verified",
+            {"lease_id": str(lease_id or "")},
+        )
+
+    def mark_failed(self, lease_id: str, reason: str = "") -> None:
+        """Keep the day-rental active so a retry can use the same number."""
+        self._emit(
+            "phone.longterm.status.failed",
+            {"lease_id": str(lease_id or ""), "reason": str(reason or "")[:300]},
+            "WARN",
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._release_activation_lock()
+        super().close()
+
+    def _required_selection(self) -> tuple[str, str]:
+        service = str(self.cfg.service or "ts").strip().lower()
+        raw_country = str(self.cfg.country or "187").strip().upper()
+        country = "187" if raw_country == "US" else re.sub(r"\D+", "", raw_country)
+        if service not in self._paypal_service_codes:
+            raise ProtocolRegistrationWorkflowError(
+                "Hero SMS long-term requires a PayPal service (ts, pp, or paypal), "
+                f"got {service or '<empty>'}"
+            )
+        if country != "187":
+            raise ProtocolRegistrationWorkflowError(
+                f"Hero SMS long-term requires country=187 (US), got {country or '<empty>'}"
+            )
+        return service, country
+
+    def _eligible_active_leases(self, *, service: str, country: str) -> list[PhoneLease]:
+        payload = self._get_active_activations()
+        activations = self._select_activations(
+            payload,
+            service=service,
+            country=country,
+        )
+        leases: list[PhoneLease] = []
+        last_error: ProtocolRegistrationWorkflowError | None = None
+        for activation in activations:
+            try:
+                self._validate_activation(activation)
+                leases.append(self._lease_from_activation(activation, country=country))
+            except ProtocolRegistrationWorkflowError as exc:
+                last_error = exc
+        if leases:
+            return leases
+        if last_error is not None:
+            raise last_error
+        raise ProtocolRegistrationWorkflowError(
+            f"Hero SMS long-term active activation not found (service={service}, country={country})"
+        )
+
+    def _get_active_activations(self) -> dict[str, Any]:
+        limit = 100
+        start = 0
+        items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for _page in range(20):
+            payload = self._request_json(
+                "getActiveActivations",
+                start=start,
+                limit=limit,
+            )
+            page_items = self._active_activation_items(payload)
+            added = 0
+            for item in page_items:
+                item_id = self._activation_id_from(item)
+                fingerprint = item_id or _hero_sms_message_fingerprint(item)
+                if fingerprint in seen_ids:
+                    continue
+                seen_ids.add(fingerprint)
+                items.append(item)
+                added += 1
+            if len(page_items) < limit or added == 0:
+                break
+            start += len(page_items)
+        return {"data": items}
+
+    @staticmethod
+    def _active_activation_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        def extract(value: Any, depth: int = 0) -> list[dict[str, Any]]:
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if not isinstance(value, dict):
+                return []
+            # A bare activation object is also a valid one-row response.
+            if any(key in value for key in ("activationId", "activation_id", "phoneNumber")):
+                return [value]
+            if depth >= 3:
+                return []
+            for key in ("rows", "row", "data", "activeActivations", "items", "results"):
+                if key in value:
+                    rows = extract(value[key], depth + 1)
+                    if rows:
+                        return rows
+            return []
+
+        # Hero has returned both `data` and `activeActivations` wrappers over
+        # time.  Merge both sources so an empty wrapper cannot hide the other.
+        items = extract(payload.get("data"))
+        items.extend(extract(payload.get("activeActivations")))
+        if not items:
+            items = extract(payload)
+        return items
+
+    def _claim_locked_lease(self, lease: PhoneLease) -> PhoneLease:
+        messages = self._get_sms_messages(lease.lease_id)
+        self._set_baseline(messages)
+        self._lease = lease
+        self._emit(
+            "phone.longterm.allocate.succeeded",
+            {
+                "lease_id": lease.lease_id,
+                "phone": lease.masked_phone,
+                "provider_country": lease.provider_country,
+                "message_count": len(messages),
+            },
+        )
+        return lease
+
+    def _select_activations(
+        self,
+        payload: dict[str, Any],
+        *,
+        service: str,
+        country: str,
+    ) -> list[dict[str, Any]]:
+        raw_items = self._active_activation_items(payload)
+
+        candidates: list[dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            item_service = (
+                str(
+                    item.get("serviceCode") or item.get("service") or item.get("service_code") or ""
+                )
+                .strip()
+                .lower()
+            )
+            item_country = str(
+                item.get("countryCode")
+                or item.get("country")
+                or item.get("country_code")
+                or ""
+            ).strip()
+            if not item_country:
+                phone_digits = re.sub(
+                    r"\D+",
+                    "",
+                    str(
+                        item.get("phoneNumber")
+                        or item.get("phone_number")
+                        or item.get("phone")
+                        or ""
+                    ),
+                )
+                if phone_digits.startswith("1") and len(phone_digits) >= 11:
+                    item_country = "187"
+            item_id = str(
+                item.get("activationId") or item.get("activation_id") or item.get("id") or ""
+            ).strip()
+            if not self._service_matches(item_service, service) or not self._country_matches(
+                item_country, country
+            ):
+                continue
+            if self.activation_id and item_id != self.activation_id:
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            requested = f" activation_id={self.activation_id}" if self.activation_id else ""
+            raise ProtocolRegistrationWorkflowError(
+                "Hero SMS long-term active activation not found "
+                f"(service={service}, country={country}{requested})"
+            )
+        return candidates
+
+    def _validate_activation(self, activation: dict[str, Any]) -> None:
+        status = (
+            str(
+                activation.get("activationStatus")
+                or activation.get("status")
+                or activation.get("activation_status")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        if status in {
+            "6",
+            "8",
+            "finished",
+            "finish",
+            "complete",
+            "completed",
+            "expired",
+            "status_expired",
+            "status_cancel",
+            "status_cancelled",
+            "status_finished",
+            "status_completed",
+            "cancel",
+            "cancelled",
+        }:
+            raise ProtocolRegistrationWorkflowError(
+                f"Hero SMS long-term activation is completed (status={status})"
+            )
+        expires_at = _hero_activation_expiry(activation)
+        if expires_at is not None and expires_at <= datetime.now(UTC):
+            raise ProtocolRegistrationWorkflowError(
+                "Hero SMS long-term activation is expired "
+                f"(activation_id={self._activation_id_from(activation)}, "
+                f"expires_at={expires_at.isoformat()})"
+            )
+
+    def _service_matches(self, item_service: str, requested_service: str) -> bool:
+        item = str(item_service or "").strip().lower()
+        requested = str(requested_service or "").strip().lower()
+        if item not in self._paypal_service_codes:
+            return False
+        return requested in self._paypal_service_codes
+
+    @staticmethod
+    def _country_matches(item_country: str, requested_country: str) -> bool:
+        normalized_item = str(item_country or "").strip().upper()
+        normalized_requested = str(requested_country or "").strip().upper()
+        if normalized_item in {"US", "1"}:
+            normalized_item = "187"
+        if normalized_requested == "US":
+            normalized_requested = "187"
+        return re.sub(r"\D+", "", normalized_item) == re.sub(
+            r"\D+", "", normalized_requested
+        )
+
+    def _lease_from_activation(self, activation: dict[str, Any], *, country: str) -> PhoneLease:
+        activation_id = self._activation_id_from(activation)
+        if not activation_id:
+            raise ProtocolRegistrationWorkflowError(
+                "Hero SMS long-term active activation is missing activationId"
+            )
+        phone = (
+            activation.get("phoneNumber")
+            or activation.get("phone_number")
+            or activation.get("phone")
+        )
+        if "*" in str(phone or ""):
+            raise ProtocolRegistrationWorkflowError(
+                f"Hero SMS long-term activation {activation_id} returned a masked phone number"
+            )
+        dial = (
+            activation.get("countryPhoneCode")
+            or activation.get("country_phone_code")
+            or self.country_phone_code
+        )
+        if not dial:
+            dial = self._dial_codes.get(country, "")
+        phone_e164, phone_national, dial_code = _hero_phone_parts(phone, dial)
+        return PhoneLease(
+            lease_id=activation_id,
+            phone_e164=phone_e164,
+            masked_phone=_mask_phone(phone_e164),
+            phone_national=phone_national,
+            country_phone_code=dial_code,
+            provider_country=country,
+            expires_at=str(_hero_activation_expiry_value(activation) or ""),
+            raw=dict(activation),
+        )
+
+    def _activation_id_from(self, activation: dict[str, Any]) -> str:
+        return str(
+            activation.get("activationId")
+            or activation.get("activation_id")
+            or activation.get("id")
+            or ""
+        ).strip()
+
+    def _get_sms_messages(self, lease_id: str) -> list[dict[str, Any]]:
+        payload = self._request_json("getAllSms", id=lease_id, size=100, page=1)
+        raw_items: Any = payload.get("data", [])
+        if isinstance(raw_items, dict):
+            raw_items = raw_items.get("data", [])
+        if raw_items is None:
+            return []
+        if not isinstance(raw_items, list):
+            raise ProtocolRegistrationWorkflowError(
+                f"Hero SMS getAllSms returned invalid data lease={lease_id}"
+            )
+        return [item for item in raw_items if isinstance(item, dict)]
+
+    def _set_baseline(self, messages: list[dict[str, Any]]) -> None:
+        self._baseline_ids = {
+            message_id for message in messages if (message_id := _hero_sms_message_id(message))
+        }
+        self._baseline_fingerprints = {
+            _hero_sms_message_fingerprint(message) for message in messages
+        }
+
+    def _acquire_activation_lock(self, lease_id: str) -> bool:
+        return self._acquire_activation_lock_internal(lease_id, blocking=True)
+
+    def _try_acquire_activation_lock(self, lease_id: str) -> bool:
+        return self._acquire_activation_lock_internal(lease_id, blocking=False)
+
+    def _acquire_activation_lock_internal(self, lease_id: str, *, blocking: bool) -> bool:
+        with self._activation_lock_registry_guard:
+            lock = self._activation_lock_registry.setdefault(lease_id, threading.Lock())
+        timeout = self.lock_timeout_s or max(1.0, float(self.cfg.otp_timeout_s or 180) + 30.0)
+        if blocking:
+            acquired = lock.acquire(timeout=timeout)
+        else:
+            acquired = lock.acquire(blocking=False)
+        if not acquired:
+            if blocking:
+                raise ProtocolRegistrationWorkflowError(
+                    f"Hero SMS long-term activation is busy (activation_id={lease_id})"
+                )
+            return False
+        lock_file = None
+        try:
+            root = Path(
+                os.getenv(
+                    "REFACTOR_APP_HERO_LONGTERM_LOCK_DIR",
+                    str(Path(tempfile.gettempdir()) / "refactor-app-hero-sms-longterm"),
+                )
+            )
+            root.mkdir(parents=True, exist_ok=True)
+            lock_file = (root / f"{hashlib.sha256(lease_id.encode()).hexdigest()}.lock").open(
+                "a+", encoding="utf-8"
+            )
+            if fcntl is not None:
+                if not blocking:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        raise _HeroActivationLockUnavailable from None
+                else:
+                    deadline = time.time() + timeout
+                    while True:
+                        try:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.time() >= deadline:
+                                raise ProtocolRegistrationWorkflowError(
+                                    "Hero SMS long-term activation is busy "
+                                    f"(activation_id={lease_id})"
+                                ) from None
+                            time.sleep(0.1)
+            self._thread_lock = lock
+            self._lock_file = lock_file
+            return True
+        except _HeroActivationLockUnavailable:
+            if lock_file is not None:
+                try:
+                    lock_file.close()
+                except Exception:
+                    pass
+            lock.release()
+            return False
+        except Exception:
+            if lock_file is not None:
+                try:
+                    lock_file.close()
+                except Exception:
+                    pass
+            lock.release()
+            raise
+
+    def _release_activation_lock(self) -> None:
+        lock_file, lock = self._lock_file, self._thread_lock
+        self._lock_file = None
+        self._thread_lock = None
+        if lock_file is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                lock_file.close()
+            except Exception:
+                pass
+        if lock is not None:
+            lock.release()
+
+
+def _hero_activation_expiry_value(activation: dict[str, Any]) -> Any:
+    return (
+        activation.get("activationEndTime")
+        or activation.get("activation_end_time")
+        or activation.get("expiresAt")
+        or activation.get("expires_at")
+        or activation.get("endTime")
+        or activation.get("end_time")
+        or activation.get("estDate")
+        or activation.get("estimatedEndTime")
+        or activation.get("estimated_end_time")
+        or ""
+    )
+
+
+def _hero_activation_expiry(activation: dict[str, Any]) -> datetime | None:
+    value = _hero_activation_expiry_value(activation)
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(value, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            parsed = None
+    elif isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        parsed = None
+        for candidate in (text, text.replace("Z", "+00:00")):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z"):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _hero_sms_message_id(message: dict[str, Any]) -> str:
+    return str(
+        message.get("id") or message.get("messageId") or message.get("message_id") or ""
+    ).strip()
+
+
+def _hero_sms_message_fingerprint(message: dict[str, Any]) -> str:
+    stable = {
+        str(key): message.get(key)
+        for key in (
+            "id",
+            "messageId",
+            "message_id",
+            "code",
+            "text",
+            "body",
+            "date",
+            "dateTime",
+            "service",
+            "type",
+        )
+        if message.get(key) is not None
+    }
+    encoded = json.dumps(
+        stable,
+        sort_keys=True,
+        ensure_ascii=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _hero_sms_message_time(message: dict[str, Any]) -> datetime | None:
+    value = (
+        message.get("date")
+        or message.get("dateTime")
+        or message.get("createdAt")
+        or message.get("created_at")
+    )
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _hero_sms_six_digit_code(message: dict[str, Any]) -> str:
+    values: list[Any] = [message.get("code"), message.get("text"), message.get("body")]
+    for value in values:
+        match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value or ""))
+        if match:
+            return match.group(1)
+    return ""
+
+
 def _phone_config(input_: ProtocolRegistrationInput) -> PhoneConfig:
     return PhoneConfig(
         enabled=True,
-        provider=input_.phone_provider or "hero_sms",
-        base_url=input_.phone_base_url or "https://hero-sms.com/stubs/handler_api.php",
-        api_key_env=input_.phone_api_key_env or "HERO_SMS_API_KEY",
+        provider=input_.phone_provider or "grizzly_sms",
+        base_url=input_.phone_base_url
+        or "https://api.grizzlysms.com/stubs/handler_api.php",
+        api_key_env=input_.phone_api_key_env or "GRIZZLY_SMS_API_KEY",
         country=input_.phone_country,
         countries=input_.phone_countries or [],
         service=input_.phone_service or "dr",
-        maxPrice=input_.phone_max_price or "0.05",
+        maxPrice=input_.phone_max_price or "0.18",
         country_max_prices=input_.phone_country_max_prices or {},
         max_number_attempts=max(1, int(input_.phone_max_number_attempts or 3)),
+        request_timeout_s=max(1, int(input_.phone_request_timeout_s or 20)),
         otp_timeout_s=max(1, int(input_.phone_otp_timeout_s or 180)),
         otp_poll_interval_s=max(1.0, float(input_.phone_otp_poll_interval_s or 3.0)),
     )

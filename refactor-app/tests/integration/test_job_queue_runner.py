@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
 import pytest
 from sqlalchemy import delete, select
@@ -793,7 +795,7 @@ def test_last_work_completion_finalizes_parent_job() -> None:
             run_status="running",
             attempt=1,
             started_at=now,
-            output_json={},
+            output_json={"retry_of_run_id": "test-previous-run"},
         )
         session.add(run)
         work = WorkQueue(session).enqueue(
@@ -815,9 +817,95 @@ def test_last_work_completion_finalizes_parent_job() -> None:
 
     with session_factory() as session:
         assert session.get(JobModel, job_id).job_status == "succeeded"
-        assert session.get(JobRunModel, "test-last-work-run").run_status == "succeeded"
+        saved_run = session.get(JobRunModel, "test-last-work-run")
+        assert saved_run.run_status == "succeeded"
+        assert saved_run.output_json["retry_of_run_id"] == "test-previous-run"
         assert session.get(WorkItemModel, work_id).work_status == "succeeded"
         session.execute(delete(JobEventModel).where(JobEventModel.run_id == "test-last-work-run"))
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
+        session.execute(delete(JobRunModel).where(JobRunModel.job_id == job_id))
+        session.execute(delete(JobModel).where(JobModel.id == job_id))
+        session.commit()
+
+
+def test_concurrent_work_failures_finalize_parent_job_once_all_are_terminal() -> None:
+    settings = Settings()
+    session_factory = make_session_factory(make_engine(settings))
+    job_type = "test.concurrent-failures-finalize-job"
+    work_type = "test.concurrent-failing-work"
+    barrier = Barrier(3)
+
+    def fail_together(_session, _input):
+        barrier.wait(timeout=10)
+        raise RuntimeError("expected concurrent failure")
+
+    runner = JobRunner(session_factory)
+    runner.register_work(work_type, fail_together)
+
+    with session_factory() as session:
+        prior_job_ids = select(JobModel.id).where(JobModel.type == job_type)
+        prior_run_ids = select(JobRunModel.id).where(
+            JobRunModel.job_id.in_(prior_job_ids)
+        )
+        session.execute(
+            delete(JobEventModel).where(JobEventModel.run_id.in_(prior_run_ids))
+        )
+        session.execute(delete(WorkItemModel).where(WorkItemModel.job_id.in_(prior_job_ids)))
+        session.execute(delete(JobRunModel).where(JobRunModel.job_id.in_(prior_job_ids)))
+        session.execute(delete(JobModel).where(JobModel.type == job_type))
+
+        now = datetime.now(UTC)
+        job = JobQueue(session).enqueue(
+            job_type=job_type,
+            input_json={"work_count": 3},
+            created_by="test",
+        )
+        job.job_status = "running"
+        session.flush()
+        run = JobRunModel(
+            id=f"test-concurrent-failure-run-{job.id}",
+            job_id=job.id,
+            run_status="running",
+            attempt=1,
+            started_at=now,
+            output_json={},
+        )
+        session.add(run)
+        work_ids: list[str] = []
+        for _ in range(3):
+            work = WorkQueue(session).enqueue(
+                job_id=job.id,
+                work_type=work_type,
+                input_json={"_run_id": run.id},
+            )
+            session.flush()
+            work.work_status = "running"
+            work.claimed_by = runner.worker_id
+            work.claimed_at = now
+            work.lease_expires_at = now + timedelta(minutes=15)
+            work.started_at = now
+            work_ids.append(work.id)
+        job_id = job.id
+        run_id = run.id
+        session.commit()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        completed = list(executor.map(runner.run_claimed_work, work_ids))
+    assert completed == work_ids
+
+    with session_factory() as session:
+        saved_job = session.get(JobModel, job_id)
+        saved_run = session.get(JobRunModel, run_id)
+        saved_works = session.scalars(
+            select(WorkItemModel).where(WorkItemModel.id.in_(work_ids))
+        ).all()
+        assert saved_job.job_status == "failed"
+        assert saved_run.run_status == "failed"
+        assert saved_run.output_json["failed"] == 3
+        assert saved_run.output_json["running"] == 0
+        assert {work.work_status for work in saved_works} == {"failed"}
+
+        session.execute(delete(JobEventModel).where(JobEventModel.run_id == run_id))
         session.execute(delete(WorkItemModel).where(WorkItemModel.job_id == job_id))
         session.execute(delete(JobRunModel).where(JobRunModel.job_id == job_id))
         session.execute(delete(JobModel).where(JobModel.id == job_id))

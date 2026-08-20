@@ -3,7 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 import refactor_app.application.workflows.account_auth as account_auth
+import refactor_app.plugins.openai_auth_protocol.session_login as session_login
 from refactor_app.application.workflows.account_auth import BackfillSessionWorkflow
+from refactor_app.config.browser_fingerprint import browser_fingerprint_for_email
 from refactor_app.plugins.openai_auth_protocol.auth_flow import (
     AuthFlow,
     AuthResult,
@@ -15,6 +17,108 @@ from refactor_app.plugins.openai_auth_protocol.codex_rt import ExternalMailOtpAd
 class _MailProvider:
     def wait_for_otp(self, *_args, **_kwargs) -> str:
         return "123456"
+
+
+def test_session_login_skips_external_mail_for_password_and_totp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared: list[str] = []
+    submitted: dict = {}
+    configured = []
+
+    class Flow:
+        def __init__(self, config) -> None:
+            configured.append(config.browser_fingerprint)
+            self.session = SimpleNamespace(cookies=[])
+
+        def run_protocol_login(self, **kwargs):
+            submitted.update(kwargs)
+            result = AuthResult()
+            result.session_token = "session-token"
+            result.access_token = "access-token"
+            return result
+
+        def _build_chatgpt_cookie_header(self) -> str:
+            return "session=value"
+
+        def export_protocol_snapshot(self, **extra) -> dict:
+            return extra
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(session_login, "AuthFlow", Flow)
+    monkeypatch.setattr(
+        session_login,
+        "prepare_domain_mailbox",
+        lambda _provider, *, email: prepared.append(email),
+    )
+
+    def totp_provider() -> str:
+        return "123456"
+
+    result = session_login.acquire_chatgpt_session(
+        email="hero-user@yandex.com",
+        password="configured-password",
+        proxy_country="US",
+        mail_provider=object(),
+        totp_code_provider=totp_provider,
+    )
+
+    assert result.ok is True
+    assert prepared == []
+    assert submitted["password"] == "configured-password"
+    assert submitted["totp_code_provider"] is totp_provider
+    assert configured == [browser_fingerprint_for_email("hero-user@yandex.com")]
+    assert result.snapshot["mail_events"] == [
+        {
+            "event": "mail.ensure_domain_email.skipped",
+            "email": "hero-user@yandex.com",
+            "reason": "password_and_totp_available",
+        }
+    ]
+
+
+def test_session_login_keeps_external_mail_for_passwordless_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared: list[str] = []
+
+    class Flow:
+        def __init__(self, _config) -> None:
+            self.session = SimpleNamespace(cookies=[])
+
+        def run_protocol_login(self, **_kwargs):
+            result = AuthResult()
+            result.session_token = "session-token"
+            result.access_token = "access-token"
+            return result
+
+        def _build_chatgpt_cookie_header(self) -> str:
+            return "session=value"
+
+        def export_protocol_snapshot(self, **extra) -> dict:
+            return extra
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(session_login, "AuthFlow", Flow)
+    monkeypatch.setattr(
+        session_login,
+        "prepare_domain_mailbox",
+        lambda _provider, *, email: prepared.append(email),
+    )
+
+    result = session_login.acquire_chatgpt_session(
+        email="passwordless@example.test",
+        password="",
+        proxy_country="US",
+        mail_provider=object(),
+    )
+
+    assert result.ok is True
+    assert prepared == ["passwordless@example.test"]
 
 
 def test_external_mail_adapter_uses_original_mailbox_email() -> None:
@@ -466,12 +570,13 @@ def test_passwordless_otp_request_matches_browser_invocation_headers() -> None:
 
 def test_backfill_session_allows_blank_password(monkeypatch: pytest.MonkeyPatch) -> None:
     captured_passwords: list[str] = []
+    captured_fingerprints = []
 
     class Workflow(BackfillSessionWorkflow):
         def _load_input(self, user_account_id: str, run_id: str = ""):
             account = SimpleNamespace(email="passwordless@example.test")
             auth = SimpleNamespace(password="")
-            return account, auth, "http://proxy.example.test"
+            return account, auth, "http://proxy.example.test", "US"
 
         def _start_step(self, *_args, **_kwargs) -> str:
             return ""
@@ -501,6 +606,7 @@ def test_backfill_session_allows_blank_password(monkeypatch: pytest.MonkeyPatch)
 
     def acquire(**kwargs):
         captured_passwords.append(kwargs["password"])
+        captured_fingerprints.append(kwargs["browser_fingerprint"])
         return SimpleNamespace(
             ok=True,
             auth_result=auth_result,
@@ -514,6 +620,9 @@ def test_backfill_session_allows_blank_password(monkeypatch: pytest.MonkeyPatch)
     workflow = Workflow(session_factory=lambda: None, mail_provider=object())
     assert workflow.run(user_account_id="account-1") == "account-1"
     assert captured_passwords == [""]
+    assert captured_fingerprints == [
+        browser_fingerprint_for_email("passwordless@example.test")
+    ]
 
 
 def test_backfill_session_resolves_totp_from_account_twofauth_id(
@@ -530,7 +639,7 @@ def test_backfill_session_resolves_totp_from_account_twofauth_id(
                 mfa_status="configured",
                 twofauth_account_id="twofauth-account-42",
             )
-            return account, auth, "http://proxy.example.test"
+            return account, auth, "http://proxy.example.test", "US"
 
         def _start_step(self, *_args, **_kwargs) -> str:
             return ""

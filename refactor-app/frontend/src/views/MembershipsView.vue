@@ -14,6 +14,10 @@ const store = useOpsStore();
 const router = useRouter();
 const selectedRows = ref<Row[]>([]);
 const sessionWorkCount = ref(10);
+const sessionProxyCountry = ref("US");
+const sessionBackfillOpen = ref(false);
+const sessionBackfillBusy = ref(false);
+const sessionBackfillRows = ref<Row[]>([]);
 const spaceDetectionBusy = ref(false);
 const authorizationWorkCount = ref(1);
 const authorizationBusy = ref(false);
@@ -239,14 +243,37 @@ async function runOtpAction() {
   }
 }
 
-async function backfillSession(rows: Row[]) {
-  const ids = Array.from(new Set(rows.map((row) => String(row.user_account_id || "")).filter(Boolean)));
+function openBackfillSession(rows: Row[]) {
+  const ids = Array.from(new Set(
+    rows.map((row) => String(row.user_account_id || "")).filter(Boolean),
+  ));
   if (!ids.length) { store.toast("未选择成员", "请先勾选成员。", "warning"); return; }
+  sessionBackfillRows.value = [...rows];
+  sessionBackfillOpen.value = true;
+}
+
+async function backfillSession() {
+  const ids = Array.from(new Set(
+    sessionBackfillRows.value
+      .map((row) => String(row.user_account_id || ""))
+      .filter(Boolean),
+  ));
+  if (!ids.length) { store.toast("未选择成员", "请重新选择成员。", "warning"); return; }
+  const proxyCountry = sessionProxyCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(proxyCountry)) {
+    store.toast("代理国家无效", "请输入两位国家代码，例如 US。", "warning");
+    return;
+  }
+  sessionProxyCountry.value = proxyCountry;
+  sessionBackfillBusy.value = true;
   try {
-    const result = await resourcesApi.backfillSession({ user_account_ids: ids, created_by: "ops-ui", work_count: sessionWorkCount.value });
-    store.toast("补 Session 任务已创建", `账号=${ids.length} Work=${result.work_count}`, "success");
+    const result = await resourcesApi.backfillSession({ user_account_ids: ids, created_by: "ops-ui", work_count: sessionWorkCount.value, proxy_country: proxyCountry });
+    sessionBackfillOpen.value = false;
+    sessionBackfillRows.value = [];
+    store.toast("补 Session 任务已创建", `账号=${ids.length} 代理=${proxyCountry} Work=${result.work_count}`, "success");
     await router.push({ name: "job-trace", params: { jobId: result.job_id } });
   } catch (err) { store.toast("创建任务失败", String((err as Error).message ?? err), "error"); }
+  finally { sessionBackfillBusy.value = false; }
 }
 
 async function refreshSessionSpaceDetection(rows: Row[]) {
@@ -257,12 +284,19 @@ async function refreshSessionSpaceDetection(rows: Row[]) {
     store.toast("未选择成员", "请先勾选成员。", "warning");
     return;
   }
+  const proxyCountry = sessionProxyCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(proxyCountry)) {
+    store.toast("代理国家无效", "请输入两位国家代码，例如 US。", "warning");
+    return;
+  }
+  sessionProxyCountry.value = proxyCountry;
   spaceDetectionBusy.value = true;
   try {
     const result = await resourcesApi.refreshSessionSpaceDetection({
       user_account_ids: ids,
       created_by: "ops-ui",
       work_count: sessionWorkCount.value,
+      proxy_country: proxyCountry,
     });
     store.toast("刷新识别空间 Job 已创建", `账号=${ids.length} Work=${result.work_count}`, "success");
     await router.push({ name: "job-trace", params: { jobId: result.job_id } });
@@ -360,8 +394,7 @@ async function authorizeSelectedPersonalCodex() {
         <button class="btn primary" :disabled="otpSummaryLoading || !otpSpaceIds.length || Boolean(otpActiveJob?.job_id)" @click="openOtpAction('remote_submit')">服务器提交 OTP（{{ otpRemoteSubmitCount }}）</button>
       </div>
       <div class="action-group">
-        <label class="inline-control"><span>Work 数</span><input v-model.number="sessionWorkCount" class="input small-input" type="number" min="1" max="500" /></label>
-        <button class="btn primary" :disabled="selectedRows.length === 0" @click="backfillSession(selectedRows)">补选中账号 Session（{{ selectedRows.length }}）</button>
+        <button class="btn primary" :disabled="selectedRows.length === 0" @click="openBackfillSession(selectedRows)">补选中账号 Session（{{ selectedRows.length }}）</button>
         <button class="btn" :disabled="selectedRows.length === 0 || spaceDetectionBusy" @click="refreshSessionSpaceDetection(selectedRows)">
           <RefreshCw :size="16" />刷新识别空间（{{ selectedRows.length }}）
         </button>
@@ -374,12 +407,33 @@ async function authorizeSelectedPersonalCodex() {
       </div>
     </template>
     <template #rowActions="{ row }">
-      <button class="btn" @click="backfillSession([row])">补 Session</button>
+      <button class="btn" @click="openBackfillSession([row])">补 Session</button>
       <button class="btn" :disabled="spaceDetectionBusy" @click="refreshSessionSpaceDetection([row])">
         <RefreshCw :size="15" />刷新识别
       </button>
     </template>
   </ResourcePage>
+  <ConfirmModal
+    :open="sessionBackfillOpen"
+    title="补 Session"
+    message="选择本次登录使用的代理国家，确认后为目标账号创建补 Session Work。"
+    :summary="{ '目标账号': new Set(sessionBackfillRows.map((row) => String(row.user_account_id || '')).filter(Boolean)).size, '代理国家': sessionProxyCountry.toUpperCase(), '同时执行 Work': sessionWorkCount }"
+    confirm-text="创建补 Session Job"
+    :busy="sessionBackfillBusy"
+    @close="sessionBackfillOpen = false"
+    @confirm="backfillSession"
+  >
+    <div class="session-backfill-config">
+      <label>
+        <span>代理国家</span>
+        <input v-model="sessionProxyCountry" class="input" maxlength="2" pattern="[A-Za-z]{2}" placeholder="US" @input="sessionProxyCountry = sessionProxyCountry.toUpperCase()" />
+      </label>
+      <label>
+        <span>并发数</span>
+        <input v-model.number="sessionWorkCount" class="input" type="number" min="1" max="500" />
+      </label>
+    </div>
+  </ConfirmModal>
   <ConfirmModal
     :open="Boolean(otpAction)"
     :title="otpAction === 'prepare' ? '预取成员 OTP' : '服务器提交成员 OTP'"
@@ -428,6 +482,8 @@ async function authorizeSelectedPersonalCodex() {
 .authorization-check input { accent-color: var(--accent); height: 16px; width: 16px; }
 .authorization-fields { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
 .authorization-fields label { color: var(--text-muted); display: grid; font-size: 11px; font-weight: 700; gap: 6px; }
+.session-backfill-config { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+.session-backfill-config label { color: var(--text-muted); display: grid; font-size: 11px; font-weight: 700; gap: 6px; }
 @media (max-width: 760px) { .otp-space-select { width: 100%; } }
-@media (max-width: 520px) { .authorization-fields { grid-template-columns: 1fr; } }
+@media (max-width: 520px) { .authorization-fields, .session-backfill-config { grid-template-columns: 1fr; } }
 </style>

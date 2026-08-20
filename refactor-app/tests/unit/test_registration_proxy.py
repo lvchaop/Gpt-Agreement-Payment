@@ -14,6 +14,7 @@ from refactor_app.application.workflows.registration_proxy import (
     cliproxy_stable_sid,
     cliproxy_username_for_email,
     detect_machine_egress_country,
+    detect_proxy_egress,
     detect_proxy_egress_country,
     probe_cliproxy_proxy,
     resolve_cliproxy_proxy,
@@ -65,6 +66,50 @@ def test_cliproxy_username_contains_documented_routing_fields() -> None:
     )
 
     assert username == f"base-user-region-US-st-Louisiana-sid-{sid}-t-15"
+
+
+def test_cliproxy_username_accepts_asn_selector() -> None:
+    sid = "a" * 64
+
+    username = cliproxy_username_for_email(
+        base_username="base-user",
+        country_code="US",
+        sid=sid,
+        asn="AS33363",
+        session_duration_minutes=15,
+    )
+
+    assert username == f"base-user-region-US-asn-AS33363-sid-{sid}-t-15"
+
+
+def test_cliproxy_route_selectors_are_mutually_exclusive() -> None:
+    with pytest.raises(CliproxyProxyError, match="mutually exclusive"):
+        cliproxy_username_for_email(
+            base_username="base-user",
+            country_code="US",
+            sid="a" * 64,
+            state="California",
+            asn="33363",
+        )
+
+
+def test_registration_proxy_uses_selector_in_sticky_sid_and_metadata() -> None:
+    proxy = resolve_cliproxy_proxy(
+        email="target@example.com",
+        country_code="US",
+        asn="AS33363",
+        config=_config(max_sid_attempts=2),
+        probe=lambda _proxy_url: True,
+    )
+
+    assert proxy.route_state == ""
+    assert proxy.route_asn == "AS33363"
+    assert "-region-US-asn-AS33363-sid-" in unquote(urlparse(proxy.proxy_url).username or "")
+    assert proxy.sid == cliproxy_stable_sid(
+        "target@example.com",
+        "US",
+        asn="AS33363",
+    )
 
 
 def test_registration_proxy_builds_authenticated_cliproxy_url_without_secret_repr() -> None:
@@ -129,9 +174,30 @@ def test_registration_proxy_returns_stable_sid_when_probe_succeeds() -> None:
     assert proxy.probe_attempts == 1
 
 
+def test_registration_proxy_can_force_a_new_sid() -> None:
+    seen_urls: list[str] = []
+
+    proxy = resolve_cliproxy_proxy(
+        email="target@example.com",
+        country_code="US",
+        config=_config(max_sid_attempts=2),
+        probe=lambda proxy_url: seen_urls.append(proxy_url) or True,
+        force_new_sid=True,
+    )
+
+    assert len(seen_urls) == 1
+    assert cliproxy_stable_sid("target@example.com", "US") not in seen_urls[0]
+    assert proxy.sid_source == "random_uuid"
+
+
 def test_registration_proxy_default_probe_rotates_country_mismatch(monkeypatch) -> None:
     seen_urls: list[str] = []
-    observed_countries = iter(("ID", "US"))
+    observed_egress = iter(
+        (
+            registration_proxy.ProxyEgressTrace("198.51.100.8", "ID"),
+            registration_proxy.ProxyEgressTrace("198.51.100.9", "US"),
+        )
+    )
 
     monkeypatch.setattr(
         registration_proxy,
@@ -140,8 +206,8 @@ def test_registration_proxy_default_probe_rotates_country_mismatch(monkeypatch) 
     )
     monkeypatch.setattr(
         registration_proxy,
-        "detect_proxy_egress_country",
-        lambda _proxy_url, **_kwargs: next(observed_countries),
+        "detect_proxy_egress",
+        lambda _proxy_url, **_kwargs: next(observed_egress),
     )
 
     proxy = resolve_cliproxy_proxy(
@@ -153,6 +219,7 @@ def test_registration_proxy_default_probe_rotates_country_mismatch(monkeypatch) 
     assert len(seen_urls) == 2
     assert cliproxy_stable_sid("target@example.com", "US") in seen_urls[0]
     assert proxy.country_code == "US"
+    assert proxy.egress_ip == "198.51.100.9"
     assert proxy.sid_source == "random_uuid"
     assert proxy.probe_attempts == 2
 
@@ -372,7 +439,7 @@ def test_machine_egress_probe_bypasses_environment_proxy_and_is_cached(monkeypat
     detect_machine_egress_country.cache_clear()
 
 
-def test_proxy_egress_probe_uses_selected_proxy_and_reads_country(monkeypatch) -> None:
+def test_proxy_egress_probe_uses_selected_proxy_and_retains_ip(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Response:
@@ -401,14 +468,13 @@ def test_proxy_egress_probe_uses_selected_proxy_and_reads_country(monkeypatch) -
     monkeypatch.setattr(registration_proxy.curl_requests, "Session", session_factory)
 
     proxy_url = "http://proxy-user:proxy-password@us.example.test:443"
-    assert (
-        detect_proxy_egress_country(
-            proxy_url,
-            trace_url="https://trace.example.test",
-            timeout_s=4.0,
-        )
-        == "US"
+    egress = detect_proxy_egress(
+        proxy_url,
+        trace_url="https://trace.example.test",
+        timeout_s=4.0,
     )
+    assert egress.country_code == "US"
+    assert egress.ip_address == "198.51.100.9"
     assert captured["session_kwargs"] == {
         "impersonate": registration_proxy.BROWSER_IMPERSONATE,
         "proxies": {"http": proxy_url, "https": proxy_url},
@@ -611,3 +677,25 @@ def test_registration_job_input_uses_configured_country_and_allows_explicit_over
 
     assert configured.proxy_country == "JP"
     assert overridden.proxy_country == "CA"
+
+
+def test_registration_job_input_preserves_clipproxy_route_selectors() -> None:
+    configured = handlers._protocol_registration_input(
+        {
+            "mode": "email_protocol_no_phone",
+            "proxy_country": "US",
+            "proxy_state": "California",
+        }
+    )
+    asn_input = handlers._protocol_registration_input(
+        {
+            "mode": "email_protocol_no_phone",
+            "proxy_country": "US",
+            "proxy_asn": "AS33363",
+        }
+    )
+
+    assert configured.proxy_state == "California"
+    assert configured.proxy_asn == ""
+    assert asn_input.proxy_state == ""
+    assert asn_input.proxy_asn == "AS33363"

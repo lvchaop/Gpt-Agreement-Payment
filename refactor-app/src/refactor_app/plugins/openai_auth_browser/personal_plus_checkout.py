@@ -4848,12 +4848,14 @@ def update_plus_checkout_promotion(
     timeout_s: float = 60.0,
     retry_attempts: int = 0,
     retry_delay_s: float = 1.0,
+    session_factory: Callable[..., Any] | None = None,
 ) -> Any:
     """Send only the promotion update request through the promotion proxy.
 
-    A failed transport can leave the proxy connection unusable, so each retry
-    gets a fresh HTTP session. ``retry_attempts`` counts retries after the
-    initial request.
+    A failed transport can leave the connection unusable, so each retry gets a
+    fresh session wrapper. Payment workflows inject a browser-context factory;
+    callers without one retain the standalone HTTP transport. ``retry_attempts``
+    counts retries after the initial request.
     """
     parsed = urlparse(str(checkout_url or "").strip())
     path_parts = [unquote(part) for part in parsed.path.split("/") if part]
@@ -4901,7 +4903,11 @@ def update_plus_checkout_promotion(
     last_retryable_error: Exception | None = None
 
     for attempt in range(1, total_attempts + 1):
-        client = create_http_session(proxy=str(proxy_url or "").strip())
+        client = (
+            session_factory(proxy_url=str(proxy_url or "").strip())
+            if session_factory is not None
+            else create_http_session(proxy=str(proxy_url or "").strip())
+        )
         try:
             try:
                 response = client.post(

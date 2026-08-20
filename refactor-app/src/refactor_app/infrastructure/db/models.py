@@ -127,6 +127,7 @@ class SpaceModel(Base):
     auto_replenish_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+
     has_promotion: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     promotion_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     has_payment_method: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -178,6 +179,65 @@ class SpaceModel(Base):
         Index("idx_spaces_auto_replenish", "auto_replenish_enabled", "space_status", "space_type"),
         Index("idx_spaces_promotion", "space_type", "has_promotion"),
         Index("idx_spaces_payment_method", "space_type", "payment_method_status"),
+    )
+
+
+class PromotionCheckRunModel(Base):
+    __tablename__ = "promotion_check_runs"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_account_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    proxy_country: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    campaigns_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    response_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    error_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    checked_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('succeeded', 'empty', 'failed', 'timeout', 'stale')"
+        ),
+        Index("idx_promotion_check_runs_space_country", "space_id", "proxy_country"),
+        Index("idx_promotion_check_runs_checked_at", "checked_at"),
+    )
+
+
+class SpacePromotionOfferModel(Base):
+    __tablename__ = "space_promotion_offers"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    space_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("spaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_account_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("user_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    proxy_country: Mapped[str] = mapped_column(Text, nullable=False)
+    promotion_id: Mapped[str] = mapped_column(Text, nullable=False)
+    promotion_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="eligible")
+    normalized_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    raw_campaign_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    first_seen_at: Mapped[datetime] = mapped_column(nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(nullable=False)
+    last_checked_at: Mapped[datetime] = mapped_column(nullable=False)
+    source_check_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    __table_args__ = (
+        CheckConstraint("status IN ('eligible', 'ineligible', 'stale')"),
+        UniqueConstraint("space_id", "proxy_country", "promotion_id"),
+        Index("idx_space_promotion_offers_space", "space_id"),
+        Index("idx_space_promotion_offers_country", "proxy_country"),
+        Index("idx_space_promotion_offers_status", "status"),
+        Index("idx_space_promotion_offers_last_checked", "last_checked_at"),
     )
 
 

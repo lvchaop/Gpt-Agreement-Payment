@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import threading
@@ -7,7 +8,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 BrowserLogEmitter = Callable[[str, dict[str, Any], str], None]
@@ -25,6 +26,35 @@ _SENSITIVE_QUERY_KEY = re.compile(
 _BEARER = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 _CARD_NUMBER = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_EMAIL = re.compile(
+    r"(?<![\w.!#$%&'*+/=?^_`{|}~-])"
+    r"[\w.!#$%&'*+/=?^_`{|}~-]+@[\w-]+(?:\.[\w-]+)*"
+    r"(?![\w@.-])",
+    re.IGNORECASE,
+)
+_IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_IPV6 = re.compile(
+    r"(?<![0-9A-Za-z:.])"
+    r"(?:[0-9A-Fa-f]{0,4}:){2,8}"
+    r"(?:[0-9A-Fa-f]{0,4}|(?:\d{1,3}\.){3}\d{1,3})"
+    r"(?:%[0-9A-Za-z_.-]+)?"
+    r"(?![0-9A-Za-z:.])"
+)
+_URL_IN_TEXT = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
+_PERSON_NAME_KEYS = frozenset(
+    {
+        "displayname",
+        "familyname",
+        "firstname",
+        "fullname",
+        "givenname",
+        "lastname",
+        "legalname",
+        "middlename",
+        "name",
+        "preferredname",
+    }
+)
 _TEXT_CONTENT_TYPE = re.compile(
     r"(?:application/(?:json|graphql|javascript|x-www-form-urlencoded)|"
     r"text/|xml|javascript)",
@@ -33,40 +63,73 @@ _TEXT_CONTENT_TYPE = re.compile(
 _BODY_RESOURCE_TYPES = frozenset({"document", "xhr", "fetch"})
 
 
+def _is_person_name_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+    return normalized in _PERSON_NAME_KEYS
+
+
+def _replace_ip(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    address = candidate.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        return candidate
+    return "<redacted-ip>"
+
+
+def _redact_plain_text(value: str) -> str:
+    text = str(value or "")
+    text = _BEARER.sub(r"\1<redacted>", text)
+    text = _JWT.sub("<redacted-jwt>", text)
+    text = _CARD_NUMBER.sub("<redacted-card>", text)
+    text = _EMAIL.sub("<redacted-email>", text)
+    text = _IPV6.sub(_replace_ip, text)
+    return _IPV4.sub(_replace_ip, text)
+
+
+def _redact_url_component(value: str, *, safe: str) -> str:
+    decoded = unquote(str(value or ""))
+    return quote(_redact_plain_text(decoded), safe=safe)
+
+
 def _redact_url(value: str) -> str:
     try:
         parsed = urlsplit(str(value or ""))
-        if not parsed.scheme and not parsed.netloc:
-            return _redact_text(str(value or ""))
-        query = [
-            (key, "<redacted>" if _SENSITIVE_QUERY_KEY.search(key) else item)
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        ]
-        hostname = parsed.hostname or ""
+        query: list[tuple[str, str]] = []
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            safe_key = _redact_plain_text(key)
+            safe_item = (
+                "<redacted>"
+                if _SENSITIVE_QUERY_KEY.search(key) or _is_person_name_key(key)
+                else _redact_text(item)
+            )
+            query.append((safe_key, safe_item))
+
+        hostname = _redact_plain_text(parsed.hostname or "")
         if parsed.port:
             hostname = f"{hostname}:{parsed.port}"
-        if parsed.username:
+        if "@" in parsed.netloc:
             hostname = f"<redacted>@{hostname}"
-        netloc = hostname
-        return urlunsplit((parsed.scheme, netloc, parsed.path, urlencode(query), ""))
+
+        path = _redact_url_component(parsed.path, safe="/:@!$&'()*+,;=-._~<>")
+        return urlunsplit((parsed.scheme, hostname, path, urlencode(query), ""))
     except Exception:
         return "<invalid-url>"
 
 
 def _redact_text(value: str) -> str:
-    text = str(value or "")
-    text = _BEARER.sub(r"\1<redacted>", text)
-    text = _JWT.sub("<redacted-jwt>", text)
-    return _CARD_NUMBER.sub("<redacted-card>", text)
+    text = _URL_IN_TEXT.sub(lambda match: _redact_url(match.group(0)), str(value or ""))
+    return _redact_plain_text(text)
 
 
 def redact_browser_value(value: Any, *, key: str = "") -> Any:
     """Return JSON-safe browser diagnostics with credential/payment data removed."""
-    if _SENSITIVE_KEY.search(str(key or "")):
+    if _SENSITIVE_KEY.search(str(key or "")) or _is_person_name_key(key):
         return "<redacted>"
     if isinstance(value, dict):
         return {
-            str(name): redact_browser_value(item, key=str(name))
+            _redact_text(str(name)): redact_browser_value(item, key=str(name))
             for name, item in value.items()
         }
     if isinstance(value, (list, tuple)):

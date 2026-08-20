@@ -506,13 +506,19 @@ def test_skipped_submit_work_reaches_barrier_without_blocking_ready_work(
     submitted: list[str] = []
     failures: list[str] = []
     written: list[str] = []
+    captured_submit: dict[str, Any] = {}
 
     def fake_load_submit_input(**kwargs: Any):
         if kwargs["user_account_id"] == "account-skipped":
             raise SpaceSessionOtpWorkflowError("snapshot is unusable")
-        return {"phase": "otp_collected", "proxy": "http://proxy.test:80"}, "http://proxy.test:80"
+        return (
+            {"phase": "otp_collected", "proxy": "http://proxy.test:80"},
+            "http://proxy.test:80",
+            "US",
+        )
 
     def fake_submit(**kwargs: Any):
+        captured_submit.update(kwargs)
         kwargs["before_validate"]("ready@example.test")
         submitted.append("ready")
         return SimpleNamespace(snapshot={"phase": "otp_validated", "otp_code": "123456"})
@@ -551,6 +557,7 @@ def test_skipped_submit_work_reaches_barrier_without_blocking_ready_work(
     assert skipped_result["_work_outcome"] == "skipped"
     assert ready_result["submit_status"] == "otp_validated"
     assert submitted == ["ready"]
+    assert captured_submit["proxy_country"] == "US"
     assert failures == ["snapshot-skipped"]
     assert written == ["snapshot-ready"]
     assert "submit-job-1" not in space_session_otp._SUBMIT_BARRIERS

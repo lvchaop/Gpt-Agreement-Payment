@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     openai_chatgpt_base_url: str = "https://chatgpt.com"
     openai_probe_path_template: str = ""
     browser_impersonate: str = Field(default="chrome142", pattern=r"^chrome\d+[a-z]*$")
+    cloakbrowser_license_key: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "CLOAKBROWSER_LICENSE_KEY",
+            "REFACTOR_APP_CLOAKBROWSER_LICENSE_KEY",
+        ),
+    )
     browser_static_asset_cache_enabled: bool = True
     browser_log_enabled: bool = Field(
         default=False,
@@ -51,6 +59,74 @@ class Settings(BaseSettings):
     hero_sms_api_key: str = Field(
         default="",
         validation_alias=AliasChoices("HERO_SMS_API_KEY", "REFACTOR_APP_HERO_SMS_API_KEY"),
+    )
+    hero_sms_base_url: str = "https://hero-sms.com/stubs/handler_api.php"
+    hero_sms_request_timeout_s: int = Field(default=20, ge=1, le=120)
+    hero_sms_poll_interval_s: float = Field(default=3.0, ge=0.1, le=60.0)
+    hero_email_api_key: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_API_KEY",
+            "REFACTOR_APP_HERO_EMAIL_API_KEY",
+        ),
+    )
+    hero_email_base_url: str = Field(
+        default="https://hero-sms.com/api/v1",
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_BASE_URL",
+            "REFACTOR_APP_HERO_EMAIL_BASE_URL",
+        ),
+    )
+    hero_email_site: str = Field(
+        default="chatgpt.com",
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_SITE",
+            "REFACTOR_APP_HERO_EMAIL_SITE",
+        ),
+    )
+    hero_email_domain: str = Field(
+        default="gmail.com",
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_DOMAIN",
+            "REFACTOR_APP_HERO_EMAIL_DOMAIN",
+        ),
+    )
+    hero_email_yandex_domains: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_YANDEX_DOMAINS",
+            "REFACTOR_APP_HERO_EMAIL_YANDEX_DOMAINS",
+        ),
+    )
+    hero_email_request_timeout_s: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=120.0,
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_REQUEST_TIMEOUT_S",
+            "REFACTOR_APP_HERO_EMAIL_REQUEST_TIMEOUT_S",
+        ),
+    )
+    hero_email_poll_interval_s: float = Field(
+        default=3.0,
+        ge=0.1,
+        le=30.0,
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_POLL_INTERVAL_S",
+            "REFACTOR_APP_HERO_EMAIL_POLL_INTERVAL_S",
+        ),
+    )
+    hero_email_user_agent: str = Field(
+        default=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        validation_alias=AliasChoices(
+            "HERO_EMAIL_USER_AGENT",
+            "REFACTOR_APP_HERO_EMAIL_USER_AGENT",
+        ),
     )
     grizzly_sms_api_key: str = Field(
         default="",
@@ -284,7 +360,7 @@ class Settings(BaseSettings):
         pattern=r"^[A-Za-z]{2}$",
     )
     personal_plus_checkout_promo_proxy_country: str = Field(
-        default="JP",
+        default="US",
         validation_alias="PERSONAL_PLUS_CHECKOUT_PROMO_PROXY_COUNTRY",
         pattern=r"^[A-Za-z]{2}$",
     )
@@ -309,6 +385,127 @@ class Settings(BaseSettings):
     personal_plus_checkout_captcha_client_key: str = Field(
         default="",
         validation_alias="PERSONAL_PLUS_CHECKOUT_CAPTCHA_CLIENT_KEY",
+    )
+    personal_paypal_link_billing_country: str = Field(
+        default="DE",
+        validation_alias="PERSONAL_PAYPAL_LINK_BILLING_COUNTRY",
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_link_proxy_country: str = Field(
+        default="BR",
+        validation_alias="PERSONAL_PAYPAL_LINK_PROXY_COUNTRY",
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_link_currency: str = Field(
+        default="EUR",
+        validation_alias="PERSONAL_PAYPAL_LINK_CURRENCY",
+        pattern=r"^[A-Za-z]{3}$",
+    )
+    personal_paypal_link_promo_campaign_id: str = Field(
+        default="plus-1-month-free",
+        validation_alias="PERSONAL_PAYPAL_LINK_PROMO_CAMPAIGN_ID",
+    )
+    personal_paypal_link_ui_mode: str = Field(
+        default="hosted",
+        validation_alias="PERSONAL_PAYPAL_LINK_UI_MODE",
+        pattern=r"^(?:hosted|custom)$",
+    )
+    personal_paypal_agreement_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_ENABLED",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_ENABLED",
+        ),
+    )
+    personal_paypal_agreement_country: str = Field(
+        default="US",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_COUNTRY",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_COUNTRY",
+        ),
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_agreement_proxy_country: str = Field(
+        default="US",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_PROXY_COUNTRY",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_PROXY_COUNTRY",
+        ),
+        pattern=r"^[A-Za-z]{2}$",
+    )
+    personal_paypal_agreement_buyer_mode: str = Field(
+        default="identity_elevation",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_BUYER_MODE",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_BUYER_MODE",
+        ),
+        pattern=r"^(?:identity_elevation|original)$",
+    )
+    personal_paypal_agreement_sms_service: str = Field(
+        default="ts",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_SMS_SERVICE",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_SMS_SERVICE",
+        ),
+        min_length=1,
+    )
+    personal_paypal_agreement_sms_country: str = Field(
+        default="187",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_SMS_COUNTRY",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_SMS_COUNTRY",
+        ),
+        pattern=r"^[0-9]+$",
+    )
+    personal_paypal_agreement_hero_lock_timeout_s: int = Field(
+        default=1800,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_HERO_LOCK_TIMEOUT_S",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_HERO_LOCK_TIMEOUT_S",
+        ),
+        ge=30,
+        le=7200,
+    )
+    personal_paypal_agreement_sms_max_price: str = Field(
+        default="0.18",
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_SMS_MAX_PRICE",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_SMS_MAX_PRICE",
+        ),
+    )
+    personal_paypal_agreement_otp_timeout_s: int = Field(
+        default=180,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_OTP_TIMEOUT_S",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_OTP_TIMEOUT_S",
+        ),
+        ge=30,
+        le=1800,
+    )
+    personal_paypal_agreement_max_phone_attempts: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_MAX_PHONE_ATTEMPTS",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_MAX_PHONE_ATTEMPTS",
+        ),
+        ge=1,
+        le=10,
+    )
+    personal_paypal_agreement_max_card_attempts: int = Field(
+        default=5,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_MAX_CARD_ATTEMPTS",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_MAX_CARD_ATTEMPTS",
+        ),
+        ge=1,
+        le=20,
+    )
+    personal_paypal_agreement_finalize_checkout: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "PERSONAL_PAYPAL_AGREEMENT_FINALIZE_CHECKOUT",
+            "REFACTOR_APP_PAYPAL_AGREEMENT_FINALIZE_CHECKOUT",
+        ),
     )
     icloud_post_registration_promotion_check_enabled: bool = Field(
         default=False,

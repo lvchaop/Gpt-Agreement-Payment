@@ -19,10 +19,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from refactor_app.api.dependencies import get_db_session
 from refactor_app.api.pagination import page_payload, page_values, total_for
-from refactor_app.application.jobs.attempt_disposition import (
-    has_personal_plus_checkout_consume_stop,
-    has_personal_plus_checkout_sync_failure,
-)
 from refactor_app.application.jobs.queue import JobQueue, WorkQueue
 from refactor_app.application.workflows.account_email_change import (
     ACCOUNT_EMAIL_CHANGE_MODE_AUTO_CLAIM,
@@ -42,10 +38,17 @@ from refactor_app.application.workflows.payment_method_inventory import (
     import_payment_method_inventory,
     payment_method_inventory_summary,
 )
+from refactor_app.application.workflows.personal_paypal_link import (
+    PAYPAL_LINK_BILLING_COUNTRIES,
+    normalize_paypal_link_currency,
+)
 from refactor_app.application.workflows.protocol_registration import (
     EMAIL_BROWSER_NO_PHONE,
     EMAIL_PROTOCOL_NO_PHONE,
+    HERO_GMAIL_PROVIDER,
+    HERO_YANDEX_PROVIDER,
     ICLOUD_HIDE_MY_EMAIL_PROVIDER,
+    PHONE_BROWSER_BIND_EMAIL,
     PHONE_PROTOCOL_BIND_EMAIL,
     SUPPORTED_REGISTRATION_MAIL_PROVIDERS,
 )
@@ -54,6 +57,10 @@ from refactor_app.application.workflows.proxy import (
     bind_team_admin_static_proxy_in_session,
     ensure_team_admin_static_proxy_url_in_session,
     reassign_team_admin_static_proxy_in_session,
+)
+from refactor_app.application.workflows.registration_proxy import (
+    CliproxyProxyError,
+    normalize_cliproxy_route_selector,
 )
 from refactor_app.application.workflows.space_authorization import (
     resolve_personal_codex_authorization_target,
@@ -130,6 +137,7 @@ from refactor_app.infrastructure.db.models import (
     SpaceCredentialUsageStateModel,
     SpaceMembershipModel,
     SpaceModel,
+    SpacePromotionOfferModel,
     SpacePushAttemptModel,
     SpacePushBindingModel,
     SpaceReplenishEmailModel,
@@ -139,6 +147,7 @@ from refactor_app.infrastructure.db.models import (
     UserAccountProxyBindingModel,
     WorkItemModel,
 )
+from refactor_app.plugins.hero_email import is_yandex_email_domain, normalize_domain_candidates
 from refactor_app.plugins.openai_chatgpt.client import (
     OpenAIChatGPTClientConfig,
     OpenAIChatGPTClientError,
@@ -387,6 +396,7 @@ class BackfillSessionRtRequest(BaseModel):
     user_account_ids: list[str]
     created_by: str = ""
     work_count: int = 10
+    proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
 
 
 class PersonalCodexAuthorizationJobRequest(BaseModel):
@@ -462,6 +472,7 @@ class SpaceSeatExpansionJobRequest(BaseModel):
 
 
 class PersonalPaymentMethodBindJobRequest(BaseModel):
+    proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
     auto_start_plus_checkout: bool = True
     checkout_ui_mode: str | None = Field(default=None, pattern=r"^(?:hosted|custom)$")
     payment_card_id: str = ""
@@ -475,8 +486,20 @@ class PersonalPaymentMethodBindJobRequest(BaseModel):
 
 
 class PersonalPlusCheckoutJobRequest(BaseModel):
-    create_proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
-    promo_proxy_country: str = Field(default="JP", pattern=r"^[A-Za-z]{2}$")
+    proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    checkout_proxy_country: str | None = Field(
+        default=None, pattern=r"^[A-Za-z]{2}$"
+    )
+    update_proxy_country: str | None = Field(
+        default=None, pattern=r"^[A-Za-z]{2}$"
+    )
+    # Backward-compatible aliases for queued jobs and older API clients.
+    create_proxy_country: str | None = Field(
+        default=None, pattern=r"^[A-Za-z]{2}$"
+    )
+    promo_proxy_country: str | None = Field(
+        default=None, pattern=r"^[A-Za-z]{2}$"
+    )
     promo_campaign_id: str = Field(default="plus-1-month-free", min_length=1, max_length=120)
     checkout_ui_mode: str | None = Field(default=None, pattern=r"^(?:hosted|custom)$")
     browser_headless: bool = True
@@ -488,8 +511,159 @@ class PersonalPlusCheckoutJobRequest(BaseModel):
     created_by: str = ""
 
 
+class PersonalPlusCheckoutSelectedJobRequest(PersonalPlusCheckoutJobRequest):
+    space_ids: list[str] = Field(min_length=1)
+    work_count: int = Field(default=5, ge=1, le=50)
+
+
+class PersonalPayPalLinkJobRequest(BaseModel):
+    payment_method_type: str = Field(
+        default="paypal", pattern=r"^(?:paypal|card|gcash|pix)$"
+    )
+    proxy_country: str = Field(default="BR", pattern=r"^[A-Za-z]{2}$")
+    checkout_proxy_country: str | None = Field(
+        default=None, pattern=r"^[A-Za-z]{2}$"
+    )
+    update_proxy_country: str | None = Field(
+        default=None, pattern=r"^[A-Za-z]{2}$"
+    )
+    billing_country: str = Field(default="DE", pattern=r"^[A-Za-z]{2}$")
+    currency: str | None = Field(default=None, pattern=r"^[A-Za-z]{3}$")
+    apply_promotion: bool = True
+    promo_campaign_id: str = Field(default="plus-1-month-free", max_length=120)
+    checkout_ui_mode: str = Field(default="hosted", pattern=r"^(?:hosted|custom)$")
+    browser_headless: bool = True
+    browser_log_enabled: bool = False
+    browser_log_capture_bodies: bool = False
+    browser_log_max_body_chars: int = Field(default=100_000, ge=1_000, le=100_000)
+    execute_agreement: bool = False
+    agreement_country: str | None = None
+    agreement_proxy_country: str | None = None
+    agreement_buyer_mode: str = Field(
+        default="identity_elevation",
+        pattern=r"^(?:identity_elevation|original)$",
+    )
+    agreement_sms_country: str = ""
+    agreement_max_card_attempts: int = Field(default=5, ge=1, le=20)
+    agreement_finalize_checkout: bool = True
+    created_by: str = ""
+
+
+class PersonalPayPalLinkSelectedJobRequest(PersonalPayPalLinkJobRequest):
+    space_ids: list[str] = Field(min_length=1)
+    work_count: int = Field(default=5, ge=1, le=50)
+
+
+def _personal_plus_checkout_country_config(
+    req: PersonalPlusCheckoutJobRequest,
+) -> tuple[str, str]:
+    checkout_proxy_country = str(
+        req.checkout_proxy_country
+        or req.create_proxy_country
+        or req.proxy_country
+        or "US"
+    ).strip().upper()
+    update_proxy_country = str(
+        req.update_proxy_country
+        or req.promo_proxy_country
+        or checkout_proxy_country
+    ).strip().upper()
+    if update_proxy_country != checkout_proxy_country:
+        raise HTTPException(
+            status_code=400,
+            detail="update_proxy_country must match checkout_proxy_country",
+        )
+    return checkout_proxy_country, update_proxy_country
+
+
+def _personal_paypal_link_country_config(
+    req: PersonalPayPalLinkJobRequest,
+) -> tuple[str, str, str, str]:
+    # PIX has a fixed BR checkout contract. Promotion update must stay on the
+    # same checkout egress, so request values cannot split the proxy chain.
+    if req.payment_method_type == "pix":
+        return "BR", "BR", "BR", "BRL"
+    # GCash keeps its PH/PHP payment contract, but the checkout egress is
+    # configurable. Checkout and update must still resolve to the same exit.
+    billing_country = (
+        "PH" if req.payment_method_type == "gcash" else req.billing_country.strip().upper()
+    )
+    checkout_proxy_country = str(
+        req.checkout_proxy_country or req.proxy_country
+    ).strip().upper()
+    update_proxy_country = str(
+        req.update_proxy_country or checkout_proxy_country
+    ).strip().upper()
+    if billing_country not in PAYPAL_LINK_BILLING_COUNTRIES:
+        raise HTTPException(
+            status_code=400,
+            detail="billing_country must be one of DE, CA, US, AU, GB, JP, PH, PL, SG, TR, VN",
+        )
+    if update_proxy_country != checkout_proxy_country:
+        raise HTTPException(
+            status_code=400,
+            detail="update_proxy_country must match checkout_proxy_country",
+        )
+    try:
+        currency = normalize_paypal_link_currency(
+            req.currency,
+            billing_country,
+            payment_method_type=req.payment_method_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return billing_country, checkout_proxy_country, update_proxy_country, currency
+
+
+def _personal_paypal_agreement_config(
+    req: PersonalPayPalLinkJobRequest,
+) -> dict[str, str | int | bool | None]:
+    agreement_country = str(req.agreement_country or "").strip().upper()
+    agreement_proxy_country = str(req.agreement_proxy_country or "").strip().upper()
+    agreement_sms_country = str(req.agreement_sms_country or "").strip()
+
+    if req.execute_agreement and req.payment_method_type != "paypal":
+        raise HTTPException(
+            status_code=400,
+            detail="PayPal agreement execution requires payment_method_type=paypal",
+        )
+    if req.execute_agreement:
+        for field_name, country in (
+            ("agreement_country", agreement_country),
+            ("agreement_proxy_country", agreement_proxy_country),
+        ):
+            if not country:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{field_name} is required when execute_agreement is true",
+                )
+            if not (len(country) == 2 and country.isascii() and country.isalpha()):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{field_name} must be a two-letter country code",
+                )
+    if agreement_sms_country and not (
+        agreement_sms_country.isascii() and agreement_sms_country.isdigit()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="agreement_sms_country must contain digits only",
+        )
+
+    return {
+        "execute_agreement": req.execute_agreement,
+        "agreement_country": agreement_country or None,
+        "agreement_proxy_country": agreement_proxy_country or None,
+        "agreement_buyer_mode": req.agreement_buyer_mode,
+        "agreement_sms_country": agreement_sms_country,
+        "agreement_max_card_attempts": req.agreement_max_card_attempts,
+        "agreement_finalize_checkout": req.agreement_finalize_checkout,
+    }
+
+
 class PersonalPaymentMethodBindSelectedJobRequest(BaseModel):
     space_ids: list[str] = Field(min_length=1)
+    proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
     auto_start_plus_checkout: bool = True
     checkout_ui_mode: str | None = Field(default=None, pattern=r"^(?:hosted|custom)$")
     browser_headless: bool = True
@@ -502,6 +676,12 @@ class PersonalPaymentMethodBindSelectedJobRequest(BaseModel):
 class PersonalPromotionCheckSelectedJobRequest(BaseModel):
     space_ids: list[str] = Field(min_length=1)
     proxy_country: str = Field(default="JP", pattern=r"^[A-Za-z]{2}$")
+    work_count: int = Field(default=5, ge=1, le=50)
+    created_by: str = ""
+
+
+class PersonalSubscriptionRefreshSelectedJobRequest(BaseModel):
+    space_ids: list[str] = Field(min_length=1)
     work_count: int = Field(default=5, ge=1, le=50)
     created_by: str = ""
 
@@ -585,6 +765,8 @@ class ProtocolRegistrationJobRequest(BaseModel):
     work_count: int = 1
     use_proxy: bool = True
     proxy_country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    proxy_state: str = Field(default="", max_length=80)
+    proxy_asn: str = Field(default="", max_length=16)
     authorize_codex_after_security: bool = False
     mail_provider: str = "outlook"
     email_domain: str = ""
@@ -596,13 +778,19 @@ class ProtocolRegistrationJobRequest(BaseModel):
     browser_log_enabled: bool | None = None
     browser_log_capture_bodies: bool | None = None
     browser_log_max_body_chars: int | None = Field(default=None, ge=1_000, le=100_000)
-    phone_provider: str = "hero_sms"
-    phone_base_url: str = "https://hero-sms.com/stubs/handler_api.php"
-    phone_api_key_env: str = "HERO_SMS_API_KEY"
+    browser_backend: str = Field(
+        default="camoufox",
+        pattern=r"^(?:camoufox|cloakbrowser)$",
+    )
+    # HeroSMS is reserved for the personal PayPal agreement OTP path.  The
+    # generic registration job must keep using the Grizzly pool.
+    phone_provider: str = "grizzly_sms"
+    phone_base_url: str = "https://api.grizzlysms.com/stubs/handler_api.php"
+    phone_api_key_env: str = "GRIZZLY_SMS_API_KEY"
     phone_service: str = "dr"
     phone_country: str = ""
-    phone_countries: list[str] = Field(default_factory=lambda: ["151", "73", "16"])
-    phone_max_price: str = "0.05"
+    phone_countries: list[str] = Field(default_factory=lambda: ["187"])
+    phone_max_price: str = "0.18"
     phone_country_max_prices: dict[str, str] = {}
     phone_max_number_attempts: int = 3
     phone_otp_timeout_s: int = 180
@@ -729,6 +917,7 @@ def list_user_accounts(
     page_size: int = 50,
     sort: str = "-created_at",
     q: str = "",
+    email_list: str = "",
     account_status: str = "",
     session_status: str = "",
     personal_plan_type: str = "",
@@ -762,6 +951,9 @@ def list_user_accounts(
                 UserAccountModel.last_login_error_message.ilike(needle),
             )
         )
+    email_values = _email_values(email_list)
+    if email_values:
+        stmt = stmt.where(func.lower(UserAccountModel.email).in_(email_values))
     if account_status.strip():
         stmt = stmt.where(UserAccountModel.account_status.in_(_csv_values(account_status)))
     if session_status.strip():
@@ -1362,6 +1554,7 @@ def list_spaces(
     page_size: int = 50,
     sort: str = "-created_at",
     q: str = "",
+    email_list: str = "",
     space_type: str = "",
     credential_type: str = "",
     plan_type: str = "",
@@ -1372,6 +1565,8 @@ def list_spaces(
     payment_method_status: str = "",
     has_payment_method: bool | None = None,
     has_promotion: bool | None = None,
+    promotion_country: str = "",
+    promotion_status: str = "",
 ) -> dict:
     page, page_size = page_values(page, page_size)
     space_session_at = case(
@@ -1396,6 +1591,21 @@ def list_spaces(
                 SpaceModel.id.ilike(needle),
                 SpaceModel.name.ilike(needle),
                 SpaceModel.external_space_id.ilike(needle),
+                exists(
+                    select(SpacePromotionOfferModel.id).where(
+                        SpacePromotionOfferModel.space_id == SpaceModel.id,
+                        SpacePromotionOfferModel.promotion_id.ilike(needle),
+                    )
+                ),
+            )
+        )
+    email_values = _email_values(email_list)
+    if email_values:
+        stmt = stmt.where(
+            or_(
+                func.lower(UserAccountModel.email).in_(email_values),
+                func.lower(TeamAdminSessionModel.admin_email).in_(email_values),
+                func.lower(SpaceModel.name).in_(email_values),
             )
         )
     for value, column in (
@@ -1412,12 +1622,26 @@ def list_spaces(
         stmt = stmt.where(SpaceModel.has_payment_method.is_(has_payment_method))
     if has_promotion is not None:
         stmt = stmt.where(SpaceModel.has_promotion.is_(has_promotion))
+    promotion_offer_filters = [SpacePromotionOfferModel.space_id == SpaceModel.id]
+    if promotion_country.strip():
+        promotion_offer_filters.append(
+            SpacePromotionOfferModel.proxy_country.in_(_csv_values(promotion_country.upper()))
+        )
+    if promotion_status.strip():
+        promotion_offer_filters.append(
+            SpacePromotionOfferModel.status.in_(_csv_values(promotion_status))
+        )
+    if len(promotion_offer_filters) > 1:
+        stmt = stmt.where(
+            exists(select(SpacePromotionOfferModel.id).where(*promotion_offer_filters))
+        )
     stmt = _apply_plan_type_filter(stmt, column=SpaceModel.plan_type, value=plan_type)
     stmt = _apply_session_recency_filter(
         stmt,
         column=space_session_at,
         value=session_recency,
     )
+
     stmt, normalized_sort = _sort_stmt(
         stmt,
         sort,
@@ -1435,10 +1659,89 @@ def list_spaces(
     )
     total = total_for(session, stmt)
     rows = session.execute(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    promotion_summaries = _space_promotion_summaries(
+        session=session,
+        space_ids=[space.id for space, _last_session_refresh_at in rows],
+    )
     return page_payload(
         items=[
-            _space_dict(space, last_session_refresh_at=last_session_refresh_at)
+            _space_dict(
+                space,
+                session=session,
+                last_session_refresh_at=last_session_refresh_at,
+                promotion_summary=promotion_summaries.get(space.id, []),
+            )
             for space, last_session_refresh_at in rows
+        ],
+        page=page,
+        page_size=page_size,
+        total=total,
+        sort=normalized_sort,
+    )
+
+
+@router.get("/spaces/promotion-offers")
+def list_space_promotion_offers(
+    session: DbSession,
+    page: int = 1,
+    page_size: int = 50,
+    sort: str = "-last_checked_at",
+    q: str = "",
+    space_ids: str = "",
+    countries: str = "",
+    promotion_ids: str = "",
+    status: str = "",
+) -> dict:
+    page, page_size = page_values(page, page_size)
+    stmt = (
+        select(SpacePromotionOfferModel, SpaceModel, UserAccountModel)
+        .join(SpaceModel, SpaceModel.id == SpacePromotionOfferModel.space_id)
+        .outerjoin(
+            UserAccountModel,
+            UserAccountModel.id == SpacePromotionOfferModel.user_account_id,
+        )
+    )
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                SpacePromotionOfferModel.promotion_id.ilike(needle),
+                SpacePromotionOfferModel.promotion_name.ilike(needle),
+                SpaceModel.name.ilike(needle),
+                SpaceModel.external_space_id.ilike(needle),
+                UserAccountModel.email.ilike(needle),
+            )
+        )
+    if space_ids.strip():
+        stmt = stmt.where(SpacePromotionOfferModel.space_id.in_(_csv_values(space_ids)))
+    if countries.strip():
+        stmt = stmt.where(
+            SpacePromotionOfferModel.proxy_country.in_(_csv_values(countries.upper()))
+        )
+    if promotion_ids.strip():
+        stmt = stmt.where(
+            SpacePromotionOfferModel.promotion_id.in_(_csv_values(promotion_ids))
+        )
+    if status.strip():
+        stmt = stmt.where(SpacePromotionOfferModel.status.in_(_csv_values(status)))
+    stmt, normalized_sort = _sort_stmt(
+        stmt,
+        sort,
+        {
+            "last_checked_at": SpacePromotionOfferModel.last_checked_at,
+            "last_seen_at": SpacePromotionOfferModel.last_seen_at,
+            "first_seen_at": SpacePromotionOfferModel.first_seen_at,
+            "proxy_country": SpacePromotionOfferModel.proxy_country,
+            "promotion_id": SpacePromotionOfferModel.promotion_id,
+        },
+        default="-last_checked_at",
+    )
+    total = total_for(session, stmt)
+    rows = session.execute(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    return page_payload(
+        items=[
+            _space_promotion_offer_dict(offer, space=space, account=account)
+            for offer, space, account in rows
         ],
         page=page,
         page_size=page_size,
@@ -2016,6 +2319,7 @@ def create_selected_personal_payment_method_bind_job(
     req: PersonalPaymentMethodBindSelectedJobRequest,
     session: DbSession,
 ) -> dict:
+    proxy_country = req.proxy_country.strip().upper()
     requested_space_ids, selected, selection_skipped = (
         _select_personal_payment_method_bind_spaces(
             session=session,
@@ -2042,11 +2346,14 @@ def create_selected_personal_payment_method_bind_job(
         }
 
     inventory = payment_method_inventory_summary(session)
+    active_address_country_counts = dict(
+        inventory.get("active_address_country_counts") or {}
+    )
     missing_pools = [
         name
         for name, count in (
             ("name", inventory["active_name_count"]),
-            ("address", inventory["active_address_count"]),
+            ("address", active_address_country_counts.get(proxy_country, 0)),
             ("card", inventory["available_card_count"]),
         )
         if int(count or 0) < 1
@@ -2054,7 +2361,11 @@ def create_selected_personal_payment_method_bind_job(
     if missing_pools:
         raise HTTPException(
             status_code=409,
-            detail={"message": "payment method inventory is empty", "pools": missing_pools},
+            detail={
+                "message": "payment method inventory is empty",
+                "pools": missing_pools,
+                "proxy_country": proxy_country,
+            },
         )
 
     settings = get_settings()
@@ -2079,6 +2390,7 @@ def create_selected_personal_payment_method_bind_job(
             "requested_count": len(requested_space_ids),
             "selected_count": len(selected),
             "selection_skipped": selection_skipped,
+            "proxy_country": proxy_country,
             "auto_start_plus_checkout": req.auto_start_plus_checkout,
             "checkout_ui_mode": checkout_ui_mode,
             "browser_headless": req.browser_headless,
@@ -2098,6 +2410,7 @@ def create_selected_personal_payment_method_bind_job(
             execution_key=f"personal-payment-method:{space.id}",
             input_json={
                 "space_id": space.id,
+                "proxy_country": proxy_country,
                 "auto_start_plus_checkout": req.auto_start_plus_checkout,
                 "checkout_ui_mode": checkout_ui_mode,
                 "browser_headless": req.browser_headless,
@@ -2201,12 +2514,84 @@ def create_selected_personal_promotion_check_job(
     return result
 
 
+@router.post("/spaces/subscription-refresh-selected-job")
+def create_selected_personal_subscription_refresh_job(
+    req: PersonalSubscriptionRefreshSelectedJobRequest,
+    session: DbSession,
+) -> dict:
+    requested_space_ids, selected, selection_skipped = (
+        _select_personal_subscription_refresh_spaces(
+            session=session,
+            space_ids=req.space_ids,
+        )
+    )
+    work_count = int(req.work_count)
+    if not selected:
+        return {
+            "job_id": "",
+            "job_status": "skipped",
+            "run_id": "",
+            "work_count": work_count,
+            "requested_count": len(requested_space_ids),
+            "selected_count": 0,
+            "selection_skipped_count": len(selection_skipped),
+            "selection_skipped": selection_skipped,
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+
+    job, run = _start_work_job(
+        session=session,
+        job_type="space.personal_subscription_refresh.selected",
+        input_json={
+            "space_ids": [space.id for space in selected],
+            "work_count": work_count,
+            "requested_count": len(requested_space_ids),
+            "selected_count": len(selected),
+            "selection_skipped": selection_skipped,
+        },
+        created_by=req.created_by.strip() or "ops:space-subscription-refresh-selected",
+    )
+    queue = WorkQueue(session)
+    for space in selected:
+        queue.enqueue(
+            job_id=job.id,
+            work_type="space.personal_subscription_refresh.space",
+            execution_key=f"personal-subscription-refresh:{space.id}",
+            input_json={
+                "space_id": space.id,
+                "_run_id": run.id,
+            },
+        )
+    session.commit()
+    result = _work_job_summary_response(
+        session=session,
+        job_id=job.id,
+        run_id=run.id,
+        work_count=work_count,
+        selected_count=len(selected),
+    )
+    result.update(
+        {
+            "requested_count": len(requested_space_ids),
+            "selection_skipped_count": len(selection_skipped),
+            "selection_skipped": selection_skipped,
+        }
+    )
+    return result
+
+
 @router.post("/spaces/{space_id}/payment-method-bind-job")
 def create_personal_payment_method_bind_job(
     space_id: str,
     req: PersonalPaymentMethodBindJobRequest,
     session: DbSession,
 ) -> dict:
+    proxy_country = req.proxy_country.strip().upper()
     settings = get_settings()
     checkout_ui_mode = str(
         req.checkout_ui_mode
@@ -2279,11 +2664,14 @@ def create_personal_payment_method_bind_job(
         }
 
     inventory = payment_method_inventory_summary(session)
+    active_address_country_counts = dict(
+        inventory.get("active_address_country_counts") or {}
+    )
     missing_pools = [
         name
         for name, count in (
             ("name", inventory["active_name_count"]),
-            ("address", inventory["active_address_count"]),
+            ("address", active_address_country_counts.get(proxy_country, 0)),
             ("card", inventory["available_card_count"]),
         )
         if int(count or 0) < 1
@@ -2291,7 +2679,11 @@ def create_personal_payment_method_bind_job(
     if missing_pools:
         raise HTTPException(
             status_code=409,
-            detail={"message": "payment method inventory is empty", "pools": missing_pools},
+            detail={
+                "message": "payment method inventory is empty",
+                "pools": missing_pools,
+                "proxy_country": proxy_country,
+            },
         )
 
     job, run = _start_work_job(
@@ -2301,6 +2693,7 @@ def create_personal_payment_method_bind_job(
             "space_id": space.id,
             "limit": 1,
             "work_count": 1,
+            "proxy_country": proxy_country,
             "auto_start_plus_checkout": req.auto_start_plus_checkout,
             "checkout_ui_mode": checkout_ui_mode,
             "payment_card_id": req.payment_card_id.strip(),
@@ -2319,6 +2712,7 @@ def create_personal_payment_method_bind_job(
         execution_key=f"personal-payment-method:{space.id}",
         input_json={
             "space_id": space.id,
+            "proxy_country": proxy_country,
             "auto_start_plus_checkout": req.auto_start_plus_checkout,
             "checkout_ui_mode": checkout_ui_mode,
             "payment_card_id": req.payment_card_id.strip(),
@@ -2370,24 +2764,9 @@ def create_personal_plus_checkout_job(
             status_code=400,
             detail="plus checkout requires an active personal space",
         )
-    if not space.has_promotion or not str(space.promotion_id or "").strip():
-        raise HTTPException(status_code=409, detail="plus checkout requires an eligible promotion")
-    if not space.has_payment_method or space.payment_method_status != "bound":
-        raise HTTPException(status_code=409, detail="plus checkout requires a bound payment method")
     account = session.get(UserAccountModel, space.owner_user_account_id)
     if account is None or account.account_status != "active":
         raise HTTPException(status_code=409, detail="plus checkout owner account is not active")
-    if has_personal_plus_checkout_consume_stop(
-        session, space_id=space.id
-    ) and not has_personal_plus_checkout_sync_failure(session, space_id=space.id):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "plus checkout has a non-replayable prior submission",
-                "error_code": "personal_plus_checkout_consume_stop_exists",
-                "attempt_disposition": "consume_stop",
-            },
-        )
     active_job = _active_work_job_for_type(
         session=session,
         job_type="space.personal_plus_checkout.tick",
@@ -2403,6 +2782,23 @@ def create_personal_plus_checkout_job(
             **summary,
             "skipped_reason": "active_personal_plus_checkout_job_exists",
         }
+    checkout_proxy_country, update_proxy_country = (
+        _personal_plus_checkout_country_config(req)
+    )
+    checkout_input = {
+        "proxy_country": checkout_proxy_country,
+        "checkout_proxy_country": checkout_proxy_country,
+        "update_proxy_country": update_proxy_country,
+        "promo_campaign_id": req.promo_campaign_id.strip(),
+        "checkout_ui_mode": req.checkout_ui_mode,
+        "browser_headless": req.browser_headless,
+        "browser_log_enabled": req.browser_log_enabled,
+        "browser_log_capture_bodies": req.browser_log_capture_bodies,
+        "browser_log_max_body_chars": req.browser_log_max_body_chars,
+        "captcha_api_url": captcha_api_url,
+        "captcha_client_key": captcha_client_key,
+        "checkout_attempt_mode": "new",
+    }
     job, run = _start_work_job(
         session=session,
         job_type="space.personal_plus_checkout.tick",
@@ -2410,17 +2806,7 @@ def create_personal_plus_checkout_job(
             "space_id": space.id,
             "limit": 1,
             "work_count": 1,
-            "checkout_attempt_mode": "new",
-            "create_proxy_country": req.create_proxy_country.strip().upper(),
-            "promo_proxy_country": req.promo_proxy_country.strip().upper(),
-            "promo_campaign_id": req.promo_campaign_id.strip(),
-            "checkout_ui_mode": req.checkout_ui_mode,
-            "browser_headless": req.browser_headless,
-            "browser_log_enabled": req.browser_log_enabled,
-            "browser_log_capture_bodies": req.browser_log_capture_bodies,
-            "browser_log_max_body_chars": req.browser_log_max_body_chars,
-            "captcha_api_url": captcha_api_url,
-            "captcha_client_key": captcha_client_key,
+            **checkout_input,
         },
         created_by=req.created_by.strip() or "ops:personal-plus-checkout",
     )
@@ -2430,17 +2816,7 @@ def create_personal_plus_checkout_job(
         execution_key=f"personal-plus-checkout:{space.id}",
         input_json={
             "space_id": space.id,
-            "checkout_attempt_mode": "new",
-            "create_proxy_country": req.create_proxy_country.strip().upper(),
-            "promo_proxy_country": req.promo_proxy_country.strip().upper(),
-            "promo_campaign_id": req.promo_campaign_id.strip(),
-            "checkout_ui_mode": req.checkout_ui_mode,
-            "browser_headless": req.browser_headless,
-            "browser_log_enabled": req.browser_log_enabled,
-            "browser_log_capture_bodies": req.browser_log_capture_bodies,
-            "browser_log_max_body_chars": req.browser_log_max_body_chars,
-            "captcha_api_url": captcha_api_url,
-            "captcha_client_key": captcha_client_key,
+            **checkout_input,
             "_run_id": run.id,
         },
     )
@@ -2452,6 +2828,314 @@ def create_personal_plus_checkout_job(
         work_count=1,
         selected_count=1,
     )
+
+
+@router.post("/spaces/plus-checkout-selected-job")
+def create_selected_personal_plus_checkout_job(
+    req: PersonalPlusCheckoutSelectedJobRequest,
+    session: DbSession,
+) -> dict:
+    requested_space_ids, selected, selection_skipped = (
+        _select_personal_plus_checkout_spaces(
+            session=session,
+            space_ids=req.space_ids,
+        )
+    )
+    work_count = int(req.work_count)
+    if not selected:
+        return {
+            "job_id": "",
+            "job_status": "skipped",
+            "run_id": "",
+            "work_count": 0,
+            "requested_count": len(requested_space_ids),
+            "selected_count": 0,
+            "selection_skipped_count": len(selection_skipped),
+            "selection_skipped": selection_skipped,
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+
+    settings = get_settings()
+    captcha_api_url = str(
+        req.captcha_api_url.strip()
+        or getattr(settings, "personal_plus_checkout_captcha_api_url", "")
+        or ""
+    )
+    captcha_client_key = str(
+        req.captcha_client_key.strip()
+        or getattr(settings, "personal_plus_checkout_captcha_client_key", "")
+        or ""
+    )
+    checkout_proxy_country, update_proxy_country = (
+        _personal_plus_checkout_country_config(req)
+    )
+    common_input = {
+        "proxy_country": checkout_proxy_country,
+        "checkout_proxy_country": checkout_proxy_country,
+        "update_proxy_country": update_proxy_country,
+        "promo_campaign_id": req.promo_campaign_id.strip(),
+        "checkout_ui_mode": req.checkout_ui_mode,
+        "checkout_attempt_mode": "new",
+        "browser_headless": req.browser_headless,
+        "browser_log_enabled": req.browser_log_enabled,
+        "browser_log_capture_bodies": req.browser_log_capture_bodies,
+        "browser_log_max_body_chars": req.browser_log_max_body_chars,
+        "captcha_api_url": captcha_api_url,
+        "captcha_client_key": captcha_client_key,
+    }
+    job, run = _start_work_job(
+        session=session,
+        job_type="space.personal_plus_checkout.tick",
+        input_json={
+            **common_input,
+            "space_ids": [space.id for space in selected],
+            "limit": len(selected),
+            "work_count": work_count,
+            "requested_count": len(requested_space_ids),
+            "selected_count": len(selected),
+            "selection_skipped": selection_skipped,
+        },
+        created_by=req.created_by.strip() or "ops:personal-plus-checkout-selected",
+    )
+    queue = WorkQueue(session)
+    for space in selected:
+        queue.enqueue(
+            job_id=job.id,
+            work_type="space.personal_plus_checkout.space",
+            execution_key=f"personal-plus-checkout:{space.id}",
+            input_json={
+                **common_input,
+                "space_id": space.id,
+                "limit": 1,
+                "work_count": 1,
+                "_run_id": run.id,
+            },
+        )
+    session.commit()
+    result = _work_job_summary_response(
+        session=session,
+        job_id=job.id,
+        run_id=run.id,
+        work_count=work_count,
+        selected_count=len(selected),
+    )
+    result.update(
+        {
+            "requested_count": len(requested_space_ids),
+            "selection_skipped_count": len(selection_skipped),
+            "selection_skipped": selection_skipped,
+        }
+    )
+    return result
+
+
+@router.post("/spaces/{space_id}/paypal-link-job")
+def create_personal_paypal_link_job(
+    space_id: str,
+    req: PersonalPayPalLinkJobRequest,
+    session: DbSession,
+) -> dict:
+    space = session.get(SpaceModel, space_id)
+    if space is None:
+        raise HTTPException(status_code=404, detail="space not found")
+    if (
+        space.provider != "openai_chatgpt"
+        or space.space_type != "personal"
+        or space.space_status != "active"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="PayPal link generation requires an active personal space",
+        )
+    account = session.get(UserAccountModel, space.owner_user_account_id)
+    if account is None or account.account_status != "active":
+        raise HTTPException(status_code=409, detail="PayPal link owner account is not active")
+    if not str(account.access_token or "").strip():
+        raise HTTPException(status_code=409, detail="PayPal link owner access token is missing")
+    active_job = _active_work_job_for_type(
+        session=session,
+        job_type="space.personal_paypal_link.tick",
+        space_id=space.id,
+    )
+    if active_job is not None:
+        return {
+            "job_id": active_job.id,
+            "job_status": active_job.job_status,
+            "work_count": 1,
+            "selected_count": 1,
+            **_work_summary(session, active_job.id),
+            "skipped_reason": "active_personal_paypal_link_job_exists",
+        }
+
+    billing_country, checkout_proxy_country, update_proxy_country, currency = (
+        _personal_paypal_link_country_config(req)
+    )
+    agreement_config = _personal_paypal_agreement_config(req)
+    input_json = {
+        "space_id": space.id,
+        "limit": 1,
+        "work_count": 1,
+        "proxy_country": checkout_proxy_country,
+        "checkout_proxy_country": checkout_proxy_country,
+        "update_proxy_country": update_proxy_country,
+        "billing_country": billing_country,
+        "currency": currency,
+        "apply_promotion": req.apply_promotion,
+        "promo_campaign_id": req.promo_campaign_id.strip(),
+        "checkout_ui_mode": (
+            "custom"
+            if req.payment_method_type in {"gcash", "pix"}
+            else req.checkout_ui_mode
+        ),
+        "payment_method_type": req.payment_method_type,
+        "browser_headless": req.browser_headless,
+        "browser_log_enabled": req.browser_log_enabled,
+        "browser_log_capture_bodies": req.browser_log_capture_bodies,
+        "browser_log_max_body_chars": req.browser_log_max_body_chars,
+        "checkout_attempt_mode": "new",
+        **agreement_config,
+    }
+    if req.apply_promotion and not input_json["promo_campaign_id"]:
+        raise HTTPException(
+            status_code=400,
+            detail="promo_campaign_id is required when apply_promotion is true",
+        )
+    job, run = _start_work_job(
+        session=session,
+        job_type="space.personal_paypal_link.tick",
+        input_json=input_json,
+        created_by=req.created_by.strip() or "ops:personal-paypal-link",
+    )
+    WorkQueue(session).enqueue(
+        job_id=job.id,
+        work_type="space.personal_paypal_link.space",
+        execution_key=f"personal-paypal-link:{space.id}",
+        input_json={**input_json, "_run_id": run.id},
+    )
+    session.commit()
+    return _work_job_summary_response(
+        session=session,
+        job_id=job.id,
+        run_id=run.id,
+        work_count=1,
+        selected_count=1,
+    )
+
+
+@router.post("/spaces/paypal-link-selected-job")
+def create_selected_personal_paypal_link_job(
+    req: PersonalPayPalLinkSelectedJobRequest,
+    session: DbSession,
+) -> dict:
+    requested_space_ids, selected, selection_skipped = (
+        _select_personal_paypal_link_spaces(
+            session=session,
+            space_ids=req.space_ids,
+            apply_promotion=req.apply_promotion,
+        )
+    )
+    work_count = int(req.work_count)
+    if not selected:
+        return {
+            "job_id": "",
+            "job_status": "skipped",
+            "run_id": "",
+            "work_count": 0,
+            "requested_count": len(requested_space_ids),
+            "selected_count": 0,
+            "selection_skipped_count": len(selection_skipped),
+            "selection_skipped": selection_skipped,
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+
+    billing_country, checkout_proxy_country, update_proxy_country, currency = (
+        _personal_paypal_link_country_config(req)
+    )
+    agreement_config = _personal_paypal_agreement_config(req)
+    promo_campaign_id = req.promo_campaign_id.strip()
+    if req.apply_promotion and not promo_campaign_id:
+        raise HTTPException(
+            status_code=400,
+            detail="promo_campaign_id is required when apply_promotion is true",
+        )
+    common_input = {
+        "proxy_country": checkout_proxy_country,
+        "checkout_proxy_country": checkout_proxy_country,
+        "update_proxy_country": update_proxy_country,
+        "billing_country": billing_country,
+        "currency": currency,
+        "apply_promotion": req.apply_promotion,
+        "promo_campaign_id": promo_campaign_id,
+        "checkout_ui_mode": (
+            "custom"
+            if req.payment_method_type in {"gcash", "pix"}
+            else req.checkout_ui_mode
+        ),
+        "payment_method_type": req.payment_method_type,
+        "browser_headless": req.browser_headless,
+        "browser_log_enabled": req.browser_log_enabled,
+        "browser_log_capture_bodies": req.browser_log_capture_bodies,
+        "browser_log_max_body_chars": req.browser_log_max_body_chars,
+        "checkout_attempt_mode": "new",
+        "work_count": work_count,
+        **agreement_config,
+    }
+    job, run = _start_work_job(
+        session=session,
+        # Reuse the registered tick handler; it observes the pre-enqueued
+        # works and returns the normal aggregate job summary.
+        job_type="space.personal_paypal_link.tick",
+        input_json={
+            **common_input,
+            "space_ids": [space.id for space in selected],
+            "limit": len(selected),
+            "work_count": work_count,
+            "requested_count": len(requested_space_ids),
+            "selected_count": len(selected),
+            "selection_skipped": selection_skipped,
+        },
+        created_by=req.created_by.strip() or "ops:personal-paypal-link-selected",
+    )
+    queue = WorkQueue(session)
+    for space in selected:
+        queue.enqueue(
+            job_id=job.id,
+            work_type="space.personal_paypal_link.space",
+            execution_key=f"personal-paypal-link:{space.id}",
+            input_json={
+                **common_input,
+                "space_id": space.id,
+                "limit": 1,
+                "work_count": 1,
+                "_run_id": run.id,
+            },
+        )
+    session.commit()
+    result = _work_job_summary_response(
+        session=session,
+        job_id=job.id,
+        run_id=run.id,
+        work_count=work_count,
+        selected_count=len(selected),
+    )
+    result.update(
+        {
+            "requested_count": len(requested_space_ids),
+            "selection_skipped_count": len(selection_skipped),
+            "selection_skipped": selection_skipped,
+        }
+    )
+    return result
 
 
 @router.get("/space-credentials")
@@ -2720,6 +3404,7 @@ def create_protocol_registration_job(
         EMAIL_PROTOCOL_NO_PHONE,
         EMAIL_BROWSER_NO_PHONE,
         PHONE_PROTOCOL_BIND_EMAIL,
+        PHONE_BROWSER_BIND_EMAIL,
     ):
         raise HTTPException(status_code=400, detail=f"unsupported registration mode: {req.mode}")
     mail_provider = str(req.mail_provider or "").strip()
@@ -2728,6 +3413,44 @@ def create_protocol_registration_job(
             status_code=400,
             detail=f"unsupported registration mail provider: {mail_provider}",
         )
+    try:
+        proxy_state, proxy_asn = normalize_cliproxy_route_selector(
+            state=req.proxy_state,
+            asn=req.proxy_asn,
+        )
+    except CliproxyProxyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    email_domain = str(req.email_domain or "").strip()
+    if mail_provider == HERO_GMAIL_PROVIDER:
+        configured_domain = str(get_settings().hero_email_domain or "gmail.com").strip().lower()
+        requested_domains = normalize_domain_candidates(email_domain)
+        if requested_domains and requested_domains != [configured_domain]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"hero_gmail requires email_domain={configured_domain}",
+            )
+        email_domain = configured_domain
+    elif mail_provider == HERO_YANDEX_PROVIDER:
+        settings = get_settings()
+        requested_domains = normalize_domain_candidates(email_domain)
+        configured_domains = normalize_domain_candidates(
+            getattr(settings, "hero_email_yandex_domains", "") or ""
+        )
+        candidates = requested_domains or configured_domains
+        invalid_domains = [
+            domain for domain in candidates if not is_yandex_email_domain(domain)
+        ]
+        if invalid_domains:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "hero_yandex email_domain values must use a yandex.* or ya.ru suffix: "
+                    + ",".join(invalid_domains)
+                ),
+            )
+        # An empty value deliberately means: select any stocked Yandex suffix
+        # advertised by Hero at claim time.
+        email_domain = ",".join(candidates)
     job = JobQueue(session).enqueue(
         job_type="account.protocol_register",
         input_json={
@@ -2736,16 +3459,21 @@ def create_protocol_registration_job(
             "work_count": max(1, int(req.work_count or 1)),
             "use_proxy": bool(req.use_proxy),
             "proxy_country": str(req.proxy_country or "US").strip().upper(),
+            "proxy_state": proxy_state,
+            "proxy_asn": proxy_asn,
             "authorize_codex_after_security": bool(req.authorize_codex_after_security),
             "mail_provider": mail_provider,
             "email_domain": (
-                "" if mail_provider == ICLOUD_HIDE_MY_EMAIL_PROVIDER else req.email_domain
+                ""
+                if mail_provider == ICLOUD_HIDE_MY_EMAIL_PROVIDER
+                else email_domain
             ),
             "project_key": req.project_key,
             "caller_id": req.caller_id,
             "browser_headless": bool(req.browser_headless),
             "browser_otp_timeout_s": max(1, int(req.browser_otp_timeout_s or 180)),
             "browser_close_delay_s": max(0.0, float(req.browser_close_delay_s or 0.0)),
+            "browser_backend": req.browser_backend,
             **(
                 {"browser_log_enabled": bool(req.browser_log_enabled)}
                 if req.browser_log_enabled is not None
@@ -4468,10 +5196,13 @@ def _space_dict(
     *,
     session: Session | None = None,
     last_session_refresh_at: datetime | None = None,
+    promotion_summary: list[dict[str, Any]] | None = None,
 ) -> dict:
     if session is not None and last_session_refresh_at is None:
         last_session_refresh_at = _space_last_session_refresh_at(session=session, space=space)
     payment_method_attempt_count = int(space.payment_method_attempt_count or 0)
+    if promotion_summary is None:
+        promotion_summary = _space_promotion_summary(session=session, space_id=space.id)
     return {
         "id": space.id,
         "provider": space.provider,
@@ -4488,6 +5219,11 @@ def _space_dict(
         "auto_replenish_enabled": space.auto_replenish_enabled,
         "has_promotion": bool(space.has_promotion),
         "promotion_id": str(space.promotion_id or ""),
+        "promotion_offer_count": sum(item["count"] for item in promotion_summary),
+        "promotion_countries": promotion_summary,
+        "promotion_country_summary": ", ".join(
+            f"{item['country']}({item['count']})" for item in promotion_summary
+        ),
         "has_payment_method": space.has_payment_method,
         "payment_method_status": space.payment_method_status,
         "payment_method_attempt_count": payment_method_attempt_count,
@@ -4511,6 +5247,89 @@ def _space_dict(
         "last_probe_at": _iso(space.last_probe_at),
         "created_at": _iso(space.created_at),
         "updated_at": _iso(space.updated_at),
+    }
+
+
+def _space_promotion_summary(*, session: Session | None, space_id: str) -> list[dict[str, Any]]:
+    return _space_promotion_summaries(session=session, space_ids=[space_id]).get(space_id, [])
+
+
+def _space_promotion_summaries(
+    *,
+    session: Session | None,
+    space_ids: Sequence[str],
+) -> dict[str, list[dict[str, Any]]]:
+    normalized_space_ids = [str(space_id or "").strip() for space_id in space_ids]
+    normalized_space_ids = [space_id for space_id in normalized_space_ids if space_id]
+    if (
+        session is None
+        or not normalized_space_ids
+        or not callable(getattr(session, "execute", None))
+    ):
+        return {}
+    rows = session.execute(
+        select(
+            SpacePromotionOfferModel.space_id,
+            SpacePromotionOfferModel.proxy_country,
+            func.count(SpacePromotionOfferModel.id),
+            func.max(SpacePromotionOfferModel.last_checked_at),
+        )
+        .where(
+            SpacePromotionOfferModel.space_id.in_(normalized_space_ids),
+            SpacePromotionOfferModel.status == "eligible",
+        )
+        .group_by(
+            SpacePromotionOfferModel.space_id,
+            SpacePromotionOfferModel.proxy_country,
+        )
+        .order_by(
+            SpacePromotionOfferModel.space_id,
+            SpacePromotionOfferModel.proxy_country,
+        )
+    ).all()
+    summaries: dict[str, list[dict[str, Any]]] = {space_id: [] for space_id in normalized_space_ids}
+    for space_id, country, count, last_checked_at in rows:
+        summaries.setdefault(str(space_id or ""), []).append(
+            {
+                "country": str(country or ""),
+                "count": int(count or 0),
+                "last_checked_at": _iso(last_checked_at),
+            }
+        )
+    return summaries
+
+
+def _space_promotion_offer_dict(
+    offer: SpacePromotionOfferModel,
+    *,
+    space: SpaceModel,
+    account: UserAccountModel | None,
+) -> dict[str, Any]:
+    raw = offer.raw_campaign_json if isinstance(offer.raw_campaign_json, dict) else {}
+    normalized = offer.normalized_json if isinstance(offer.normalized_json, dict) else {}
+    return {
+        "id": offer.id,
+        "space_id": offer.space_id,
+        "space_name": space.name,
+        "external_space_id": space.external_space_id,
+        "user_account_id": offer.user_account_id,
+        "email": account.email if account is not None else "",
+        "proxy_country": offer.proxy_country,
+        "promotion_id": offer.promotion_id,
+        "promotion_name": offer.promotion_name or str(
+            raw.get("name") or raw.get("display_name") or raw.get("title") or ""
+        ),
+        "status": offer.status,
+        "currency": normalized.get("currency", raw.get("currency", "")),
+        "amount": normalized.get("amount", raw.get("amount", "")),
+        "discount": normalized.get("discount", raw.get("discount", "")),
+        "duration": normalized.get("duration", raw.get("duration", "")),
+        "expires_at": normalized.get("expires_at", raw.get("expires_at", "")),
+        "raw_campaign": raw,
+        "first_seen_at": _iso(offer.first_seen_at),
+        "last_seen_at": _iso(offer.last_seen_at),
+        "last_checked_at": _iso(offer.last_checked_at),
+        "source_check_id": offer.source_check_id,
     }
 
 
@@ -5359,6 +6178,7 @@ def _create_account_work_job(
 ) -> dict:
     user_account_ids = _validated_user_account_ids(session=session, ids=req.user_account_ids)
     worker_count = max(1, int(req.work_count or 10))
+    proxy_country = str(getattr(req, "proxy_country", "US") or "US").strip().upper()
     job, run = _start_work_job(
         session=session,
         job_type=job_type,
@@ -5366,6 +6186,7 @@ def _create_account_work_job(
             "user_account_ids": user_account_ids,
             "work_count": worker_count,
             "selected_count": len(user_account_ids),
+            "proxy_country": proxy_country,
         },
         created_by=req.created_by,
     )
@@ -5374,16 +6195,22 @@ def _create_account_work_job(
         work_queue.enqueue(
             job_id=job.id,
             work_type=work_type,
-            input_json={"user_account_id": user_account_id, "_run_id": run.id},
+            input_json={
+                "user_account_id": user_account_id,
+                "proxy_country": proxy_country,
+                "_run_id": run.id,
+            },
         )
     session.commit()
-    return _work_job_summary_response(
+    result = _work_job_summary_response(
         session=session,
         job_id=job.id,
         run_id=run.id,
         work_count=worker_count,
         selected_count=len(user_account_ids),
     )
+    result["proxy_country"] = proxy_country
+    return result
 
 
 def _create_personal_codex_authorization_work_job(
@@ -5492,6 +6319,8 @@ def _create_personal_codex_credential_heartbeat_work_job(
     hero_sms_country: str,
     hero_sms_max_price: str,
     force_clean_browser_login: bool,
+    proxy_mode: str = "cliproxy",
+    proxy_country: str = "US",
 ) -> dict:
     job_type = "space.personal_codex_credential_heartbeat.tick"
     active_job = _active_work_job_for_type(session=session, job_type=job_type)
@@ -5509,6 +6338,15 @@ def _create_personal_codex_credential_heartbeat_work_job(
     normalized_space_id = str(space_id or "").strip()
     normalized_limit = max(1, min(int(limit or 100), 1000))
     worker_count = max(1, min(int(work_count or 10), 350))
+    normalized_proxy_mode = str(proxy_mode or "cliproxy").strip().lower()
+    if normalized_proxy_mode not in {"cliproxy", "proxyserver"}:
+        raise HTTPException(status_code=400, detail="proxy_mode must be cliproxy or proxyserver")
+    normalized_proxy_country = str(proxy_country or "US").strip().upper()
+    if len(normalized_proxy_country) != 2 or not normalized_proxy_country.isalpha():
+        raise HTTPException(
+            status_code=400,
+            detail="proxy_country must be a two-letter country code",
+        )
     stmt = (
         select(SpaceCredentialModel)
         .join(SpaceModel, SpaceModel.id == SpaceCredentialModel.space_id)
@@ -5568,6 +6406,8 @@ def _create_personal_codex_credential_heartbeat_work_job(
             "hero_sms_country": hero_sms_country,
             "hero_sms_max_price": hero_sms_max_price,
             "force_clean_browser_login": force_clean_browser_login,
+            "proxy_mode": normalized_proxy_mode,
+            "proxy_country": normalized_proxy_country,
         },
         created_by=created_by,
     )
@@ -5583,6 +6423,8 @@ def _create_personal_codex_credential_heartbeat_work_job(
                 "hero_sms_country": hero_sms_country,
                 "hero_sms_max_price": hero_sms_max_price,
                 "force_clean_browser_login": force_clean_browser_login,
+                "proxy_mode": normalized_proxy_mode,
+                "proxy_country": normalized_proxy_country,
                 "_run_id": run.id,
             },
         )
@@ -5969,6 +6811,72 @@ def _active_personal_payment_method_bind_jobs_by_space_id(
     return result
 
 
+def _select_personal_subscription_refresh_spaces(
+    *,
+    session: Session,
+    space_ids: Sequence[str],
+) -> tuple[list[str], list[SpaceModel], list[dict[str, str]]]:
+    requested_space_ids = list(
+        dict.fromkeys(
+            space_id
+            for space_id in (str(item or "").strip() for item in space_ids)
+            if space_id
+        )
+    )
+    if not requested_space_ids:
+        raise HTTPException(status_code=400, detail="space_ids must not be empty")
+
+    spaces_by_id = {
+        space.id: space
+        for space in session.scalars(
+            select(SpaceModel).where(SpaceModel.id.in_(requested_space_ids))
+        ).all()
+    }
+    owner_account_ids = {
+        space.owner_user_account_id
+        for space in spaces_by_id.values()
+        if space.owner_user_account_id
+    }
+    accounts_by_id = {
+        account.id: account
+        for account in session.scalars(
+            select(UserAccountModel).where(UserAccountModel.id.in_(owner_account_ids))
+        ).all()
+    }
+    selected: list[SpaceModel] = []
+    selection_skipped: list[dict[str, str]] = []
+
+    for space_id in requested_space_ids:
+        space = spaces_by_id.get(space_id)
+        account = accounts_by_id.get(space.owner_user_account_id) if space is not None else None
+        reason = ""
+        if space is None:
+            reason = "space_not_found"
+        elif space.provider != "openai_chatgpt":
+            reason = "subscription_refresh_provider_not_supported"
+        elif space.space_type != "personal":
+            reason = "subscription_refresh_personal_space_required"
+        elif space.space_status != "active":
+            reason = "subscription_refresh_space_not_active"
+        elif account is None:
+            reason = "subscription_refresh_owner_account_missing"
+        elif account.account_status != "active":
+            reason = "subscription_refresh_owner_account_not_active"
+        elif not str(account.email or "").strip():
+            reason = "subscription_refresh_owner_email_missing"
+        elif not str(account.access_token or "").strip():
+            reason = "subscription_refresh_owner_access_token_missing"
+        elif not str(space.external_space_id or "").strip():
+            reason = "subscription_refresh_external_space_id_missing"
+
+        if reason:
+            selection_skipped.append({"space_id": space_id, "reason": reason})
+        elif space is not None:
+            selected.append(space)
+
+    return requested_space_ids, selected, selection_skipped
+
+
 def _select_personal_promotion_check_spaces(
     *,
     session: Session,
@@ -6077,6 +6985,160 @@ def _active_personal_promotion_check_jobs_by_space_id(
             if space_id:
                 result.setdefault(space_id, job)
     return result
+
+
+def _select_personal_plus_checkout_spaces(
+    *,
+    session: Session,
+    space_ids: Sequence[str],
+) -> tuple[list[str], list[SpaceModel], list[dict[str, str]]]:
+    requested_space_ids = list(
+        dict.fromkeys(
+            space_id
+            for space_id in (str(item or "").strip() for item in space_ids)
+            if space_id
+        )
+    )
+    if not requested_space_ids:
+        raise HTTPException(status_code=400, detail="space_ids must not be empty")
+
+    spaces_by_id = {
+        space.id: space
+        for space in session.scalars(
+            select(SpaceModel).where(SpaceModel.id.in_(requested_space_ids))
+        ).all()
+    }
+    owner_account_ids = {
+        space.owner_user_account_id
+        for space in spaces_by_id.values()
+        if space.owner_user_account_id
+    }
+    accounts_by_id = {
+        account.id: account
+        for account in session.scalars(
+            select(UserAccountModel).where(UserAccountModel.id.in_(owner_account_ids))
+        ).all()
+    }
+    active_space_ids = {
+        str((work.input_json or {}).get("space_id") or "").strip()
+        for work in session.scalars(
+            select(WorkItemModel)
+            .join(JobModel, JobModel.id == WorkItemModel.job_id)
+            .where(
+                WorkItemModel.work_type == "space.personal_plus_checkout.space",
+                WorkItemModel.work_status.in_(("queued", "running")),
+                JobModel.job_status.in_(("queued", "running")),
+            )
+        ).all()
+    }
+    selected: list[SpaceModel] = []
+    selection_skipped: list[dict[str, str]] = []
+    for space_id in requested_space_ids:
+        space = spaces_by_id.get(space_id)
+        account = accounts_by_id.get(space.owner_user_account_id) if space else None
+        reason = ""
+        if space is None:
+            reason = "space_not_found"
+        elif space.provider != "openai_chatgpt":
+            reason = "plus_checkout_provider_not_supported"
+        elif space.space_type != "personal":
+            reason = "plus_checkout_personal_space_required"
+        elif space.space_status != "active":
+            reason = "plus_checkout_space_not_active"
+        elif account is None:
+            reason = "plus_checkout_owner_account_missing"
+        elif account.account_status != "active":
+            reason = "plus_checkout_owner_account_not_active"
+        elif not str(account.access_token or "").strip() and not (
+            str(account.cookie_header or "").strip()
+            and str(account.auth_cookie_header or "").strip()
+        ):
+            reason = "plus_checkout_owner_session_missing"
+        elif space.id in active_space_ids:
+            reason = "active_personal_plus_checkout_job_exists"
+
+        if reason:
+            selection_skipped.append({"space_id": space_id, "reason": reason})
+        elif space is not None:
+            selected.append(space)
+
+    return requested_space_ids, selected, selection_skipped
+
+
+def _select_personal_paypal_link_spaces(
+    *,
+    session: Session,
+    space_ids: Sequence[str],
+    apply_promotion: bool,
+) -> tuple[list[str], list[SpaceModel], list[dict[str, str]]]:
+    requested_space_ids = list(
+        dict.fromkeys(
+            space_id
+            for space_id in (str(item or "").strip() for item in space_ids)
+            if space_id
+        )
+    )
+    if not requested_space_ids:
+        raise HTTPException(status_code=400, detail="space_ids must not be empty")
+
+    spaces_by_id = {
+        space.id: space
+        for space in session.scalars(
+            select(SpaceModel).where(SpaceModel.id.in_(requested_space_ids))
+        ).all()
+    }
+    owner_account_ids = {
+        space.owner_user_account_id
+        for space in spaces_by_id.values()
+        if space.owner_user_account_id
+    }
+    accounts_by_id = {
+        account.id: account
+        for account in session.scalars(
+            select(UserAccountModel).where(UserAccountModel.id.in_(owner_account_ids))
+        ).all()
+    }
+    active_space_ids = {
+        str((work.input_json or {}).get("space_id") or "").strip()
+        for work in session.scalars(
+            select(WorkItemModel)
+            .join(JobModel, JobModel.id == WorkItemModel.job_id)
+            .where(
+                WorkItemModel.work_type == "space.personal_paypal_link.space",
+                WorkItemModel.work_status.in_(("queued", "running")),
+                JobModel.job_status.in_(("queued", "running")),
+            )
+        ).all()
+    }
+    selected: list[SpaceModel] = []
+    selection_skipped: list[dict[str, str]] = []
+    for space_id in requested_space_ids:
+        space = spaces_by_id.get(space_id)
+        account = accounts_by_id.get(space.owner_user_account_id) if space else None
+        reason = ""
+        if space is None:
+            reason = "space_not_found"
+        elif space.provider != "openai_chatgpt":
+            reason = "paypal_link_provider_not_supported"
+        elif space.space_type != "personal":
+            reason = "paypal_link_personal_space_required"
+        elif space.space_status != "active":
+            reason = "paypal_link_space_not_active"
+        elif account is None:
+            reason = "paypal_link_owner_account_missing"
+        elif account.account_status != "active":
+            reason = "paypal_link_owner_account_not_active"
+        elif not str(account.access_token or "").strip():
+            reason = "paypal_link_owner_access_token_missing"
+        elif space.id in active_space_ids:
+            reason = "active_personal_paypal_link_job_exists"
+
+        if reason:
+            selection_skipped.append({"space_id": space_id, "reason": reason})
+        elif space is not None:
+            selected.append(space)
+
+    return requested_space_ids, selected, selection_skipped
 
 
 def _active_work_job_for_type(
@@ -6623,6 +7685,7 @@ def _space_schedule_defaults() -> dict[str, dict[str, Any]]:
                 "space_id": "",
                 "limit": 10,
                 "work_count": 1,
+                "proxy_country": "US",
                 "auto_start_plus_checkout": True,
             },
         },
@@ -6636,6 +7699,8 @@ def _space_schedule_defaults() -> dict[str, dict[str, Any]]:
                 "hero_sms_country": "187",
                 "hero_sms_max_price": "0.18",
                 "force_clean_browser_login": False,
+                "proxy_mode": "cliproxy",
+                "proxy_country": "US",
             },
         },
     }
@@ -6714,6 +7779,7 @@ def _validated_space_schedule_config_values(
             "space_id": ("str", None, None),
             "limit": ("int", 1, 100),
             "work_count": ("int", 1, 10),
+            "proxy_country": ("str", None, None),
             "auto_start_plus_checkout": ("bool", None, None),
             "checkout_ui_mode": ("str", None, None),
         },
@@ -6725,6 +7791,8 @@ def _validated_space_schedule_config_values(
             "hero_sms_country": ("str", None, None),
             "hero_sms_max_price": ("str", None, None),
             "force_clean_browser_login": ("bool", None, None),
+            "proxy_mode": ("str", None, None),
+            "proxy_country": ("str", None, None),
         },
     }
     schema = schemas[schedule_type]
@@ -6746,6 +7814,13 @@ def _validated_space_schedule_config_values(
                     status_code=400,
                     detail=f"{key} must be hosted, custom, or empty",
                 )
+            if key == "proxy_country":
+                parsed = parsed.upper()
+                if not (len(parsed) == 2 and parsed.isascii() and parsed.isalpha()):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="proxy_country must be a two-letter country code",
+                    )
         elif value_type == "bool":
             if isinstance(value, bool):
                 parsed = value
@@ -7006,6 +8081,7 @@ def _execute_space_automation_schedule(
                     "space_id": str(effective_config["space_id"]),
                     "limit": int(effective_config["limit"]),
                     "work_count": int(effective_config["work_count"]),
+                    "proxy_country": str(effective_config["proxy_country"]),
                     "auto_start_plus_checkout": bool(
                         effective_config["auto_start_plus_checkout"]
                     ),
@@ -7033,6 +8109,8 @@ def _execute_space_automation_schedule(
                 hero_sms_country=str(effective_config["hero_sms_country"]),
                 hero_sms_max_price=str(effective_config["hero_sms_max_price"]),
                 force_clean_browser_login=bool(effective_config["force_clean_browser_login"]),
+                proxy_mode=str(effective_config["proxy_mode"]),
+                proxy_country=str(effective_config["proxy_country"]),
             )
             schedule.last_job_id = str(result.get("job_id") or "")
             schedule.last_run_status = str(result.get("job_status") or "skipped")
@@ -7294,6 +8372,18 @@ def _space_export_response(result) -> Response:
 
 def _csv_values(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _email_values(value: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for line in value.replace("\r", "\n").split("\n"):
+        for item in line.split(","):
+            normalized = item.strip().lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                values.append(normalized)
+    return values
 
 
 def _apply_plan_type_filter(stmt, *, column, value: str):

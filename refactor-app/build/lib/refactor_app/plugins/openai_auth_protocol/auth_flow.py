@@ -614,7 +614,7 @@ class AuthFlow:
                 except Exception as e:
                     logger.debug(f"HTTP trace callback failed: {e}")
 
-            if str(os.getenv("AUTH_DEBUG_HTTP", "1")).lower() not in ("0", "false", "no", "off"):
+            if str(os.getenv("AUTH_DEBUG_HTTP", "0")).lower() not in ("0", "false", "no", "off"):
                 logger.info(
                     "[AUTH DEBUG] %s | %s %s -> %s | final=%s | location=%s | req_body=%s | body=%s",
                     step,

@@ -30,6 +30,8 @@ class ExternalMailApiPlugin:
             "mailbox.poll_otp",
             "mailbox.ensure_email",
             "mailbox.ensure_domain_email",
+            "mailbox.apply_temp_email",
+            "mailbox.finish_temp_email",
             "mailbox.wait_for_otp_by_email",
             "mailbox.mark_used",
             "mailbox.mark_failed",
@@ -50,6 +52,34 @@ class ExternalMailApiPlugin:
 
     def ensure_domain_email(self, *, email: str) -> dict:
         return self._client.ensure_domain_email(email=email)
+
+    def apply_temp_email(
+        self,
+        *,
+        caller_id: str,
+        task_id: str,
+        prefix: str = "",
+        domain: str = "",
+    ) -> ClaimedMailAccount:
+        return self._client.apply_temp_email(
+            caller_id=caller_id,
+            task_id=task_id,
+            prefix=prefix,
+            domain=domain,
+        )
+
+    def finish_temp_email(
+        self,
+        *,
+        task_token: str,
+        result: str,
+        detail: str = "",
+    ) -> dict:
+        return self._client.finish_temp_email(
+            task_token=task_token,
+            result=result,
+            detail=detail,
+        )
 
     def wait_for_otp_by_email(
         self,

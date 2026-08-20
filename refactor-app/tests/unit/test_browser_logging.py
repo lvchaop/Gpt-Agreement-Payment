@@ -5,7 +5,10 @@ import json
 from types import SimpleNamespace
 
 from refactor_app.config.settings import Settings
-from refactor_app.plugins.openai_auth_browser.browser_logging import BrowserLogRecorder
+from refactor_app.plugins.openai_auth_browser.browser_logging import (
+    BrowserLogRecorder,
+    redact_browser_value,
+)
 from refactor_app.plugins.openai_auth_browser.email_registration import (
     BrowserEmailRegistrationConfig,
     CamoufoxEmailRegistration,
@@ -124,6 +127,94 @@ def test_browser_log_recorder_captures_events_and_redacts_sensitive_values(tmp_p
         assert secret not in serialized
     assert "generic_decline" in serialized
     assert any(event == "browser.response" and level == "WARN" for event, _, level in emitted)
+
+
+def test_browser_log_redacts_identity_values_at_every_nested_level() -> None:
+    raw = {
+        "email": "customer.alpha@example.com",
+        "first_name": "FirstnameSecret",
+        "lastName": "LastnameSecret",
+        "profile": {
+            "full_name": "Fullname Secret",
+            "network": [
+                "public=8.8.8.8",
+                "private=192.168.10.24",
+                "loopback=127.0.0.1",
+                "ipv6=2001:db8:85a3::8a2e:370:7334",
+                "link_local=fe80::1%en0",
+                "mapped=::ffff:10.0.0.7",
+                b"backup-email@example.net from 172.16.0.9",
+            ],
+        },
+        "owner@example.org": "key contains an email",
+        "event_name": "registration_finished",
+    }
+
+    safe = redact_browser_value(raw)
+    serialized = json.dumps(safe, ensure_ascii=False)
+
+    for private_value in (
+        "customer.alpha@example.com",
+        "FirstnameSecret",
+        "LastnameSecret",
+        "Fullname Secret",
+        "8.8.8.8",
+        "192.168.10.24",
+        "127.0.0.1",
+        "2001:db8:85a3::8a2e:370:7334",
+        "fe80::1%en0",
+        "::ffff:10.0.0.7",
+        "backup-email@example.net",
+        "172.16.0.9",
+        "owner@example.org",
+    ):
+        assert private_value not in serialized
+    assert safe["first_name"] == "<redacted>"
+    assert safe["lastName"] == "<redacted>"
+    assert safe["profile"]["full_name"] == "<redacted>"
+    assert safe["event_name"] == "registration_finished"
+    assert "<redacted-email>" in serialized
+    assert "<redacted-ip>" in serialized
+
+
+def test_browser_log_redacts_identity_values_from_all_url_components() -> None:
+    raw = {
+        "url": (
+            "https://customer%40example.com:password@192.168.1.15/"
+            "accounts/other%40example.net/2001%3Adb8%3A%3A5"
+            "?email=query%40example.org&ip=10.20.30.40&first_name=UrlName"
+        ),
+        "href": "https://[2001:db8::8]/callback?next=https%3A%2F%2F8.8.4.4%2Fu",
+        "message": (
+            "open https://example.com/users/embedded%40example.dev/"
+            "172.20.1.4?display_name=EmbeddedName"
+        ),
+    }
+
+    serialized = json.dumps(redact_browser_value(raw), ensure_ascii=False)
+
+    for private_value in (
+        "customer%40example.com",
+        "customer@example.com",
+        "password",
+        "192.168.1.15",
+        "other%40example.net",
+        "other@example.net",
+        "2001%3Adb8%3A%3A5",
+        "2001:db8::5",
+        "query%40example.org",
+        "query@example.org",
+        "10.20.30.40",
+        "UrlName",
+        "2001:db8::8",
+        "8.8.4.4",
+        "embedded%40example.dev",
+        "embedded@example.dev",
+        "172.20.1.4",
+        "EmbeddedName",
+    ):
+        assert private_value not in serialized
+    assert "<redacted>@" in serialized
 
 
 def test_browser_log_recorder_swallows_cancelled_response_body_reads(tmp_path) -> None:

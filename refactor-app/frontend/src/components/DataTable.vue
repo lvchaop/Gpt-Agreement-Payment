@@ -43,6 +43,7 @@ export type TableFilter = {
   label: string;
   options?: FilterOption[];
   loader?: (query: string, values: Readonly<Record<string, string>>) => Promise<FilterOption[]>;
+  input?: boolean;
   placeholder?: string;
   dependsOn?: string;
 };
@@ -61,6 +62,9 @@ const props = withDefaults(defineProps<{
   pageSize?: number;
   sort?: string;
   allRowsLoader?: (query: PageQuery) => Promise<Record<string, unknown>[]>;
+  batchSearchEnabled?: boolean;
+  batchSearchPlaceholder?: string;
+  batchSearchValue?: string;
 }>(), {
   loading: false,
   error: "",
@@ -72,6 +76,9 @@ const props = withDefaults(defineProps<{
   page: 1,
   pageSize: 50,
   sort: "",
+  batchSearchEnabled: false,
+  batchSearchPlaceholder: "邮箱，一行一个",
+  batchSearchValue: "",
 });
 
 const emit = defineEmits<{
@@ -82,6 +89,7 @@ const emit = defineEmits<{
 }>();
 
 const search = ref("");
+const batchSearch = ref(props.batchSearchValue);
 const internalPage = ref(props.page);
 const internalPageSize = ref(props.pageSize);
 const internalSort = ref(props.sort);
@@ -93,6 +101,14 @@ let selectionRequestId = 0;
 
 function rowKey(row: Record<string, unknown>, index = 0) {
   return String(row.id ?? row.space_credential_id ?? `${row.email ?? "row"}-${index}`);
+}
+
+function normalizeBatchSearch(value: string | undefined) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 const localFilteredRows = computed(() => {
@@ -129,12 +145,19 @@ const allRowsSelected = computed(() =>
   effectiveTotal.value > 0 && selectedRowsById.value.size === effectiveTotal.value,
 );
 const hasActiveFilters = computed(() =>
-  Boolean(search.value.trim()) || Object.values(filterValues.value).some(Boolean),
+  Boolean(search.value.trim())
+  || (props.batchSearchEnabled && Boolean(batchSearch.value.trim()))
+  || Object.values(filterValues.value).some(Boolean),
 );
 
 watch(() => props.page, (value) => { internalPage.value = value; });
 watch(() => props.pageSize, (value) => { internalPageSize.value = value; });
 watch(() => props.sort, (value) => { internalSort.value = value; });
+watch(() => props.batchSearchValue, (value) => {
+  if (normalizeBatchSearch(value) !== normalizeBatchSearch(batchSearch.value)) {
+    batchSearch.value = value || "";
+  }
+});
 watch(search, () => { if (!props.remote) clearSelection(); });
 watch(selectedRows, (rows) => emit("selectionChange", rows));
 watch(totalPages, (value) => {
@@ -151,6 +174,7 @@ function currentQuery(overrides: PageQuery = {}): PageQuery {
     page_size: internalPageSize.value,
     sort: internalSort.value,
     q: search.value.trim(),
+    email_list: props.batchSearchEnabled ? normalizeBatchSearch(batchSearch.value) : "",
     ...filterValues.value,
     ...overrides,
   };
@@ -178,9 +202,13 @@ function loadFilterOptions(filter: TableFilter, query: string) {
 function resetFilters() {
   clearSelection();
   search.value = "";
-  filterValues.value = {};
+  batchSearch.value = "";
+  const clearedFilters = Object.fromEntries(props.filters.map((filter) => [filter.key, ""]));
+  filterValues.value = clearedFilters;
   internalPage.value = 1;
-  if (props.remote) emitQuery({ page: 1, q: "" });
+  if (props.remote) {
+    emitQuery({ page: 1, q: "", email_list: "", ...clearedFilters });
+  }
 }
 
 function setPage(page: number) {
@@ -285,10 +313,26 @@ defineExpose({ clearSelection });
         <Search :size="16" aria-hidden="true" />
         <input v-model="search" placeholder="搜索 ID、邮箱、名称或错误信息" aria-label="关键词" />
       </label>
+      <label v-if="batchSearchEnabled" class="batch-search-control">
+        <span>批量邮箱</span>
+        <textarea
+          v-model="batchSearch"
+          rows="2"
+          :placeholder="batchSearchPlaceholder"
+          aria-label="批量邮箱，一行一个"
+        />
+      </label>
       <div v-for="filter in filters" :key="filter.key" class="filter-control">
         <span>{{ filter.label }}</span>
+        <input
+          v-if="filter.input"
+          class="filter-input"
+          :value="filterValues[filter.key] || ''"
+          :placeholder="filter.placeholder || `输入${filter.label}`"
+          @input="updateFilterValue(filter, ($event.target as HTMLInputElement).value)"
+        />
         <EntitySelect
-          v-if="filter.loader"
+          v-else-if="filter.loader"
           :model-value="filterValues[filter.key] || ''"
           :loader="(query) => loadFilterOptions(filter, query)"
           :placeholder="filter.placeholder || `搜索${filter.label}`"
@@ -465,6 +509,7 @@ defineExpose({ clearSelection });
 
 .search-control input,
 .filter-control select,
+.filter-control input,
 .page-size-control select {
   background: transparent;
   border: 0;
@@ -474,6 +519,38 @@ defineExpose({ clearSelection });
 
 .search-control input { min-width: 0; width: 100%; }
 .search-control svg { color: var(--text-faint); flex: 0 0 auto; }
+
+.batch-search-control {
+  display: grid;
+  gap: 3px;
+  min-width: min(280px, 100%);
+}
+
+.batch-search-control span {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.batch-search-control textarea {
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.35;
+  min-height: 36px;
+  min-width: 0;
+  outline: none;
+  padding: 7px 9px;
+  resize: vertical;
+  width: 100%;
+}
+
+.batch-search-control textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
 
 .filter-control,
 .page-size-control {
@@ -489,12 +566,17 @@ defineExpose({ clearSelection });
 }
 
 .filter-control select,
+.filter-control input,
 .page-size-control select {
   background: var(--input-bg);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   min-height: 36px;
   padding: 0 26px 0 9px;
+}
+
+.filter-control input {
+  padding: 0 9px;
 }
 
 .toolbar-spacer { flex: 1 1 auto; }
@@ -584,6 +666,7 @@ tr:hover td.actions-column { background: var(--row-hover-solid); }
 
 @media (max-width: 767px) {
   .search-control { width: 100%; }
+  .batch-search-control { width: 100%; }
   .filter-control { flex: 1 1 140px; }
   .toolbar-spacer { display: none; }
   .table-footer { align-items: flex-start; flex-direction: column; }

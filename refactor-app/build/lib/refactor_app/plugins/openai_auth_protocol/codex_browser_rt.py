@@ -873,13 +873,44 @@ def _submit_email_if_visible(page, email: str) -> bool:
         if not email_input:
             return False
         email_input.click(timeout=3000)
-        email_input.fill(email.strip())
+        if not _replace_input_value(email_input, email.strip()):
+            return False
         return _click_first_visible(
             page,
             ['button[type="submit"]', 'button:has-text("Continue")', "#btnNext"],
         )
     except Exception:
         return False
+
+
+def _replace_input_value(input_element, value: str) -> bool:
+    try:
+        input_element.evaluate(
+            """(el, nextValue) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                )?.set;
+                if (setter) setter.call(el, nextValue);
+                else el.value = nextValue;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            value,
+        )
+    except Exception:
+        try:
+            input_element.fill(value)
+        except Exception:
+            return False
+
+    try:
+        actual = str(input_element.input_value())
+    except Exception:
+        try:
+            actual = str(input_element.evaluate("el => el.value"))
+        except Exception:
+            return True
+    return actual == value
 
 
 def _submit_password_if_visible(page, password: str) -> bool:

@@ -9,6 +9,21 @@ from sqlalchemy.orm import Session, aliased
 from refactor_app.infrastructure.db.models import JobModel, WorkItemModel
 
 DEFAULT_WORK_LEASE_SECONDS = 120
+PERSONAL_PAYPAL_LINK_TICK_JOB_TYPE = "space.personal_paypal_link.tick"
+PERSONAL_PAYPAL_LINK_WORK_TYPE = "space.personal_paypal_link.space"
+
+
+def normalize_personal_paypal_link_input(
+    work_type: str,
+    input_json: dict,
+) -> dict:
+    normalized_input_json = dict(input_json)
+    if work_type in {
+        PERSONAL_PAYPAL_LINK_TICK_JOB_TYPE,
+        PERSONAL_PAYPAL_LINK_WORK_TYPE,
+    }:
+        normalized_input_json["checkout_attempt_mode"] = "new"
+    return normalized_input_json
 
 
 class JobQueue:
@@ -24,12 +39,13 @@ class JobQueue:
         priority: int = 0,
     ) -> JobModel:
         now = datetime.now(UTC)
+        normalized_input_json = normalize_personal_paypal_link_input(job_type, input_json)
         job = JobModel(
             id=str(uuid4()),
             type=job_type,
             job_status="queued",
             priority=priority,
-            input_json=input_json,
+            input_json=normalized_input_json,
             created_by=created_by,
             created_at=now,
             updated_at=now,
@@ -67,6 +83,7 @@ class WorkQueue:
         execution_key: str = "",
     ) -> WorkItemModel:
         now = datetime.now(UTC)
+        normalized_input_json = normalize_personal_paypal_link_input(work_type, input_json)
         work = WorkItemModel(
             id=str(uuid4()),
             job_id=job_id,
@@ -74,7 +91,7 @@ class WorkQueue:
             work_status="queued",
             priority=priority,
             execution_key=execution_key.strip(),
-            input_json=input_json,
+            input_json=normalized_input_json,
             output_json={},
             created_at=now,
             updated_at=now,

@@ -4,7 +4,7 @@
 import os
 import json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -144,6 +144,9 @@ class Config:
     auth_trace_dump_enabled: bool = False
     auth_trace_dump_path: str = ""
     auth_env_flags: dict = field(default_factory=dict)
+    # Runtime-only browser identity. Session backfill derives this from the
+    # normalized mailbox so retries retain one coherent TLS/HTTP/JS profile.
+    browser_fingerprint: Any = None
     # 已有凭证（可选，跳过注册直接支付时使用）
     session_token: Optional[str] = None
     access_token: Optional[str] = None

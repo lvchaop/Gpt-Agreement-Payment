@@ -1,8 +1,9 @@
 <script setup lang="ts">
+import { RotateCcw } from "@lucide/vue";
 import { ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { cancelJob, listJobs } from "../api/jobs";
+import { cancelJob, listJobs, retryJob } from "../api/jobs";
 import type { PagedResult, PageQuery, Row } from "../api/types";
 import ConfirmModal from "../components/ConfirmModal.vue";
 import ResourcePage from "../components/ResourcePage.vue";
@@ -13,7 +14,9 @@ const router = useRouter();
 const store = useOpsStore();
 const pageRef = ref<InstanceType<typeof ResourcePage> | null>(null);
 const pendingCancel = ref<Row | null>(null);
+const pendingRetry = ref<Row | null>(null);
 const cancelling = ref(false);
+const retrying = ref(false);
 
 const columns: Column[] = [
   { key: "id", label: "任务 ID", mono: true, summary: 24, copyable: true },
@@ -66,6 +69,24 @@ async function confirmCancel() {
     store.toast("取消失败", String((err as Error).message ?? err), "error");
   } finally { cancelling.value = false; }
 }
+
+async function confirmRetry() {
+  const id = String(pendingRetry.value?.id ?? "");
+  if (!id) return;
+  retrying.value = true;
+  try {
+    const result = await retryJob(id);
+    store.toast(
+      "失败 Work 已重新排队",
+      `${result.retried_work_count} 个 Work / 第 ${result.attempt} 次运行`,
+      "success",
+    );
+    pendingRetry.value = null;
+    await router.push(`/jobs/${result.job_id}`);
+  } catch (err) {
+    store.toast("重试失败", String((err as Error).message ?? err), "error");
+  } finally { retrying.value = false; }
+}
 </script>
 
 <template>
@@ -81,9 +102,26 @@ async function confirmCancel() {
     @row-click="(row) => row.id && router.push(`/jobs/${row.id}`)"
   >
     <template #rowActions="{ row }">
+      <button
+        v-if="row.job_status === 'failed' && Number(row.work_failed || 0) > 0"
+        class="btn"
+        @click="pendingRetry = row"
+      >
+        <RotateCcw :size="14" />重试
+      </button>
       <button v-if="row.job_status === 'queued'" class="btn danger" @click="pendingCancel = row">取消</button>
     </template>
   </ResourcePage>
+  <ConfirmModal
+    :open="Boolean(pendingRetry)"
+    title="重试失败任务"
+    message="只重新执行该任务中失败的 Work；已成功的 Work 和原运行日志会保留。"
+    :summary="{ '任务 ID': pendingRetry?.id, '任务类型': pendingRetry?.type, '失败 Work': pendingRetry?.work_failed }"
+    confirm-text="确认重试"
+    :busy="retrying"
+    @close="pendingRetry = null"
+    @confirm="confirmRetry"
+  />
   <ConfirmModal
     :open="Boolean(pendingCancel)"
     title="取消排队任务"

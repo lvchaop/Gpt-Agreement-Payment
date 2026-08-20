@@ -49,8 +49,12 @@ def test_create_app_registers_p8_routes(monkeypatch: MonkeyPatch) -> None:
     assert "/payment-method-pools/summary" in paths
     assert "/payment-method-pools/import" in paths
     assert "/spaces/{space_id}/payment-method-bind-job" in paths
+    assert "/spaces/{space_id}/paypal-link-job" in paths
+    assert "/spaces/paypal-link-selected-job" in paths
     assert "/spaces/payment-method-bind-selected-job" in paths
     assert "/spaces/promotion-check-selected-job" in paths
+    assert "/spaces/promotion-offers" in paths
+    assert "/spaces/subscription-refresh-selected-job" in paths
     assert "/memberships/personal-codex-authorize-job" in paths
     assert "/space-credentials" in paths
     assert "/space-credentials/business-access-token-job" in paths
@@ -148,6 +152,299 @@ def test_protocol_registration_api_normalizes_and_defaults_proxy_country(
             with session_factory() as session:
                 session.execute(delete(JobModel).where(JobModel.id.in_(job_ids)))
                 session.commit()
+
+
+def test_protocol_registration_api_accepts_state_or_asn_route_selector(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    job_ids: list[str] = []
+
+    try:
+        state_response = client.post(
+            "/account-protocol-registration/jobs",
+            json={
+                "mode": "email_protocol_no_phone",
+                "proxy_country": "us",
+                "proxy_state": "California",
+            },
+        )
+        asn_response = client.post(
+            "/account-protocol-registration/jobs",
+            json={
+                "mode": "email_protocol_no_phone",
+                "proxy_country": "us",
+                "proxy_asn": "AS33363",
+            },
+        )
+        both_response = client.post(
+            "/account-protocol-registration/jobs",
+            json={
+                "mode": "email_protocol_no_phone",
+                "proxy_state": "California",
+                "proxy_asn": "33363",
+            },
+        )
+
+        assert state_response.status_code == 200
+        assert asn_response.status_code == 200
+        assert both_response.status_code == 422
+        job_ids = [state_response.json()["job_id"], asn_response.json()["job_id"]]
+
+        session_factory = make_session_factory(make_engine(Settings()))
+        with session_factory() as session:
+            state_job = session.get(JobModel, job_ids[0])
+            asn_job = session.get(JobModel, job_ids[1])
+            assert state_job is not None
+            assert asn_job is not None
+            assert state_job.input_json["proxy_country"] == "US"
+            assert state_job.input_json["proxy_state"] == "California"
+            assert state_job.input_json["proxy_asn"] == ""
+            assert asn_job.input_json["proxy_country"] == "US"
+            assert asn_job.input_json["proxy_state"] == ""
+            assert asn_job.input_json["proxy_asn"] == "AS33363"
+    finally:
+        if job_ids:
+            session_factory = make_session_factory(make_engine(Settings()))
+            with session_factory() as session:
+                session.execute(delete(JobModel).where(JobModel.id.in_(job_ids)))
+                session.commit()
+
+
+def test_protocol_registration_api_persists_browser_backend_without_license_key(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    monkeypatch.setenv("CLOAKBROWSER_LICENSE_KEY", "cb_fixture_secret")
+    client = TestClient(create_app())
+    response = client.post(
+        "/account-protocol-registration/jobs",
+        json={
+            "mode": "email_browser_no_phone",
+            "browser_backend": "cloakbrowser",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    session_factory = make_session_factory(make_engine(Settings()))
+    try:
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            assert job is not None
+            assert job.input_json["browser_backend"] == "cloakbrowser"
+            assert "cloakbrowser_license_key" not in job.input_json
+            assert "cb_fixture_secret" not in str(job.input_json)
+    finally:
+        with session_factory() as session:
+            session.execute(delete(JobModel).where(JobModel.id == job_id))
+            session.commit()
+
+
+def test_protocol_registration_api_accepts_phone_browser_mode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    response = client.post(
+        "/account-protocol-registration/jobs",
+        json={
+            "mode": "phone_browser_bind_email",
+            "mail_provider": "hero_yandex",
+            "browser_backend": "camoufox",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    session_factory = make_session_factory(make_engine(Settings()))
+    try:
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            assert job is not None
+            assert job.input_json["mode"] == "phone_browser_bind_email"
+            assert job.input_json["mail_provider"] == "hero_yandex"
+    finally:
+        with session_factory() as session:
+            session.execute(delete(JobModel).where(JobModel.id == job_id))
+            session.commit()
+
+
+def test_backfill_session_job_persists_selected_proxy_country(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    suffix = uuid4().hex
+    account_id = f"test-backfill-country-{suffix}"
+    job_id = ""
+    session_factory = make_session_factory(make_engine(Settings()))
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        session.add(
+            UserAccountModel(
+                id=account_id,
+                email=f"backfill-country-{suffix}@yandex.lt",
+                account_status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+    try:
+        response = client.post(
+            "/user-accounts/backfill-session-job",
+            json={"user_account_ids": [account_id], "proxy_country": "de"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        job_id = payload["job_id"]
+        assert payload["proxy_country"] == "DE"
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            work = session.scalars(
+                select(WorkItemModel).where(WorkItemModel.job_id == job_id)
+            ).one()
+            assert job is not None
+            assert job.input_json["proxy_country"] == "DE"
+            assert work.input_json["proxy_country"] == "DE"
+    finally:
+        with session_factory() as session:
+            if job_id:
+                session.execute(delete(JobModel).where(JobModel.id == job_id))
+            session.execute(delete(UserAccountModel).where(UserAccountModel.id == account_id))
+            session.commit()
+
+
+def test_backfill_session_request_defaults_proxy_country_to_us() -> None:
+    request = resource_routes.BackfillSessionRtRequest(user_account_ids=["account-1"])
+
+    assert request.proxy_country == "US"
+
+
+def test_backfill_session_work_handler_passes_explicit_proxy_country(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    class Workflow:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def run(self, **kwargs):
+            captured["run"] = kwargs
+            return kwargs["user_account_id"]
+
+    monkeypatch.setattr(handlers, "BackfillSessionWorkflow", Workflow)
+    monkeypatch.setattr(handlers, "_mail_plugin", lambda _settings: object())
+    runner = handlers.JobRunner(lambda: None)
+    handlers.register_core_handlers(
+        runner,
+        session_factory=lambda: None,
+        settings=Settings(_env_file=None),
+    )
+
+    result = runner._work_handlers["account.backfill_session"](
+        None,
+        {"user_account_id": "account-1", "proxy_country": "de", "_run_id": "run-1"},
+    )
+
+    assert result == {"user_account_id": "account-1"}
+    assert captured["init"]["proxy_country"] == "DE"
+    assert captured["init"]["prefer_configured_proxy_country"] is True
+    assert captured["run"] == {"user_account_id": "account-1", "run_id": "run-1"}
+
+
+def test_protocol_registration_api_accepts_hero_gmail_provider(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    response = client.post(
+        "/account-protocol-registration/jobs",
+        json={
+            "mode": "email_browser_no_phone",
+            "mail_provider": "hero_gmail",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    session_factory = make_session_factory(make_engine(Settings()))
+    try:
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            assert job is not None
+            assert job.input_json["mail_provider"] == "hero_gmail"
+            assert job.input_json["email_domain"] == "gmail.com"
+    finally:
+        with session_factory() as session:
+            session.execute(delete(JobModel).where(JobModel.id == job_id))
+            session.commit()
+
+
+def test_protocol_registration_api_rejects_non_gmail_hero_domain(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    response = client.post(
+        "/account-protocol-registration/jobs",
+        json={
+            "mode": "email_browser_no_phone",
+            "mail_provider": "hero_gmail",
+            "email_domain": "hotmail.com",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_protocol_registration_api_accepts_multiple_hero_yandex_domains(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    response = client.post(
+        "/account-protocol-registration/jobs",
+        json={
+            "mode": "email_browser_no_phone",
+            "mail_provider": "hero_yandex",
+            "email_domain": " yandex.ru, yandex.com.tr;ya.ru ",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    session_factory = make_session_factory(make_engine(Settings()))
+    try:
+        with session_factory() as session:
+            job = session.get(JobModel, job_id)
+            assert job is not None
+            assert job.input_json["mail_provider"] == "hero_yandex"
+            assert job.input_json["email_domain"] == "yandex.ru,yandex.com.tr,ya.ru"
+    finally:
+        with session_factory() as session:
+            session.execute(delete(JobModel).where(JobModel.id == job_id))
+            session.commit()
+
+
+def test_protocol_registration_api_rejects_non_yandex_hero_domain(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    client = TestClient(create_app())
+    response = client.post(
+        "/account-protocol-registration/jobs",
+        json={
+            "mode": "email_browser_no_phone",
+            "mail_provider": "hero_yandex",
+            "email_domain": "yandex.ru,gmail.com",
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_delete_selected_user_accounts(monkeypatch: MonkeyPatch) -> None:
@@ -401,10 +698,10 @@ def test_payment_method_pool_import_and_personal_job_api(
                 "addresses": [
                     {
                         "line1": f"{prefix} Main Street",
-                        "city": "New York",
-                        "state": "NY",
-                        "postal_code": "10001",
-                        "country": "US",
+                        "city": "Berlin",
+                        "state": "BE",
+                        "postal_code": "10115",
+                        "country": "DE",
                     }
                 ],
                 "cards": [
@@ -420,6 +717,7 @@ def test_payment_method_pool_import_and_personal_job_api(
         assert import_response.status_code == 200
         import_payload = import_response.json()
         assert import_payload["inserted_count"] == 3
+        assert import_payload["summary"]["active_address_country_counts"]["DE"] >= 1
         assert card_number not in import_response.text
         assert '"cvc":"123"' not in import_response.text
 
@@ -434,7 +732,7 @@ def test_payment_method_pool_import_and_personal_job_api(
 
         job_response = client.post(
             f"/spaces/{space_id}/payment-method-bind-job",
-            json={"created_by": "test"},
+            json={"created_by": "test", "proxy_country": "de"},
         )
         assert job_response.status_code == 200
         job_id = job_response.json()["job_id"]
@@ -445,6 +743,8 @@ def test_payment_method_pool_import_and_personal_job_api(
                 select(WorkItemModel).where(WorkItemModel.job_id == job_id)
             ).one()
         assert job is not None
+        assert job.input_json["proxy_country"] == "DE"
+        assert work.input_json["proxy_country"] == "DE"
         assert job.input_json["checkout_ui_mode"] == "custom"
         assert work.input_json["checkout_ui_mode"] == "custom"
         assert job.input_json["captcha_api_url"] == "https://captcha.test"
@@ -503,6 +803,7 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
         lambda _session: {
             "active_name_count": 1,
             "active_address_count": 1,
+            "active_address_country_counts": {"JP": 1},
             "available_card_count": 10,
         },
     )
@@ -588,6 +889,21 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
 
     job_id = ""
     try:
+        missing_country_response = client.post(
+            "/spaces/payment-method-bind-selected-job",
+            json={
+                "space_ids": [space_ids["eligible"]],
+                "proxy_country": "DE",
+                "created_by": "test",
+            },
+        )
+        assert missing_country_response.status_code == 409
+        assert missing_country_response.json()["detail"] == {
+            "message": "payment method inventory is empty",
+            "pools": ["address"],
+            "proxy_country": "DE",
+        }
+
         bound_response = client.get(
             "/spaces",
             params={"q": prefix, "has_payment_method": "true"},
@@ -621,6 +937,7 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
                     f"{prefix}-missing",
                     space_ids["eligible"],
                 ],
+                "proxy_country": "jp",
                 "created_by": "test",
             },
         )
@@ -646,6 +963,8 @@ def test_space_payment_method_boolean_filter_and_selected_bind_job(
             ).all()
         assert job is not None
         assert len(works) == 1
+        assert job.input_json["proxy_country"] == "JP"
+        assert works[0].input_json["proxy_country"] == "JP"
         assert works[0].input_json["space_id"] == space_ids["eligible"]
         assert job.input_json["checkout_ui_mode"] == "custom"
         assert works[0].input_json["checkout_ui_mode"] == "custom"
@@ -868,6 +1187,892 @@ def test_personal_promotion_check_selected_job_normalizes_config_and_enqueues_wo
     assert all(work["input_json"]["proxy_country"] == "JP" for work in captured["works"])
 
 
+def test_personal_subscription_refresh_selected_job_enqueues_eligible_spaces(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    captured: dict = {"works": []}
+    selected = [SimpleNamespace(id="space-1"), SimpleNamespace(id="space-2")]
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_subscription_refresh_spaces",
+        lambda **_kwargs: (
+            ["space-1", "space-2", "space-missing"],
+            selected,
+            [{"space_id": "space-missing", "reason": "space_not_found"}],
+        ),
+    )
+
+    def start_work_job(**kwargs):
+        captured["start"] = kwargs
+        return SimpleNamespace(id="job-1"), SimpleNamespace(id="run-1")
+
+    class CapturingWorkQueue:
+        def __init__(self, _session):
+            pass
+
+        def enqueue(self, **kwargs):
+            captured["works"].append(kwargs)
+
+    monkeypatch.setattr(resource_routes, "_start_work_job", start_work_job)
+    monkeypatch.setattr(resource_routes, "WorkQueue", CapturingWorkQueue)
+    monkeypatch.setattr(
+        resource_routes,
+        "_work_job_summary_response",
+        lambda **_kwargs: {
+            "job_id": "job-1",
+            "job_status": "running",
+            "run_id": "run-1",
+            "work_count": 2,
+            "selected_count": 2,
+            "queued": 2,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        },
+    )
+
+    response = TestClient(create_app()).post(
+        "/spaces/subscription-refresh-selected-job",
+        json={
+            "space_ids": ["space-1", "space-2", "space-missing"],
+            "work_count": 2,
+            "created_by": "test",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == "job-1"
+    assert payload["requested_count"] == 3
+    assert payload["selected_count"] == 2
+    assert payload["selection_skipped_count"] == 1
+    assert payload["selection_skipped"] == [
+        {"space_id": "space-missing", "reason": "space_not_found"}
+    ]
+    assert captured["start"]["job_type"] == "space.personal_subscription_refresh.selected"
+    assert captured["start"]["input_json"]["work_count"] == 2
+    assert [work["execution_key"] for work in captured["works"]] == [
+        "personal-subscription-refresh:space-1",
+        "personal-subscription-refresh:space-2",
+    ]
+    assert all(
+        work["work_type"] == "space.personal_subscription_refresh.space"
+        for work in captured["works"]
+    )
+
+
+def test_personal_plus_checkout_single_job_accepts_space_without_local_promotion(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    space = SimpleNamespace(
+        id="space-1",
+        owner_user_account_id="user-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        has_promotion=False,
+        promotion_id="",
+    )
+    account = SimpleNamespace(account_status="active")
+
+    class Session:
+        committed = False
+
+        @staticmethod
+        def get(model, row_id):
+            if model is SpaceModel and row_id == "space-1":
+                return space
+            if model is UserAccountModel and row_id == "user-1":
+                return account
+            raise AssertionError((model, row_id))
+
+        def commit(self):
+            self.committed = True
+
+    def start_work_job(**kwargs):
+        captured["job"] = kwargs
+        return SimpleNamespace(id="job-1"), SimpleNamespace(id="run-1")
+
+    class CapturingWorkQueue:
+        def __init__(self, _session):
+            pass
+
+        def enqueue(self, **kwargs):
+            captured["work"] = kwargs
+
+    monkeypatch.setattr(
+        resource_routes,
+        "get_settings",
+        lambda: SimpleNamespace(
+            personal_plus_checkout_captcha_api_url="",
+            personal_plus_checkout_captcha_client_key="",
+        ),
+    )
+    monkeypatch.setattr(
+        resource_routes,
+        "_active_work_job_for_type",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(resource_routes, "_start_work_job", start_work_job)
+    monkeypatch.setattr(resource_routes, "WorkQueue", CapturingWorkQueue)
+    monkeypatch.setattr(
+        resource_routes,
+        "_work_job_summary_response",
+        lambda **_kwargs: {"job_id": "job-1", "job_status": "running"},
+    )
+    session = Session()
+
+    result = resource_routes.create_personal_plus_checkout_job(
+        "space-1",
+        resource_routes.PersonalPlusCheckoutJobRequest(),
+        session,
+    )
+
+    assert result["job_id"] == "job-1"
+    assert session.committed is True
+    assert captured["job"]["input_json"]["promo_campaign_id"] == "plus-1-month-free"
+    assert captured["work"]["input_json"]["promo_campaign_id"] == "plus-1-month-free"
+
+
+def test_personal_paypal_agreement_single_job_accepts_space_without_local_promotion(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    space = SimpleNamespace(
+        id="space-1",
+        owner_user_account_id="user-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        has_promotion=False,
+        promotion_id="",
+    )
+    account = SimpleNamespace(account_status="active", access_token="access-token")
+
+    class Session:
+        committed = False
+
+        @staticmethod
+        def get(model, row_id):
+            if model is SpaceModel and row_id == "space-1":
+                return space
+            if model is UserAccountModel and row_id == "user-1":
+                return account
+            raise AssertionError((model, row_id))
+
+        def commit(self):
+            self.committed = True
+
+    def start_work_job(**kwargs):
+        captured["job"] = kwargs
+        return SimpleNamespace(id="job-1"), SimpleNamespace(id="run-1")
+
+    class CapturingWorkQueue:
+        def __init__(self, _session):
+            pass
+
+        def enqueue(self, **kwargs):
+            captured["work"] = kwargs
+
+    monkeypatch.setattr(
+        resource_routes,
+        "_active_work_job_for_type",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(resource_routes, "_start_work_job", start_work_job)
+    monkeypatch.setattr(resource_routes, "WorkQueue", CapturingWorkQueue)
+    monkeypatch.setattr(
+        resource_routes,
+        "_work_job_summary_response",
+        lambda **_kwargs: {"job_id": "job-1", "job_status": "running"},
+    )
+    session = Session()
+
+    result = resource_routes.create_personal_paypal_link_job(
+        "space-1",
+        resource_routes.PersonalPayPalLinkJobRequest(
+            execute_agreement=True,
+            agreement_country="US",
+            agreement_proxy_country="US",
+        ),
+        session,
+    )
+
+    assert result["job_id"] == "job-1"
+    assert session.committed is True
+    assert captured["job"]["input_json"]["apply_promotion"] is True
+    assert captured["job"]["input_json"]["promo_campaign_id"] == "plus-1-month-free"
+    assert captured["job"]["input_json"]["execute_agreement"] is True
+    assert captured["work"]["input_json"]["promo_campaign_id"] == "plus-1-month-free"
+
+
+def test_personal_paypal_link_selected_job_enqueues_each_selected_space(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    captured: dict = {"works": []}
+    selected = [SimpleNamespace(id="space-1"), SimpleNamespace(id="space-2")]
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_paypal_link_spaces",
+        lambda **_kwargs: (
+            ["space-1", "space-2", "space-missing"],
+            selected,
+            [{"space_id": "space-missing", "reason": "space_not_found"}],
+        ),
+    )
+
+    def start_work_job(**kwargs):
+        captured["start"] = kwargs
+        return SimpleNamespace(id="job-1"), SimpleNamespace(id="run-1")
+
+    class CapturingWorkQueue:
+        def __init__(self, _session):
+            pass
+
+        def enqueue(self, **kwargs):
+            captured["works"].append(kwargs)
+
+    monkeypatch.setattr(resource_routes, "_start_work_job", start_work_job)
+    monkeypatch.setattr(resource_routes, "WorkQueue", CapturingWorkQueue)
+    monkeypatch.setattr(
+        resource_routes,
+        "_work_job_summary_response",
+        lambda **_kwargs: {
+            "job_id": "job-1",
+            "job_status": "running",
+            "run_id": "run-1",
+            "work_count": 2,
+            "selected_count": 2,
+            "queued": 2,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        },
+    )
+
+    response = TestClient(create_app()).post(
+        "/spaces/paypal-link-selected-job",
+        json={
+            "space_ids": ["space-1", "space-2", "space-missing"],
+            "proxy_country": "jp",
+            "checkout_proxy_country": "br",
+            "update_proxy_country": "br",
+            "billing_country": "jp",
+            "currency": "usd",
+            "apply_promotion": True,
+            "promo_campaign_id": "plus-1-month-free",
+            "checkout_ui_mode": "hosted",
+            "execute_agreement": True,
+            "agreement_country": "jp",
+            "agreement_proxy_country": "us",
+            "agreement_buyer_mode": "original",
+            "agreement_sms_country": "43",
+            "agreement_max_card_attempts": 9,
+            "agreement_finalize_checkout": False,
+            "work_count": 1,
+            "created_by": "test",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == "job-1"
+    assert payload["requested_count"] == 3
+    assert payload["selected_count"] == 2
+    assert payload["selection_skipped_count"] == 1
+    assert captured["start"]["job_type"] == "space.personal_paypal_link.tick"
+    assert captured["start"]["input_json"]["proxy_country"] == "BR"
+    assert captured["start"]["input_json"]["checkout_proxy_country"] == "BR"
+    assert captured["start"]["input_json"]["update_proxy_country"] == "BR"
+    assert captured["start"]["input_json"]["billing_country"] == "JP"
+    assert captured["start"]["input_json"]["currency"] == "USD"
+    assert captured["start"]["input_json"]["checkout_attempt_mode"] == "new"
+    assert captured["start"]["input_json"]["execute_agreement"] is True
+    assert captured["start"]["input_json"]["agreement_country"] == "JP"
+    assert captured["start"]["input_json"]["agreement_proxy_country"] == "US"
+    assert captured["start"]["input_json"]["agreement_buyer_mode"] == "original"
+    assert captured["start"]["input_json"]["agreement_sms_country"] == "43"
+    assert captured["start"]["input_json"]["agreement_max_card_attempts"] == 9
+    assert captured["start"]["input_json"]["agreement_finalize_checkout"] is False
+    assert captured["start"]["input_json"]["work_count"] == 1
+    assert [work["execution_key"] for work in captured["works"]] == [
+        "personal-paypal-link:space-1",
+        "personal-paypal-link:space-2",
+    ]
+    assert all(
+        work["input_json"]["proxy_country"] == "BR" for work in captured["works"]
+    )
+    assert all(
+        work["input_json"]["checkout_proxy_country"] == "BR"
+        for work in captured["works"]
+    )
+    assert all(
+        work["input_json"]["update_proxy_country"] == "BR"
+        for work in captured["works"]
+    )
+    assert all(
+        work["input_json"]["billing_country"] == "JP"
+        for work in captured["works"]
+    )
+    assert all(work["input_json"]["currency"] == "USD" for work in captured["works"])
+    assert all(
+        work["input_json"]["checkout_attempt_mode"] == "new"
+        for work in captured["works"]
+    )
+    agreement_fields = {
+        "execute_agreement": True,
+        "agreement_country": "JP",
+        "agreement_proxy_country": "US",
+        "agreement_buyer_mode": "original",
+        "agreement_sms_country": "43",
+        "agreement_max_card_attempts": 9,
+        "agreement_finalize_checkout": False,
+    }
+    assert all(
+        {
+            field: work["input_json"][field]
+            for field in agreement_fields
+        }
+        == agreement_fields
+        for work in captured["works"]
+    )
+
+
+def test_personal_plus_checkout_selected_job_reuses_checkout_proxy_and_work_count(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    captured: dict = {"works": []}
+    selected = [SimpleNamespace(id="space-1"), SimpleNamespace(id="space-2")]
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_plus_checkout_spaces",
+        lambda **_kwargs: (
+            ["space-1", "space-2", "space-missing"],
+            selected,
+            [{"space_id": "space-missing", "reason": "space_not_found"}],
+        ),
+    )
+
+    def start_work_job(**kwargs):
+        captured["start"] = kwargs
+        return SimpleNamespace(id="job-1"), SimpleNamespace(id="run-1")
+
+    class CapturingWorkQueue:
+        def __init__(self, _session):
+            pass
+
+        def enqueue(self, **kwargs):
+            captured["works"].append(kwargs)
+
+    monkeypatch.setattr(resource_routes, "_start_work_job", start_work_job)
+    monkeypatch.setattr(resource_routes, "WorkQueue", CapturingWorkQueue)
+    monkeypatch.setattr(
+        resource_routes,
+        "_work_job_summary_response",
+        lambda **_kwargs: {
+            "job_id": "job-1",
+            "job_status": "running",
+            "run_id": "run-1",
+            "work_count": 30,
+            "selected_count": 2,
+            "queued": 2,
+            "running": 0,
+            "succeeded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "cancelled": 0,
+        },
+    )
+
+    response = TestClient(create_app()).post(
+        "/spaces/plus-checkout-selected-job",
+        json={
+            "space_ids": ["space-1", "space-2", "space-missing"],
+            "proxy_country": "de",
+            "checkout_proxy_country": "de",
+            "update_proxy_country": "de",
+            "promo_campaign_id": "plus-1-month-free",
+            "work_count": 30,
+            "created_by": "test",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == "job-1"
+    assert payload["requested_count"] == 3
+    assert payload["selected_count"] == 2
+    assert payload["selection_skipped_count"] == 1
+    assert captured["start"]["job_type"] == "space.personal_plus_checkout.tick"
+    assert captured["start"]["input_json"]["work_count"] == 30
+    assert captured["start"]["input_json"]["proxy_country"] == "DE"
+    assert captured["start"]["input_json"]["checkout_proxy_country"] == "DE"
+    assert captured["start"]["input_json"]["update_proxy_country"] == "DE"
+    assert [work["execution_key"] for work in captured["works"]] == [
+        "personal-plus-checkout:space-1",
+        "personal-plus-checkout:space-2",
+    ]
+    assert all(work["input_json"]["proxy_country"] == "DE" for work in captured["works"])
+    assert all(
+        work["input_json"]["checkout_proxy_country"] == "DE"
+        for work in captured["works"]
+    )
+    assert all(
+        work["input_json"]["update_proxy_country"] == "DE"
+        for work in captured["works"]
+    )
+
+
+def test_personal_plus_checkout_selection_accepts_space_without_local_promotion() -> None:
+    space = SimpleNamespace(
+        id="space-1",
+        owner_user_account_id="user-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        has_promotion=False,
+        promotion_id="",
+        has_payment_method=False,
+        payment_method_status="unbound",
+    )
+    account = SimpleNamespace(
+        id="user-1",
+        account_status="active",
+        access_token="access-token",
+        cookie_header="",
+        auth_cookie_header="",
+    )
+
+    class ScalarRows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class Session:
+        calls = 0
+
+        def scalars(self, _statement):
+            type(self).calls += 1
+            return ScalarRows(
+                {
+                    1: [space],
+                    2: [account],
+                    3: [],
+                }[type(self).calls]
+            )
+
+    requested, selected, skipped = (
+        resource_routes._select_personal_plus_checkout_spaces(
+            session=Session(),
+            space_ids=["space-1"],
+        )
+    )
+
+    assert requested == ["space-1"]
+    assert selected == [space]
+    assert skipped == []
+
+
+def test_personal_paypal_link_selection_accepts_space_without_local_promotion() -> None:
+    space = SimpleNamespace(
+        id="space-1",
+        owner_user_account_id="user-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        has_promotion=False,
+        promotion_id="",
+    )
+    account = SimpleNamespace(
+        id="user-1",
+        account_status="active",
+        access_token="access-token",
+    )
+
+    class ScalarRows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class Session:
+        calls = 0
+
+        def scalars(self, _statement):
+            type(self).calls += 1
+            return ScalarRows(
+                {
+                    1: [space],
+                    2: [account],
+                    3: [],
+                }[type(self).calls]
+            )
+
+    requested, selected, skipped = (
+        resource_routes._select_personal_paypal_link_spaces(
+            session=Session(),
+            space_ids=["space-1"],
+            apply_promotion=True,
+        )
+    )
+
+    assert requested == ["space-1"]
+    assert selected == [space]
+    assert skipped == []
+
+
+def test_personal_plus_checkout_selected_job_rejects_proxy_mismatch(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_plus_checkout_spaces",
+        lambda **_kwargs: (["space-1"], [SimpleNamespace(id="space-1")], []),
+    )
+
+    response = TestClient(create_app()).post(
+        "/spaces/plus-checkout-selected-job",
+        json={
+            "space_ids": ["space-1"],
+            "checkout_proxy_country": "us",
+            "update_proxy_country": "jp",
+            "work_count": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "update_proxy_country must match checkout_proxy_country"
+    }
+
+
+def test_personal_paypal_link_agreement_api_defaults_are_backward_compatible() -> None:
+    request = resource_routes.PersonalPayPalLinkJobRequest()
+
+    assert resource_routes._personal_paypal_agreement_config(request) == {
+        "execute_agreement": False,
+        "agreement_country": None,
+        "agreement_proxy_country": None,
+        "agreement_buyer_mode": "identity_elevation",
+        "agreement_sms_country": "",
+        "agreement_max_card_attempts": 5,
+        "agreement_finalize_checkout": True,
+    }
+
+
+def test_personal_paypal_link_accepts_tr_billing_country() -> None:
+    request = resource_routes.PersonalPayPalLinkJobRequest(
+        proxy_country="US",
+        billing_country="tr",
+    )
+
+    assert resource_routes._personal_paypal_link_country_config(request) == (
+        "TR",
+        "US",
+        "US",
+        "USD",
+    )
+
+
+def test_personal_gcash_link_keeps_ph_contract_and_configured_checkout_proxy() -> None:
+    request = resource_routes.PersonalPayPalLinkJobRequest(
+        payment_method_type="gcash",
+        proxy_country="US",
+        checkout_proxy_country="DE",
+        update_proxy_country="DE",
+        billing_country="DE",
+        currency="EUR",
+        checkout_ui_mode="hosted",
+    )
+
+    assert resource_routes._personal_paypal_link_country_config(request) == (
+        "PH",
+        "DE",
+        "DE",
+        "PHP",
+    )
+
+
+def test_personal_paypal_link_selected_job_rejects_invalid_agreement_config(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_paypal_link_spaces",
+        lambda **_kwargs: (["space-1"], [SimpleNamespace(id="space-1")], []),
+    )
+    client = TestClient(create_app())
+
+    invalid_country = client.post(
+        "/spaces/paypal-link-selected-job",
+        json={
+            "space_ids": ["space-1"],
+            "execute_agreement": True,
+            "agreement_country": "USA",
+        },
+    )
+    missing_country = client.post(
+        "/spaces/paypal-link-selected-job",
+        json={
+            "space_ids": ["space-1"],
+            "execute_agreement": True,
+        },
+    )
+    invalid_sms_country = client.post(
+        "/spaces/paypal-link-selected-job",
+        json={
+            "space_ids": ["space-1"],
+            "agreement_sms_country": "18A",
+        },
+    )
+    gcash_agreement = client.post(
+        "/spaces/paypal-link-selected-job",
+        json={
+            "space_ids": ["space-1"],
+            "payment_method_type": "gcash",
+            "execute_agreement": True,
+            "agreement_country": "US",
+            "agreement_proxy_country": "US",
+        },
+    )
+
+    assert invalid_country.status_code == 400
+    assert invalid_country.json() == {
+        "detail": "agreement_country must be a two-letter country code"
+    }
+    assert missing_country.status_code == 400
+    assert missing_country.json() == {
+        "detail": "agreement_country is required when execute_agreement is true"
+    }
+    assert invalid_sms_country.status_code == 400
+    assert invalid_sms_country.json() == {
+        "detail": "agreement_sms_country must contain digits only"
+    }
+    assert gcash_agreement.status_code == 400
+    assert gcash_agreement.json() == {
+        "detail": "PayPal agreement execution requires payment_method_type=paypal"
+    }
+
+
+def test_personal_paypal_link_selected_job_rejects_update_proxy_mismatch(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _disable_web_login(monkeypatch)
+    monkeypatch.setattr(
+        resource_routes,
+        "_select_personal_paypal_link_spaces",
+        lambda **_kwargs: (
+            ["space-1"],
+            [SimpleNamespace(id="space-1")],
+            [],
+        ),
+    )
+
+    response = TestClient(create_app()).post(
+        "/spaces/paypal-link-selected-job",
+        json={
+            "space_ids": ["space-1"],
+            "billing_country": "de",
+            "checkout_proxy_country": "br",
+            "update_proxy_country": "th",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "update_proxy_country must match checkout_proxy_country"
+    }
+
+
+def test_personal_subscription_refresh_work_uses_stored_auth_and_writes_snapshot(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {"commit_count": 0}
+    prior_session_refresh = datetime(2026, 1, 2, tzinfo=UTC)
+    space = SimpleNamespace(
+        id="space-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        owner_user_account_id="account-1",
+        external_space_id="personal-account-1",
+        plan_type="plus",
+        seats_entitled=1,
+        seat_limit=1,
+        seats_in_use=1,
+        raw_space_json={"before": True},
+        last_subscription_sync_at=None,
+        updated_at=None,
+    )
+    account = SimpleNamespace(
+        id="account-1",
+        email="selected@example.com",
+        account_status="active",
+        access_token="db-access-token",
+        cookie_header="   ",
+        auth_cookie_header="auth=fallback-cookie",
+        last_session_refresh_at=prior_session_refresh,
+    )
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, key):
+            if model is SpaceModel and key == "space-1":
+                return space
+            if model is UserAccountModel and key == "account-1":
+                return account
+            return None
+
+        def commit(self):
+            captured["commit_count"] += 1
+
+    class FakeProvider:
+        def fetch_subscription(self, **kwargs):
+            captured["fetch"] = kwargs
+            return {
+                "plan_type": "free",
+                "seats_entitled": 0,
+                "seats_in_use": 0,
+                "has_active_subscription": False,
+            }
+
+    def resolve_proxy(**kwargs):
+        captured["proxy"] = kwargs
+        return SimpleNamespace(
+            proxy_url="http://us-proxy.example:8080",
+            country_code="US",
+            provider="cliproxy",
+            sid_source="email_sha256",
+            probe_attempts=1,
+        )
+
+    monkeypatch.setattr(handlers, "_openai_plugin", lambda _settings: FakeProvider())
+    monkeypatch.setattr(handlers, "resolve_cliproxy_proxy", resolve_proxy)
+    runner = handlers.JobRunner(FakeSession)
+    handlers.register_core_handlers(
+        runner,
+        session_factory=FakeSession,
+        settings=Settings(),
+    )
+
+    assert "space.personal_subscription_refresh.selected" in runner._handlers
+    assert "space.personal_subscription_refresh.space" in runner._work_handlers
+    result = runner._work_handlers["space.personal_subscription_refresh.space"](
+        None,
+        {"space_id": "space-1", "_run_id": "run-1"},
+    )
+
+    assert captured["proxy"] == {
+        "email": "selected@example.com",
+        "country_code": "US",
+    }
+    assert captured["fetch"] == {
+        "access_token": "db-access-token",
+        "account_id": "personal-account-1",
+        "cookie_header": "auth=fallback-cookie",
+        "proxy_url": "http://us-proxy.example:8080",
+    }
+    assert captured["commit_count"] == 1
+    assert account.last_session_refresh_at == prior_session_refresh
+    assert space.plan_type == "free"
+    assert space.seats_entitled == 0
+    assert space.seat_limit == 0
+    assert space.seats_in_use == 0
+    assert space.raw_space_json["has_active_subscription"] is False
+    assert space.last_subscription_sync_at is not None
+    assert space.updated_at == space.last_subscription_sync_at
+    assert result["subscription_status"] == "refreshed"
+    assert result["plan_type"] == "free"
+
+
+def test_personal_subscription_refresh_work_treats_404_as_no_subscription(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured = {"commit_count": 0}
+    space = SimpleNamespace(
+        id="space-1",
+        provider="openai_chatgpt",
+        space_type="personal",
+        space_status="active",
+        owner_user_account_id="account-1",
+        external_space_id="personal-account-1",
+        raw_space_json={"before": True},
+        last_subscription_sync_at=None,
+    )
+    account = SimpleNamespace(
+        id="account-1",
+        email="selected@example.com",
+        account_status="active",
+        access_token="db-access-token",
+        cookie_header="primary=cookie",
+        auth_cookie_header="auth=fallback-cookie",
+    )
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, key):
+            if model is SpaceModel and key == "space-1":
+                return space
+            if model is UserAccountModel and key == "account-1":
+                return account
+            return None
+
+        def commit(self):
+            captured["commit_count"] += 1
+
+    class MissingSubscriptionProvider:
+        def fetch_subscription(self, **_kwargs):
+            raise handlers.OpenAIChatGPTClientError(
+                "chatgpt backend request failed: http_status=404 body_snippet={}"
+            )
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_cliproxy_proxy",
+        lambda **_kwargs: SimpleNamespace(proxy_url="http://us-proxy.example:8080"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_openai_plugin",
+        lambda _settings: MissingSubscriptionProvider(),
+    )
+
+    result = handlers._run_personal_subscription_refresh_work(
+        session_factory=FakeSession,
+        settings=Settings(),
+        input_json={"space_id": "space-1"},
+    )
+
+    assert result["subscription_status"] == "no_subscription"
+    assert result["http_status"] == 404
+    assert captured["commit_count"] == 0
+    assert space.raw_space_json == {"before": True}
+    assert space.last_subscription_sync_at is None
+
+
 def test_personal_promotion_check_work_uses_selected_space_and_jp_proxy(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -948,6 +2153,120 @@ def test_personal_promotion_check_work_uses_selected_space_and_jp_proxy(
     assert result["proxy_sid_source"] == "email_sha256"
     assert result["proxy_probe_attempts"] == 1
     assert result["has_promotion"] is True
+
+
+def test_personal_codex_heartbeat_work_can_use_cliproxy_us(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    account = SimpleNamespace(id="account-1", email="heartbeat@example.com")
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, model, key):
+            if model is UserAccountModel and key == "account-1":
+                return account
+            return None
+
+    class FakeHeartbeatWorkflow:
+        def __init__(self, **kwargs):
+            captured["workflow"] = kwargs
+
+        def run(self, input_):
+            captured["proxy_url"] = captured["workflow"]["proxy_resolver"]("account-1")
+            captured["proxy_url_reused"] = captured["workflow"]["proxy_resolver"](
+                "account-1"
+            )
+            return {"space_credential_id": input_.space_credential_id, "action": "ok"}
+
+    def resolve_proxy(**kwargs):
+        captured["proxy"] = kwargs
+        return SimpleNamespace(proxy_url="http://us-cliproxy.example:443")
+
+    monkeypatch.setattr(handlers, "resolve_cliproxy_proxy", resolve_proxy)
+    monkeypatch.setattr(
+        handlers,
+        "PersonalCodexCredentialHeartbeatWorkflow",
+        FakeHeartbeatWorkflow,
+    )
+    monkeypatch.setattr(handlers, "_openai_plugin", lambda _settings: object())
+
+    result = handlers._run_personal_codex_credential_heartbeat_work(
+        session_factory=FakeSession,
+        settings=Settings(),
+        input_json={
+            "space_credential_id": "credential-1",
+            "proxy_mode": "cliproxy",
+            "proxy_country": "US",
+        },
+    )
+
+    assert result == {"space_credential_id": "credential-1", "action": "ok"}
+    assert captured["proxy"] == {
+        "email": "heartbeat@example.com",
+        "country_code": "US",
+    }
+    assert captured["proxy_url"] == "http://us-cliproxy.example:443"
+    assert captured["proxy_url_reused"] == "http://us-cliproxy.example:443"
+
+
+def test_personal_codex_authorization_work_uses_proxy_override(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    target = SimpleNamespace(
+        user_account_id="account-1",
+        space_id="space-1",
+        space_membership_id="membership-1",
+    )
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def scalar(self, _stmt):
+            return "credential-1"
+
+    class FakeBackfillRtWorkflow:
+        def __init__(self, **kwargs):
+            captured["workflow"] = kwargs
+
+        def run(self, **kwargs):
+            captured["run"] = kwargs
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_personal_codex_authorization_target",
+        lambda **_kwargs: (target, ""),
+    )
+    monkeypatch.setattr(handlers, "BackfillRtWorkflow", FakeBackfillRtWorkflow)
+    monkeypatch.setattr(handlers, "_mail_plugin", lambda _settings: object())
+    monkeypatch.setattr(handlers, "_twofauth_otp_resolver", lambda _settings: None)
+    monkeypatch.setattr(
+        handlers,
+        "_personal_codex_grizzly_phone_provider",
+        lambda **_kwargs: None,
+    )
+
+    result = handlers._run_personal_codex_authorization_work(
+        session_factory=FakeSession,
+        settings=Settings(),
+        input_json={
+            "space_membership_id": "membership-1",
+            "proxy_url_override": "http://us-cliproxy.example:443",
+        },
+    )
+
+    assert result["space_credential_id"] == "credential-1"
+    assert captured["run"]["proxy_url_override"] == "http://us-cliproxy.example:443"
 
 
 def test_payment_method_pool_imports_each_pool_independently(
@@ -1390,6 +2709,22 @@ def test_account_and_space_session_recency_filters(monkeypatch: MonkeyPatch) -> 
         assert account_items[account_ids["recent"]]["codex_select_channel_required"] is True
         assert account_items[account_ids["recent"]]["codex_select_channel_detected_at"]
 
+        account_batch_response = client.get(
+            "/user-accounts",
+            params={
+                "email_list": (
+                    f" {prefix}-stale@example.com\n"
+                    f"{prefix}-NEVER@example.com\n"
+                    f"{prefix}-stale@example.com "
+                ),
+                "page_size": 20,
+            },
+        )
+        assert account_batch_response.status_code == 200
+        assert {
+            item["id"] for item in account_batch_response.json()["items"]
+        } == {account_ids["stale"], account_ids["never"]}
+
         account_select_channel_response = client.get(
             "/user-accounts",
             params={
@@ -1450,6 +2785,18 @@ def test_account_and_space_session_recency_filters(monkeypatch: MonkeyPatch) -> 
         assert space_items[space_ids["recent"]]["plan_type"] == "plus"
         assert space_items[space_ids["recent"]]["last_session_refresh_at"]
         assert space_items[space_ids["business"]]["last_session_refresh_at"]
+
+        space_batch_response = client.get(
+            "/spaces",
+            params={
+                "email_list": f"{prefix}-recent@example.com\n{prefix}-ADMIN@example.com",
+                "page_size": 20,
+            },
+        )
+        assert space_batch_response.status_code == 200
+        assert {
+            item["id"] for item in space_batch_response.json()["items"]
+        } == {space_ids["recent"], space_ids["business"]}
 
         space_never_response = client.get(
             "/spaces",

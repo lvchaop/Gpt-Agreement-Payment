@@ -17,11 +17,15 @@ const props = withDefaults(defineProps<{
   filters?: TableFilter[];
   selectable?: boolean;
   defaultSort?: string;
+  batchSearch?: boolean;
+  batchSearchPlaceholder?: string;
 }>(), {
   description: "",
   filters: () => [],
   selectable: true,
   defaultSort: "-created_at",
+  batchSearch: false,
+  batchSearchPlaceholder: "邮箱，一行一个",
 });
 
 defineEmits<{
@@ -45,6 +49,7 @@ const query = ref<PageQuery>({
   page_size: Number(initialValue("page_size") || 50),
   sort: initialValue("sort") || props.defaultSort,
   q: initialValue("q") || "",
+  email_list: initialValue("email_list") || "",
   ...Object.fromEntries(props.filters.map((filter) => [filter.key, initialValue(filter.key) || ""])),
 });
 const loading = ref(false);
@@ -55,7 +60,7 @@ const tableRef = ref<InstanceType<typeof DataTable> | null>(null);
 async function load(next: PageQuery = {}) {
   query.value = { ...query.value, ...next };
   const routeQuery: Record<string, string> = {};
-  for (const key of ["page", "page_size", "sort", "q", ...props.filters.map((filter) => filter.key)]) {
+  for (const key of ["page", "page_size", "sort", "q", "email_list", ...props.filters.map((filter) => filter.key)]) {
     const value = query.value[key];
     if (value !== undefined && String(value).trim()) routeQuery[key] = String(value);
   }
@@ -112,6 +117,9 @@ defineExpose({ load, clearSelection });
     :empty-text="emptyText"
     :filters="filters"
     :selectable="selectable"
+    :batch-search-enabled="batchSearch"
+    :batch-search-placeholder="batchSearchPlaceholder"
+    :batch-search-value="String(query.email_list || '')"
     :all-rows-loader="loadAllRows"
     remote
     @refresh="load()"

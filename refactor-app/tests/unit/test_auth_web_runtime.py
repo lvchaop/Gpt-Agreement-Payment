@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from refactor_app.config.browser_fingerprint import browser_fingerprint_for
 from refactor_app.plugins.openai_auth_protocol.auth_flow import (
     AuthFlow,
     _resolve_auth_web_page_context,
@@ -23,6 +24,12 @@ from refactor_app.plugins.openai_auth_protocol.config import Config
 from refactor_app.plugins.openai_auth_protocol.sentinel_quickjs import (
     create_sentinel_runtime_context,
 )
+
+
+def _proxy_config(country_code: str = "US") -> Config:
+    config = Config()
+    config.proxy_meta = {"register": {"country_code": country_code}}
+    return config
 
 
 class _Response:
@@ -172,7 +179,7 @@ class _RuntimeStub:
 
 
 def test_auth_flow_routes_only_auth_domain_through_sdk_runtime() -> None:
-    flow = AuthFlow(Config())
+    flow = AuthFlow(_proxy_config())
     raw_session = _RawSession()
     flow.session.raw_session = raw_session
     runtime = _RuntimeStub()
@@ -212,7 +219,7 @@ def test_auth_flow_routes_only_auth_domain_through_sdk_runtime() -> None:
 
 
 def test_auth_flow_switches_runtime_view_from_auth_step_response() -> None:
-    flow = AuthFlow(Config())
+    flow = AuthFlow(_proxy_config())
     runtime = _RuntimeStub()
     runtime.next_response = _Response(
         body=json.dumps(
@@ -249,7 +256,7 @@ def test_auth_flow_switches_runtime_view_from_auth_step_response() -> None:
 def test_auth_flow_document_navigation_uses_browser_navigation_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    flow = AuthFlow(Config())
+    flow = AuthFlow(_proxy_config())
     raw_session = _RawSession()
     flow.session.raw_session = raw_session
     started: list[dict] = []
@@ -390,7 +397,79 @@ def _statsig_events(calls: list[tuple[str, str, dict]]) -> list[dict]:
     not all(path.exists() for path in (_STATSIG_BUNDLE, _APP_CORE_BUNDLE, _DATADOG_BUNDLE)),
     reason="captured Auth Web SDK bundles are not present",
 )
-def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
+@pytest.mark.parametrize(
+    ("browser_fingerprint", "expected_low_entropy", "expected_high_entropy"),
+    [
+        (
+            browser_fingerprint_for("chrome136", os_profile="windows"),
+            {
+                "brands": [
+                    {"brand": "Chromium", "version": "136"},
+                    {"brand": "Google Chrome", "version": "136"},
+                    {"brand": "Not.A/Brand", "version": "99"},
+                ],
+                "mobile": False,
+                "platform": "Windows",
+            },
+            {
+                "architecture": "x86",
+                "bitness": "64",
+                "brands": [
+                    {"brand": "Chromium", "version": "136"},
+                    {"brand": "Google Chrome", "version": "136"},
+                    {"brand": "Not.A/Brand", "version": "99"},
+                ],
+                "fullVersionList": [
+                    {"brand": "Chromium", "version": "136.0.0.0"},
+                    {"brand": "Google Chrome", "version": "136.0.0.0"},
+                    {"brand": "Not.A/Brand", "version": "99.0.0.0"},
+                ],
+                "mobile": False,
+                "model": "",
+                "platform": "Windows",
+                "platformVersion": "15.0.0",
+                "uaFullVersion": "136.0.0.0",
+            },
+        ),
+        (
+            browser_fingerprint_for("chrome145", os_profile="linux"),
+            {
+                "brands": [
+                    {"brand": "Not:A-Brand", "version": "99"},
+                    {"brand": "Google Chrome", "version": "145"},
+                    {"brand": "Chromium", "version": "145"},
+                ],
+                "mobile": False,
+                "platform": "Linux",
+            },
+            {
+                "architecture": "x86",
+                "bitness": "64",
+                "brands": [
+                    {"brand": "Not:A-Brand", "version": "99"},
+                    {"brand": "Google Chrome", "version": "145"},
+                    {"brand": "Chromium", "version": "145"},
+                ],
+                "fullVersionList": [
+                    {"brand": "Not:A-Brand", "version": "99.0.0.0"},
+                    {"brand": "Google Chrome", "version": "145.0.0.0"},
+                    {"brand": "Chromium", "version": "145.0.0.0"},
+                ],
+                "mobile": False,
+                "model": "",
+                "platform": "Linux",
+                "platformVersion": "6.8.0",
+                "uaFullVersion": "145.0.0.0",
+            },
+        ),
+    ],
+    ids=("windows-x86", "linux-x86"),
+)
+def test_real_sdk_injects_trace_generates_rum_and_closes_node(
+    browser_fingerprint,
+    expected_low_entropy,
+    expected_high_entropy,
+) -> None:
     config, statsig_key, statsig_api, statsig_log_event_url = _parse_app_core_config(
         _APP_CORE_BUNDLE.read_text(encoding="utf-8")
     )
@@ -420,7 +499,14 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
         route_id="EMAIL_VERIFICATION",
         page_url="https://auth.openai.com/email-verification",
     )
-    runtime = AuthWebRuntime(session, assets, create_sentinel_runtime_context("US"))
+    runtime = AuthWebRuntime(
+        session,
+        assets,
+        create_sentinel_runtime_context(
+            "US",
+            browser_fingerprint=browser_fingerprint,
+        ),
+    )
     process = runtime._process
     assert process is not None
 
@@ -502,7 +588,11 @@ def test_real_sdk_injects_trace_generates_rum_and_closes_node() -> None:
         browser_profile = runtime.runtime_info["browserProfile"]
         assert browser_profile["webdriver"] is False
         assert browser_profile["cookieEnabled"] is True
-        assert browser_profile["userAgentData"]["platform"] == "macOS"
+        assert browser_profile["userAgentData"] == expected_low_entropy
+        assert (
+            browser_profile["userAgentDataHighEntropyValues"]
+            == expected_high_entropy
+        )
         assert runtime.page_url == "https://auth.openai.com/about-you"
         assert auth_call[2]["allow_redirects"] is False
         assert {

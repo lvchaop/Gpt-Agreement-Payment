@@ -5,6 +5,7 @@ export type PageQuery = Record<string, string | number | boolean | undefined> & 
   page_size?: number;
   sort?: string;
   q?: string;
+  email_list?: string;
 };
 
 export type PagedResult<T> = {

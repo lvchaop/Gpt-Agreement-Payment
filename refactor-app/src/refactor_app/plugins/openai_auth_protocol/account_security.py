@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 from refactor_app.config.browser_fingerprint import (
+    BROWSER_IMPERSONATE,
     BROWSER_SEC_CH_UA,
     BROWSER_SEC_CH_UA_PLATFORM,
     BROWSER_USER_AGENT,
@@ -28,6 +30,7 @@ class TotpVault(Protocol):
 @dataclass(frozen=True)
 class ProtocolAccountSecurityConfig:
     proxy_url: str = ""
+    accept_language: str = ""
     request_timeout_s: int = 30
 
 
@@ -90,13 +93,17 @@ class ProtocolAccountSecurity:
             )
 
         owned_session = http_session is None
-        session = http_session or create_http_session(proxy=self.config.proxy_url)
+        session = http_session or create_http_session(
+            proxy=self.config.proxy_url,
+            impersonate=_protocol_impersonate(auth_result),
+        )
         try:
             mfa = _ensure_totp(
                 session,
                 auth_result=auth_result,
                 twofauth_client=twofauth_client,
                 timeout_s=max(1, int(self.config.request_timeout_s)),
+                accept_language=str(self.config.accept_language or "").strip(),
                 emit=self._emit,
             )
             result = AccountSecuritySetupResult(
@@ -126,6 +133,7 @@ def _ensure_totp(
     auth_result: AuthResult,
     twofauth_client: TotpVault | None,
     timeout_s: int,
+    accept_language: str,
     emit: TraceEmitter,
 ) -> _MfaResult:
     external_account_id = ""
@@ -136,6 +144,7 @@ def _ensure_totp(
             "/backend-api/accounts/mfa_info",
             auth_result=auth_result,
             timeout_s=timeout_s,
+            accept_language=accept_language,
             emit=emit,
         )
         if _totp_factor_present(mfa_info):
@@ -156,6 +165,7 @@ def _ensure_totp(
             method="POST",
             body={"factor_type": "totp"},
             timeout_s=timeout_s,
+            accept_language=accept_language,
             emit=emit,
         )
         session_id = str(enroll.get("session_id") or "").strip()
@@ -183,6 +193,7 @@ def _ensure_totp(
                 "session_id": session_id,
             },
             timeout_s=timeout_s,
+            accept_language=accept_language,
             emit=emit,
         )
         activation_succeeded = True
@@ -192,6 +203,7 @@ def _ensure_totp(
                 "/backend-api/accounts/mfa_info",
                 auth_result=auth_result,
                 timeout_s=timeout_s,
+                accept_language=accept_language,
                 emit=emit,
             )
             if _totp_factor_present(mfa_info):
@@ -245,23 +257,34 @@ def _protocol_api_json(
     method: str = "GET",
     body: dict[str, Any] | None = None,
     timeout_s: int = 30,
+    accept_language: str = "",
     emit: TraceEmitter | None = None,
 ) -> dict[str, Any]:
     normalized_path = "/" + str(path or "").lstrip("/")
+    user_agent = str(auth_result.browser_user_agent or "").strip() or BROWSER_USER_AGENT
+    request_accept_language = (
+        str(auth_result.browser_accept_language or "").strip()
+        or str(accept_language or "").strip()
+    )
     headers = {
         "Accept": "application/json",
-        "Accept-Language": "zh-CN,zh;q=0.9",
         "Authorization": f"Bearer {str(auth_result.access_token or '').strip()}",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
-        "User-Agent": BROWSER_USER_AGENT,
-        "sec-ch-ua": BROWSER_SEC_CH_UA,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": BROWSER_SEC_CH_UA_PLATFORM,
+        "User-Agent": user_agent,
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
     }
+    if request_accept_language:
+        headers["Accept-Language"] = request_accept_language
+    if "firefox/" not in user_agent.casefold():
+        headers["sec-ch-ua"] = _chromium_sec_ch_ua(user_agent)
+        headers["sec-ch-ua-mobile"] = "?0"
+        headers["sec-ch-ua-platform"] = _chromium_sec_ch_ua_platform(
+            str(auth_result.browser_platform or "").strip(),
+            user_agent=user_agent,
+        )
     cookie_header = _session_cookie_header(auth_result)
     if cookie_header:
         headers["Cookie"] = cookie_header
@@ -304,6 +327,46 @@ def _session_cookie_header(auth_result: AuthResult) -> str:
         session_cookie = f"__Secure-next-auth.session-token={session_token}"
         cookie_header = f"{cookie_header}; {session_cookie}" if cookie_header else session_cookie
     return cookie_header
+
+
+def _protocol_impersonate(auth_result: AuthResult) -> str:
+    requested = str(auth_result.browser_impersonate or "").strip().casefold()
+    user_agent = str(auth_result.browser_user_agent or "").strip().casefold()
+    if requested.startswith("firefox") or "firefox/" in user_agent:
+        # curl_cffi's generic alias selects its newest supported Firefox TLS profile.
+        return "firefox"
+    if re.fullmatch(r"chrome\d+[a-z]*", requested) or re.search(
+        r"(?:chrome|chromium)/\d+", user_agent
+    ):
+        return "chrome"
+    return requested or BROWSER_IMPERSONATE
+
+
+def _chromium_sec_ch_ua(user_agent: str) -> str:
+    match = re.search(r"(?:Chrome|Chromium)/(\d+)", str(user_agent or ""), re.IGNORECASE)
+    if match is None:
+        return BROWSER_SEC_CH_UA
+    major = match.group(1)
+    return (
+        f'"Chromium";v="{major}", "Google Chrome";v="{major}", '
+        '"Not_A Brand";v="99"'
+    )
+
+
+def _chromium_sec_ch_ua_platform(browser_platform: str, *, user_agent: str) -> str:
+    platform = str(browser_platform or "").strip().casefold()
+    user_agent_lower = str(user_agent or "").casefold()
+    if platform.startswith(("mac", "darwin")) or "mac os x" in user_agent_lower:
+        return '"macOS"'
+    if platform.startswith("win") or "windows" in user_agent_lower:
+        return '"Windows"'
+    if "android" in platform or "android" in user_agent_lower:
+        return '"Android"'
+    if platform.startswith(("iphone", "ipad", "ipod")):
+        return '"iOS"'
+    if "linux" in platform or "linux" in user_agent_lower:
+        return '"Linux"'
+    return BROWSER_SEC_CH_UA_PLATFORM
 
 
 def _fresh_totp(client: TotpVault, account_id: str) -> TwoFAuthOtp:

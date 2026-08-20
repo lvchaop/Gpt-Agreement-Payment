@@ -165,7 +165,6 @@ def acquire_codex_rt_with_existing_browser_session(
 
     try:
         from browserforge.fingerprints import Screen
-        from camoufox.sync_api import Camoufox
     except Exception as exc:
         return CodexBrowserRtResult(
             ok=False,
@@ -205,7 +204,6 @@ def acquire_codex_rt_with_existing_browser_session(
 
     try:
         with managed_camoufox_context(
-            Camoufox,
             flow="codex-existing-session",
             headless=(
                 bool(headless)
@@ -219,7 +217,6 @@ def acquire_codex_rt_with_existing_browser_session(
             screen=Screen(max_width=1920, max_height=1080),
             proxy=proxy_cfg,
             geoip=True,
-            locale="en-US",
         ) as ctx:
             _seed_context_cookies(ctx, cookie_header, ".chatgpt.com")
             _seed_context_cookies(ctx, auth_cookie_header, ".auth.openai.com")
@@ -405,7 +402,6 @@ def acquire_codex_rt_with_browser_login(
         )
     try:
         from browserforge.fingerprints import Screen
-        from camoufox.sync_api import Camoufox
     except Exception as exc:
         return CodexBrowserRtResult(
             ok=False,
@@ -452,9 +448,9 @@ def acquire_codex_rt_with_browser_login(
         return True
 
     try:
-        prepare_domain_mailbox(mail_provider, email=email)
+        if not (password.strip() and totp_code_provider is not None):
+            prepare_domain_mailbox(mail_provider, email=email)
         with managed_camoufox_context(
-            Camoufox,
             flow="codex-browser-login",
             headless=(
                 bool(headless)
@@ -468,7 +464,6 @@ def acquire_codex_rt_with_browser_login(
             screen=Screen(max_width=1920, max_height=1080),
             proxy=proxy_cfg,
             geoip=True,
-            locale="en-US",
         ) as ctx:
             _seed_context_cookies(ctx, cookie_header, ".chatgpt.com")
             _seed_context_cookies(ctx, auth_cookie_header, ".auth.openai.com")
@@ -882,13 +877,44 @@ def _submit_email_if_visible(page, email: str) -> bool:
         if not email_input:
             return False
         email_input.click(timeout=3000)
-        email_input.fill(email.strip())
+        if not _replace_input_value(email_input, email.strip()):
+            return False
         return _click_first_visible(
             page,
             ['button[type="submit"]', 'button:has-text("Continue")', "#btnNext"],
         )
     except Exception:
         return False
+
+
+def _replace_input_value(input_element, value: str) -> bool:
+    try:
+        input_element.evaluate(
+            """(el, nextValue) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                )?.set;
+                if (setter) setter.call(el, nextValue);
+                else el.value = nextValue;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            value,
+        )
+    except Exception:
+        try:
+            input_element.fill(value)
+        except Exception:
+            return False
+
+    try:
+        actual = str(input_element.input_value())
+    except Exception:
+        try:
+            actual = str(input_element.evaluate("el => el.value"))
+        except Exception:
+            return True
+    return actual == value
 
 
 def _submit_password_if_visible(page, password: str) -> bool:

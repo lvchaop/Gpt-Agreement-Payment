@@ -2,21 +2,46 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from refactor_app.application.workflows.personal_payment_method import (
+    _payment_locale_for_proxy_country,
+    _payment_timezone_for_proxy_country,
+)
+from refactor_app.application.workflows.personal_paypal_link import (
+    paypal_checkout_currency_for_country,
+)
 from refactor_app.application.workflows.registration_proxy import (
     resolve_cliproxy_proxy,
 )
 from refactor_app.application.workflows.space_membership_invite_sync import (
     _write_space_subscription_snapshot,
 )
-from refactor_app.infrastructure.db.models import SpaceModel, UserAccountModel
+from refactor_app.config.browser_fingerprint import (
+    BrowserFingerprint,
+    browser_fingerprint_for_email,
+)
+from refactor_app.infrastructure.db.models import (
+    PaymentAddressPoolModel,
+    PaymentNamePoolModel,
+    SpaceModel,
+    UserAccountModel,
+)
 from refactor_app.infrastructure.logging.event_writer import EventWriter
 from refactor_app.plugins.contracts import OpenAIChatGPTProvider
 from refactor_app.plugins.mail_external_api.plugin import ExternalMailApiPlugin
+from refactor_app.plugins.openai_auth_browser.browser_http_session import (
+    browser_http_session_factory,
+)
+from refactor_app.plugins.openai_auth_browser.email_registration import (
+    BrowserEmailRegistrationError,
+    CamoufoxEmailRegistration,
+)
 from refactor_app.plugins.openai_auth_browser.personal_plus_checkout import (
     READ_PLUS_CHECKOUT_SESSION_SCRIPT,
     PlusCheckoutAlreadyPaidError,
@@ -53,8 +78,10 @@ class PersonalPlusCheckoutWorkflow:
         *,
         session_factory: Callable[[], Session],
         mail_provider: ExternalMailApiPlugin | None = None,
-        us_proxy_country: str = "US",
-        jp_proxy_country: str = "JP",
+        checkout_proxy_country: str = "",
+        update_proxy_country: str = "",
+        us_proxy_country: str = "",
+        jp_proxy_country: str = "",
         promo_campaign_id: str = "plus-1-month-free",
         checkout_ui_mode: str = "hosted",
         browser_headless: bool = True,
@@ -71,9 +98,26 @@ class PersonalPlusCheckoutWorkflow:
     ) -> None:
         self._session_factory = session_factory
         self._mail_provider = mail_provider
-        self._us_proxy_country = us_proxy_country
-        self._jp_proxy_country = jp_proxy_country
-        self._promo_campaign_id = promo_campaign_id
+        self._checkout_proxy_country = (
+            str(checkout_proxy_country or us_proxy_country or "US").strip().upper()
+        )
+        self._update_proxy_country = (
+            str(update_proxy_country or jp_proxy_country or self._checkout_proxy_country)
+            .strip()
+            .upper()
+        )
+        if self._update_proxy_country != self._checkout_proxy_country:
+            raise PersonalPlusCheckoutError(
+                "plus_checkout_proxy_country_mismatch",
+                error_code="plus_checkout_proxy_country_mismatch",
+                diagnostics={
+                    "checkout_proxy_country": self._checkout_proxy_country,
+                    "update_proxy_country": self._update_proxy_country,
+                },
+            )
+        self._promo_campaign_id = (
+            str(promo_campaign_id or "plus-1-month-free").strip() or "plus-1-month-free"
+        )
         self._checkout_ui_mode = str(checkout_ui_mode or "hosted").strip().lower()
         self._browser_headless = bool(browser_headless)
         self._browser_log_enabled = bool(browser_log_enabled)
@@ -85,6 +129,7 @@ class PersonalPlusCheckoutWorkflow:
         self._captcha_api_url = str(captcha_api_url or "").strip()
         self._captcha_client_key = str(captcha_client_key or "").strip()
         self._captcha_solver = captcha_solver
+        self._protocol_runner_injected = protocol_checkout_runner is not None
         self._protocol_checkout_runner = protocol_checkout_runner or run_plus_checkout
 
     def run(self, *, space_id: str, work_id: str = "", run_id: str = "") -> dict[str, Any]:
@@ -105,12 +150,12 @@ class PersonalPlusCheckoutWorkflow:
                     "source": "local_snapshot",
                 },
             }
-        us_proxy = resolve_cliproxy_proxy(
-            email=context["email"], country_code=self._us_proxy_country
+        browser_fingerprint = browser_fingerprint_for_email(context["email"])
+        checkout_proxy = resolve_cliproxy_proxy(
+            email=context["email"], country_code=self._checkout_proxy_country
         )
-        jp_proxy = resolve_cliproxy_proxy(
-            email=context["email"], country_code=self._jp_proxy_country
-        )
+        billing_country = str(checkout_proxy.country_code or "").strip().upper()
+        currency = paypal_checkout_currency_for_country(billing_country)
 
         config = PlusCheckoutConfig(
             access_token=context["access_token"],
@@ -119,56 +164,165 @@ class PersonalPlusCheckoutWorkflow:
             cookie_header=context["cookie_header"],
             auth_cookie_header=context["auth_cookie_header"],
             device_id=context["device_id"],
-            billing={"email": context["email"]},
-            billing_country="US",
-            currency="USD",
-            promo_campaign_id=context["promotion_id"] or self._promo_campaign_id,
+            billing={"email": context["email"], "country": billing_country},
+            oaics_billing_fallback_provider=lambda: self._reserve_checkout_billing_profile(
+                email=context["email"],
+                country=billing_country,
+            ),
+            billing_country=billing_country,
+            country=billing_country,
+            currency=currency,
+            promo_campaign_id=self._promo_campaign_id,
             checkout_ui_mode=self._checkout_ui_mode,
             captcha_api_url=self._captcha_api_url,
             captcha_client_key=self._captcha_client_key,
+            proxy_country=checkout_proxy.country_code,
+            locale=_payment_locale_for_proxy_country(checkout_proxy.country_code),
+            browser_timezone=_payment_timezone_for_proxy_country(checkout_proxy.country_code),
+            browser_headless=self._browser_headless,
         )
 
-        def update_promotion(**kwargs: Any) -> Any:
-            created = kwargs.get("created")
-            state = kwargs.get("state")
-            checkout_url = str(
-                kwargs.get("checkout_url") or getattr(created, "checkout_url", "") or ""
-            )
-            access_token = str(
-                kwargs.get("access_token") or getattr(state, "access_token", "") or ""
-            )
-            return self._promotion_updater(
-                proxy_url=jp_proxy.proxy_url,
-                checkout_url=checkout_url,
-                access_token=access_token or context["access_token"],
-                account_id=context["external_space_id"],
-                promo_campaign_id=config.promo_campaign_id,
-                cookie_header=str(kwargs.get("cookie_header") or context["cookie_header"]),
-                user_agent=str(kwargs.get("user_agent") or config.user_agent),
-            )
+        def execute_protocol(
+            runtime_config: PlusCheckoutConfig,
+            *,
+            request_session_factory: Callable[..., Any] | None = None,
+        ) -> Any:
+            def update_promotion(**kwargs: Any) -> Any:
+                created = kwargs.get("created")
+                state = kwargs.get("state")
+                checkout_url = str(
+                    kwargs.get("checkout_url") or getattr(created, "checkout_url", "") or ""
+                )
+                access_token = str(
+                    kwargs.get("access_token") or getattr(state, "access_token", "") or ""
+                )
+                promotion_kwargs: dict[str, Any] = {
+                    "proxy_url": checkout_proxy.proxy_url,
+                    "checkout_url": checkout_url,
+                    "access_token": access_token or runtime_config.access_token,
+                    "account_id": context["external_space_id"],
+                    "promo_campaign_id": runtime_config.promo_campaign_id,
+                    "cookie_header": str(
+                        kwargs.get("cookie_header") or runtime_config.cookie_header
+                    ),
+                    "user_agent": str(kwargs.get("user_agent") or runtime_config.user_agent),
+                }
+                if request_session_factory is not None:
+                    promotion_kwargs["session_factory"] = request_session_factory
+                return self._promotion_updater(**promotion_kwargs)
 
-        try:
-            protocol_result = self._protocol_checkout_runner(
-                config,
-                payment_method_id=context["payment_method_id"],
-                proxy_url=us_proxy.proxy_url,
-                promotion_callback=update_promotion,
-                session_update_callback=lambda credentials: self._persist_protocol_session(
+            protocol_kwargs: dict[str, Any] = {
+                "payment_method_id": context["payment_method_id"],
+                "proxy_url": checkout_proxy.proxy_url,
+                "promotion_callback": update_promotion,
+                "session_update_callback": lambda credentials: self._persist_protocol_session(
                     user_account_id=context["user_account_id"],
                     credentials=credentials,
                 ),
-                event_callback=(
+                "event_callback": (
                     self._browser_event(run_id=run_id, work_id=work_id, stage="protocol")
                     if run_id
                     else None
                 ),
-            )
+            }
+            if request_session_factory is not None:
+                protocol_kwargs.update(
+                    session_factory=request_session_factory,
+                    stripe_session_factory=request_session_factory,
+                    captcha_session_factory=request_session_factory,
+                )
+            return self._protocol_checkout_runner(runtime_config, **protocol_kwargs)
+
+        try:
+            if self._protocol_runner_injected:
+                protocol_result = execute_protocol(config)
+            else:
+                browser = CamoufoxEmailRegistration(
+                    self._browser_config(
+                        checkout_proxy.proxy_url,
+                        work_id=work_id,
+                        country_code=checkout_proxy.country_code,
+                        browser_fingerprint=browser_fingerprint,
+                    ),
+                    event_callback=(
+                        self._browser_event(
+                            run_id=run_id,
+                            work_id=work_id,
+                            stage="browser",
+                        )
+                        if run_id
+                        else None
+                    ),
+                )
+
+                def run_in_browser(browser_context: Any, _page: Any, auth: Any) -> Any:
+                    observed_account_id = str(getattr(auth, "chatgpt_account_id", "") or "").strip()
+                    if observed_account_id and observed_account_id != context["external_space_id"]:
+                        raise PersonalPlusCheckoutError(
+                            "plus_checkout_browser_account_mismatch",
+                            error_code="plus_checkout_browser_account_mismatch",
+                            diagnostics={"stage": "browser_session_reuse"},
+                        )
+                    credentials = {
+                        "access_token": str(getattr(auth, "access_token", "") or ""),
+                        "session_token": str(getattr(auth, "session_token", "") or ""),
+                        "cookie_header": str(getattr(auth, "cookie_header", "") or ""),
+                        "device_id": str(getattr(auth, "device_id", "") or ""),
+                        "csrf_token": str(getattr(auth, "csrf_token", "") or ""),
+                    }
+                    self._persist_protocol_session(
+                        user_account_id=context["user_account_id"],
+                        credentials=credentials,
+                    )
+                    runtime_config = replace(
+                        config,
+                        access_token=credentials["access_token"] or config.access_token,
+                        session_token=credentials["session_token"] or config.session_token,
+                        cookie_header=credentials["cookie_header"] or config.cookie_header,
+                        auth_cookie_header=(
+                            str(getattr(auth, "auth_cookie_header", "") or "")
+                            or config.auth_cookie_header
+                        ),
+                        device_id=credentials["device_id"] or config.device_id,
+                        user_agent=(
+                            str(getattr(auth, "browser_user_agent", "") or "") or config.user_agent
+                        ),
+                    )
+                    request_session_factory = browser_http_session_factory(browser_context)
+                    protocol_result = execute_protocol(
+                        runtime_config,
+                        request_session_factory=request_session_factory,
+                    )
+                    subscription_sync = self._sync_subscription_snapshot(
+                        space_id=space_id,
+                        user_account_id=context["user_account_id"],
+                        proxy_url=checkout_proxy.proxy_url,
+                        run_id=run_id,
+                        work_id=work_id,
+                        request_session_factory=request_session_factory,
+                        user_agent=runtime_config.user_agent,
+                        device_id=runtime_config.device_id,
+                    )
+                    return protocol_result, subscription_sync
+
+                protocol_result, subscription_sync = browser.run_authenticated_page(
+                    email=context["email"],
+                    cookie_header=context["cookie_header"],
+                    auth_cookie_header=context["auth_cookie_header"],
+                    after_session=run_in_browser,
+                )
         except PlusCheckoutError as exc:
             raise PersonalPlusCheckoutError(
                 str(exc),
                 attempt_disposition=exc.attempt_disposition,
                 error_code=exc.error_code,
                 diagnostics=exc.diagnostics,
+            ) from exc
+        except BrowserEmailRegistrationError as exc:
+            raise PersonalPlusCheckoutError(
+                str(exc),
+                error_code="plus_checkout_browser_context_failed",
+                diagnostics={"stage": "browser_context"},
             ) from exc
         checkout = (
             protocol_result.to_dict()
@@ -182,23 +336,36 @@ class PersonalPlusCheckoutWorkflow:
         checkout_url = str(created.get("checkout_url") or "")
 
         refreshed = submitted["session_after_payment"]
-        subscription_sync = self._sync_subscription_snapshot(
-            space_id=space_id,
-            user_account_id=context["user_account_id"],
-            proxy_url=us_proxy.proxy_url,
-            run_id=run_id,
-            work_id=work_id,
+        if self._protocol_runner_injected:
+            subscription_sync = self._sync_subscription_snapshot(
+                space_id=space_id,
+                user_account_id=context["user_account_id"],
+                proxy_url=checkout_proxy.proxy_url,
+                run_id=run_id,
+                work_id=work_id,
+            )
+        subscription_sync = self._finalize_post_payment_subscription_sync(
+            subscription_sync,
+            submitted=submitted,
         )
-        self._require_subscription_sync(subscription_sync)
+        sync_marker = self._subscription_sync_marker(subscription_sync)
         return {
+            **sync_marker,
             "space_id": space_id,
             "user_account_id": context["user_account_id"],
             "checkout_url": checkout_url,
             "checkout_session_id": created.get("checkout_session_id", ""),
-            "create_proxy_country": us_proxy.country_code,
-            "promo_proxy_country": jp_proxy.country_code,
-            "promo_proxy_sid_source": jp_proxy.sid_source,
-            "promo_proxy_probe_attempts": jp_proxy.probe_attempts,
+            "proxy_country": checkout_proxy.country_code,
+            "checkout_proxy_country": checkout_proxy.country_code,
+            "update_proxy_country": checkout_proxy.country_code,
+            "create_proxy_country": checkout_proxy.country_code,
+            "promo_proxy_country": checkout_proxy.country_code,
+            "billing_country": billing_country,
+            "currency": currency,
+            "checkout_proxy_sid_source": checkout_proxy.sid_source,
+            "checkout_proxy_probe_attempts": checkout_proxy.probe_attempts,
+            "promo_proxy_sid_source": checkout_proxy.sid_source,
+            "promo_proxy_probe_attempts": checkout_proxy.probe_attempts,
             "promo_campaign_id": config.promo_campaign_id,
             "checkout_result": submitted,
             "session_refresh": refreshed,
@@ -209,29 +376,112 @@ class PersonalPlusCheckoutWorkflow:
         self,
         *,
         space_id: str,
+        proxy_url_override: str = "",
         work_id: str = "",
         run_id: str = "",
     ) -> dict[str, Any]:
         """Retry only the post-payment snapshot; never create or submit checkout."""
         context = self._load_context(space_id, require_payment_method=False)
-        us_proxy = resolve_cliproxy_proxy(
-            email=context["email"], country_code=self._us_proxy_country
+        browser_fingerprint = browser_fingerprint_for_email(context["email"])
+        proxy_url = str(proxy_url_override or "").strip()
+        checkout_proxy = None
+        if not proxy_url:
+            checkout_proxy = resolve_cliproxy_proxy(
+                email=context["email"], country_code=self._checkout_proxy_country
+            )
+            proxy_url = checkout_proxy.proxy_url
+        browser = CamoufoxEmailRegistration(
+            self._browser_config(
+                proxy_url,
+                work_id=work_id,
+                country_code=(
+                    checkout_proxy.country_code
+                    if checkout_proxy is not None
+                    else self._checkout_proxy_country
+                ),
+                browser_fingerprint=browser_fingerprint,
+            ),
+            event_callback=(
+                self._browser_event(
+                    run_id=run_id,
+                    work_id=work_id,
+                    stage="browser_subscription_sync",
+                )
+                if run_id
+                else None
+            ),
         )
-        subscription_sync = self._sync_subscription_snapshot(
-            space_id=space_id,
-            user_account_id=context["user_account_id"],
-            proxy_url=us_proxy.proxy_url,
-            run_id=run_id,
-            work_id=work_id,
-        )
+
+        def sync_in_browser(browser_context: Any, _page: Any, auth: Any) -> dict[str, Any]:
+            observed_account_id = str(getattr(auth, "chatgpt_account_id", "") or "").strip()
+            if observed_account_id and observed_account_id != context["external_space_id"]:
+                raise PersonalPlusCheckoutError(
+                    "plus_checkout_browser_account_mismatch",
+                    error_code="plus_checkout_browser_account_mismatch",
+                    diagnostics={"stage": "browser_subscription_sync"},
+                )
+            credentials = {
+                "access_token": str(getattr(auth, "access_token", "") or ""),
+                "session_token": str(getattr(auth, "session_token", "") or ""),
+                "cookie_header": str(getattr(auth, "cookie_header", "") or ""),
+                "device_id": str(getattr(auth, "device_id", "") or ""),
+                "csrf_token": str(getattr(auth, "csrf_token", "") or ""),
+            }
+            self._persist_protocol_session(
+                user_account_id=context["user_account_id"],
+                credentials=credentials,
+            )
+            return self._sync_subscription_snapshot(
+                space_id=space_id,
+                user_account_id=context["user_account_id"],
+                proxy_url=proxy_url,
+                run_id=run_id,
+                work_id=work_id,
+                request_session_factory=browser_http_session_factory(browser_context),
+                user_agent=str(getattr(auth, "browser_user_agent", "") or ""),
+                device_id=credentials["device_id"] or context["device_id"],
+            )
+
+        try:
+            subscription_sync = browser.run_authenticated_page(
+                email=context["email"],
+                cookie_header=context["cookie_header"],
+                auth_cookie_header=context["auth_cookie_header"],
+                after_session=sync_in_browser,
+            )
+        except BrowserEmailRegistrationError as exc:
+            raise PersonalPlusCheckoutError(
+                str(exc),
+                error_code="plus_checkout_browser_context_failed",
+                diagnostics={"stage": "browser_subscription_sync"},
+            ) from exc
         self._require_subscription_sync(subscription_sync)
         return {
             "space_id": space_id,
             "user_account_id": context["user_account_id"],
             "mode": "subscription_sync_only",
-            "create_proxy_country": us_proxy.country_code,
-            "create_proxy_sid_source": us_proxy.sid_source,
-            "create_proxy_probe_attempts": us_proxy.probe_attempts,
+            "proxy_country": (
+                checkout_proxy.country_code
+                if checkout_proxy is not None
+                else self._checkout_proxy_country
+            ),
+            "checkout_proxy_country": (
+                checkout_proxy.country_code
+                if checkout_proxy is not None
+                else self._checkout_proxy_country
+            ),
+            "update_proxy_country": self._update_proxy_country,
+            "create_proxy_country": (
+                checkout_proxy.country_code
+                if checkout_proxy is not None
+                else self._checkout_proxy_country
+            ),
+            "create_proxy_sid_source": (
+                checkout_proxy.sid_source if checkout_proxy is not None else "checkout_reuse"
+            ),
+            "create_proxy_probe_attempts": (
+                checkout_proxy.probe_attempts if checkout_proxy is not None else 0
+            ),
             "subscription_sync": subscription_sync,
         }
 
@@ -245,16 +495,14 @@ class PersonalPlusCheckoutWorkflow:
     ) -> dict[str, Any]:
         """Continue directly from a successful bind page before its browser closes."""
         context = self._load_context(space_id, require_payment_method=False)
-        us_proxy = resolve_cliproxy_proxy(
-            email=context["email"], country_code=self._us_proxy_country
-        )
-        jp_proxy = resolve_cliproxy_proxy(
-            email=context["email"], country_code=self._jp_proxy_country
+        checkout_proxy = resolve_cliproxy_proxy(
+            email=context["email"], country_code=self._checkout_proxy_country
         )
         checkout = self._checkout_on_page(
             page=page,
             context=context,
-            promotion_proxy_url=jp_proxy.proxy_url,
+            promotion_proxy_url=checkout_proxy.proxy_url,
+            request_session_factory=browser_http_session_factory(page.context),
             trace_emitter=(
                 self._browser_event(run_id=run_id, work_id=work_id, stage="checkout")
                 if run_id
@@ -268,9 +516,11 @@ class PersonalPlusCheckoutWorkflow:
         subscription_sync = self._sync_subscription_snapshot(
             space_id=space_id,
             user_account_id=context["user_account_id"],
-            proxy_url=us_proxy.proxy_url,
+            proxy_url=checkout_proxy.proxy_url,
             run_id=run_id,
             work_id=work_id,
+            request_session_factory=browser_http_session_factory(page.context),
+            device_id=context["device_id"],
         )
         self._require_subscription_sync(subscription_sync)
         return {
@@ -278,10 +528,15 @@ class PersonalPlusCheckoutWorkflow:
             "user_account_id": context["user_account_id"],
             "checkout_url": checkout_url,
             "checkout_session_id": created.get("checkout_session_id", ""),
-            "create_proxy_country": self._us_proxy_country,
-            "promo_proxy_country": jp_proxy.country_code,
-            "promo_proxy_sid_source": jp_proxy.sid_source,
-            "promo_proxy_probe_attempts": jp_proxy.probe_attempts,
+            "proxy_country": checkout_proxy.country_code,
+            "checkout_proxy_country": checkout_proxy.country_code,
+            "update_proxy_country": checkout_proxy.country_code,
+            "create_proxy_country": checkout_proxy.country_code,
+            "promo_proxy_country": checkout_proxy.country_code,
+            "checkout_proxy_sid_source": checkout_proxy.sid_source,
+            "checkout_proxy_probe_attempts": checkout_proxy.probe_attempts,
+            "promo_proxy_sid_source": checkout_proxy.sid_source,
+            "promo_proxy_probe_attempts": checkout_proxy.probe_attempts,
             "promo_campaign_id": self._promo_campaign_id,
             "checkout_result": submitted,
             "session_refresh": refreshed,
@@ -296,9 +551,12 @@ class PersonalPlusCheckoutWorkflow:
         proxy_url: str,
         run_id: str,
         work_id: str,
+        request_session_factory: Callable[..., Any] | None = None,
+        user_agent: str = "",
+        device_id: str = "",
     ) -> dict[str, Any]:
         """Refresh the paid space snapshot after payment and session refresh."""
-        if self._openai_provider is None:
+        if self._openai_provider is None and request_session_factory is None:
             result = {"status": "skipped", "reason": "openai_provider_not_configured"}
             self._write_subscription_event(
                 run_id=run_id, work_id=work_id, space_id=space_id, result=result
@@ -324,6 +582,9 @@ class PersonalPlusCheckoutWorkflow:
                 account_id=account_id,
                 cookie_header=cookie_header,
                 proxy_url=proxy_url,
+                request_session_factory=request_session_factory,
+                user_agent=user_agent,
+                device_id=device_id,
             )
 
             now = datetime.now(UTC)
@@ -347,9 +608,7 @@ class PersonalPlusCheckoutWorkflow:
                 "seats_entitled": subscription.get(
                     "seats_entitled", subscription.get("seatsEntitled")
                 ),
-                "seats_in_use": subscription.get(
-                    "seats_in_use", subscription.get("seatsInUse")
-                ),
+                "seats_in_use": subscription.get("seats_in_use", subscription.get("seatsInUse")),
             }
             self._write_subscription_event(
                 run_id=run_id, work_id=work_id, space_id=space_id, result=result
@@ -377,23 +636,33 @@ class PersonalPlusCheckoutWorkflow:
         account_id: str,
         cookie_header: str,
         proxy_url: str,
+        request_session_factory: Callable[..., Any] | None = None,
+        user_agent: str = "",
+        device_id: str = "",
     ) -> dict[str, Any]:
-        if self._openai_provider is None:
-            raise PersonalPlusCheckoutError(
-                "plus_checkout_subscription_provider_not_configured"
-            )
+        if self._openai_provider is None and request_session_factory is None:
+            raise PersonalPlusCheckoutError("plus_checkout_subscription_provider_not_configured")
         last_error: Exception | None = None
         last_plan_type = ""
         for delay in (0.0, 1.0, 2.0, 4.0, 8.0):
             if delay > 0:
                 time.sleep(delay)
             try:
-                raw = self._openai_provider.fetch_subscription(
-                    access_token=access_token,
-                    account_id=account_id,
-                    cookie_header=cookie_header,
-                    proxy_url=proxy_url,
-                )
+                if request_session_factory is not None:
+                    raw = self._fetch_subscription_in_browser_context(
+                        request_session_factory=request_session_factory,
+                        access_token=access_token,
+                        account_id=account_id,
+                        user_agent=user_agent,
+                        device_id=device_id,
+                    )
+                else:
+                    raw = self._openai_provider.fetch_subscription(
+                        access_token=access_token,
+                        account_id=account_id,
+                        cookie_header=cookie_header,
+                        proxy_url=proxy_url,
+                    )
             except Exception as exc:
                 last_error = exc
                 continue
@@ -420,6 +689,49 @@ class PersonalPlusCheckoutWorkflow:
                 "error_type": type(last_error).__name__ if last_error else "",
             },
         ) from last_error
+
+    @staticmethod
+    def _fetch_subscription_in_browser_context(
+        *,
+        request_session_factory: Callable[..., Any],
+        access_token: str,
+        account_id: str,
+        user_agent: str = "",
+        device_id: str = "",
+    ) -> dict[str, Any]:
+        client = request_session_factory()
+        try:
+            headers = {
+                "authorization": f"Bearer {access_token}",
+                "chatgpt-account-id": account_id,
+                "accept": "*/*",
+                "origin": "https://chatgpt.com",
+                "referer": "https://chatgpt.com/",
+            }
+            if str(user_agent or "").strip():
+                headers["user-agent"] = str(user_agent).strip()
+            if str(device_id or "").strip():
+                headers["oai-device-id"] = str(device_id).strip()
+            response = client.get(
+                "https://chatgpt.com/backend-api/subscriptions",
+                params={"account_id": account_id},
+                headers=headers,
+                timeout=30.0,
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code < 200 or status_code >= 300:
+                raise PersonalPlusCheckoutError(
+                    f"plus_checkout_subscription_http_{status_code}",
+                    diagnostics={"stage": "subscription_sync"},
+                )
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise PersonalPlusCheckoutError("plus_checkout_subscription_response_invalid")
+            return payload
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
     @staticmethod
     def _subscription_plan_type(subscription: Mapping[str, Any]) -> str:
@@ -482,8 +794,7 @@ class PersonalPlusCheckoutWorkflow:
         error_type = str(result.get("error_type") or "unknown")
         error_message = str(result.get("error_message") or "")[:500]
         raise PersonalPlusCheckoutError(
-            "plus_checkout_subscription_sync_failed: "
-            f"{error_type}: {error_message}",
+            f"plus_checkout_subscription_sync_failed: {error_type}: {error_message}",
             attempt_disposition="consume_stop",
             error_code="plus_checkout_subscription_sync_failed",
             diagnostics={
@@ -492,6 +803,57 @@ class PersonalPlusCheckoutWorkflow:
                 "error_message": error_message,
             },
         )
+
+    @classmethod
+    def _finalize_post_payment_subscription_sync(
+        cls,
+        result: dict[str, Any],
+        *,
+        submitted: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if str(result.get("status") or "").strip().lower() == "succeeded":
+            return result
+        if not cls._checkout_payment_confirmed(submitted):
+            cls._require_subscription_sync(result)
+        return {
+            **result,
+            "status": "pending",
+            "error_code": "plus_checkout_subscription_sync_pending",
+            "payment_confirmed": True,
+            "recovery_mode": "subscription_sync_only",
+        }
+
+    @staticmethod
+    def _checkout_payment_confirmed(submitted: Mapping[str, Any]) -> bool:
+        payment_result = submitted.get("payment_result")
+        if not isinstance(payment_result, Mapping):
+            return False
+        verification = payment_result.get("checkout_verification")
+        if not isinstance(verification, Mapping):
+            return False
+        status = str(verification.get("status") or "").strip().lower()
+        payment_status = str(verification.get("payment_status") or "").strip().lower()
+        post_checkout_result = str(verification.get("post_checkout_result") or "").strip().lower()
+        return (
+            status in {"complete", "completed", "succeeded"}
+            and payment_status in {"paid", "complete", "completed", "succeeded"}
+            and post_checkout_result == "success"
+            and verification.get("completion_success") is True
+        )
+
+    @staticmethod
+    def _subscription_sync_marker(result: Mapping[str, Any]) -> dict[str, Any]:
+        if str(result.get("status") or "").strip().lower() != "pending":
+            return {}
+        return {
+            "failure_scope": "personal_plus_checkout",
+            "exception_type": "PersonalPlusCheckoutError",
+            "attempt_disposition": "consume_stop",
+            "terminal": True,
+            "error_code": "plus_checkout_subscription_sync_pending",
+            "recovery_mode": "subscription_sync_only",
+            "payment_checkpoint_stage": "checkout_completed",
+        }
 
     def _persist_protocol_session(
         self,
@@ -551,7 +913,7 @@ class PersonalPlusCheckoutWorkflow:
         space_id: str,
         *,
         require_payment_method: bool = True,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         with self._session_factory() as session:
             space = session.get(SpaceModel, space_id)
             if space is None:
@@ -562,12 +924,13 @@ class PersonalPlusCheckoutWorkflow:
                 or space.space_status != "active"
             ):
                 raise PersonalPlusCheckoutError("plus_checkout_personal_space_required")
-            if not space.has_promotion or not str(space.promotion_id or "").strip():
-                raise PersonalPlusCheckoutError("plus_checkout_promotion_required")
             if require_payment_method and (
                 not space.has_payment_method or space.payment_method_status != "bound"
             ):
-                raise PersonalPlusCheckoutError("plus_checkout_payment_method_required")
+                raise PersonalPlusCheckoutError(
+                    "plus_checkout_payment_method_required",
+                    error_code="plus_checkout_payment_method_required",
+                )
             account = session.get(UserAccountModel, space.owner_user_account_id)
             if account is None or account.account_status != "active":
                 raise PersonalPlusCheckoutError("plus_checkout_owner_account_not_active")
@@ -588,7 +951,90 @@ class PersonalPlusCheckoutWorkflow:
                 "twofauth_account_id": account.twofauth_account_id,
             }
 
-    def _browser_config(self, proxy_url: str, *, work_id: str):
+    def _reserve_checkout_billing_profile(
+        self,
+        *,
+        email: str,
+        country: str,
+    ) -> dict[str, str]:
+        normalized_country = str(country or "").strip().upper()
+        with self._session_factory() as session:
+            name = session.scalar(
+                select(PaymentNamePoolModel)
+                .where(PaymentNamePoolModel.name_status == "active")
+                .order_by(func.random())
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            address = session.scalar(
+                select(PaymentAddressPoolModel)
+                .where(
+                    PaymentAddressPoolModel.address_status == "active",
+                    PaymentAddressPoolModel.country == normalized_country,
+                )
+                .order_by(func.random())
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if name is None:
+                raise PlusCheckoutError(
+                    "plus_checkout_billing_name_pool_empty",
+                    "active payment name pool is empty",
+                    {"stage": "oaics_billing_fallback"},
+                )
+            if address is None:
+                raise PlusCheckoutError(
+                    "plus_checkout_billing_address_pool_empty",
+                    f"active {normalized_country} payment address pool is empty",
+                    {"stage": "oaics_billing_fallback"},
+                )
+
+            profile = {
+                "email": str(email or "").strip(),
+                "name": " ".join(str(name.full_name or "").split()),
+                "phone": str(address.phone or "").strip(),
+                "line1": str(address.line1 or "").strip(),
+                "line2": str(address.line2 or "").strip(),
+                "city": str(address.city or "").strip(),
+                "state": str(address.state or "").strip(),
+                "postal_code": str(address.postal_code or "").strip(),
+                "country": str(address.country or "").strip().upper(),
+            }
+            required = (
+                "email",
+                "name",
+                "line1",
+                "city",
+                "state",
+                "postal_code",
+                "country",
+            )
+            missing = [field for field in required if not profile[field]]
+            if missing:
+                raise PlusCheckoutError(
+                    "plus_checkout_billing_profile_incomplete",
+                    "payment billing profile is incomplete: " + ", ".join(missing),
+                    {"stage": "oaics_billing_fallback"},
+                )
+
+            now = datetime.now(UTC)
+            name.use_count = int(name.use_count or 0) + 1
+            name.last_used_at = now
+            name.updated_at = now
+            address.use_count = int(address.use_count or 0) + 1
+            address.last_used_at = now
+            address.updated_at = now
+            session.commit()
+            return profile
+
+    def _browser_config(
+        self,
+        proxy_url: str,
+        *,
+        work_id: str,
+        country_code: str = "",
+        browser_fingerprint: BrowserFingerprint | None = None,
+    ):
         from refactor_app.plugins.openai_auth_browser.email_registration import (
             BrowserEmailRegistrationConfig,
         )
@@ -596,6 +1042,8 @@ class PersonalPlusCheckoutWorkflow:
         return BrowserEmailRegistrationConfig(
             proxy_url=proxy_url,
             headless=self._browser_headless,
+            locale=_payment_locale_for_proxy_country(country_code),
+            browser_fingerprint=browser_fingerprint,
             work_id=work_id,
             browser_log_enabled=self._browser_log_enabled,
             browser_log_capture_bodies=self._browser_log_capture_bodies,
@@ -640,6 +1088,7 @@ class PersonalPlusCheckoutWorkflow:
         page: Any,
         context: dict[str, str],
         promotion_proxy_url: str,
+        request_session_factory: Callable[..., Any] | None = None,
         trace_emitter: Callable[[str, dict[str, Any], str], None] | None = None,
     ) -> dict[str, dict[str, Any]]:
         created = self._create_checkout(
@@ -677,14 +1126,19 @@ class PersonalPlusCheckoutWorkflow:
             page,
             account_id=context["external_space_id"],
         )
+        promotion_kwargs: dict[str, Any] = {
+            "proxy_url": promotion_proxy_url,
+            "checkout_url": checkout_url,
+            "access_token": session["access_token"],
+            "account_id": session["account_id"],
+            "promo_campaign_id": self._promo_campaign_id,
+            "cookie_header": self._current_cookie_header(page) or context["cookie_header"],
+            "user_agent": session["user_agent"],
+        }
+        if request_session_factory is not None:
+            promotion_kwargs["session_factory"] = request_session_factory
         promo_update = self._promotion_updater(
-            proxy_url=promotion_proxy_url,
-            checkout_url=checkout_url,
-            access_token=session["access_token"],
-            account_id=session["account_id"],
-            promo_campaign_id=self._promo_campaign_id,
-            cookie_header=self._current_cookie_header(page) or context["cookie_header"],
-            user_agent=session["user_agent"],
+            **promotion_kwargs,
         )
         submitted = self._submit_checkout(
             page,
@@ -692,9 +1146,9 @@ class PersonalPlusCheckoutWorkflow:
             account_id=context["external_space_id"],
             trace_emitter=trace_emitter,
         )
-        payment_state = str(
-            (submitted.get("payment_result") or {}).get("state") or ""
-        ).strip().lower()
+        payment_state = (
+            str((submitted.get("payment_result") or {}).get("state") or "").strip().lower()
+        )
         if payment_state != "succeeded":
             raise PersonalPlusCheckoutError(
                 f"plus_checkout_payment_not_succeeded:{payment_state or 'missing'}"
@@ -822,8 +1276,7 @@ class PersonalPlusCheckoutWorkflow:
                 str(cookie.get("value") or ""),
             )
             for cookie in cookies
-            if str(cookie.get("name") or "").startswith(prefix)
-            and cookie.get("value")
+            if str(cookie.get("name") or "").startswith(prefix) and cookie.get("value")
         )
         return "".join(value for _, value in chunks)
 
@@ -869,6 +1322,7 @@ class PersonalPlusCheckoutWorkflow:
             raise PersonalPlusCheckoutError("plus_checkout_account_id_missing")
         captcha_solver = self._captcha_solver
         if captcha_solver is None and self._captcha_api_url and self._captcha_client_key:
+
             def remote_solver(challenge: dict[str, Any]) -> dict[str, Any]:
                 return solve_plus_checkout_challenge(
                     challenge,

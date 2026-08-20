@@ -87,6 +87,9 @@ const filters: TableFilter[] = [
 const selectedCount = ref(0);
 const selectedRows = ref<Row[]>([]);
 const backfillWorkCount = ref(10);
+const backfillProxyCountry = ref("US");
+const backfillConfirmOpen = ref(false);
+const backfillBusy = ref(false);
 const deleteTarget = ref<Row | null>(null);
 const bulkDeleteOpen = ref(false);
 const deleting = ref(false);
@@ -123,18 +126,33 @@ async function runSelectedAccountJob() {
     store.toast("未选择账号", "请先勾选账号。", "warning");
     return;
   }
+  const proxyCountry = backfillProxyCountry.value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(proxyCountry)) {
+    store.toast("代理国家无效", "请输入两位国家代码，例如 US。", "warning");
+    return;
+  }
+  backfillProxyCountry.value = proxyCountry;
   const payload = {
     user_account_ids: ids,
     created_by: "ops-ui",
     work_count: backfillWorkCount.value,
+    proxy_country: proxyCountry,
   };
-  const result = await resourcesApi.backfillSession(payload);
-  store.toast(
-    "补 Session 执行完成",
-    `work=${result.work_count} 成功=${result.succeeded} 失败=${result.failed}`,
-    result.failed > 0 ? "warning" : "success",
-  );
-  await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  backfillBusy.value = true;
+  try {
+    const result = await resourcesApi.backfillSession(payload);
+    backfillConfirmOpen.value = false;
+    store.toast(
+      "补 Session Job 已创建",
+      `账号=${ids.length} 代理=${proxyCountry} Work=${result.work_count}`,
+      "success",
+    );
+    await router.push({ name: "job-trace", params: { jobId: result.job_id } });
+  } catch (err) {
+    store.toast("补 Session Job 创建失败", String((err as Error).message ?? err), "error");
+  } finally {
+    backfillBusy.value = false;
+  }
 }
 
 async function deleteAccount() {
@@ -194,17 +212,14 @@ async function deleteSelectedAccounts() {
     :columns="columns"
     :loader="resourcesApi.accounts"
     :filters="filters"
+    batch-search
     selectable
     empty-text="暂无账号。"
     @selection-change="updateSelection"
   >
     <template #actions>
       <div class="action-group">
-          <label class="inline-control">
-            <span>Work 数</span>
-            <input v-model.number="backfillWorkCount" class="input small-input" type="number" min="1" max="500" />
-          </label>
-          <button class="btn primary" :disabled="selectedCount === 0" @click="runSelectedAccountJob">补 Session（{{ selectedCount }}）</button>
+          <button class="btn primary" :disabled="selectedCount === 0" @click="backfillConfirmOpen = true">补 Session（{{ selectedCount }}）</button>
           <button class="btn danger" :disabled="selectedCount === 0 || deleting" @click="openSelectedDelete">
             <Trash2 :size="16" />删除选中（{{ selectedCount }}）
           </button>
@@ -222,6 +237,27 @@ async function deleteSelectedAccounts() {
       <button class="btn danger" @click="deleteTarget = row"><Trash2 :size="15" />删除</button>
     </template>
   </ResourcePage>
+  <ConfirmModal
+    :open="backfillConfirmOpen"
+    title="补 Session"
+    message="选择本次登录使用的代理国家，确认后为选中账号创建补 Session Work。"
+    :summary="{ '选中账号': selectedCount, '代理国家': backfillProxyCountry.toUpperCase(), '同时执行 Work': backfillWorkCount }"
+    confirm-text="创建补 Session Job"
+    :busy="backfillBusy"
+    @close="backfillConfirmOpen = false"
+    @confirm="runSelectedAccountJob"
+  >
+    <div class="backfill-config">
+      <label class="field">
+        <span>代理国家</span>
+        <input v-model="backfillProxyCountry" class="input" maxlength="2" pattern="[A-Za-z]{2}" placeholder="US" @input="backfillProxyCountry = backfillProxyCountry.toUpperCase()" />
+      </label>
+      <label class="field">
+        <span>并发数</span>
+        <input v-model.number="backfillWorkCount" class="input" type="number" min="1" max="500" />
+      </label>
+    </div>
+  </ConfirmModal>
   <ConfirmModal :open="Boolean(deleteTarget)" title="删除账号" message="会同时删除该账号拥有的个人空间、个人空间关联数据和代理绑定。" :summary="{ '账号邮箱': deleteTarget?.email, '账号 ID': deleteTarget?.id }" confirm-text="确认删除" danger :busy="deleting" @close="deleteTarget = null" @confirm="deleteAccount" />
   <ConfirmModal
     :open="bulkDeleteOpen"
@@ -238,4 +274,6 @@ async function deleteSelectedAccounts() {
 
 <style scoped>
 .action-group { align-items: center; display: flex; gap: 8px; }
+.backfill-config { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 520px) { .backfill-config { grid-template-columns: 1fr; } }
 </style>

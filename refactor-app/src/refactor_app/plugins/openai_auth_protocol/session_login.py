@@ -5,6 +5,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 
+from refactor_app.application.workflows.proxy_locale import normalize_proxy_country
+from refactor_app.config.browser_fingerprint import (
+    BrowserFingerprint,
+    browser_fingerprint_for_email,
+)
 from refactor_app.plugins.mail_external_api.plugin import prepare_domain_mailbox
 
 from .auth_flow import AuthFlow, AuthResult
@@ -38,13 +43,16 @@ def acquire_chatgpt_session(
     email: str,
     password: str,
     proxy: str = "",
+    proxy_country: str = "",
     mail_provider: OtpProvider,
     trace_dump_path: str = "",
     skip_oauth_token_exchange: bool = True,
     totp_code_provider: Callable[[], str] | None = None,
+    browser_fingerprint: BrowserFingerprint | None = None,
 ) -> SessionLoginResult:
     config = Config()
-    config.proxy = proxy or None
+    config.browser_fingerprint = browser_fingerprint or browser_fingerprint_for_email(email)
+    _configure_proxy_context(config, proxy=proxy, proxy_country=proxy_country)
     config.auth_env_flags = {
         "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
         "OAUTH_CODEX_RT_EXCHANGE": "0",
@@ -59,7 +67,9 @@ def acquire_chatgpt_session(
 
     mailbox_email = email.strip()
     openai_email = mailbox_email
-    prepare_domain_mailbox(mail_provider, email=mailbox_email)
+    password_totp_login = bool(password.strip() and totp_code_provider is not None)
+    if not password_totp_login:
+        prepare_domain_mailbox(mail_provider, email=mailbox_email)
     flow = AuthFlow(config)
     try:
         adapter = ExternalMailOtpAdapter(
@@ -67,6 +77,14 @@ def acquire_chatgpt_session(
             ensure_before_wait=False,
             mailbox_email=mailbox_email,
         )
+        if password_totp_login:
+            adapter.events.append(
+                {
+                    "event": "mail.ensure_domain_email.skipped",
+                    "email": mailbox_email,
+                    "reason": "password_and_totp_available",
+                }
+            )
         result = flow.run_protocol_login(
             email=openai_email,
             password=password,
@@ -95,11 +113,13 @@ def prepare_chatgpt_session_otp(
     email: str,
     password: str,
     proxy: str = "",
+    proxy_country: str = "",
     mail_provider: OtpProvider,
     trace_dump_path: str = "",
 ) -> SessionOtpPrepareResult:
     config = Config()
-    config.proxy = proxy or None
+    config.browser_fingerprint = browser_fingerprint_for_email(email)
+    _configure_proxy_context(config, proxy=proxy, proxy_country=proxy_country)
     config.auth_env_flags = {
         "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
         "OAUTH_CODEX_RT_EXCHANGE": "0",
@@ -142,12 +162,29 @@ def submit_prepared_chatgpt_session_otp(
     *,
     snapshot: dict,
     proxy: str = "",
+    proxy_country: str = "",
     mail_provider: OtpProvider,
     before_validate=None,
     before_skip=None,
 ) -> SessionOtpSubmitResult:
     config = Config()
-    config.proxy = proxy or str(snapshot.get("proxy") or "") or None
+    snapshot_email = str(
+        snapshot.get("mailbox_email") or snapshot.get("email") or ""
+    ).strip()
+    config.browser_fingerprint = browser_fingerprint_for_email(snapshot_email)
+    snapshot_country = ""
+    sentinel = snapshot.get("sentinel") if isinstance(snapshot.get("sentinel"), dict) else {}
+    runtime_context = (
+        sentinel.get("runtime_context")
+        if isinstance(sentinel.get("runtime_context"), dict)
+        else {}
+    )
+    snapshot_country = str(runtime_context.get("country_code") or "")
+    _configure_proxy_context(
+        config,
+        proxy=proxy or str(snapshot.get("proxy") or ""),
+        proxy_country=proxy_country or snapshot_country,
+    )
     config.auth_env_flags = {
         "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
         "OAUTH_CODEX_RT_EXCHANGE": "0",
@@ -178,6 +215,12 @@ def submit_prepared_chatgpt_session_otp(
         )
     finally:
         flow.close()
+
+
+def _configure_proxy_context(config: Config, *, proxy: str, proxy_country: str) -> None:
+    country = normalize_proxy_country(proxy_country)
+    config.proxy = proxy or None
+    config.proxy_meta = {"register": {"country_code": country}}
 
 
 def _cookie_header_from_session(flow: AuthFlow, domain_keyword: str) -> str:

@@ -485,6 +485,35 @@ def test_email_submission_preserves_original_case() -> None:
     assert page.email_input.value == "AshleyJackson500604@hotmail.com"
 
 
+def test_repeated_email_submission_replaces_camoufox_appended_value() -> None:
+    class AppendingEmailInput(_EmailInput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.native_setter_script = ""
+
+        def fill(self, value: str) -> None:
+            self.value += value
+
+        def evaluate(self, script: str, value: str | None = None):
+            if value is None:
+                return self.value
+            self.native_setter_script = script
+            self.value = value
+            return None
+
+        def input_value(self) -> str:
+            return self.value
+
+    page = _EmailPage()
+    page.email_input = AppendingEmailInput()
+    email = "onion.dupers6x@icloud.com"
+
+    assert _submit_email_if_visible(page, email) is True
+    assert _submit_email_if_visible(page, email) is True
+    assert page.email_input.value == email
+    assert "HTMLInputElement.prototype" in page.email_input.native_setter_script
+
+
 class _PasswordlessPage:
     def __init__(self) -> None:
         self.requests: list[tuple[str, str]] = []

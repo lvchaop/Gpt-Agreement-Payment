@@ -50,6 +50,16 @@ export function cancelJob(jobId: string) {
   return postJson<Job>(`/jobs/${encodeURIComponent(jobId)}/cancel`, {});
 }
 
+export function retryJob(jobId: string) {
+  return postJson<{
+    job_id: string;
+    job_status: string;
+    run_id: string;
+    attempt: number;
+    retried_work_count: number;
+  }>(`/jobs/${encodeURIComponent(jobId)}/retry`, {});
+}
+
 export function listRuns(jobId: string) {
   return getJson<JobRun[]>(`/jobs/${encodeURIComponent(jobId)}/runs`);
 }

@@ -378,14 +378,8 @@ class BrowserCodexCredentialProvisioner:
         )
 
     def prepare(self) -> None:
-        from camoufox.pkgman import camoufox_path, launch_path
-        from camoufox.sync_api import Camoufox
-
-        install_dir = camoufox_path(download_if_missing=True)
-        executable = launch_path()
-        with TemporaryDirectory(prefix="invite_executor_camoufox_") as profile_dir:
+        with TemporaryDirectory(prefix="invite_executor_browser_") as profile_dir:
             with managed_camoufox_context(
-                Camoufox,
                 flow="invite-executor-runtime-prepare",
                 headless=True,
                 persistent_context=True,
@@ -393,14 +387,10 @@ class BrowserCodexCredentialProvisioner:
             ) as context:
                 if not context.pages:
                     raise ReplenishmentUpstreamError(
-                        "Camoufox persistent context opened without an initial page"
+                        "fingerprint browser persistent context opened without an initial page"
                     )
                 context.pages[0].title()
-        logger.info(
-            "Camoufox runtime ready: install_dir=%s executable=%s",
-            install_dir,
-            executable,
-        )
+        logger.info("Camoufox browser runtime ready")
 
     def close(self) -> None:
         if self._phone_provider is not None:

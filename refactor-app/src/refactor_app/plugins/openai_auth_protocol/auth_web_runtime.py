@@ -32,6 +32,10 @@ _BOOTSTRAP_SCRIPT_ID = "bootstrap-inert-script"
 _DEFAULT_RUM_PROXY_PATH = "/awe/api/v2/rum"
 _DEFAULT_STATSIG_API_URL = "https://ab.chatgpt.com/v1"
 _DEFAULT_STATSIG_LOG_EVENT_URL = "https://chatgpt.com/ces/v1/rgstr"
+_CLIENT_HINT_BRAND_PATTERN = re.compile(
+    r'(?P<brand>"(?:\\.|[^"\\])*")\s*;\s*v\s*=\s*'
+    r'(?P<version>"(?:\\.|[^"\\])*")'
+)
 
 
 class AuthWebRuntimeError(RuntimeError):
@@ -76,6 +80,30 @@ class _AuthHtmlParser(HTMLParser):
             self.title = "".join(self._title_chunks).strip()
             self._in_title = False
             self._title_chunks = []
+
+
+def _parse_client_hint_brands(value: Any) -> list[dict[str, str]]:
+    brands = [
+        {
+            "brand": str(json.loads(match.group("brand"))),
+            "version": str(json.loads(match.group("version"))),
+        }
+        for match in _CLIENT_HINT_BRAND_PATTERN.finditer(str(value or ""))
+    ]
+    if not brands:
+        raise AuthWebRuntimeError("browser profile Client Hint brand list is invalid")
+    return brands
+
+
+def _decode_client_hint_string(value: Any) -> str:
+    encoded = str(value or "").strip()
+    if not encoded:
+        return ""
+    try:
+        decoded = json.loads(encoded)
+    except json.JSONDecodeError:
+        return encoded
+    return str(decoded) if isinstance(decoded, str) else encoded
 
 
 @dataclass(frozen=True)
@@ -215,21 +243,38 @@ def _document_cookie_header(session: Any, page_url: str) -> str:
     return "; ".join(pairs)
 
 
-def _download_asset(session: Any, url: str, *, referer: str) -> bytes:
+def _download_asset(
+    session: Any,
+    url: str,
+    *,
+    referer: str,
+    accept_language: str = "",
+    browser_profile: dict[str, Any] | None = None,
+) -> bytes:
+    profile = browser_profile or {}
+    request_headers = {
+        "Accept": "*/*",
+        "Referer": referer,
+        "User-Agent": str(
+            profile.get("user_agent") or BROWSER_FINGERPRINT.user_agent
+        ),
+        "sec-ch-ua": str(
+            profile.get("sec_ch_ua") or BROWSER_FINGERPRINT.sec_ch_ua
+        ),
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": str(
+            profile.get("sec_ch_ua_platform")
+            or BROWSER_FINGERPRINT.sec_ch_ua_platform
+        ),
+        "Sec-Fetch-Dest": "script",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    }
+    if str(accept_language or "").strip():
+        request_headers["Accept-Language"] = str(accept_language).strip()
     response = session.get(
         url,
-        headers={
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": referer,
-            "User-Agent": BROWSER_FINGERPRINT.user_agent,
-            "sec-ch-ua": BROWSER_FINGERPRINT.sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_FINGERPRINT.sec_ch_ua_platform,
-            "Sec-Fetch-Dest": "script",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-        },
+        headers=request_headers,
         timeout=30,
     )
     if int(getattr(response, "status_code", 0) or 0) != 200:
@@ -247,6 +292,8 @@ def load_auth_web_runtime_assets(
     *,
     html_text: str,
     page_url: str,
+    accept_language: str = "",
+    browser_profile: dict[str, Any] | None = None,
 ) -> AuthWebRuntimeAssets:
     parser = _AuthHtmlParser()
     parser.feed(html_text)
@@ -273,15 +320,39 @@ def load_auth_web_runtime_assets(
             f"Auth Web entry bundle count was {len(set(entry_matches))}, expected 1"
         )
     entry_url = entry_matches[0]
-    entry_content = _download_asset(session, entry_url, referer=page_url)
+    entry_content = _download_asset(
+        session,
+        entry_url,
+        referer=page_url,
+        accept_language=accept_language,
+        browser_profile=browser_profile,
+    )
     entry_source = entry_content.decode("utf-8")
     statsig_url = _find_import_url(entry_url, entry_source, "statsig-")
     app_core_url = _find_import_url(entry_url, entry_source, "app-core-")
     datadog_url = _find_import_url(entry_url, entry_source, "datadog-")
 
-    statsig_content = _download_asset(session, statsig_url, referer=page_url)
-    app_core_content = _download_asset(session, app_core_url, referer=page_url)
-    datadog_content = _download_asset(session, datadog_url, referer=page_url)
+    statsig_content = _download_asset(
+        session,
+        statsig_url,
+        referer=page_url,
+        accept_language=accept_language,
+        browser_profile=browser_profile,
+    )
+    app_core_content = _download_asset(
+        session,
+        app_core_url,
+        referer=page_url,
+        accept_language=accept_language,
+        browser_profile=browser_profile,
+    )
+    datadog_content = _download_asset(
+        session,
+        datadog_url,
+        referer=page_url,
+        accept_language=accept_language,
+        browser_profile=browser_profile,
+    )
     if b"StatsigClient" not in statsig_content:
         raise AuthWebRuntimeError("Auth Web Statsig bundle marker was missing")
     if b"startDurationVital" not in datadog_content or b"setGlobalContext" not in datadog_content:
@@ -376,9 +447,9 @@ class AuthWebRuntime:
     def _start(self) -> None:
         runner = Path(__file__).resolve().with_name("auth_web_runtime_runner.js")
         env = dict(os.environ)
-        timezone_name = str(
-            self.sentinel_context.browser_profile.get("timezone_iana") or "UTC"
-        ).strip()
+        timezone_name = str(self.sentinel_context.browser_profile.get("timezone_iana") or "").strip()
+        if not timezone_name:
+            raise RuntimeError("verified proxy timezone is missing from Sentinel context")
         env["TZ"] = timezone_name
         self._process = subprocess.Popen(
             [_resolve_node_binary(), str(runner)],
@@ -400,6 +471,13 @@ class AuthWebRuntime:
         ).start()
         identity = self.assets.bootstrap["statsigClientInitData"]["identity"]
         profile = self.sentinel_context.browser_profile
+        sec_ch_ua = str(
+            profile.get("sec_ch_ua") or BROWSER_FINGERPRINT.sec_ch_ua
+        )
+        sec_ch_ua_full_version_list = str(
+            profile.get("sec_ch_ua_full_version_list")
+            or BROWSER_FINGERPRINT.sec_ch_ua_full_version_list
+        )
         result = self._command(
             {
                 "type": "init",
@@ -421,15 +499,21 @@ class AuthWebRuntime:
                         self.assets.page_url,
                     ),
                     "language": str(
-                        identity.get("locale") or profile.get("navigator_language") or "en-US"
+                        profile.get("navigator_language") or identity.get("locale") or ""
                     ),
-                    "languages": list(profile.get("navigator_languages") or ["en-US"]),
+                    "languages": list(
+                        profile.get("navigator_languages")
+                        or [profile.get("navigator_language") or identity.get("locale")]
+                    ),
                     "userAgent": str(
-                        identity.get("userAgent")
-                        or profile.get("user_agent")
+                        profile.get("user_agent")
+                        or identity.get("userAgent")
                         or BROWSER_FINGERPRINT.user_agent
                     ),
-                    "platform": str(profile.get("navigator_platform") or "MacIntel"),
+                    "platform": str(
+                        profile.get("navigator_platform")
+                        or BROWSER_FINGERPRINT.navigator_platform
+                    ),
                     "hardwareConcurrency": int(profile.get("hardware_concurrency") or 8),
                     "deviceMemory": int(profile.get("device_memory") or 8),
                     "screenWidth": int(profile.get("screen_width") or 1512),
@@ -442,9 +526,37 @@ class AuthWebRuntime:
                         profile.get("chrome_full_version")
                         or BROWSER_FINGERPRINT.sec_ch_ua_full_version.strip('"')
                     ),
-                    "userAgentDataPlatform": str(
-                        profile.get("user_agent_data_platform") or "macOS"
-                    ),
+                    "userAgentData": {
+                        "brands": _parse_client_hint_brands(sec_ch_ua),
+                        "mobile": False,
+                        "platform": _decode_client_hint_string(
+                            profile.get("sec_ch_ua_platform")
+                            or BROWSER_FINGERPRINT.sec_ch_ua_platform
+                        ),
+                        "architecture": _decode_client_hint_string(
+                            profile.get("sec_ch_ua_arch")
+                            or BROWSER_FINGERPRINT.sec_ch_ua_arch
+                        ),
+                        "bitness": _decode_client_hint_string(
+                            profile.get("sec_ch_ua_bitness")
+                            or BROWSER_FINGERPRINT.sec_ch_ua_bitness
+                        ),
+                        "model": _decode_client_hint_string(
+                            profile.get("sec_ch_ua_model") or '""'
+                        ),
+                        "platformVersion": _decode_client_hint_string(
+                            profile.get("sec_ch_ua_platform_version")
+                            or BROWSER_FINGERPRINT.sec_ch_ua_platform_version
+                        ),
+                        "uaFullVersion": _decode_client_hint_string(
+                            profile.get("sec_ch_ua_full_version")
+                            or profile.get("chrome_full_version")
+                            or BROWSER_FINGERPRINT.sec_ch_ua_full_version
+                        ),
+                        "fullVersionList": _parse_client_hint_brands(
+                            sec_ch_ua_full_version_list
+                        ),
+                    },
                     "navigationDuration": 3459.1,
                     "domInteractive": 3425.8,
                     "redirectCount": 1,
@@ -562,14 +674,23 @@ class AuthWebRuntime:
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": str(
-                profile.get("accept_language") or identity.get("locale") or "en-US"
+                profile.get("accept_language") or identity.get("locale") or ""
             ),
             "Origin": f"{page_url.scheme}://{page_url.netloc}",
             "Referer": referer,
-            "User-Agent": str(identity.get("userAgent") or BROWSER_FINGERPRINT.user_agent),
-            "sec-ch-ua": BROWSER_FINGERPRINT.sec_ch_ua,
+            "User-Agent": str(
+                profile.get("user_agent")
+                or identity.get("userAgent")
+                or BROWSER_FINGERPRINT.user_agent
+            ),
+            "sec-ch-ua": str(
+                profile.get("sec_ch_ua") or BROWSER_FINGERPRINT.sec_ch_ua
+            ),
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": BROWSER_FINGERPRINT.sec_ch_ua_platform,
+            "sec-ch-ua-platform": str(
+                profile.get("sec_ch_ua_platform")
+                or BROWSER_FINGERPRINT.sec_ch_ua_platform
+            ),
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": fetch_site,
@@ -831,5 +952,9 @@ def start_auth_web_runtime(
         session,
         html_text=html_text,
         page_url=page_url,
+        accept_language=str(
+            sentinel_context.browser_profile.get("accept_language") or ""
+        ),
+        browser_profile=sentinel_context.browser_profile,
     )
     return AuthWebRuntime(session, assets, sentinel_context)

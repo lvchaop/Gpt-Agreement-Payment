@@ -4,6 +4,7 @@ import re
 from datetime import UTC, datetime
 from typing import Annotated, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -21,6 +22,7 @@ from refactor_app.infrastructure.db.models import (
     UserAccountModel,
     WorkItemModel,
 )
+from refactor_app.infrastructure.logging.event_writer import EventWriter
 
 router = APIRouter(tags=["jobs"])
 DbSession = Annotated[Session, Depends(get_db_session)]
@@ -209,6 +211,151 @@ def cancel_job(job_id: str, session: DbSession) -> dict:
         )
         or 0,
     }
+
+
+@router.post("/jobs/{job_id}/retry")
+def retry_failed_job(job_id: str, session: DbSession) -> dict:
+    job = session.get(JobModel, job_id, with_for_update=True)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.job_status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "only failed jobs can be retried",
+                "job_status": job.job_status,
+            },
+        )
+
+    failed_work_items = list(
+        session.scalars(
+            select(WorkItemModel)
+            .where(
+                WorkItemModel.job_id == job_id,
+                WorkItemModel.work_status == "failed",
+            )
+            .order_by(WorkItemModel.created_at, WorkItemModel.id)
+            .with_for_update()
+        ).all()
+    )
+    if not failed_work_items:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "failed job has no failed work items to retry",
+                "job_status": job.job_status,
+            },
+        )
+
+    latest_run = session.scalars(
+        select(JobRunModel)
+        .where(JobRunModel.job_id == job_id)
+        .order_by(JobRunModel.attempt.desc(), JobRunModel.started_at.desc().nullslast())
+        .limit(1)
+    ).first()
+    attempt = int(latest_run.attempt if latest_run is not None else 0) + 1
+    now = datetime.now(UTC)
+    run = JobRunModel(
+        id=str(uuid4()),
+        job_id=job_id,
+        run_status="running",
+        attempt=attempt,
+        started_at=now,
+        output_json={
+            "retry_of_run_id": str(latest_run.id if latest_run is not None else ""),
+            "retried_work_count": len(failed_work_items),
+        },
+    )
+    session.add(run)
+
+    barrier_sizes = _retry_barrier_sizes(failed_work_items)
+    for work in failed_work_items:
+        work_input = dict(work.input_json or {})
+        work_input["_run_id"] = run.id
+        _reset_retry_barrier(
+            work_input,
+            attempt=attempt,
+            barrier_sizes=barrier_sizes,
+        )
+        work.input_json = work_input
+        work.work_status = "queued"
+        work.claimed_by = ""
+        work.claimed_at = None
+        work.lease_expires_at = None
+        work.started_at = None
+        work.finished_at = None
+        work.error_code = ""
+        work.error_message = ""
+        work.updated_at = now
+
+    job.job_status = "running"
+    job.updated_at = now
+    session.flush()
+    EventWriter(session).write(
+        run_id=run.id,
+        event_type="job.retry.started",
+        message=f"retrying {len(failed_work_items)} failed work items",
+        data_json={
+            "job_id": job_id,
+            "retry_of_run_id": str(latest_run.id if latest_run is not None else ""),
+            "attempt": attempt,
+            "retried_work_count": len(failed_work_items),
+        },
+    )
+    session.commit()
+    return {
+        "job_id": job.id,
+        "job_status": job.job_status,
+        "run_id": run.id,
+        "attempt": attempt,
+        "retried_work_count": len(failed_work_items),
+    }
+
+
+def _retry_barrier_sizes(
+    work_items: list[WorkItemModel],
+) -> dict[tuple[str, str, str], int]:
+    sizes: dict[tuple[str, str, str], int] = {}
+    for work in work_items:
+        barrier = _retry_barrier_identity(dict(work.input_json or {}))
+        if barrier is not None:
+            sizes[barrier] = sizes.get(barrier, 0) + 1
+    return sizes
+
+
+def _retry_barrier_identity(
+    input_json: dict[str, Any],
+) -> tuple[str, str, str] | None:
+    private_key = str(input_json.get("_barrier_key") or "").strip()
+    if private_key:
+        return (
+            "private",
+            private_key,
+            str(input_json.get("_barrier_group") or "").strip(),
+        )
+    public_key = str(input_json.get("barrier_key") or "").strip()
+    if public_key:
+        return ("public", public_key, "")
+    return None
+
+
+def _reset_retry_barrier(
+    input_json: dict[str, Any],
+    *,
+    attempt: int,
+    barrier_sizes: dict[tuple[str, str, str], int],
+) -> None:
+    barrier = _retry_barrier_identity(input_json)
+    if barrier is None:
+        return
+    kind, barrier_key, _group = barrier
+    retry_key = f"{barrier_key}:retry-{attempt}"
+    if kind == "private":
+        input_json["_barrier_key"] = retry_key
+        input_json["_barrier_expected"] = barrier_sizes[barrier]
+        return
+    input_json["barrier_key"] = retry_key
+    input_json["barrier_expected"] = barrier_sizes[barrier]
 
 
 @router.get("/jobs/{job_id}/work-items")

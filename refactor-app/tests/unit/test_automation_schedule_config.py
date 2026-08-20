@@ -250,6 +250,7 @@ def test_personal_payment_method_schedule_defaults_and_job_mapping() -> None:
         "space_id": "",
         "limit": 10,
         "work_count": 1,
+        "proxy_country": "US",
         "auto_start_plus_checkout": True,
     }
     assert resources._fixed_automation_schedule_id(
@@ -279,6 +280,7 @@ def test_personal_payment_method_schedule_propagates_plus_checkout_setting(
             "space_id": "",
             "limit": 10,
             "work_count": 1,
+            "proxy_country": "US",
             "auto_start_plus_checkout": True,
         },
     )
@@ -302,6 +304,7 @@ def test_personal_payment_method_schedule_propagates_plus_checkout_setting(
             "space_id": "space-personal-1",
             "limit": 5,
             "work_count": 2,
+            "proxy_country": "de",
             "auto_start_plus_checkout": False,
             "checkout_ui_mode": "custom",
         },
@@ -316,6 +319,7 @@ def test_personal_payment_method_schedule_propagates_plus_checkout_setting(
             "space_id": "space-personal-1",
             "limit": 5,
             "work_count": 2,
+            "proxy_country": "DE",
             "auto_start_plus_checkout": False,
             "checkout_ui_mode": "custom",
         },
@@ -347,6 +351,8 @@ def test_personal_codex_credential_heartbeat_schedule_defaults_and_mapping() -> 
         "hero_sms_country": "187",
         "hero_sms_max_price": "0.18",
         "force_clean_browser_login": False,
+        "proxy_mode": "cliproxy",
+        "proxy_country": "US",
     }
     assert resources._fixed_automation_schedule_id(
         "automation.personal_codex_credential_heartbeat"
@@ -387,6 +393,8 @@ def test_personal_codex_credential_heartbeat_schedule_creates_personal_job(
             "hero_sms_country": "187",
             "hero_sms_max_price": "0.18",
             "force_clean_browser_login": True,
+            "proxy_mode": "cliproxy",
+            "proxy_country": "US",
         },
         advance_next_run=False,
         created_by="ops:test",
@@ -403,6 +411,8 @@ def test_personal_codex_credential_heartbeat_schedule_creates_personal_job(
         "hero_sms_country": "187",
         "hero_sms_max_price": "0.18",
         "force_clean_browser_login": True,
+        "proxy_mode": "cliproxy",
+        "proxy_country": "US",
     }
     assert schedule.last_job_id == "heartbeat-job-1"
     assert schedule.last_run_status == "running"
